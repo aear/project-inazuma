@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 def sanitize_filename(name):
-    """Replace non-alphanumeric characters with underscores for safe filenames."""
+    """Retain hyphens while converting other non-alphanumeric characters to underscores for safe filenames."""
     return re.sub(r"[^\w\-]", "_", name)
 
 def register_birth(data: dict) -> str:
