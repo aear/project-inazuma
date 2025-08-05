@@ -8,6 +8,7 @@ from pathlib import Path
 from memory_graph import build_fractal_memory
 from model_manager import update_inastate, load_config, get_inastate
 from gui_hook import log_to_statusbox
+from safe_popen import safe_popen
 from who_am_i import run_reflection
 
 
@@ -169,7 +170,7 @@ def run_birth_sequence(child):
         launch_symbolic_startup(child)
 
         log_to_statusbox("[Birth] Launching runtime...")
-        subprocess.Popen(["python", "model_manager.py"])
+        safe_popen(["python", "model_manager.py"])
 
         time.sleep(1)
         log_to_statusbox("[Birth] Performing first introspection (who_am_i)...")

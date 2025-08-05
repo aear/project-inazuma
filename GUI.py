@@ -3,7 +3,7 @@ from tkinter import Menu, messagebox, filedialog
 import json
 import os
 import sys
-import subprocess
+from safe_popen import safe_popen
 import psutil
 import shutil
 from pathlib import Path
@@ -34,13 +34,21 @@ def status_log_server():
                         while True:
                             msg = pipe.readline()
                             if msg:
-                                status_box.insert(tk.END, msg)
+                                tag = "error" if msg.startswith("[ERROR]") else None
+                                if tag:
+                                    status_box.insert(tk.END, msg, tag)
+                                else:
+                                    status_box.insert(tk.END, msg)
                                 status_box.see(tk.END)
                 else:
                     with open(STATUS_PIPE_PATH, "r") as pipe:
                         for msg in pipe:
                             if msg.strip():
-                                status_box.insert(tk.END, msg)
+                                tag = "error" if msg.startswith("[ERROR]") else None
+                                if tag:
+                                    status_box.insert(tk.END, msg, tag)
+                                else:
+                                    status_box.insert(tk.END, msg)
                                 status_box.see(tk.END)
             except Exception as e:
                 status_box.insert(tk.END, f"[Pipe Error] {e}\n")
@@ -48,8 +56,6 @@ def status_log_server():
                 time.sleep(2)
 
     threading.Thread(target=run_pipe, daemon=True).start()
-
-import shutil
 
 def clear_status_log():
     status_box.delete("1.0", tk.END)
@@ -78,18 +84,13 @@ def stream_subprocess_to_status(command, label="Process"):
     def stream_output():
         status_box.insert(tk.END, f"[{label}] Starting...\n")
         status_box.see(tk.END)
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in iter(process.stdout.readline, ''):
-                if line:
-                    status_box.insert(tk.END, f"[{label}] {line}")
-                    status_box.see(tk.END)
-            process.stdout.close()
+        process = safe_popen(command, label=label, verbose=True)
+        if process is not None:
             process.wait()
             status_box.insert(tk.END, f"[{label}] Completed.\n")
             status_box.see(tk.END)
-        except Exception as e:
-            status_box.insert(tk.END, f"[{label}] ERROR: {e}\n")
+        else:
+            status_box.insert(tk.END, f"[{label}] Failed to start.\n", "error")
             status_box.see(tk.END)
 
     threading.Thread(target=stream_output, daemon=True).start()
@@ -125,7 +126,7 @@ def save_config():
 def birth_new_model():
     status_box.insert(tk.END, "Opening Birth Certificate window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "birth_certificate.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "birth_certificate.py"], verbose=True)
 
 def load_child():
     status_box.insert(tk.END, "Load Child selected.\n")
@@ -176,17 +177,17 @@ def save_load_config():
 def exceptions_list():
     status_box.insert(tk.END, "Opening Exceptions List window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "exception_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "exception_window.py"], verbose=True)
 
 def precision_settings():
     status_box.insert(tk.END, "Opening Precision Settings window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "precision_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "precision_window.py"], verbose=True)
 
 def open_timers_config():
     status_box.insert(tk.END, "Opening Timers configuration.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "timers_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "timers_window.py"], verbose=True)
 
 
 def pretrain_mode():
@@ -201,23 +202,14 @@ def pretrain_mode():
         status_box.insert(tk.END, f"[Pretrain] Using child: {child}\n")
         status_box.see(tk.END)
 
-        # Now pass child to pretrain_logic.py as an argument
-        process = subprocess.Popen(
-            [sys.executable, "pretrain_logic.py", child],  # Only call pretrain_logic.py
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                status_box.insert(tk.END, f"[Pretrain] {line}")
-                status_box.see(tk.END)
-        process.stdout.close()
-        process.wait()
-
-        status_box.insert(tk.END, "[Pretrain] Finished pretraining.\n")
-        status_box.see(tk.END)
+        process = safe_popen([sys.executable, "pretrain_logic.py", child], label="Pretrain", verbose=True)
+        if process is not None:
+            process.wait()
+            status_box.insert(tk.END, "[Pretrain] Finished pretraining.\n")
+            status_box.see(tk.END)
+        else:
+            status_box.insert(tk.END, "[Pretrain] Failed to start pretraining.\n", "error")
+            status_box.see(tk.END)
 
     threading.Thread(target=stream_pretrain, daemon=True).start()
 
@@ -226,13 +218,11 @@ def pretrain_mode():
 def open_eeg_view():
     status_box.insert(tk.END, "Opening EEG window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "EEG.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "EEG.py"], label="EEG", verbose=True)
 
 def update_ai_count_label():
     ai_count = 1 if model_running else 0
     canvas.itemconfig(ai_text_id, text=str(ai_count))
-
-from gui_hook import log_to_statusbox
 
 def start_model():
     status_box.insert(tk.END, "Start Button clicked.\n")
@@ -305,7 +295,7 @@ def emergency_shutdown():
 
 def tuck_in():
     try:
-        subprocess.Popen(["python", "dreamstate.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        safe_popen(["python", "dreamstate.py"], label="Dream", verbose=True)
     except Exception as e:
         messagebox.showerror("Dream Error", f"Failed to launch dreamstate: {e}")
 
@@ -320,7 +310,7 @@ def wake_up():
 
     time.sleep(1)
     status_box.insert(tk.END, "[Wake] Resuming communication loop...\n")
-    subprocess.Popen([sys.executable, "early_comm.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "early_comm.py"], verbose=False)
 
 
 
@@ -417,6 +407,7 @@ scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
 status_box = tk.Text(status_frame, height=6, wrap=tk.WORD, yscrollcommand=scrollbar.set)
 status_box.pack(expand=True, fill=tk.BOTH)
+status_box.tag_config("error", foreground="red")
 scrollbar.config(command=status_box.yview)
 
 button_frame = tk.Frame(root)

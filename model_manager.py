@@ -4,6 +4,7 @@ import os
 import json
 import time
 import subprocess
+from safe_popen import safe_popen
 from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
@@ -80,8 +81,8 @@ def seed_self_question(question):
     log_to_statusbox(f"[Manager] Self-question seeded: {question}")
 
 def launch_background_loops():
-    subprocess.Popen(["python", "audio_listener.py"])
-    subprocess.Popen(["python", "vision_window.py"])
+    safe_popen(["python", "audio_listener.py"])
+    safe_popen(["python", "vision_window.py"])
     log_to_statusbox("[Manager] Background loops launched.")
 
 def monitor_energy():
@@ -157,23 +158,23 @@ def run_internal_loop():
     if check_audio_index_change():
         subprocess.call(["pkill", "-f", "audio_listener.py"])
         time.sleep(2)  # Let config settle and avoid early InputStream calls
-        subprocess.Popen(["python", "audio_listener.py"])
+        safe_popen(["python", "audio_listener.py"])
 
 
 
     if get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
-        subprocess.Popen(["python", "meditation_state.py"])
+        safe_popen(["python", "meditation_state.py"])
 
     if get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
-        subprocess.Popen(["python", "dreamstate.py"])
+        safe_popen(["python", "dreamstate.py"])
 
     subprocess.run(["python", "emotion_engine.py"], check=False)
     subprocess.run(["python", "instinct_engine.py"], check=False)
-    subprocess.Popen(["python", "early_comm.py"])
+    safe_popen(["python", "early_comm.py"])
 
     if not feedback_inhibition():
-        subprocess.Popen(["python", "predictive_layer.py"])
-        subprocess.Popen(["python", "logic_engine.py"])
+        safe_popen(["python", "predictive_layer.py"])
+        safe_popen(["python", "logic_engine.py"])
 
     boredom_check()
     rebuild_maps_if_needed()

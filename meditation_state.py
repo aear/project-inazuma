@@ -3,6 +3,7 @@
 # Reflection mode — builds maps, performs symbolic introspection, exits on emotional drift
 
 import subprocess
+from safe_popen import safe_popen
 import time
 import json
 import os
@@ -93,7 +94,7 @@ def meditate_loop():
             return
         if fuzz > 0.7 and stress > 0.5:
             exit_meditation("transition to dream")
-            subprocess.Popen(["python", "dreamstate.py"])
+            safe_popen(["python", "dreamstate.py"])
             return
 
         save_log({
