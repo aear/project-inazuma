@@ -19,11 +19,12 @@ SLIDERS = [
 ]
 
 def load_fragments(path):
-    return [
-        json.load(open(f, "r"))
-        for f in sorted(Path(path).glob("frag_*.json"))
-        if f.is_file() and f.suffix == ".json"
-    ]
+    fragments = []
+    for f in sorted(Path(path).glob("frag_*.json")):
+        if f.is_file() and f.suffix == ".json":
+            with open(f, "r") as handle:
+                fragments.append(json.load(handle))
+    return fragments
 
 def calculate_emotion_state(fragments):
     totals = {k: 0.0 for k in SLIDERS}
