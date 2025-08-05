@@ -138,7 +138,7 @@ def run_all():
         else:
             log_to_statusbox("[Pretrain] No Sakura_as_mother.json found — skipping audio pretraining.")
     except:
-        log_to_statusbox(f"[Prtrain] Failed to inject birth certificate and/or voice samples.")
+        log_to_statusbox(f"[Pretrain] Failed to inject birth certificate and/or voice samples.")
 
         # Reindex memory directly (no subprocess)
         log_to_statusbox("[Pretrain] Reindexing memory map...")

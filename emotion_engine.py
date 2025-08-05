@@ -24,6 +24,8 @@ def load_fragments(path):
                     fragments.append(json.load(fh))
             except (OSError, json.JSONDecodeError) as e:
                 log_to_statusbox(f"[Emotion] Failed to load {f.name}: {e}")
+            with open(f, "r") as handle:
+                fragments.append(json.load(handle))
     return fragments
 
 def calculate_emotion_state(fragments):
