@@ -1,16 +1,13 @@
 # === emotion_engine.py (Slider-Based Emotion Engine) ===
 
-import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import (
     load_config,
-    get_inastate,
     update_inastate,
 )
 from gui_hook import log_to_statusbox
-from fractal_multidimensional_transformers import FractalTransformer
 
 SLIDERS = [
     "intensity", "attention", "trust", "care", "curiosity", "novelty", "familiarity", "stress", "risk",
@@ -22,6 +19,11 @@ def load_fragments(path):
     fragments = []
     for f in sorted(Path(path).glob("frag_*.json")):
         if f.is_file() and f.suffix == ".json":
+            try:
+                with open(f, "r") as fh:
+                    fragments.append(json.load(fh))
+            except (OSError, json.JSONDecodeError) as e:
+                log_to_statusbox(f"[Emotion] Failed to load {f.name}: {e}")
             with open(f, "r") as handle:
                 fragments.append(json.load(handle))
     return fragments
@@ -93,12 +95,13 @@ def run_emotion_engine():
             frag["emotions"] = tag_fragment(frag, snapshot)
             with open(fpath, "w") as f:
                 json.dump(frag, f, indent=4)
-        except:
+        except Exception as e:
+            log_to_statusbox(f"[Emotion] Failed to tag {fpath.name}: {e}")
             continue
 
     update_inastate("emotion_snapshot", snapshot)
     log_emotion_snapshot(child, snapshot)
-    log_to_statusbox(f"[Emotion] Emotion snapshot stored.")
+    log_to_statusbox("[Emotion] Emotion snapshot stored.")
 
 if __name__ == "__main__":
     run_emotion_engine()

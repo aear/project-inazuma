@@ -7,7 +7,7 @@ import subprocess
 import psutil
 import shutil
 from pathlib import Path
-from model_manager import update_inastate, seed_self_question
+from model_manager import update_inastate
 import threading
 import time
 from memory_graph import build_fractal_memory
@@ -48,8 +48,6 @@ def status_log_server():
                 time.sleep(2)
 
     threading.Thread(target=run_pipe, daemon=True).start()
-
-import shutil
 
 def clear_status_log():
     status_box.delete("1.0", tk.END)
@@ -99,6 +97,14 @@ def stream_subprocess_to_status(command, label="Process"):
 CONFIG_FILE = "config.json"
 model_running = False
 
+
+def safe_popen(cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as e:
+        status_box.insert(tk.END, f"[ERROR] Failed to start {' '.join(map(str, cmd))}: {e}\n")
+        status_box.see(tk.END)
+
 def refresh_config():
     global config
     if os.path.exists(CONFIG_FILE):
@@ -125,7 +131,7 @@ def save_config():
 def birth_new_model():
     status_box.insert(tk.END, "Opening Birth Certificate window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "birth_certificate.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "birth_certificate.py"])
 
 def load_child():
     status_box.insert(tk.END, "Load Child selected.\n")
@@ -176,17 +182,17 @@ def save_load_config():
 def exceptions_list():
     status_box.insert(tk.END, "Opening Exceptions List window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "exception_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "exception_window.py"])
 
 def precision_settings():
     status_box.insert(tk.END, "Opening Precision Settings window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "precision_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "precision_window.py"])
 
 def open_timers_config():
     status_box.insert(tk.END, "Opening Timers configuration.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "timers_window.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "timers_window.py"])
 
 
 def pretrain_mode():
@@ -202,19 +208,24 @@ def pretrain_mode():
         status_box.see(tk.END)
 
         # Now pass child to pretrain_logic.py as an argument
-        process = subprocess.Popen(
-            [sys.executable, "pretrain_logic.py", child],  # Only call pretrain_logic.py
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "pretrain_logic.py", child],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
 
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                status_box.insert(tk.END, f"[Pretrain] {line}")
-                status_box.see(tk.END)
-        process.stdout.close()
-        process.wait()
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    status_box.insert(tk.END, f"[Pretrain] {line}")
+                    status_box.see(tk.END)
+            process.stdout.close()
+            process.wait()
+        except Exception as e:
+            status_box.insert(tk.END, f"[Pretrain] ERROR: {e}\n")
+            status_box.see(tk.END)
+            return
 
         status_box.insert(tk.END, "[Pretrain] Finished pretraining.\n")
         status_box.see(tk.END)
@@ -226,13 +237,11 @@ def pretrain_mode():
 def open_eeg_view():
     status_box.insert(tk.END, "Opening EEG window.\n")
     status_box.see(tk.END)
-    subprocess.Popen([sys.executable, "EEG.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "EEG.py"])
 
 def update_ai_count_label():
     ai_count = 1 if model_running else 0
     canvas.itemconfig(ai_text_id, text=str(ai_count))
-
-from gui_hook import log_to_statusbox
 
 def start_model():
     status_box.insert(tk.END, "Start Button clicked.\n")
@@ -305,7 +314,7 @@ def emergency_shutdown():
 
 def tuck_in():
     try:
-        subprocess.Popen(["python", "dreamstate.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        safe_popen(["python", "dreamstate.py"])
     except Exception as e:
         messagebox.showerror("Dream Error", f"Failed to launch dreamstate: {e}")
 
@@ -320,12 +329,11 @@ def wake_up():
 
     time.sleep(1)
     status_box.insert(tk.END, "[Wake] Resuming communication loop...\n")
-    subprocess.Popen([sys.executable, "early_comm.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    safe_popen([sys.executable, "early_comm.py"])
 
 
 
 def reboot_model():
-    global model_running
     refresh_config()
 
     if config.get("dreaming", False):
@@ -350,7 +358,6 @@ def reboot_model():
 
 
 def quit_program():
-    global model_running
     if model_running:
         status_box.insert(tk.END, "Quit blocked: model is currently running.\n")
         status_box.see(tk.END)
