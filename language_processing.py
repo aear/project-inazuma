@@ -1,9 +1,7 @@
 import os
 import json
-import time
 import cv2
 import fitz  # PyMuPDF
-from datetime import datetime, timezone
 from pathlib import Path
 from fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
@@ -176,7 +174,6 @@ def train_from_symbol_images(child):
 
 def synthesize_from_fingerprint(fingerprint, duration_ms=1500, sr=22050):
     import numpy as np
-    import sounddevice as sd
 
     pitch = fingerprint.get("pitch_mean", 440)
     freq = fingerprint.get("dominant_freq", pitch)
@@ -210,20 +207,18 @@ def train_from_books(child):
 
     for file in book_path.glob("*.pdf"):
         try:
-            doc = fitz.open(file)
-            text = ""
-            for page in doc:
-                text += page.get_text()
+            with fitz.open(file) as doc:
+                text = "".join(page.get_text() for page in doc)
             all_texts.append(text)
-        except:
-            continue
+        except Exception as e:
+            print(f"[LangTrain] Failed to read {file}: {e}")
 
     for file in book_path.glob("*.txt"):
         try:
             text = file.read_text(encoding="utf-8")
             all_texts.append(text)
-        except:
-            continue
+        except Exception as e:
+            print(f"[LangTrain] Failed to read {file}: {e}")
 
     count = 0
     for text in all_texts:
