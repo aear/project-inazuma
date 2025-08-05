@@ -11,7 +11,6 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 from fractal_multidimensional_transformers import FractalTransformer
-from model_manager import load_config
 from gui_hook import log_to_statusbox
 
 
@@ -23,7 +22,7 @@ ALLOWED_MEDIA_EXT = {".png", ".jpg", ".jpeg", ".wav", ".mp3"}
 def load_config():
     path = Path("config.json")
     if not path.exists():
-        log_to_statusbox(f"[Pretrain] config.json not found.")
+        log_to_statusbox("[Pretrain] config.json not found.")
         return {}
     with open(path, "r") as f:
         return json.load(f)
@@ -123,8 +122,8 @@ def fragment_text(text, source, transformer):
 
 def fragment_image(image_path, transformer):
     try:
-        img = Image.open(image_path).convert("L")
-        array = np.array(img).flatten().tolist()
+        with Image.open(image_path) as img:
+            array = np.array(img.convert("L")).flatten().tolist()
         frag = {
             "modality": "image",
             "image_features": array[:512],
@@ -137,7 +136,8 @@ def fragment_image(image_path, transformer):
         vec = transformer.encode_image_fragment(frag)
         frag["importance"] = vec["importance"]
         return [frag]
-    except:
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to process image {image_path}: {e}")
         return []
 
 def fragment_audio(audio_path, transformer):
@@ -157,7 +157,8 @@ def fragment_audio(audio_path, transformer):
             vec = transformer.encode_audio_fragment(frag)
             frag["importance"] = vec["importance"]
             return [frag]
-    except:
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to process audio {audio_path}: {e}")
         return []
 
 def self_read_and_train():

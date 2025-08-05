@@ -7,7 +7,7 @@ from safe_popen import safe_popen
 import psutil
 import shutil
 from pathlib import Path
-from model_manager import update_inastate, seed_self_question
+from model_manager import update_inastate
 import threading
 import time
 from memory_graph import build_fractal_memory
@@ -100,6 +100,14 @@ def stream_subprocess_to_status(command, label="Process"):
 CONFIG_FILE = "config.json"
 model_running = False
 
+
+def safe_popen(cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as e:
+        status_box.insert(tk.END, f"[ERROR] Failed to start {' '.join(map(str, cmd))}: {e}\n")
+        status_box.see(tk.END)
+
 def refresh_config():
     global config
     if os.path.exists(CONFIG_FILE):
@@ -179,6 +187,7 @@ def exceptions_list():
     status_box.see(tk.END)
     safe_popen([sys.executable, "exception_window.py"], verbose=True)
 
+
 def precision_settings():
     status_box.insert(tk.END, "Opening Precision Settings window.\n")
     status_box.see(tk.END)
@@ -210,7 +219,7 @@ def pretrain_mode():
         else:
             status_box.insert(tk.END, "[Pretrain] Failed to start pretraining.\n", "error")
             status_box.see(tk.END)
-
+            
     threading.Thread(target=stream_pretrain, daemon=True).start()
 
 
@@ -315,7 +324,6 @@ def wake_up():
 
 
 def reboot_model():
-    global model_running
     refresh_config()
 
     if config.get("dreaming", False):
@@ -340,7 +348,6 @@ def reboot_model():
 
 
 def quit_program():
-    global model_running
     if model_running:
         status_box.insert(tk.END, "Quit blocked: model is currently running.\n")
         status_box.see(tk.END)

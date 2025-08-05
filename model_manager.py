@@ -1,6 +1,5 @@
 # === model_manager.py (Final Rewrite + Module Awareness) ===
 
-import os
 import json
 import time
 import subprocess
@@ -19,6 +18,27 @@ def load_config():
 config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
+
+
+def safe_popen(cmd):
+    try:
+        subprocess.Popen(cmd)
+    except Exception as e:
+        log_to_statusbox(f"[Manager] Failed to start {' '.join(cmd)}: {e}")
+
+
+def safe_call(cmd):
+    try:
+        subprocess.call(cmd)
+    except Exception as e:
+        log_to_statusbox(f"[Manager] Failed to call {' '.join(cmd)}: {e}")
+
+
+def safe_run(cmd):
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception as e:
+        log_to_statusbox(f"[Manager] Failed to run {' '.join(cmd)}: {e}")
 
 def get_sweet_spots():
     path = MEMORY_PATH / "sweet_spots.json"
@@ -119,7 +139,7 @@ def feedback_inhibition():
 def boredom_check():
     boredom = get_inastate("emotion_boredom") or 0.0
     if boredom > 0.4:
-        subprocess.call(["python", "boredom_state.py"])
+        safe_call(["python", "boredom_state.py"])
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
 def rebuild_maps_if_needed():
@@ -128,10 +148,10 @@ def rebuild_maps_if_needed():
     drift = emo.get("symbolic_drift", 0.0)
     if fuzz > 0.7 or drift > 0.5:
         log_to_statusbox("[Manager] Rebuilding maps due to emotional drift.")
-        subprocess.call(["python", "memory_graph.py"])
-        subprocess.call(["python", "meaning_map.py"])
-        subprocess.call(["python", "logic_map_builder.py"])
-        subprocess.call(["python", "emotion_map.py"])
+        safe_call(["python", "memory_graph.py"])
+        safe_call(["python", "meaning_map.py"])
+        safe_call(["python", "logic_map_builder.py"])
+        safe_call(["python", "emotion_map.py"])
         update_inastate("last_map_rebuild", datetime.now(timezone.utc).isoformat())
 
 def run_internal_loop():
@@ -156,7 +176,7 @@ def run_internal_loop():
         return False
 
     if check_audio_index_change():
-        subprocess.call(["pkill", "-f", "audio_listener.py"])
+        safe_call(["pkill", "-f", "audio_listener.py"])
         time.sleep(2)  # Let config settle and avoid early InputStream calls
         safe_popen(["python", "audio_listener.py"])
 
@@ -170,6 +190,7 @@ def run_internal_loop():
 
     subprocess.run(["python", "emotion_engine.py"], check=False)
     subprocess.run(["python", "instinct_engine.py"], check=False)
+
     safe_popen(["python", "early_comm.py"])
 
     if not feedback_inhibition():
