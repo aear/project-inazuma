@@ -3,6 +3,7 @@
 import json
 import time
 import subprocess
+from safe_popen import safe_popen
 from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
@@ -187,8 +188,9 @@ def run_internal_loop():
     if get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
         safe_popen(["python", "dreamstate.py"])
 
-    safe_run(["python", "emotion_engine.py"])
-    safe_run(["python", "instinct_engine.py"])
+    subprocess.run(["python", "emotion_engine.py"], check=False)
+    subprocess.run(["python", "instinct_engine.py"], check=False)
+
     safe_popen(["python", "early_comm.py"])
 
     if not feedback_inhibition():
