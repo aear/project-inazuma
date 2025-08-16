@@ -6,6 +6,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
+from alignment.metrics import evaluate_alignment
 from alignment import check_action
 
 def load_config():
@@ -220,6 +221,8 @@ def run_internal_loop():
 
     boredom_check()
     rebuild_maps_if_needed()
+    # Periodically evaluate alignment metrics and surface warnings if needed
+    evaluate_alignment()
 
 def schedule_runtime():
     log_to_statusbox("[Manager] Starting main runtime loop...")
