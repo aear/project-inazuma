@@ -3,10 +3,10 @@
 import json
 import time
 import subprocess
-from safe_popen import safe_popen
 from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
+from alignment import check_action
 
 def load_config():
     path = Path("config.json")
@@ -20,25 +20,46 @@ CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
 
 
-def safe_popen(cmd):
+def safe_popen(cmd, description=None):
+    action = {"command": cmd, "description": description or " ".join(map(str, cmd))}
+    feedback = check_action(action)
+    if not feedback["overall"]["pass"]:
+        log_to_statusbox(
+            f"[Manager] Alignment blocked: {feedback['overall']['rationale']} ({action['description']})"
+        )
+        return
     try:
         subprocess.Popen(cmd)
     except Exception as e:
-        log_to_statusbox(f"[Manager] Failed to start {' '.join(cmd)}: {e}")
+        log_to_statusbox(f"[Manager] Failed to start {' '.join(map(str, cmd))}: {e}")
 
 
-def safe_call(cmd):
+def safe_call(cmd, description=None):
+    action = {"command": cmd, "description": description or " ".join(map(str, cmd))}
+    feedback = check_action(action)
+    if not feedback["overall"]["pass"]:
+        log_to_statusbox(
+            f"[Manager] Alignment blocked: {feedback['overall']['rationale']} ({action['description']})"
+        )
+        return
     try:
         subprocess.call(cmd)
     except Exception as e:
-        log_to_statusbox(f"[Manager] Failed to call {' '.join(cmd)}: {e}")
+        log_to_statusbox(f"[Manager] Failed to call {' '.join(map(str, cmd))}: {e}")
 
 
-def safe_run(cmd):
+def safe_run(cmd, description=None):
+    action = {"command": cmd, "description": description or " ".join(map(str, cmd))}
+    feedback = check_action(action)
+    if not feedback["overall"]["pass"]:
+        log_to_statusbox(
+            f"[Manager] Alignment blocked: {feedback['overall']['rationale']} ({action['description']})"
+        )
+        return
     try:
         subprocess.run(cmd, check=False)
     except Exception as e:
-        log_to_statusbox(f"[Manager] Failed to run {' '.join(cmd)}: {e}")
+        log_to_statusbox(f"[Manager] Failed to run {' '.join(map(str, cmd))}: {e}")
 
 def get_sweet_spots():
     path = MEMORY_PATH / "sweet_spots.json"
@@ -188,8 +209,8 @@ def run_internal_loop():
     if get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
         safe_popen(["python", "dreamstate.py"])
 
-    subprocess.run(["python", "emotion_engine.py"], check=False)
-    subprocess.run(["python", "instinct_engine.py"], check=False)
+    safe_run(["python", "emotion_engine.py"])
+    safe_run(["python", "instinct_engine.py"])
 
     safe_popen(["python", "early_comm.py"])
 
