@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
 from gui_hook import log_to_statusbox
 from language_processing import load_generated_symbols, cosine_similarity

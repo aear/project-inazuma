@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import load_config, update_inastate, seed_self_question
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
 def cosine_similarity(v1, v2):

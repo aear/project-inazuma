@@ -4,7 +4,7 @@ import os
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, mark_module_running, clear_module_running
 from gui_hook import log_to_statusbox
 from memory_graph import MemoryManager

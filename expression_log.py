@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from math import sqrt
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config
 
 def emotion_distance(e1, e2):

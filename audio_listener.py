@@ -8,7 +8,7 @@ from pathlib import Path
 from gui_hook import log_to_statusbox
 from model_manager import load_config, get_sweet_spots
 from audio_digest import analyze_audio_clip, generate_fragment
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 LABELS = ["mic_headset", "mic_webcam", "output_headset", "output_TV"]
 FLUSH_INTERVAL = 60  # seconds

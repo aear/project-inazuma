@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import seed_self_question, get_inastate
 from gui_hook import log_to_statusbox
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 CONFIG_FILE = "config.json"
 

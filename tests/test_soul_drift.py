@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from ina.transformers.soul_drift import DriftConfig, DriftState, SoulDriftTransformer
+from transformers.soul_drift import DriftConfig, DriftState, SoulDriftTransformer
 
 
 def _basic_state(num_symbols=3, non_uniform=False):

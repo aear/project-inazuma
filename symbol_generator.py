@@ -3,7 +3,7 @@ import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config
 
 # Procedural symbol parts

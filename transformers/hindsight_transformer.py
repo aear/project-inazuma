@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
 from model_manager import load_config, update_inastate
-from fractal_multidimensional_transformers import FractalTransformer
+from .fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
 
 class HindsightTransformer:
