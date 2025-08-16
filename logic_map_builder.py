@@ -6,7 +6,7 @@ import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config
 from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts

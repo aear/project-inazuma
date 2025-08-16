@@ -7,7 +7,7 @@ from model_manager import load_config
 from gui_hook import log_to_statusbox
 import time
 import json
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from memory_graph import MemoryManager
 from emotion_map import run_emotion_map
 from meaning_map import run_meaning_map

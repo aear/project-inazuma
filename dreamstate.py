@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from model_manager import get_inastate, update_inastate, mark_module_running, clear_module_running
 from emotion_engine import tag_fragment_emotions
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
 
