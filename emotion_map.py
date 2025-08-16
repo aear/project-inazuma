@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from model_manager import load_config, seed_self_question
 from gui_hook import log_to_statusbox
 from emotion_engine import SLIDERS
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
 
 MAP_PATH = Path("AI_Children") / "Inazuma_Yagami" / "memory" / "emotion_symbol_map.json"

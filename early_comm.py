@@ -10,7 +10,7 @@ from pathlib import Path
 from model_manager import (
     load_config, update_inastate, get_inastate, seed_self_question
 )
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from language_processing import associate_symbol_with_word, backprop_symbol_confidence, synthesize_from_fingerprint
 from gui_hook import log_to_statusbox
 

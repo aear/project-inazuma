@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import pyautogui
 from model_manager import load_config
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
 

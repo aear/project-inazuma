@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from mycelial_transformer import MycelialTransformer
+from transformers.mycelial_transformer import MycelialTransformer
 
 
 def test_weave_cross_domain():

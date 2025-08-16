@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image
 import numpy as np
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
 

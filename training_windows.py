@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 CONFIG_FILE = "config.json"
     

@@ -3,7 +3,7 @@ import json
 import cv2
 import fitz  # PyMuPDF
 from pathlib import Path
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
 
 

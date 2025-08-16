@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from heuristic_mirror_transformer import HeuristicMirrorTransformer
+from transformers.heuristic_mirror_transformer import HeuristicMirrorTransformer
 
 
 def test_mirror_basic(tmp_path):

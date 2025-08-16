@@ -1,9 +1,28 @@
-
 # === fractal_multidimensional_transformers.py (Multimodal Upgrade) ===
 
 import math
 import hashlib
 import numpy as np
+
+def load_precision_profile(child="Inazuma_Yagami"):
+    """Return stored precision profile for a given child."""
+    import json
+    from pathlib import Path
+    from gui_hook import log_to_statusbox
+
+    profile_path = Path("AI_Children") / child / "memory" / "precision_profile.json"
+    config_path = Path("precision_config.json")
+    try:
+        if profile_path.exists():
+            with open(profile_path, "r") as f:
+                return json.load(f)
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        log_to_statusbox(f"[Precision] Failed to load profile: {e}")
+    return {"max_precision": 64}
+
 
 
 class FractalLayer:

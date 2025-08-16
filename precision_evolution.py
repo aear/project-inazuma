@@ -6,7 +6,7 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import get_inastate, get_sweet_spots
-from fractal_multidimensional_transformers import load_precision_profile, FractalTransformer
+from transformers.fractal_multidimensional_transformers import load_precision_profile, FractalTransformer
 from gui_hook import log_to_statusbox
 
 CONFIG_FILE = "config.json"

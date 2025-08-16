@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
 from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts

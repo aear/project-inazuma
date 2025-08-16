@@ -8,7 +8,7 @@ import librosa
 from datetime import datetime, timezone
 from pathlib import Path
 from pydub import AudioSegment
-from fractal_multidimensional_transformers import FractalTransformer
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
 
 def analyze_audio_clip(path, transformer):
