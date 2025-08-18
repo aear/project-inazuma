@@ -5,6 +5,7 @@ from .fractal_multidimensional_transformers import (
     FractalTransformer,
     load_precision_profile,
 )
+from .seedling_transformer import SeedlingTransformer
 try:  # pragma: no cover - optional dependency
     from .QTransformer import QTransformer
 except Exception:  # pragma: no cover
@@ -20,6 +21,7 @@ __all__ = [
     "HeuristicMirrorTransformer",
     "FractalTransformer",
     "load_precision_profile",
+    "SeedlingTransformer",
     "QTransformer",
     "HindsightTransformer",
     "ShadowTransformer",
