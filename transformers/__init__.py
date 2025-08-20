@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover
     QTransformer = None
 from .hindsight_transformer import HindsightTransformer
 from .shadow_transformer import ShadowTransformer
+from .bridge_transformer import BridgeTransformer
 
 __all__ = [
     "DriftConfig",
@@ -25,4 +26,5 @@ __all__ = [
     "QTransformer",
     "HindsightTransformer",
     "ShadowTransformer",
+    "BridgeTransformer",
 ]
