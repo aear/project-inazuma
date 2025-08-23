@@ -6,7 +6,12 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from model_manager import load_config, update_inastate, seed_self_question
+from model_manager import (
+    load_config,
+    update_inastate,
+    seed_self_question,
+    get_inastate,
+)
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
@@ -58,15 +63,22 @@ def run_prediction():
     avg_vector = [sum(x)/len(x) for x in zip(*[e["vector"] for e in encoded])]
     clarity = round(sum(avg_vector) / len(avg_vector), 4)
 
-    log_to_statusbox(f"[Predict] Encoded prediction vector. Clarity: {clarity:.4f}")
+    emotion = get_inastate("emotion_snapshot") or {}
+    stress = emotion.get("stress", 0.0)
+    adj_clarity = round(clarity * (1 - stress), 4)
+    log_to_statusbox(
+        f"[Predict] Encoded prediction vector. Clarity: {clarity:.4f} (stress-adjusted: {adj_clarity:.4f})"
+    )
 
     predicted = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "predicted_vector": {
             "vector": avg_vector,
-            "clarity": clarity
+            "clarity": adj_clarity,
         },
-        "fragments_used": [f["id"] for f in fragments]
+        "fragments_used": [f["id"] for f in fragments],
+        "emotion_snapshot": emotion,
+        "base_clarity": clarity,
     }
 
     # Match to known symbol word
