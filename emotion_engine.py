@@ -6,6 +6,7 @@ from pathlib import Path
 from model_manager import (
     load_config,
     update_inastate,
+    get_inastate,
 )
 from gui_hook import log_to_statusbox
 
@@ -87,6 +88,15 @@ def run_emotion_engine():
     log_to_statusbox("[Emotion] Tagging fragments...")
     fragments = load_fragments(frag_dir)
     snapshot = calculate_emotion_state(fragments)
+
+    current_pred = get_inastate("current_prediction") or {}
+    pred_clarity = (
+        current_pred.get("predicted_vector", {}).get("clarity")
+        if isinstance(current_pred, dict)
+        else None
+    )
+    if pred_clarity is not None:
+        snapshot["prediction_clarity"] = pred_clarity
 
     for fpath in frag_dir.glob("frag_*.json"):
         try:
