@@ -8,6 +8,7 @@ from pathlib import Path
 from gui_hook import log_to_statusbox
 from model_manager import load_config, get_sweet_spots
 from audio_digest import analyze_audio_clip, generate_fragment
+from fragmentation_engine import fragment_device_log
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 LABELS = ["mic_headset", "mic_webcam", "output_headset", "output_TV"]
@@ -66,21 +67,36 @@ def record_clip(label, device_string):
         return None
 
 
+def append_session_log(label, clip_path, duration):
+    """Append metadata about the captured clip to the device log."""
+    log_file = save_path / f"{label}_log.json"
+    entry = {
+        "path": str(clip_path),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "duration": duration,
+    }
+    try:
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8") as f:
+                log = json.load(f)
+        else:
+            log = []
+        log.append(entry)
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2)
+    except Exception as e:
+        log_to_statusbox(f"[Audio] Failed to append session log for {label}: {e}")
+
+
 def flush_and_digest(label, device_string):
     clip_path = record_clip(label, device_string)
     if not clip_path or not clip_path.exists():
         return
     try:
-        clarity, pitch, tags = analyze_audio_clip(str(clip_path))
-        generate_fragment(
-            file_path=str(clip_path),
-            clarity_input=clarity,
-            pitch_info=pitch,
-            tags=tags + [label],
-            label=label,
-            child=child,
-            transformer=transformer
-        )
+        analysis = analyze_audio_clip(clip_path, transformer)
+        if analysis:
+            generate_fragment(clip_path, analysis, child)
+            append_session_log(label, clip_path, analysis.get("duration", FLUSH_INTERVAL))
     except Exception as e:
         log_to_statusbox(f"[Audio] Digest failed on {label}: {e}")
 
@@ -98,11 +114,14 @@ def run_audio_loop():
                 flush_and_digest(label, devices[label])
                 last_flush[label] = now
 
-        # Hourly fragmentation logic (stub)
         global last_fragmentation
         if now - last_fragmentation >= FRAGMENT_INTERVAL:
-            log_to_statusbox("[Audio] Hourly audio fragmentation (placeholder)")
-            # (Insert symbolic training logic here if needed)
+            for label in LABELS:
+                try:
+                    fragment_device_log(label, child=child)
+                except Exception as e:
+                    log_to_statusbox(f"[Audio] Fragmentation failed for {label}: {e}")
+            log_to_statusbox("[Audio] Hourly audio fragmentation complete")
             last_fragmentation = now
 
         time.sleep(1)
