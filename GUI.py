@@ -98,6 +98,13 @@ def stream_subprocess_to_status(command, label="Process"):
 
 
 CONFIG_FILE = "config.json"
+CONFIG_DEFAULTS = {
+    "book_folder_path": "",
+    "music_folder_path": "",
+}
+config = dict(CONFIG_DEFAULTS)
+book_path_var = None
+music_path_var = None
 model_running = False
 
 
@@ -110,26 +117,100 @@ def safe_popen(cmd):
 
 def refresh_config():
     global config
+    data = {}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
+                data = json.load(f)
         except json.JSONDecodeError:
-            pass
+            data = {}
+    config = dict(CONFIG_DEFAULTS)
+    if isinstance(data, dict):
+        config.update(data)
+
+    if book_path_var is not None:
+        book_path_var.set(config.get("book_folder_path", ""))
+    if music_path_var is not None:
+        music_path_var.set(config.get("music_folder_path", ""))
 
 
 def save_config():
+    global config
     config_path = CONFIG_FILE
+    updated = dict(config)
+
+    if 'root' in globals():
+        updated["geometry"] = root.winfo_geometry()
+
+    if book_path_var is not None:
+        updated["book_folder_path"] = book_path_var.get()
+    if music_path_var is not None:
+        updated["music_folder_path"] = music_path_var.get()
+
     current = {}
     if os.path.exists(config_path):
         try:
             with open(config_path, "r") as f:
                 current = json.load(f)
         except json.JSONDecodeError:
-            pass
-    current["geometry"] = root.winfo_geometry()
+            current = {}
+
+    if isinstance(current, dict):
+        current.update(updated)
+    else:
+        current = updated
+
+    config = current
+
     with open(config_path, "w") as f:
         json.dump(current, f, indent=4)
+
+
+def _update_folder_setting(key, var, description):
+    if var is None:
+        return
+
+    new_value = var.get().strip()
+    if config.get(key, "") == new_value:
+        return
+
+    var.set(new_value)
+    config[key] = new_value
+    status_box.insert(tk.END, f"[Config] {description} set to: {new_value or '(empty)'}\n")
+    status_box.see(tk.END)
+    save_config()
+
+
+def commit_book_folder(event=None):
+    _update_folder_setting("book_folder_path", book_path_var, "Book folder")
+    if event and getattr(event, "keysym", None) == "Return":
+        return "break"
+
+
+def commit_music_folder(event=None):
+    _update_folder_setting("music_folder_path", music_path_var, "Music folder")
+    if event and getattr(event, "keysym", None) == "Return":
+        return "break"
+
+
+def browse_book_folder():
+    if book_path_var is None:
+        return
+    initial_dir = book_path_var.get() or os.getcwd()
+    path = filedialog.askdirectory(initialdir=initial_dir)
+    if path:
+        book_path_var.set(path)
+        commit_book_folder()
+
+
+def browse_music_folder():
+    if music_path_var is None:
+        return
+    initial_dir = music_path_var.get() or os.getcwd()
+    path = filedialog.askdirectory(initialdir=initial_dir)
+    if path:
+        music_path_var.set(path)
+        commit_music_folder()
 
 def birth_new_model():
     status_box.insert(tk.END, "Opening Birth Certificate window.\n")
@@ -381,6 +462,9 @@ else:
     root.geometry("500x450")
 root.minsize(500, 450)
 
+book_path_var = tk.StringVar(value=config.get("book_folder_path", ""))
+music_path_var = tk.StringVar(value=config.get("music_folder_path", ""))
+
 menu_bar = Menu(root)
 file_menu = Menu(menu_bar, tearoff=0)
 file_menu.add_command(label="Birth New Model", command=birth_new_model)
@@ -416,6 +500,27 @@ status_box = tk.Text(status_frame, height=6, wrap=tk.WORD, yscrollcommand=scroll
 status_box.pack(expand=True, fill=tk.BOTH)
 status_box.tag_config("error", foreground="red")
 scrollbar.config(command=status_box.yview)
+
+paths_container = tk.Frame(main_frame)
+paths_container.pack(fill=tk.X, pady=(5, 10))
+
+book_row = tk.Frame(paths_container)
+book_row.pack(fill=tk.X, pady=2)
+tk.Label(book_row, text="Book Folder:").pack(side=tk.LEFT)
+book_entry = tk.Entry(book_row, textvariable=book_path_var)
+book_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+book_entry.bind("<FocusOut>", commit_book_folder)
+book_entry.bind("<Return>", commit_book_folder)
+tk.Button(book_row, text="Browse...", command=browse_book_folder).pack(side=tk.LEFT, padx=(5, 0))
+
+music_row = tk.Frame(paths_container)
+music_row.pack(fill=tk.X, pady=2)
+tk.Label(music_row, text="Music Folder:").pack(side=tk.LEFT)
+music_entry = tk.Entry(music_row, textvariable=music_path_var)
+music_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+music_entry.bind("<FocusOut>", commit_music_folder)
+music_entry.bind("<Return>", commit_music_folder)
+tk.Button(music_row, text="Browse...", command=browse_music_folder).pack(side=tk.LEFT, padx=(5, 0))
 
 button_frame = tk.Frame(root)
 button_frame.pack(side=tk.BOTTOM, pady=10)
