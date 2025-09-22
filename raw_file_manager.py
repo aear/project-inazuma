@@ -13,6 +13,14 @@ import numpy as np
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 
+_AUDIO_DIGEST_IMPORT_ERROR = None
+try:
+    from audio_digest import analyze_audio_clip, generate_fragment
+except Exception as e:  # pragma: no cover - import guard
+    analyze_audio_clip = None
+    generate_fragment = None
+    _AUDIO_DIGEST_IMPORT_ERROR = e
+
 
 FRAG_LIMIT = 1000
 ALLOWED_TEXT_EXT = {".txt", ".md", ".json", ".py"}
@@ -141,25 +149,80 @@ def fragment_image(image_path, transformer):
         return []
 
 def fragment_audio(audio_path, transformer):
-    try:
-        with contextlib.closing(wave.open(str(audio_path), 'r')) as wf:
-            frames = wf.readframes(wf.getnframes())
-            audio_data = list(frames[:1024])
-            frag = {
-                "modality": "audio",
-                "audio_features": [x / 255.0 for x in audio_data],
-                "summary": f"Sound fragment from {audio_path.name}",
-                "tags": ["self_read", "audio"],
-                "source": str(audio_path),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "emotions": {"attention": 0.5, "novelty": 0.6}
-            }
-            vec = transformer.encode_audio_fragment(frag)
+    ext = audio_path.suffix.lower()
+
+    if ext == ".wav":
+        try:
+            with contextlib.closing(wave.open(str(audio_path), "r")) as wf:
+                frames = wf.readframes(wf.getnframes())
+        except Exception as e:
+            log_to_statusbox(f"[RawFileManager] Failed to process WAV {audio_path}: {e}")
+            return []
+
+        audio_data = list(frames[:1024])
+        frag = {
+            "modality": "audio",
+            "audio_features": [x / 255.0 for x in audio_data],
+            "summary": f"Sound fragment from {audio_path.name}",
+            "tags": ["self_read", "audio"],
+            "source": str(audio_path),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "emotions": {"attention": 0.5, "novelty": 0.6},
+        }
+        vec = transformer.encode_audio_fragment(frag)
+        frag["importance"] = vec["importance"]
+        return [frag]
+
+    if ext == ".mp3":
+        if analyze_audio_clip is None:
+            log_to_statusbox(
+                "[RawFileManager] MP3 decoding unavailable: "
+                f"{_AUDIO_DIGEST_IMPORT_ERROR}"
+            )
+            return []
+        try:
+            analysis = analyze_audio_clip(audio_path, transformer)
+        except Exception as e:
+            log_to_statusbox(f"[RawFileManager] Failed to decode MP3 {audio_path}: {e}")
+            return []
+
+        if not analysis:
+            log_to_statusbox(
+                f"[RawFileManager] MP3 analysis returned no data for {audio_path.name}."
+            )
+            return []
+
+        tags = ["self_read", "audio"]
+        for tag in analysis.get("tags", []):
+            if tag not in tags:
+                tags.append(tag)
+
+        frag = {
+            "modality": "audio",
+            "summary": analysis.get(
+                "summary", f"Sound fragment from {audio_path.name}"
+            ),
+            "tags": tags,
+            "source": str(audio_path),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "emotions": analysis.get("emotions", {"attention": 0.5}),
+        }
+
+        vec = transformer.encode_audio_fragment(frag)
+        clarity = analysis.get("clarity")
+        try:
+            frag["importance"] = (
+                round(float(clarity), 4) if clarity is not None else vec["importance"]
+            )
+        except (TypeError, ValueError):
             frag["importance"] = vec["importance"]
-            return [frag]
-    except Exception as e:
-        log_to_statusbox(f"[RawFileManager] Failed to process audio {audio_path}: {e}")
-        return []
+
+        return [frag]
+
+    log_to_statusbox(
+        f"[RawFileManager] Unsupported audio format for {audio_path.name}: {ext}"
+    )
+    return []
 
 def self_read_and_train():
     child = get_child()
@@ -200,12 +263,8 @@ def self_read_and_train():
             elif ext in [".png", ".jpg", ".jpeg"]:
                 result = fragment_image(path, transformer)
 
-            elif ext in [".wav"]:
+            elif ext in [".wav", ".mp3"]:
                 result = fragment_audio(path, transformer)
-
-            elif ext in [".mp3"]:
-                log_to_statusbox(f"[SelfRead] NOTE: {path.name} is mp3 — audio_digest handles those. Skipping.")
-                continue
 
             else:
                 log_to_statusbox(f"[SelfRead] SKIP {path.name} — unrecognized extension.")
@@ -246,11 +305,16 @@ def self_read_and_train():
         log_to_statusbox("[SelfRead] No new fragments to train on.")
 
 
-from audio_digest import analyze_audio_clip, generate_fragment
-
 def pretrain_audio_digest(paths, child):
     log_to_statusbox(f"[PretrainDigest] Starting digest on {len(paths)} file(s) for {child}")
     transformer = FractalTransformer()
+
+    if analyze_audio_clip is None or generate_fragment is None:
+        log_to_statusbox(
+            "[PretrainDigest] Audio digest unavailable: "
+            f"{_AUDIO_DIGEST_IMPORT_ERROR}"
+        )
+        return
 
     for path_str in paths:
         path = Path(path_str)
