@@ -130,6 +130,10 @@ class MemoryManager:
         self.memory_map = {}
         self.load_map()
 
+    def ensure_tier_directories(self):
+        for tier in MEMORY_TIERS:
+            (self.base_path / tier).mkdir(parents=True, exist_ok=True)
+
     def load_map(self):
         if self.index_path.exists():
             try:
@@ -152,11 +156,16 @@ class MemoryManager:
             try:
                 with open(frag, "r") as f:
                     data = json.load(f)
+                existing = self.memory_map.get(data["id"], {})
                 self.memory_map[data["id"]] = {
                     "tier": tier,
                     "tags": data.get("tags", []),
                     "importance": data.get("importance", 0),
-                    "last_seen": data.get("timestamp", datetime.now(timezone.utc).isoformat())
+                    "last_seen": existing.get(
+                        "last_seen",
+                        data.get("timestamp", datetime.now(timezone.utc).isoformat())
+                    ),
+                    "filename": frag.name,
                 }
             except:
                 continue
@@ -183,28 +192,93 @@ class MemoryManager:
                             "tier": tier,
                             "tags": data.get("tags", []),
                             "importance": data.get("importance", 0),
-                            "last_seen": data.get("timestamp", datetime.now(timezone.utc).isoformat())
+                            "last_seen": data.get(
+                                "timestamp",
+                                datetime.now(timezone.utc).isoformat()
+                            ),
+                            "filename": frag.name,
                         }
                         added += 1
+                    else:
+                        existing = self.memory_map.get(data["id"], {})
+                        existing.update({
+                            "tier": tier,
+                            "tags": data.get("tags", []),
+                            "importance": data.get("importance", 0),
+                            "filename": frag.name,
+                        })
+                        self.memory_map[data["id"]] = existing
                 except:
                     continue
         self.save_map()
         log_to_statusbox(f"[Memory] Reindexed {added} new fragments across tiers. Current total: {len(self.memory_map)}")
 
-    def promote(self, frag_id, to_tier):
+    def ingest_fragment_file(self, fragment_path, to_tier):
+        try:
+            with open(fragment_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+
+        frag_id = data.get("id")
+        if not frag_id:
+            return False
+
+        destination = self.base_path / to_tier
+        destination.mkdir(parents=True, exist_ok=True)
+        target_path = destination / fragment_path.name
+
+        try:
+            fragment_path.rename(target_path)
+        except FileNotFoundError:
+            return False
+
+        self.memory_map[frag_id] = {
+            "tier": to_tier,
+            "tags": data.get("tags", []),
+            "importance": data.get("importance", 0),
+            "last_seen": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "filename": target_path.name,
+        }
+        self.save_map()
+        return True
+
+    def prune_missing(self):
+        removed = []
+        for frag_id, meta in list(self.memory_map.items()):
+            tier = meta.get("tier")
+            filename = meta.get("filename", f"frag_{frag_id}.json")
+            candidate_paths = []
+            if tier:
+                candidate_paths.append(self.base_path / tier / filename)
+            candidate_paths.append(self.base_path / filename)
+            if not any(path.exists() for path in candidate_paths):
+                removed.append(frag_id)
+                self.memory_map.pop(frag_id, None)
+        if removed:
+            self.save_map()
+            log_to_statusbox(
+                f"[Memory] Pruned {len(removed)} missing fragment entries from index."
+            )
+        return len(removed)
+
+    def promote(self, frag_id, to_tier, *, touch=True):
         if frag_id not in self.memory_map:
             return False
         old_tier = self.memory_map[frag_id]["tier"]
         if old_tier == to_tier:
             return True
-        src = self.base_path / old_tier / f"frag_{frag_id}.json"
-        dst = self.base_path / to_tier / f"frag_{frag_id}.json"
+        filename = self.memory_map[frag_id].get("filename", f"frag_{frag_id}.json")
+        src = self.base_path / old_tier / filename
+        dst = self.base_path / to_tier / filename
         if not src.exists():
             return False
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
         self.memory_map[frag_id]["tier"] = to_tier
-        self.memory_map[frag_id]["last_seen"] = datetime.now(timezone.utc).isoformat()
+        self.memory_map[frag_id]["filename"] = dst.name
+        if touch:
+            self.memory_map[frag_id]["last_seen"] = datetime.now(timezone.utc).isoformat()
         self.save_map()
         return True
 
