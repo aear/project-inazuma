@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, mark_module_running, clear_module_running
 from gui_hook import log_to_statusbox
-from memory_graph import MemoryManager
+from memory_graph import MEMORY_TIERS, MemoryManager
+from memory_gatekeeper import MemoryGatekeeper
 
 
 # === Utility ===
@@ -35,7 +36,13 @@ def load_fragments_from_disk(child, limit=500):
 
     loaded = []
     seen = set()
-    for f in sorted(frag_dir.glob("frag_*.json")):
+    search_paths = list(frag_dir.glob("frag_*.json"))
+    for tier in MEMORY_TIERS:
+        search_paths.extend(list((frag_dir / tier).glob("frag_*.json")))
+
+    for f in sorted(search_paths):
+        if "archived" in f.parts:
+            continue
         try:
             with open(f, "r") as jf:
                 data = json.load(jf)
@@ -84,6 +91,7 @@ def train_model(config=None, child=None, store=True):
         log_to_statusbox(f"[Train] Sending call to memory manager for indexing and storage.")
         memory = MemoryManager(child)
         memory.reindex(new_only=True)
+        MemoryGatekeeper(memory).run()
     else:
         log_to_statusbox(f"[Train] Trained on {len(encoded)} fragments (not saved).")
 
@@ -103,4 +111,5 @@ def train_from_memory(fragments, child, store=False):
         log_to_statusbox(f"[Train] Sending call to memory manager for indexing and storage.")
         memory = MemoryManager(child)
         memory.reindex(new_only=True)
+        MemoryGatekeeper(memory).run()
     return encoded

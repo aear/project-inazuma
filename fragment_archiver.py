@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from emotion_engine import tag_fragment_emotions
 from model_manager import load_config
+from memory_graph import MEMORY_TIERS, MemoryManager
 
 def archive_fragment(frag, archive_path):
     frag_id = frag.get("id")
@@ -21,9 +22,15 @@ def archive_fragment(frag, archive_path):
 def scan_and_archive(child, threshold=0.1):
     frag_path = Path("AI_Children") / child / "memory" / "fragments"
     archive_path = frag_path / "archived"
+    manager = MemoryManager(child)
+    manager.ensure_tier_directories()
+
+    targets = list(frag_path.glob("frag_*.json"))
+    for tier in MEMORY_TIERS:
+        targets.extend(list((frag_path / tier).glob("frag_*.json")))
 
     count = 0
-    for f in frag_path.glob("frag_*.json"):
+    for f in targets:
         try:
             with open(f, "r") as file:
                 frag = json.load(file)
@@ -38,6 +45,8 @@ def scan_and_archive(child, threshold=0.1):
             print(f"[Archive] Error processing {f.name}: {e}")
 
     print(f"[Archive] Archived {count} fragments.")
+    if count:
+        manager.prune_missing()
 
 def main():
     config = load_config()
