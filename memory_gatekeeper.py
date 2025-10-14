@@ -130,12 +130,18 @@ class MemoryGatekeeper:
         if not raw:
             return None
         if isinstance(raw, datetime):
-            return raw
+            ts = raw
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts
         try:
             text = str(raw)
             if text.endswith("Z"):
                 text = text.replace("Z", "+00:00")
-            return datetime.fromisoformat(text)
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
         except Exception:
             return None
 
