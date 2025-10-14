@@ -7,12 +7,26 @@ import wave
 import contextlib
 import sys
 import itertools
+import io
+import zipfile
+import tarfile
+import gzip
+import bz2
+import lzma
+from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image
 import numpy as np
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
+
+_VIDEO_IMPORT_ERROR = None
+try:
+    import cv2  # type: ignore
+except Exception as e:  # pragma: no cover - optional dependency
+    cv2 = None
+    _VIDEO_IMPORT_ERROR = e
 
 _AUDIO_DIGEST_IMPORT_ERROR = None
 try:
@@ -24,8 +38,21 @@ except Exception as e:  # pragma: no cover - import guard
 
 
 FRAG_LIMIT = 1000
-ALLOWED_TEXT_EXT = {".txt", ".md", ".json", ".py"}
-ALLOWED_MEDIA_EXT = {".png", ".jpg", ".jpeg", ".wav", ".mp3"}
+TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
+VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".webm"}
+SIMPLE_COMPRESSED_EXTENSIONS = {".gz", ".bz2", ".xz"}
+
+FILE_SIZE_LIMITS = {
+    "text": 5 * 1024 * 1024,        # 5 MB
+    "image": 25 * 1024 * 1024,      # 25 MB
+    "audio": 75 * 1024 * 1024,      # 75 MB
+    "video": 800 * 1024 * 1024,     # 800 MB
+    "archive": 800 * 1024 * 1024,   # 800 MB for compressed bundles
+}
+
+ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
 
 # === Core Config and State ===
 def load_config():
@@ -49,6 +76,7 @@ def _load_path_from_config(key):
 
 book_folder_path = _load_path_from_config("book_folder_path")
 music_folder_path = _load_path_from_config("music_folder_path")
+ina_work_path = _load_path_from_config("ina_work_path")
 
 def get_child():
     log_to_statusbox("[RawFileManager] Attempting to retrieve 'child'...")
@@ -87,11 +115,46 @@ child = get_child()
 log_to_statusbox(f"[RawFileManager] Final child: {child}")
 
 
+def classify_suffixes(suffixes):
+    if not suffixes:
+        return None
+    ext = suffixes[-1].lower()
+    if ext in TEXT_EXTENSIONS:
+        return "text"
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in SIMPLE_COMPRESSED_EXTENSIONS:
+        return "archive"
+    return None
+
+
+def classify_path(path):
+    category = classify_suffixes([s.lower() for s in path.suffixes])
+    if category:
+        return category
+    try:
+        if zipfile.is_zipfile(path) or tarfile.is_tarfile(path):
+            return "archive"
+    except Exception:
+        return None
+    return None
+
+
 def is_readable_file(path):
-    return (
-        path.suffix.lower() in set(ALLOWED_TEXT_EXT).union(ALLOWED_MEDIA_EXT)
-        and path.stat().st_size < 5 * 1024 * 1024  # < 5MB
-    )
+    category = classify_path(path)
+    if not category:
+        return False
+    size_limit = FILE_SIZE_LIMITS.get(category)
+    if not size_limit:
+        return False
+    try:
+        return path.stat().st_size <= size_limit
+    except FileNotFoundError:
+        return False
 
 def load_history(child):
     path = Path("AI_Children") / child / "memory" / "read_history.json"
@@ -141,16 +204,31 @@ def fragment_text(text, source, transformer):
         fragments.append(frag)
     return fragments
 
-def fragment_image(image_path, transformer):
+def fragment_image(image_source, transformer, source_label=None):
     try:
-        with Image.open(image_path) as img:
+        if isinstance(image_source, (str, Path)):
+            open_target = image_source
+        else:
+            image_source.seek(0)
+            open_target = image_source
+
+        with Image.open(open_target) as img:
             array = np.array(img.convert("L")).flatten().tolist()
+
+        if source_label:
+            source = source_label
+        elif isinstance(image_source, (str, Path)):
+            source = str(image_source)
+        else:
+            source = getattr(image_source, "name", "<memory_image>")
+
+        summary_name = Path(source).name if isinstance(source, str) else "image"
         frag = {
             "modality": "image",
-            "image_features": array[:512],
-            "summary": f"Visual symbol or artifact from {image_path.name}",
+            "image_features": array[:1024],
+            "summary": f"Visual symbol or artifact from {summary_name}",
             "tags": ["self_read", "image"],
-            "source": str(image_path),
+            "source": source,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"focus": 0.3, "novelty": 0.5}
         }
@@ -158,7 +236,8 @@ def fragment_image(image_path, transformer):
         frag["importance"] = vec["importance"]
         return [frag]
     except Exception as e:
-        log_to_statusbox(f"[RawFileManager] Failed to process image {image_path}: {e}")
+        label = source_label or image_source
+        log_to_statusbox(f"[RawFileManager] Failed to process image {label}: {e}")
         return []
 
 def fragment_audio(audio_path, transformer):
@@ -237,6 +316,184 @@ def fragment_audio(audio_path, transformer):
     )
     return []
 
+
+def fragment_video(video_path, transformer, source_label=None):
+    summary_parts = []
+    preview_features = []
+    duration_seconds = None
+    resolution = None
+
+    if cv2 is not None:
+        capture = cv2.VideoCapture(str(video_path))
+        if capture.isOpened():
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if frame_count and fps:
+                duration_seconds = frame_count / fps
+            if width and height:
+                resolution = (width, height)
+
+            target_frame = frame_count // 2 if frame_count else 0
+            if target_frame:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+
+            success, frame = capture.read()
+            if success and frame is not None:
+                try:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    preview_image = Image.fromarray(frame_rgb).convert("L").resize((32, 32))
+                    preview_features = (
+                        np.array(preview_image).astype(float).flatten() / 255.0
+                    ).tolist()
+                except Exception as frame_err:
+                    log_to_statusbox(
+                        f"[RawFileManager] Failed to extract frame from {video_path}: {frame_err}"
+                    )
+            capture.release()
+        else:
+            capture.release()
+    elif _VIDEO_IMPORT_ERROR:
+        log_to_statusbox(
+            f"[RawFileManager] OpenCV unavailable for {video_path.name}: {_VIDEO_IMPORT_ERROR}"
+        )
+
+    if duration_seconds:
+        summary_parts.append(f"~{duration_seconds:.1f}s")
+    if resolution:
+        summary_parts.append(f"{resolution[0]}x{resolution[1]}")
+
+    try:
+        size_mb = video_path.stat().st_size / (1024 * 1024)
+        summary_parts.append(f"{size_mb:.1f}MB")
+    except Exception:
+        pass
+
+    summary_details = " (" + ", ".join(summary_parts) + ")" if summary_parts else ""
+    source = source_label or str(video_path)
+
+    frag = {
+        "modality": "video",
+        "summary": f"Video essay from {Path(source).name}{summary_details}",
+        "tags": ["self_read", "video"],
+        "source": source,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "emotions": {"focus": 0.4, "curiosity": 0.55},
+    }
+
+    if preview_features:
+        frag["video_features"] = preview_features[:1024]
+    else:
+        metadata_features = []
+        if duration_seconds:
+            metadata_features.append(min(duration_seconds / 600.0, 1.0))
+        if resolution:
+            metadata_features.extend([
+                min(resolution[0] / 4000.0, 1.0),
+                min(resolution[1] / 4000.0, 1.0),
+            ])
+        if metadata_features:
+            frag["video_features"] = metadata_features
+
+    vec = transformer.encode_video_fragment(frag)
+    frag["importance"] = vec.get("importance", 0.0)
+    return [frag]
+
+
+def _fragments_from_data_buffer(data, inner_path, container_path, category, transformer):
+    source_label = f"{container_path.name}:{inner_path.as_posix()}"
+    if category == "text":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1", errors="ignore")
+        return fragment_text(text, source_label, transformer)
+
+    if category == "image":
+        return fragment_image(io.BytesIO(data), transformer, source_label=source_label)
+
+    if category in {"audio", "video"}:
+        suffix = inner_path.suffix or ""
+        with NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            temp_path = Path(tmp.name)
+            if category == "audio":
+                results = fragment_audio(temp_path, transformer)
+            else:
+                results = fragment_video(temp_path, transformer, source_label=source_label)
+            for frag in results:
+                frag["source"] = source_label
+            return results
+
+    return []
+
+
+def process_archive(path, transformer):
+    fragments = []
+
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                for info in archive.infolist():
+                    if info.is_dir() or info.file_size > ARCHIVE_MEMBER_LIMIT:
+                        continue
+                    inner_path = Path(info.filename)
+                    category = classify_suffixes([s.lower() for s in inner_path.suffixes])
+                    if not category or category == "archive":
+                        continue
+                    with archive.open(info, "r") as member:
+                        data = member.read()
+                    fragments.extend(
+                        _fragments_from_data_buffer(
+                            data, inner_path, path, category, transformer
+                        )
+                    )
+
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path, "r:*") as archive:
+                for member in archive.getmembers():
+                    if not member.isfile() or member.size > ARCHIVE_MEMBER_LIMIT:
+                        continue
+                    inner_path = Path(member.name)
+                    category = classify_suffixes([s.lower() for s in inner_path.suffixes])
+                    if not category or category == "archive":
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        continue
+                    data = extracted.read()
+                    fragments.extend(
+                        _fragments_from_data_buffer(
+                            data, inner_path, path, category, transformer
+                        )
+                    )
+
+        else:
+            ext = path.suffix.lower()
+            opener_map = {
+                ".gz": gzip.open,
+                ".bz2": bz2.open,
+                ".xz": lzma.open,
+            }
+            opener = opener_map.get(ext)
+            if opener:
+                inner_name = Path(path.name).with_suffix("")
+                category = classify_suffixes([s.lower() for s in inner_name.suffixes])
+                if category and category != "archive":
+                    with opener(path, "rb") as compressed:
+                        data = compressed.read()
+                    fragments.extend(
+                        _fragments_from_data_buffer(
+                            data, inner_name, path, category, transformer
+                        )
+                    )
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to process archive {path}: {e}")
+
+    return fragments
+
 def self_read_and_train():
     child = get_child()
     default_root = Path.home() / "Projects" / "Project Inazuma"
@@ -274,6 +531,11 @@ def self_read_and_train():
     elif music_folder_path:
         log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
 
+    if ina_work_path and ina_work_path.exists():
+        add_root(ina_work_path, audio_only=False)
+    elif ina_work_path:
+        log_to_statusbox(f"[SelfRead] Ina work folder not found: {ina_work_path}")
+
     log_to_statusbox(f"[SelfRead] Child set to: {child}")
     if roots:
         log_to_statusbox("[SelfRead] Roots to scan: " + ", ".join(str(path) for path, _ in roots))
@@ -307,44 +569,47 @@ def self_read_and_train():
             rel_str = relative_path.as_posix() if isinstance(relative_path, Path) else str(relative_path)
             history_key = f"{base_root.name}/{rel_str}"
 
-
-            elif ext in [".wav", ".mp3"]:
-                result = fragment_audio(path, transformer)
-
-            else:
-                log_to_statusbox(f"[SelfRead] SKIP {path.name} — unrecognized extension.")
-
             log_to_statusbox(f"[SelfRead] Inspecting: {path}")
 
             if history_key in history or (base_root == default_root and path.name in legacy_history):
                 log_to_statusbox(f"[SelfRead] SKIP {path.name} — already seen.")
                 continue
 
-            if not is_readable_file(path):
-                log_to_statusbox(f"[SelfRead] SKIP {path.name} — not a supported format or too large.")
+            category = classify_path(path)
+            if not category:
+                log_to_statusbox(f"[SelfRead] SKIP {path.name} — unrecognized type.")
                 continue
 
-            ext = path.suffix.lower()
-            log_to_statusbox(f"[SelfRead] PROCESSING {path.name} (.{ext})")
+            if not is_readable_file(path):
+                log_to_statusbox(
+                    f"[SelfRead] SKIP {path.name} — not a supported format or too large."
+                )
+                continue
+
+            log_to_statusbox(f"[SelfRead] PROCESSING {path.name} [{category}]")
 
             try:
-                if ext in ALLOWED_TEXT_EXT:
+                if category == "text":
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
                     result = fragment_text(text, path.name, transformer)
 
-                elif ext in [".png", ".jpg", ".jpeg"]:
+                elif category == "image":
                     result = fragment_image(path, transformer)
 
-                elif ext in [".wav"]:
+                elif category == "audio":
                     result = fragment_audio(path, transformer)
 
-                elif ext in [".mp3"]:
-                    log_to_statusbox(f"[SelfRead] NOTE: {path.name} is mp3 — audio_digest handles those. Skipping.")
-                    continue
+                elif category == "video":
+                    result = fragment_video(path, transformer)
+
+                elif category == "archive":
+                    result = process_archive(path, transformer)
 
                 else:
-                    log_to_statusbox(f"[SelfRead] SKIP {path.name} — unrecognized extension.")
+                    log_to_statusbox(
+                        f"[SelfRead] SKIP {path.name} — unsupported processing category {category}."
+                    )
                     continue
 
                 if result:
