@@ -1,10 +1,12 @@
 import os
 import json
-import cv2
-import fitz  # PyMuPDF
 from pathlib import Path
-from transformers.fractal_multidimensional_transformers import FractalTransformer
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from model_manager import load_config, seed_self_question
+from experience_logger import ExperienceLogger
+
+if TYPE_CHECKING:  # pragma: no cover
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 
 def load_sound_symbol_map(child):
@@ -69,7 +71,14 @@ def cosine_similarity(v1, v2):
     norm2 = sum(b * b for b in v2) ** 0.5
     return dot / (norm1 * norm2 + 1e-8)
 
-def associate_symbol_with_word(child, symbol_id, word, confidence=1.0):
+def associate_symbol_with_word(
+    child,
+    symbol_id,
+    word,
+    confidence=1.0,
+    grounding: Optional[Dict[str, str]] = None,
+    base_path: Optional[Path] = None,
+):
     vocab = load_symbol_to_token(child)
     if symbol_id not in vocab:
         vocab[symbol_id] = {"word": word, "uses": 1, "confidence": round(confidence, 2)}
@@ -84,6 +93,18 @@ def associate_symbol_with_word(child, symbol_id, word, confidence=1.0):
         vocab[symbol_id] = entry
     save_symbol_to_token(child, vocab)
     print(f"[LangLearn] Associated {symbol_id} → '{word}' with confidence {vocab[symbol_id]['confidence']}")
+    if grounding and grounding.get("event_id"):
+        logger = ExperienceLogger(child=child, base_path=base_path)
+        logger.attach_word_usage(
+            grounding["event_id"],
+            speaker=grounding.get("speaker", "system"),
+            utterance=grounding.get("utterance", word),
+            words=[word],
+            entity_links=grounding.get("entity_links"),
+        )
+        print(
+            f"[LangLearn] Grounded '{word}' in experience event {grounding['event_id']} (speaker: {grounding.get('speaker', 'system')})."
+        )
 
 def backprop_symbol_confidence(child, predicted_word, expressed_symbol):
     vocab = load_symbol_to_token(child)
@@ -142,6 +163,10 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
 
 # === New: Symbol Image Training ===
 def train_from_symbol_images(child):
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+
+    import cv2
+
     transformer = FractalTransformer()
     symbol_dir = Path("AI_Children") / child / "memory" / "vision_session" / "generated_symbols"
     manifest_path = symbol_dir / "manifest.json"
@@ -196,6 +221,10 @@ def synthesize_from_fingerprint(fingerprint, duration_ms=1500, sr=22050):
 
 # === New: Book Text Training ===
 def train_from_books(child):
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+
+    import fitz  # PyMuPDF
+
     config = load_config()
     book_path = Path(config.get("book_folder_path", "books/"))
     if not book_path.exists():
@@ -246,6 +275,13 @@ def summarize_known_words(child):
     print("[LangLearn] Known vocabulary:")
     for sym, entry in vocab.items():
         print(f" - {entry['word']} (symbol: {sym}, uses: {entry['uses']})")
+        groundings = describe_word_grounding(child, entry["word"])
+        for grounding in groundings:
+            tags = ", ".join(grounding.get("situation_tags", []))
+            print(
+                f"    ↳ grounded in event {grounding['event_id']} ({tags or 'no tags'})"
+                f" — narrative: {grounding.get('narrative', '')}"
+            )
 
 def respond_to_word(child, word):
     vocab_path = Path("AI_Children") / child / "memory" / "symbol_to_token.json"
@@ -271,12 +307,105 @@ def respond_to_word(child, word):
                     from pydub.playback import play
                     audio = AudioSegment.from_mp3(clip_path)
                     play(audio)
-                    return
+            describe_word_grounding(child, word, verbose=True)
+            return
     print(f"[LangLearn] No audio response found for: '{word}'")
+
+
+# === Experience Graph Queries ===
+def load_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict[str, Any]:
+    base = Path(base_path) if base_path else Path("AI_Children")
+    path = base / child / "memory" / "experiences" / "experience_graph.json"
+    if not path.exists():
+        return {"events": [], "edges": [], "words_index": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {"events": [], "edges": [], "words_index": {}}
+
+
+def describe_word_grounding(
+    child: str,
+    word: str,
+    *,
+    base_path: Optional[Path] = None,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return the experiences that ground a given word."""
+
+    graph = load_experience_graph(child, base_path)
+    grounded_events: List[Dict[str, Any]] = []
+    target = word.lower()
+    for event in graph.get("events", []):
+        for usage in event.get("word_usage", []):
+            if target in [w.lower() for w in usage.get("words", [])]:
+                result = {
+                    "event_id": event.get("id"),
+                    "timestamp": event.get("timestamp"),
+                    "situation_tags": event.get("situation_tags", []),
+                    "narrative": event.get("narrative", ""),
+                    "speaker": usage.get("speaker"),
+                    "utterance": usage.get("utterance"),
+                    "words": usage.get("words", []),
+                }
+                grounded_events.append(result)
+                if verbose:
+                    tags = ", ".join(result["situation_tags"])
+                    print(
+                        f"[LangLearn] Experience grounding for '{word}': event {result['event_id']}"
+                        f" ({tags or 'no tags'}) — utterance '{usage.get('utterance')}'"
+                    )
+    return grounded_events
+
+
+def suggest_words_for_context(
+    child: str,
+    *,
+    situation_tags: Optional[Iterable[str]] = None,
+    entity_labels: Optional[Iterable[str]] = None,
+    base_path: Optional[Path] = None,
+) -> List[str]:
+    """Suggest vocabulary grounded in experiences matching the context."""
+
+    graph = load_experience_graph(child, base_path)
+    tags = set(tag.lower() for tag in (situation_tags or []))
+    entities = set(label.lower() for label in (entity_labels or []))
+    candidates: Dict[str, int] = {}
+
+    for event in graph.get("events", []):
+        event_tags = {tag.lower() for tag in event.get("situation_tags", [])}
+        event_entities = {ent.lower() for ent in event.get("entities", [])}
+        if tags and not tags.intersection(event_tags):
+            continue
+        if entities and not entities.intersection(event_entities):
+            continue
+        for usage in event.get("word_usage", []):
+            for word in usage.get("words", []):
+                candidates[word] = candidates.get(word, 0) + 1
+
+    return sorted(candidates, key=lambda w: (-candidates[w], w))
+
+
+def is_word_grounded(child: str, word: str, base_path: Optional[Path] = None) -> bool:
+    """Check whether a vocabulary item is backed by at least one experience."""
+
+    graph = load_experience_graph(child, base_path)
+    target = word.lower()
+    index = graph.get("words_index", {})
+    if target in index and index[target]:
+        return True
+    for event in graph.get("events", []):
+        for usage in event.get("word_usage", []):
+            if target in [w.lower() for w in usage.get("words", [])]:
+                return True
+    return False
 
 if __name__ == "__main__":
     config = load_config()
     child = config.get("current_child", "default_child")
+
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
 
     transformer = FractalTransformer()
     symbol_map = load_sound_symbol_map(child)

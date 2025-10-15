@@ -6,10 +6,111 @@ import math
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from transformers.fractal_multidimensional_transformers import FractalTransformer
+from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
 from gui_hook import log_to_statusbox
 
+if TYPE_CHECKING:  # pragma: no cover
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+
 MEMORY_TIERS = ["short", "working", "long", "cold"]
+
+
+# === Experience Graph Utilities ===
+def _experience_base(child: str, base_path: Optional[Path] = None) -> Path:
+    root = Path(base_path) if base_path else Path("AI_Children")
+    return root / child / "memory" / "experiences"
+
+
+def load_experience_events(child: str, base_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Load structured events previously logged by the experience logger."""
+
+    events_dir = _experience_base(child, base_path) / "events"
+    if not events_dir.exists():
+        return []
+
+    events: List[Dict[str, Any]] = []
+    for path in sorted(events_dir.glob("evt_*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if "id" in data:
+                    events.append(data)
+        except Exception:
+            continue
+    return events
+
+
+def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Construct a graph over events grounded in shared entities and words."""
+
+    events = load_experience_events(child, base_path)
+    if not events:
+        return {
+            "events": [],
+            "edges": [],
+            "words_index": {},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    nodes: List[Dict[str, Any]] = []
+    words_index: Dict[str, Set[str]] = {}
+
+    for raw in events:
+        entity_labels = {
+            entity.get("name") or entity.get("label")
+            for entity in raw.get("perceived_entities", [])
+            if entity.get("name") or entity.get("label")
+        }
+        node = {
+            "id": raw.get("id"),
+            "timestamp": raw.get("timestamp"),
+            "situation_tags": raw.get("situation_tags", []),
+            "entities": sorted(entity_labels),
+            "episode_id": raw.get("episode_id"),
+            "narrative": raw.get("narrative", ""),
+            "word_usage": raw.get("word_usage", []),
+        }
+        nodes.append(node)
+        for usage in node["word_usage"]:
+            for word in usage.get("words", []):
+                if not word:
+                    continue
+                words_index.setdefault(word.lower(), set()).add(node["id"])
+
+    edges: List[Dict[str, Any]] = []
+    for i, left in enumerate(nodes):
+        left_tags = set(left.get("situation_tags", []))
+        left_entities = set(left.get("entities", []))
+        for right in nodes[i + 1 :]:
+            shared_tags = left_tags.intersection(right.get("situation_tags", []))
+            shared_entities = left_entities.intersection(right.get("entities", []))
+            if not shared_tags and not shared_entities:
+                continue
+            edges.append(
+                {
+                    "source": left["id"],
+                    "target": right["id"],
+                    "shared_tags": sorted(shared_tags),
+                    "shared_entities": sorted(shared_entities),
+                }
+            )
+
+    graph = {
+        "events": nodes,
+        "edges": edges,
+        "words_index": {word: sorted(list(event_ids)) for word, event_ids in words_index.items()},
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    out_path = _experience_base(child, base_path) / "experience_graph.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(graph, fh, indent=2)
+
+    log_to_statusbox(
+        f"[ExperienceGraph] {len(nodes)} events | {len(edges)} edges | {len(words_index)} grounded words."
+    )
+    return graph
 
 # === Core Utilities ===
 def cosine_similarity(v1, v2):
@@ -79,6 +180,8 @@ def build_synaptic_links(neurons, cache, threshold=0.91):
 
 def build_fractal_memory(child):
     start_time = datetime.now()
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+
     transformer = FractalTransformer()
     fragments = load_fragments(child)
     log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
@@ -303,3 +406,4 @@ if __name__ == "__main__":
     mgr.reindex_all()
     mgr.stats()
     build_fractal_memory(mgr.child)
+    build_experience_graph(mgr.child)
