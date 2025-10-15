@@ -54,6 +54,18 @@ FILE_SIZE_LIMITS = {
 
 ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
 
+
+def _read_limited(stream, limit):
+    data = bytearray()
+    while True:
+        chunk = stream.read(64 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError("archive member exceeds limit")
+    return bytes(data)
+
 # === Core Config and State ===
 def load_config():
     path = Path("config.json")
@@ -482,13 +494,19 @@ def process_archive(path, transformer):
                 inner_name = Path(path.name).with_suffix("")
                 category = classify_suffixes([s.lower() for s in inner_name.suffixes])
                 if category and category != "archive":
-                    with opener(path, "rb") as compressed:
-                        data = compressed.read()
-                    fragments.extend(
-                        _fragments_from_data_buffer(
-                            data, inner_name, path, category, transformer
+                    try:
+                        with opener(path, "rb") as compressed:
+                            data = _read_limited(compressed, ARCHIVE_MEMBER_LIMIT)
+                    except ValueError:
+                        log_to_statusbox(
+                            f"[RawFileManager] Skipping {path} because the decompressed size exceeds the per-file limit"
                         )
-                    )
+                    else:
+                        fragments.extend(
+                            _fragments_from_data_buffer(
+                                data, inner_name, path, category, transformer
+                            )
+                        )
     except Exception as e:
         log_to_statusbox(f"[RawFileManager] Failed to process archive {path}: {e}")
 
