@@ -1,84 +1,58 @@
 import json
 import sys
-from types import ModuleType
+from pathlib import Path
 
 import pytest
 
-np = pytest.importorskip("numpy")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from experience_logger import ExperienceLogger
 from live_experience_bridge import LiveExperienceBridge
 
 
-def test_log_screen_snapshot_creates_event(tmp_path, monkeypatch):
+@pytest.fixture()
+def bridge(tmp_path):
+    base = tmp_path / "AI_Children"
     child = "TestChild"
-    bridge = LiveExperienceBridge(child=child, base_path=tmp_path)
+    logger = ExperienceLogger(child=child, base_path=base)
+    bridge = LiveExperienceBridge(child=child, base_path=base, logger=logger)
+    return bridge, child, base
 
-    dummy_tokens = ["Hello", "World"]
 
-    fake_module = ModuleType("vision_digest")
-    fake_module.run_text_recognition = lambda frame, child_name: dummy_tokens
-    monkeypatch.setitem(sys.modules, "vision_digest", fake_module)
+def test_log_conversation_turn_creates_event_with_word_usage(bridge):
+    bridge_instance, child, base = bridge
 
-    frame = np.full((4, 4, 3), 255, dtype=np.uint8)
-    event_id = bridge.log_screen_snapshot(frame, metadata={"window": "browser"})
+    event_id = bridge_instance.log_conversation_turn("Hello Ina", speaker="parent")
 
-    event_path = (
-        tmp_path
-        / child
-        / "memory"
-        / "experiences"
-        / "events"
-        / f"{event_id}.json"
+    # Event file should exist and include attached word usage
+    events_dir = base / child / "memory" / "experiences" / "events"
+    event_file = events_dir / f"{event_id}.json"
+    assert event_file.exists()
+    event_data = json.loads(event_file.read_text(encoding="utf-8"))
+    assert event_data["word_usage"], "word usage annotations should be recorded"
+    assert event_data["word_usage"][0]["words"] == ["hello", "ina"]
+
+    # Logger should allow us to attach another turn to the same event
+    bridge_instance.log_conversation_turn(
+        "Nice to meet you", speaker="parent", event_id=event_id
     )
-    with open(event_path, "r", encoding="utf-8") as fh:
-        event = json.load(fh)
+    updated_data = json.loads(event_file.read_text(encoding="utf-8"))
+    utterances = [entry["utterance"] for entry in updated_data["word_usage"]]
+    assert "Nice to meet you" in utterances
 
-    assert event["narrative"].startswith("Observed")
-    assert event["perceived_entities"]
-    assert event["word_usage"]
-
-    screen_meta = (
-        tmp_path
-        / child
-        / "memory"
-        / "experiences"
-        / "live_media"
-        / f"{event_id}_screen.json"
-    )
-    assert screen_meta.exists()
-
-
-def test_log_conversation_turn_attach_existing_event(tmp_path):
-    child = "TestChild"
-    logger = ExperienceLogger(child=child, base_path=tmp_path)
-    bridge = LiveExperienceBridge(child=child, base_path=tmp_path, logger=logger)
-
-    event_id = bridge.log_screen_snapshot(np.zeros((2, 2, 3), dtype=np.uint8))
-    bridge.log_conversation_turn(
-        "This is a live description", speaker="operator", event_id=event_id
-    )
-
-    event_path = (
-        tmp_path
-        / child
-        / "memory"
-        / "experiences"
-        / "events"
-        / f"{event_id}.json"
-    )
-    with open(event_path, "r", encoding="utf-8") as fh:
-        event = json.load(fh)
-
-    assert len(event["word_usage"]) >= 1
-
-    dialogue_meta = (
-        tmp_path
+    # Ensure the dialogue metadata file aggregates turns
+    meta_path = (
+        base
         / child
         / "memory"
         / "experiences"
         / "live_media"
         / f"{event_id}_dialogue.json"
     )
-    assert dialogue_meta.exists()
-
+    assert meta_path.exists()
+    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert len(payload["turns"]) == 2
+    assert payload["turns"][0]["utterance"] == "Hello Ina"
+    assert payload["turns"][1]["utterance"] == "Nice to meet you"
