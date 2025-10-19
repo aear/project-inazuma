@@ -9,15 +9,20 @@ if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 
-def load_sound_symbol_map(child):
-    path = Path("AI_Children") / child / "memory" / "sound_symbol_map.json"
+def _memory_root(child: str, base_path: Optional[Path] = None) -> Path:
+    base = Path(base_path) if base_path else Path("AI_Children")
+    return base / child / "memory"
+
+
+def load_sound_symbol_map(child, base_path: Optional[Path] = None):
+    path = _memory_root(child, base_path) / "sound_symbol_map.json"
     if not path.exists():
         return {}
     with open(path, "r") as f:
         return json.load(f)
 
-def load_fragments(child):
-    frag_path = Path("AI_Children") / child / "memory" / "fragments"
+def load_fragments(child, base_path: Optional[Path] = None):
+    frag_path = _memory_root(child, base_path) / "fragments"
     fragments = []
     for f in frag_path.glob("frag_*.json"):
         try:
@@ -41,15 +46,16 @@ def extract_sound_features_from_summary(summary):
         }
     return {}
 
-def load_symbol_to_token(child):
-    path = Path("AI_Children") / child / "memory" / "symbol_to_token.json"
+def load_symbol_to_token(child, base_path: Optional[Path] = None):
+    path = _memory_root(child, base_path) / "symbol_to_token.json"
     if not path.exists():
         return {}
     with open(path, "r") as f:
         return json.load(f)
-    
-def save_symbol_to_token(child, data):
-    path = Path("AI_Children") / child / "memory" / "symbol_to_token.json"
+
+def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
+    path = _memory_root(child, base_path) / "symbol_to_token.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
 
@@ -79,7 +85,7 @@ def associate_symbol_with_word(
     grounding: Optional[Dict[str, str]] = None,
     base_path: Optional[Path] = None,
 ):
-    vocab = load_symbol_to_token(child)
+    vocab = load_symbol_to_token(child, base_path)
     if symbol_id not in vocab:
         vocab[symbol_id] = {"word": word, "uses": 1, "confidence": round(confidence, 2)}
     else:
@@ -91,7 +97,7 @@ def associate_symbol_with_word(
             entry["uses"] += 1
             entry["confidence"] = round(min(1.0, entry.get("confidence", 0.5) + 0.05), 2)
         vocab[symbol_id] = entry
-    save_symbol_to_token(child, vocab)
+    save_symbol_to_token(child, vocab, base_path)
     print(f"[LangLearn] Associated {symbol_id} → '{word}' with confidence {vocab[symbol_id]['confidence']}")
     if grounding and grounding.get("event_id"):
         logger = ExperienceLogger(child=child, base_path=base_path)
@@ -105,9 +111,13 @@ def associate_symbol_with_word(
         print(
             f"[LangLearn] Grounded '{word}' in experience event {grounding['event_id']} (speaker: {grounding.get('speaker', 'system')})."
         )
+    else:
+        seed_self_question(
+            f"What experience grounds the word '{word}' for symbol {symbol_id}?"
+        )
 
-def backprop_symbol_confidence(child, predicted_word, expressed_symbol):
-    vocab = load_symbol_to_token(child)
+def backprop_symbol_confidence(child, predicted_word, expressed_symbol, base_path: Optional[Path] = None):
+    vocab = load_symbol_to_token(child, base_path)
     if expressed_symbol not in vocab:
         return
 
@@ -121,7 +131,7 @@ def backprop_symbol_confidence(child, predicted_word, expressed_symbol):
         entry["confidence"] = round(min(1.0, entry.get("confidence", 0.5) + 0.1), 2)
 
     vocab[expressed_symbol] = entry
-    save_symbol_to_token(child, vocab)
+    save_symbol_to_token(child, vocab, base_path)
     print(f"[LangLearn] Updated confidence for {expressed_symbol} → '{entry['word']}' to {entry['confidence']}")
 
 def speak_symbolically(symbols, child="Inazuma_Yagami"):
@@ -283,12 +293,16 @@ def summarize_known_words(child):
                 f" — narrative: {grounding.get('narrative', '')}"
             )
 
-def respond_to_word(child, word):
-    vocab_path = Path("AI_Children") / child / "memory" / "symbol_to_token.json"
-    symbol_map_path = Path("AI_Children") / child / "memory" / "sound_symbol_map.json"
+def respond_to_word(child, word, *, base_path: Optional[Path] = None):
+    vocab_path = _memory_root(child, base_path) / "symbol_to_token.json"
+    symbol_map_path = _memory_root(child, base_path) / "sound_symbol_map.json"
 
     if not os.path.exists(vocab_path) or not os.path.exists(symbol_map_path):
         print("[LangLearn] No vocab or symbol map found.")
+        return
+
+    if not ensure_word_grounded(child, word, base_path=base_path):
+        print(f"[LangLearn] Cannot respond with '{word}' without experiential grounding.")
         return
 
     with open(vocab_path, "r") as f:
@@ -300,16 +314,40 @@ def respond_to_word(child, word):
         if entry["word"].lower() == word.lower():
             clip = symbol_map.get(sym, {}).get("clip")
             if clip:
-                clip_path = Path("AI_Children") / child / "memory" / "audio_session" / clip
+                clip_path = _memory_root(child, base_path) / "audio_session" / clip
                 if clip_path.exists():
                     print(f"[LangLearn] Responding with: {word} → {clip_path.name}")
                     from pydub import AudioSegment
                     from pydub.playback import play
                     audio = AudioSegment.from_mp3(clip_path)
                     play(audio)
-            describe_word_grounding(child, word, verbose=True)
+            describe_word_grounding(child, word, base_path=base_path, verbose=True)
             return
     print(f"[LangLearn] No audio response found for: '{word}'")
+
+
+def ensure_word_grounded(
+    child: str,
+    word: str,
+    *,
+    base_path: Optional[Path] = None,
+) -> bool:
+    """Ensure that a word is backed by experiential memory before use."""
+
+    if is_word_grounded(child, word, base_path=base_path):
+        return True
+
+    groundings = describe_word_grounding(child, word, base_path=base_path)
+    if groundings:
+        context = ", ".join(g.get("event_id", "?") for g in groundings)
+        seed_self_question(
+            f"I recall events {context} but they do not ground '{word}' sufficiently."
+        )
+    else:
+        seed_self_question(
+            f"What experience grounds the word '{word}'? I should ask for clarification."
+        )
+    return False
 
 
 # === Experience Graph Queries ===

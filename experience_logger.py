@@ -72,6 +72,7 @@ class EpisodeRecord:
     events: List[str] = field(default_factory=list)
     narrative: str = ""
     feedback: List[Dict[str, Any]] = field(default_factory=list)
+    feedback_hooks: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -89,6 +90,7 @@ class EpisodeRecord:
             events=list(data.get("events", [])),
             narrative=data.get("narrative", ""),
             feedback=list(data.get("feedback", [])),
+            feedback_hooks=list(data.get("feedback_hooks", [])),
         )
 
 
@@ -212,6 +214,7 @@ class ExperienceLogger:
         result: Optional[Dict[str, Any]] = None,
         feedback: Optional[Iterable[Dict[str, Any]]] = None,
         narrative: Optional[str] = None,
+        feedback_hooks: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """Close the currently active episode."""
 
@@ -224,6 +227,8 @@ class ExperienceLogger:
             self._active_episode.feedback.extend(list(feedback))
         if narrative is not None:
             self._active_episode.narrative = narrative
+        if feedback_hooks is not None:
+            self._active_episode.feedback_hooks.extend(list(feedback_hooks))
         episode_id = self._active_episode.id
         self._persist_active_episode()
         self._active_episode = None
@@ -247,8 +252,34 @@ class ExperienceLogger:
                 continue
         narration = " -> ".join(event_narratives)
         episode.narrative = narration
+        episode.feedback_hooks = self._ensure_feedback_hooks(episode)
         self._save_episode(episode)
         return narration
+
+    def finish_and_narrate_episode(
+        self,
+        *,
+        result: Optional[Dict[str, Any]] = None,
+        feedback: Optional[Iterable[Dict[str, Any]]] = None,
+        narrative: Optional[str] = None,
+        feedback_hooks: Optional[Iterable[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Finish the active episode and immediately narrate it.
+
+        Returns a mapping containing the ``episode_id`` and generated
+        ``narrative`` when an episode was active.
+        """
+
+        episode_id = self.finish_episode(
+            result=result,
+            feedback=feedback,
+            narrative=narrative,
+            feedback_hooks=feedback_hooks,
+        )
+        if episode_id is None:
+            return None
+        narration = self.narrate_episode(episode_id)
+        return {"episode_id": episode_id, "narrative": narration}
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -293,6 +324,19 @@ class ExperienceLogger:
             ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in utterance
         )
         return [token for token in cleaned.split() if token]
+
+    @staticmethod
+    def _ensure_feedback_hooks(episode: EpisodeRecord) -> List[Dict[str, Any]]:
+        hooks = {hook.get("event_id"): hook for hook in episode.feedback_hooks if hook.get("event_id")}
+        for event_id in episode.events:
+            if event_id not in hooks:
+                hooks[event_id] = {
+                    "event_id": event_id,
+                    "status": "pending",
+                    "created_at": _now_iso(),
+                    "notes": "",
+                }
+        return [hooks[event_id] for event_id in episode.events if event_id in hooks]
 
 
 __all__ = [
