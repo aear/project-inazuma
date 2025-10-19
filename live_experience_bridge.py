@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timezone
 
 try:
     import numpy as np
@@ -147,16 +148,13 @@ class LiveExperienceBridge:
 
     def log_screen_snapshot(
         self,
-        frame: np.ndarray,
+        frame: Any,
         *,
         tags: Optional[Iterable[str]] = None,
         narrative: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Persist a single screen observation as an experiential event."""
-
-        if np is None:
-            raise RuntimeError("numpy is required to process screen snapshots.")
 
         situation_tags = list(tags or self._screen_config.tags)
         narrative_text = narrative or self._screen_config.narrative
@@ -191,14 +189,20 @@ class LiveExperienceBridge:
             )
         return event_id
 
-    def _describe_frame(self, frame: np.ndarray) -> Tuple[List[str], List[float]]:
-        sample = frame.reshape(-1).astype(float)[:512]
-        feature_sample = np.round(sample / 255.0, 4).tolist()
+    def _describe_frame(self, frame: Any) -> Tuple[List[str], List[float]]:
+        flattened = self._flatten_pixels(frame)
+        feature_sample = [
+            round(min(255.0, max(0.0, value)) / 255.0, 4)
+            for value in flattened[:512]
+        ]
         recognized: List[str] = []
         try:
             from vision_digest import run_text_recognition
 
-            recognized = run_text_recognition(frame, self.child)
+            recognition_input: Any = frame
+            if np is not None and not isinstance(frame, np.ndarray):
+                recognition_input = np.array(frame)
+            recognized = run_text_recognition(recognition_input, self.child)
         except Exception:
             recognized = []
         return recognized, feature_sample
@@ -206,36 +210,46 @@ class LiveExperienceBridge:
     def _persist_frame(
         self,
         event_id: str,
-        frame: np.ndarray,
+        frame: Any,
         recognized_text: List[str],
         metadata: Optional[Dict[str, Any]],
     ) -> None:
         media_meta: Dict[str, Any] = {
             "event_id": event_id,
-            "shape": list(frame.shape),
             "recognized_text": recognized_text,
             "metadata": metadata or {},
         }
         saved = False
+        if np is not None and isinstance(frame, np.ndarray):
+            media_meta["shape"] = list(frame.shape)
         image_path = self._media_dir / f"{event_id}_screen.png"
         try:
-            if Image is not None:
-                img = Image.fromarray(frame.astype(np.uint8))
+            if np is not None and isinstance(frame, np.ndarray):
+                array = frame.astype(np.uint8)
+            elif np is not None:
+                array = np.array(frame).astype(np.uint8)
+            else:
+                array = None
+            if array is not None and Image is not None:
+                img = Image.fromarray(array)
                 img.save(image_path)
                 saved = True
-            elif cv2 is not None:
-                cv2.imwrite(str(image_path), frame)
+            elif array is not None and cv2 is not None:
+                cv2.imwrite(str(image_path), array)
                 saved = True
         except Exception:
             saved = False
 
         if not saved:
-            fallback = self._media_dir / f"{event_id}_screen.npy"
-            try:
-                np.save(fallback, frame)
-                media_meta["raw_file"] = fallback.name
-            except Exception:
-                media_meta["raw_file"] = None
+            if np is not None and isinstance(frame, np.ndarray):
+                fallback = self._media_dir / f"{event_id}_screen.npy"
+                try:
+                    np.save(fallback, frame)
+                    media_meta["raw_file"] = fallback.name
+                except Exception:
+                    media_meta["raw_file"] = None
+            else:
+                media_meta["sample_pixels"] = self._flatten_pixels(frame)[:64]
         else:
             media_meta["image_file"] = image_path.name
 
@@ -255,6 +269,7 @@ class LiveExperienceBridge:
         tags: Optional[Iterable[str]] = None,
         entity_links: Optional[Iterable[Dict[str, Any]]] = None,
         timestamp: Optional[str] = None,
+        audio_features: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Capture a spoken utterance and bind it to an experiential event."""
 
@@ -266,9 +281,16 @@ class LiveExperienceBridge:
             event_id = self.logger.log_event(
                 situation_tags=situation_tags,
                 narrative=narrative,
-                internal_state={"speaker": speaker_name},
+                internal_state={
+                    "speaker": speaker_name,
+                    "audio_features": dict(audio_features or {}),
+                },
                 timestamp=timestamp,
             )
+        elif audio_features:
+            event = self.logger._load_event(event_id)
+            event.internal_state.setdefault("audio_features", {}).update(audio_features)
+            self.logger._save_event(event)
         annotation = self.logger.attach_word_usage(
             event_id,
             speaker=speaker_name,
@@ -285,10 +307,89 @@ class LiveExperienceBridge:
                 payload = {"event_id": event_id, "turns": []}
         except Exception:
             payload = {"event_id": event_id, "turns": []}
-        payload["turns"].append(annotation)
+        turn_entry = dict(annotation)
+        if audio_features:
+            turn_entry["audio_features"] = dict(audio_features)
+        payload["turns"].append(turn_entry)
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         return event_id
+
+    def log_motor_feedback(
+        self,
+        action: str,
+        *,
+        success: bool,
+        sensor_readings: Optional[Dict[str, Any]] = None,
+        tags: Optional[Iterable[str]] = None,
+        vocabulary: Optional[Iterable[str]] = None,
+        narrative: Optional[str] = None,
+        timestamp: Optional[str] = None,
+        entities: Optional[Iterable[Dict[str, Any]]] = None,
+    ) -> str:
+        """Persist tactile or proprioceptive feedback as an experiential event."""
+
+        situation_tags = list(tags or ["motor", "feedback"])
+        narrative_text = narrative or f"Motor action '{action}' executed."
+        sensors = dict(sensor_readings or {})
+        perceived_entities = list(entities or [])
+        if not perceived_entities:
+            perceived_entities.append({"type": "motor_action", "name": action})
+        event_id = self.logger.log_event(
+            situation_tags=situation_tags,
+            perceived_entities=perceived_entities,
+            actions=[{"type": "motor", "action": action}],
+            outcome={"success": success, "sensor": sensors},
+            internal_state={"motor_feedback": sensors, "action": action},
+            narrative=narrative_text,
+            timestamp=timestamp,
+        )
+        if vocabulary:
+            utterance = " ".join(vocabulary)
+            self.logger.attach_word_usage(
+                event_id,
+                speaker="motor_feedback",
+                utterance=utterance,
+                words=list(vocabulary),
+                entity_links=[{"type": "action", "name": action}],
+                timestamp=timestamp,
+            )
+        meta_path = self._media_dir / f"{event_id}_motor.json"
+        payload = {
+            "event_id": event_id,
+            "action": action,
+            "success": success,
+            "sensor_readings": sensors,
+            "vocabulary": list(vocabulary or []),
+            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        }
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        return event_id
+
+    def _flatten_pixels(self, frame: Any) -> List[float]:
+        if np is not None and isinstance(frame, np.ndarray):
+            return frame.reshape(-1).astype(float).tolist()
+        if np is not None:
+            try:
+                return np.array(frame).reshape(-1).astype(float).tolist()
+            except Exception:
+                pass
+
+        flattened: List[float] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, (list, tuple)):
+                for item in node:
+                    _walk(item)
+            else:
+                try:
+                    flattened.append(float(node))
+                except Exception:
+                    flattened.append(0.0)
+
+        _walk(frame)
+        return flattened
 
 
 __all__ = ["LiveExperienceBridge", "ScreenCaptureConfig", "AudioCaptureConfig"]
