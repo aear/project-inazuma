@@ -19,6 +19,7 @@ AI_Children*/
 *.png
 *.json
 *.txt
+*.odt
 
 
 # --- WORK DIRECTORIES ---
