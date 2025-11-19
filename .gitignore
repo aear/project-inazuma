@@ -1,0 +1,46 @@
+# --- AI CHILDREN ---
+AI_Children/
+AI_Children*/
+
+
+# --- LOGS ---
+*.log
+
+
+# --- SENSITIVE MEDIA ---
+*.wav
+*.mp3
+*.flac
+*.opus
+*.mp4
+*.avi
+*.mkv
+*.jpg
+*.png
+*.json
+*.txt
+
+
+# --- WORK DIRECTORIES ---
+venv/
+.env/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.sh
+
+# --- EDITOR NOISE ---
+*.swp
+*.swo
+*.bak
+.DS_Store
+.idea/
+.vscode/
+
+# --- ZIP/BUNDLE OUTPUTS ---
+*.zip
+*.tar
+*.gz
+dist/
+build/
