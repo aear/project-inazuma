@@ -93,9 +93,9 @@ def flush_and_digest(label, device_string):
     if not clip_path or not clip_path.exists():
         return
     try:
-        analysis = analyze_audio_clip(clip_path, transformer)
+        analysis = analyze_audio_clip(clip_path, transformer, child=child, label=label)
         if analysis:
-            generate_fragment(clip_path, analysis, child)
+            generate_fragment(clip_path, analysis, child=child, label=label)
             append_session_log(label, clip_path, analysis.get("duration", FLUSH_INTERVAL))
     except Exception as e:
         log_to_statusbox(f"[Audio] Digest failed on {label}: {e}")

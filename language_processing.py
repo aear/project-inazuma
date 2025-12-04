@@ -13,13 +13,29 @@ def _memory_root(child: str, base_path: Optional[Path] = None) -> Path:
     base = Path(base_path) if base_path else Path("AI_Children")
     return base / child / "memory"
 
+LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
+
+
+def _load_json(path: Path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _normalize_symbol_map(raw):
+    if isinstance(raw, dict) and "symbols" in raw:
+        return raw.get("symbols", {})
+    return raw if isinstance(raw, dict) else {}
+
 
 def load_sound_symbol_map(child, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "sound_symbol_map.json"
-    if not path.exists():
-        return {}
-    with open(path, "r") as f:
-        return json.load(f)
+    data = _load_json(path) if path.exists() else None
+    if data is None and LEGACY_SOUND_SYMBOL_MAP.exists():
+        data = _load_json(LEGACY_SOUND_SYMBOL_MAP)
+    return _normalize_symbol_map(data or {})
 
 def load_fragments(child, base_path: Optional[Path] = None):
     frag_path = _memory_root(child, base_path) / "fragments"

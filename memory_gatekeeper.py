@@ -1,159 +1,313 @@
-"""Automatic gating logic for Ina's fragment memory tiers."""
+# memory_gatekeeper.py
+"""
+Memory gatekeeper for Ina's fragments.
+
+This module decides what to do with newly created fragments:
+  - drop them
+  - store them in short_term / working / long_term / cold shards
+
+It sits between:
+  - fragmentation_engine (upstream, creates fragments)
+  - fragment_archiver (downstream, persists fragments)
+  - memory_graph (later, for structural reasoning)
+
+For now, routing is rule-based and uses:
+  - modality        (audio / vision)
+  - metadata.flags  (e.g. "self_voice", "dreamstate", "high_emotion")
+  - attention_state (focused / peripheral / ignored)
+  - optional extra fields in metadata.extra
+
+This is intentionally simple and explainable so we can evolve it
+as Ina's emotion + meaning systems mature.
+"""
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Iterable, Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
-from gui_hook import log_to_statusbox
-from memory_graph import MEMORY_TIERS, MemoryManager
+from fragment_schema import Fragment, Modality, AttentionState
+from fragment_archiver import FragmentArchiver, FragmentArchiverConfig
+
+
+# --------------------------------------------------------------------------- #
+# Gate decisions
+# --------------------------------------------------------------------------- #
+
+
+class GateAction(str, Enum):
+    DROP = "drop"
+    STORE = "store"  # store in a specific shard
+
+
+@dataclass
+class GateDecision:
+    """
+    Result of routing a fragment.
+
+    Attributes:
+        action: GateAction.DROP or GateAction.STORE
+        target_shard: valid shard name if action == STORE, else None
+        reason: human-readable note for logging / introspection
+    """
+
+    action: GateAction
+    target_shard: Optional[str]
+    reason: str
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class MemoryGatekeeperConfig:
+    """
+    Config for MemoryGatekeeper.
+
+    Attributes:
+        archiver_config: config passed through to FragmentArchiver.
+        short_term_shard: shard name for "recent, maybe important" fragments.
+        working_shard: shard name for "actively being thought about / used".
+        long_term_shard: shard name for "kept, important, likely to recur".
+        cold_shard: shard name for "rarely used, archival".
+        drop_ignored: if True, fragments with attention_state=IGNORED are dropped
+                      unless explicitly forced by flags.
+    """
+
+    archiver_config: FragmentArchiverConfig = FragmentArchiverConfig()
+
+    short_term_shard: str = "short_term"
+    working_shard: str = "working"
+    long_term_shard: str = "long_term"
+    cold_shard: str = "cold"
+
+    drop_ignored: bool = True
+
+
+# --------------------------------------------------------------------------- #
+# MemoryGatekeeper
+# --------------------------------------------------------------------------- #
 
 
 class MemoryGatekeeper:
-    """Review and (re)assign memory fragments across tiered storage."""
+    """
+    Central gatekeeper responsible for routing fragments into Ina's memory tiers.
 
-    PINNED_TAGS = {"core_memory", "identity", "self_identity", "trauma"}
+    Typical usage:
 
-    def __init__(self, manager: Optional[MemoryManager] = None):
-        self.manager = manager or MemoryManager()
-        self._tier_index = {tier: idx for idx, tier in enumerate(MEMORY_TIERS)}
+        gk_cfg = MemoryGatekeeperConfig()
+        gatekeeper = MemoryGatekeeper(gk_cfg)
 
-    # === Public API ===
-    def run(self) -> None:
-        """Execute the gating cycle: ingest, score, and move fragments."""
+        # from fragmentation_engine:
+        decision, frag_id = gatekeeper.handle_new_fragment(fragment)
 
-        self.manager.ensure_tier_directories()
-        self.manager.prune_missing()
+    If you just want the decision without writing to disk:
 
-        ingested = self._ingest_unassigned()
-        if ingested:
-            log_to_statusbox(
-                f"[MemoryGate] Routed {ingested} new fragments into tier storage."
+        decision = gatekeeper.route_fragment(fragment)
+    """
+
+    def __init__(self, config: MemoryGatekeeperConfig) -> None:
+        self.config = config
+        self.archiver = FragmentArchiver(config.archiver_config)
+
+        # Convenience: set of known shard names for validation
+        self._valid_shards = set(self.config.archiver_config.shard_names)
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def handle_new_fragment(self, fragment: Fragment) -> Tuple[GateDecision, Optional[str]]:
+        """
+        Route the fragment and, if stored, archive it.
+
+        Returns:
+            (GateDecision, fragment_id or None)
+        """
+        decision = self.route_fragment(fragment)
+
+        if decision.action == GateAction.DROP:
+            # For debugging, you might log the reason here.
+            return decision, None
+
+        shard = decision.target_shard
+        if shard is None:
+            # Misconfiguration: STORE action but no shard.
+            # Fallback: short_term.
+            shard = self.config.short_term_shard
+
+        if shard not in self._valid_shards:
+            # Unknown shard name – again fallback to short_term.
+            shard = self.config.short_term_shard
+
+        frag_id = self.archiver.save_fragment(fragment, target_shard=shard)
+        return decision, frag_id
+
+    def route_fragment(self, fragment: Fragment) -> GateDecision:
+        """
+        Decide what to do with a fragment without writing it to disk.
+
+        The current rule set is deliberately simple and based on:
+          - attention_state
+          - metadata.flags
+          - modality
+          - optional heuristic fields in metadata.extra
+        """
+        meta = fragment.get("metadata", {})
+        flags: List[str] = meta.get("flags", [])
+        modality_str: str = meta.get("modality", "")
+        attention_state_str: str = meta.get("attention_state", AttentionState.PERIPHERAL.value)
+
+        # Convert to enums where possible
+        try:
+            modality = Modality(modality_str)
+        except ValueError:
+            modality = None  # type: ignore
+
+        try:
+            attention_state = AttentionState(attention_state_str)
+        except ValueError:
+            attention_state = AttentionState.PERIPHERAL
+
+        # ------------------------------------------------------------------
+        # 1. Hard drop rules
+        # ------------------------------------------------------------------
+        if self._has_flag(flags, "drop"):
+            return GateDecision(
+                action=GateAction.DROP,
+                target_shard=None,
+                reason="Explicit drop flag set on fragment",
             )
 
-        # Refresh map with any new metadata before rebalancing
-        self.manager.reindex(new_only=True)
+        if self.config.drop_ignored and attention_state == AttentionState.IGNORED:
+            # Unless explicitly protected by some flag, we discard ignored noise.
+            if not self._has_any_flag(flags, ["high_emotion", "system_event", "self_voice"]):
+                return GateDecision(
+                    action=GateAction.DROP,
+                    target_shard=None,
+                    reason="Ignored input (no override flags)",
+                )
 
-        moved = self._rebalance_existing()
-        if moved:
-            log_to_statusbox(
-                f"[MemoryGate] Shifted {moved} fragments between memory tiers."
+        # ------------------------------------------------------------------
+        # 2. High-salience routing (emotionally or semantically important)
+        # ------------------------------------------------------------------
+        # NOTE: meta["extra"] is a good place to stash numbers like
+        # "emotion_intensity", "novelty_score", etc. when you have them.
+        extra: Dict[str, Any] = meta.get("extra", {}) or {}
+        emotion_intensity = float(extra.get("emotion_intensity", 0.0))  # [-1, 1] if you adopt that convention
+        novelty_score = float(extra.get("novelty_score", 0.0))          # [0, 1] heuristic
+
+        # Example heuristic thresholds – adjust later:
+        HIGH_EMOTION = 0.6
+        HIGH_NOVELTY = 0.7
+
+        if self._has_flag(flags, "system_event"):
+            # Things like wake/sleep, crash/reboot, etc.
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.long_term_shard,
+                reason="System event fragment",
             )
-        elif ingested == 0:
-            log_to_statusbox("[MemoryGate] No gating changes required.")
 
-    # === Internal helpers ===
-    def _ingest_unassigned(self) -> int:
-        count = 0
-        base = self.manager.base_path
-        for fragment_path in sorted(base.glob("frag_*.json")):
-            target = self._initial_tier(fragment_path)
-            if self.manager.ingest_fragment_file(fragment_path, target):
-                count += 1
-        return count
+        if self._has_flag(flags, "self_reflection"):
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.long_term_shard,
+                reason="Self-reflection fragment",
+            )
 
-    def _initial_tier(self, fragment_path: Path) -> str:
-        metadata = self._load_fragment(fragment_path)
-        return self._tier_from_metadata(metadata, default="working")
+        if emotion_intensity >= HIGH_EMOTION or self._has_flag(flags, "high_emotion"):
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.long_term_shard,
+                reason="High emotional intensity",
+            )
 
-    def _rebalance_existing(self) -> int:
-        moves = 0
-        now = datetime.now(timezone.utc)
-        for frag_id, meta in list(self.manager.memory_map.items()):
-            target = self._target_tier(meta, now)
-            if target != meta.get("tier"):
-                if self.manager.promote(frag_id, target, touch=False):
-                    moves += 1
-        return moves
+        if novelty_score >= HIGH_NOVELTY or self._has_flag(flags, "novel"):
+            # Strongly novel experience, but maybe not emotionally intense yet.
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.working_shard,
+                reason="High novelty",
+            )
 
-    def _target_tier(self, meta: Dict[str, object], now: datetime) -> str:
-        importance = float(meta.get("importance", 0.0) or 0.0)
-        tags: Iterable[str] = meta.get("tags", []) or []
-        candidate = self._tier_from_metadata(meta, default="short")
+        # ------------------------------------------------------------------
+        # 3. Modality-specific heuristics
+        # ------------------------------------------------------------------
+        if modality == Modality.AUDIO:
+            # Examples:
+            # - Ina's own speech ("self_voice") might go to working/long_term.
+            # - Background ambient might be short_term.
+            if self._has_flag(flags, "self_voice"):
+                return GateDecision(
+                    action=GateAction.STORE,
+                    target_shard=self.config.working_shard,
+                    reason="Self-voice audio fragment",
+                )
+            if self._has_flag(flags, "music"):
+                return GateDecision(
+                    action=GateAction.STORE,
+                    target_shard=self.config.short_term_shard,
+                    reason="Music audio fragment",
+                )
 
-        last_seen = self._parse_timestamp(meta.get("last_seen"))
-        age_hours: Optional[float]
-        if last_seen is None:
-            age_hours = None
-        else:
-            age_hours = (now - last_seen).total_seconds() / 3600.0
+        if modality == Modality.VISION:
+            if self._has_flag(flags, "face_detected"):
+                return GateDecision(
+                    action=GateAction.STORE,
+                    target_shard=self.config.working_shard,
+                    reason="Vision fragment with face detected",
+                )
+            if self._has_flag(flags, "ui_like") or self._has_flag(flags, "text_like"):
+                # Screens, interfaces, etc. – probably short term unless reused.
+                return GateDecision(
+                    action=GateAction.STORE,
+                    target_shard=self.config.short_term_shard,
+                    reason="UI/text-like vision fragment",
+                )
 
-        if age_hours is not None:
-            if age_hours > 24 and importance < 0.75 and candidate == "long":
-                candidate = "working"
-            if age_hours > 72:
-                if candidate == "long" and importance < 0.85:
-                    candidate = "working"
-                elif candidate == "working" and importance < 0.65:
-                    candidate = "short"
-            if age_hours > 168 and importance < 0.8:
-                candidate = "cold"
-            if age_hours > 336 and importance < 0.9:
-                candidate = "cold"
+        # ------------------------------------------------------------------
+        # 4. Default routing based on attention
+        # ------------------------------------------------------------------
+        if attention_state == AttentionState.FOCUSED:
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.short_term_shard,
+                reason="Focused input (default short_term)",
+            )
 
-        if any(tag in self.PINNED_TAGS for tag in tags):
-            candidate = self._enforce_min_tier(candidate, minimum="working")
-            if candidate == "cold":
-                candidate = "long"
+        if attention_state == AttentionState.PERIPHERAL:
+            # Peripheral but not ignored: store in short_term or cold depending on flags.
+            if self._has_flag(flags, "dreamstate"):
+                return GateDecision(
+                    action=GateAction.STORE,
+                    target_shard=self.config.cold_shard,
+                    reason="Dreamstate fragment (cold tier)",
+                )
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.short_term_shard,
+                reason="Peripheral input (default short_term)",
+            )
 
-        return candidate
+        # Fallback – shouldn't normally hit if attention_state is valid.
+        return GateDecision(
+            action=GateAction.STORE,
+            target_shard=self.config.short_term_shard,
+            reason="Fallback routing (short_term)",
+        )
 
-    def _tier_from_metadata(
-        self,
-        meta: Dict[str, object],
-        *,
-        default: str = "short",
-    ) -> str:
-        importance = float(meta.get("importance", 0.0) or 0.0)
-        tags: Iterable[str] = meta.get("tags", []) or []
-
-        if any(tag in self.PINNED_TAGS for tag in tags):
-            return "long" if importance >= 0.6 else "working"
-
-        if importance >= 0.85:
-            return "long"
-        if importance >= 0.6:
-            return "working"
-        if importance <= 0.25:
-            return "short"
-        return default
-
-    def _enforce_min_tier(self, tier: str, *, minimum: str) -> str:
-        if self._tier_index.get(tier, 0) < self._tier_index.get(minimum, 0):
-            return minimum
-        return tier
-
-    @staticmethod
-    def _parse_timestamp(raw: object) -> Optional[datetime]:
-        if not raw:
-            return None
-        if isinstance(raw, datetime):
-            ts = raw
-            if ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            return ts
-        try:
-            text = str(raw)
-            if text.endswith("Z"):
-                text = text.replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(text)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed
-        except Exception:
-            return None
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _load_fragment(fragment_path: Path) -> Dict[str, object]:
-        try:
-            with open(fragment_path, "r", encoding="utf-8") as handle:
-                return dict(json.load(handle))  # type: ignore[arg-type]
-        except Exception:
-            return {}
+    def _has_flag(flags: List[str], flag: str) -> bool:
+        return flag in flags
 
-
-if __name__ == "__main__":
-    gatekeeper = MemoryGatekeeper()
-    gatekeeper.run()
+    @staticmethod
+    def _has_any_flag(flags: List[str], candidates: List[str]) -> bool:
+        return any(f in flags for f in candidates)

@@ -255,45 +255,73 @@ def fragment_image(image_source, transformer, source_label=None):
 def fragment_audio(audio_path, transformer):
     ext = audio_path.suffix.lower()
 
+    analysis = None
+    if analyze_audio_clip is not None and ext in {".wav", ".mp3"}:
+        try:
+            analysis = analyze_audio_clip(audio_path, transformer, child=child, label="self_read")
+        except Exception as e:
+            log_to_statusbox(f"[RawFileManager] Audio digest failed for {audio_path}: {e}")
+
     if ext == ".wav":
         try:
             with contextlib.closing(wave.open(str(audio_path), "r")) as wf:
                 frames = wf.readframes(wf.getnframes())
+                frame_count = wf.getnframes()
+                sample_rate = wf.getframerate()
         except Exception as e:
             log_to_statusbox(f"[RawFileManager] Failed to process WAV {audio_path}: {e}")
             return []
 
+        duration = frame_count / float(sample_rate or 1)
         audio_data = list(frames[:1024])
+        tags = ["self_read", "audio"]
+
+        if analysis:
+            for tag in analysis.get("tags", []):
+                if tag not in tags:
+                    tags.append(tag)
+
         frag = {
             "modality": "audio",
             "audio_features": [x / 255.0 for x in audio_data],
-            "summary": f"Sound fragment from {audio_path.name}",
-            "tags": ["self_read", "audio"],
+            "summary": analysis.get("summary", f"Sound fragment from {audio_path.name}") if analysis else f"Sound fragment from {audio_path.name}",
+            "tags": tags,
             "source": str(audio_path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "emotions": {"attention": 0.5, "novelty": 0.6},
+            "emotions": (analysis.get("emotions") if analysis else None) or {"attention": 0.5, "novelty": 0.6},
+            "duration": analysis.get("duration", duration) if analysis else duration,
         }
+
+        if analysis:
+            frag["symbols"] = analysis.get("symbols", [])
+            frag["proto_words"] = analysis.get("proto_words", [])
+            frag["analysis_paths"] = {
+                "symbol_map": analysis.get("symbol_map_path"),
+                "symbol_words": analysis.get("symbol_words_path"),
+            }
+
         vec = transformer.encode_audio_fragment(frag)
-        frag["importance"] = vec["importance"]
+        clarity = analysis.get("clarity") if analysis else None
+        try:
+            frag["importance"] = (
+                round(float(clarity), 4) if clarity is not None else vec["importance"]
+            )
+        except (TypeError, ValueError):
+            frag["importance"] = vec["importance"]
+
         return [frag]
 
     if ext == ".mp3":
-        if analyze_audio_clip is None:
-            log_to_statusbox(
-                "[RawFileManager] MP3 decoding unavailable: "
-                f"{_AUDIO_DIGEST_IMPORT_ERROR}"
-            )
-            return []
-        try:
-            analysis = analyze_audio_clip(audio_path, transformer)
-        except Exception as e:
-            log_to_statusbox(f"[RawFileManager] Failed to decode MP3 {audio_path}: {e}")
-            return []
-
-        if not analysis:
-            log_to_statusbox(
-                f"[RawFileManager] MP3 analysis returned no data for {audio_path.name}."
-            )
+        if analysis is None:
+            if analyze_audio_clip is None:
+                log_to_statusbox(
+                    "[RawFileManager] MP3 decoding unavailable: "
+                    f"{_AUDIO_DIGEST_IMPORT_ERROR}"
+                )
+            else:
+                log_to_statusbox(
+                    f"[RawFileManager] MP3 analysis returned no data for {audio_path.name}."
+                )
             return []
 
         tags = ["self_read", "audio"]
@@ -303,14 +331,19 @@ def fragment_audio(audio_path, transformer):
 
         frag = {
             "modality": "audio",
-            "summary": analysis.get(
-                "summary", f"Sound fragment from {audio_path.name}"
-            ),
+            "summary": analysis.get("summary", f"Sound fragment from {audio_path.name}"),
             "tags": tags,
             "source": str(audio_path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": analysis.get("emotions", {"attention": 0.5}),
+            "symbols": analysis.get("symbols", []),
+            "proto_words": analysis.get("proto_words", []),
+            "duration": analysis.get("duration", 0),
         }
+
+        frames = analysis.get("frames") or []
+        if frames:
+            frag["audio_features"] = frames[:256]
 
         vec = transformer.encode_audio_fragment(frag)
         clarity = analysis.get("clarity")
@@ -694,9 +727,9 @@ def pretrain_audio_digest(paths, child):
 
         try:
             log_to_statusbox(f"[PretrainDigest] Analyzing {path.name}...")
-            result = analyze_audio_clip(path, transformer)
+            result = analyze_audio_clip(path, transformer, child=child, label="pretrain")
             if result:
-                generate_fragment(path, result, child)
+                generate_fragment(path, result, child=child, label="pretrain")
                 log_to_statusbox(f"[PretrainDigest] + Fragment created for: {path.name}")
             else:
                 log_to_statusbox(f"[PretrainDigest] Failed to analyze: {path.name}")

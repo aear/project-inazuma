@@ -14,6 +14,14 @@ from transformers.fractal_multidimensional_transformers import FractalTransforme
 from language_processing import associate_symbol_with_word, backprop_symbol_confidence, synthesize_from_fingerprint
 from gui_hook import log_to_statusbox
 
+LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
+
+
+def _normalize_symbol_map(raw):
+    if isinstance(raw, dict) and "symbols" in raw:
+        return raw.get("symbols", {})
+    return raw if isinstance(raw, dict) else {}
+
 
 def load_prediction(child):
     path = Path("AI_Children") / child / "memory" / "prediction_log.json"
@@ -32,13 +40,20 @@ def load_prediction(child):
 
 def load_sound_symbol_map(child):
     path = Path("AI_Children") / child / "memory" / "sound_symbol_map.json"
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+    data = None
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    if not data and LEGACY_SOUND_SYMBOL_MAP.exists():
+        try:
+            with open(LEGACY_SOUND_SYMBOL_MAP, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    return _normalize_symbol_map(data or {})
 
 def load_symbol_words(child):
     path = Path("AI_Children") / child / "memory" / "symbol_words.json"
