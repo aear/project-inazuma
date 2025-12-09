@@ -238,6 +238,42 @@ def log_emotion_snapshot(child: str, snapshot: EmotionSnapshot) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Query helpers (lightweight, no drift)
+# ---------------------------------------------------------------------------
+
+def _normalize_values(raw: Dict[str, float]) -> Dict[str, float]:
+    return {k: _clamp(float(raw.get(k, 0.0))) for k in SLIDERS}
+
+
+def get_current_emotion_state(child: Optional[str] = None) -> Dict[str, float]:
+    """
+    Lightweight accessor used by audio/shadow modules to grab the latest
+    24D emotion vector without recomputing drift. Prefers inastate, falls
+    back to the last logged snapshot, then baseline.
+    """
+    try:
+        snap = get_inastate("emotion_snapshot")
+        if isinstance(snap, dict):
+            vals = snap.get("values") if "values" in snap else snap
+            if isinstance(vals, dict):
+                return _normalize_values(vals)
+    except Exception:
+        pass
+
+    try:
+        cfg = load_config()
+        child = child or cfg.get("current_child", "Inazuma_Yagami")
+    except Exception:
+        child = child or "Inazuma_Yagami"
+
+    last = load_last_snapshot(child)
+    if last:
+        return _normalize_values(last.values)
+
+    return _normalize_values(load_baseline(child))
+
+
+# ---------------------------------------------------------------------------
 # Drift + update logic
 # ---------------------------------------------------------------------------
 
@@ -245,8 +281,8 @@ def _mode_from_inastate() -> str:
     """
     Pull Ina's current mode from inastate if available.
     """
-    state = get_inastate() or {}
-    return state.get("mode", "awake")
+    mode = get_inastate("mode", "awake")
+    return mode or "awake"
 
 
 def _drift_amount_for_mode(mode: str) -> float:
@@ -437,8 +473,16 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
     from emotion_processor import process_emotion
 
     # inside run_emotion_engine(), after snapshot = calculate_emotion_state(fragments)
-    processed = process_emotion(snapshot, mode="awake")
-    snapshot = processed  # or keep both: raw vs processed
+    processed_values = process_emotion(snapshot, mode=snapshot.mode)
+    snapshot.values = processed_values  # keep snapshot metadata/timestamp while using processed sliders
+
+    # Map current emotions to nearest symbolic emotions (for multi-neuron style use).
+    try:
+        from emotion_map import rank_emotion_symbols
+        symbol_matches = rank_emotion_symbols(snapshot.values, child=child, top_n=2)
+        update_inastate("emotion_symbol_matches", symbol_matches)
+    except Exception as e:
+        _log(f"Failed to map emotions to symbols: {e}")
 
     # Update inastate
     update_inastate("emotion_snapshot", snapshot.to_dict())

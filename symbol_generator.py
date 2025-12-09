@@ -1,10 +1,9 @@
 
 import os
 import json
+import random
 from datetime import datetime, timezone
 from pathlib import Path
-from transformers.fractal_multidimensional_transformers import FractalTransformer
-from model_manager import load_config
 
 # Procedural symbol parts
 EMOTION_GLYPHS = {
@@ -17,9 +16,36 @@ CONCEPT_GLYPHS = {
     "self": "ν", "pattern": "Ξ", "truth": "φ", "change": "∵", "unknown": "∅"
 }
 
+# Extra marks used to vary length/texture of generated symbols
+ACCENT_GLYPHS = ["·", ":", "~", "ː", "⁂", "↺", "↯"]
+
 # Procedural map
-def generate_symbol_from_parts(emotion_key, mod_key, concept_key):
-    return EMOTION_GLYPHS[emotion_key] + MODULATION_GLYPHS[mod_key] + CONCEPT_GLYPHS[concept_key]
+def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None):
+    """
+    Build a symbol from emotion/modulation/concept glyphs.
+    Length can vary (defaults to 2–5 chars) so symbols are not locked to 3 chars.
+    """
+    base_parts = [
+        EMOTION_GLYPHS[emotion_key],
+        MODULATION_GLYPHS[mod_key],
+        CONCEPT_GLYPHS[concept_key],
+    ]
+
+    target_len = length if length is not None else random.choice([2, 3, 3, 4, 4, 5])
+    target_len = max(2, min(target_len, 6))  # keep symbols compact
+
+    # Always keep emotion + concept, optionally keep modulation if length allows
+    symbol_parts = [base_parts[0], base_parts[2]]
+    if target_len >= 3:
+        symbol_parts.insert(1, base_parts[1])
+    elif random.random() < 0.5:
+        symbol_parts[1] = base_parts[1]  # occasionally swap concept for modulation when length=2
+
+    # Add accent glyphs or repeat base glyphs until we reach the target length
+    while len(symbol_parts) < target_len:
+        symbol_parts.append(random.choice(ACCENT_GLYPHS + base_parts))
+
+    return "".join(symbol_parts)
 
 def procedural_combinations():
     combos = []
@@ -85,6 +111,10 @@ def save_as_fragments(child, enriched):
         print(f"[SymbolGen] Saved fragment: {frag['id']}")
 
 def run_symbol_generator():
+    # Lazy imports to avoid circular import with transformers/__init__ (HindsightTransformer).
+    from model_manager import load_config
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+
     config = load_config()
     child = config.get("current_child", "default_child")
     transformer = FractalTransformer()

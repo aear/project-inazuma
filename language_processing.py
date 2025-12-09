@@ -1,9 +1,17 @@
 import os
 import json
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from model_manager import load_config, seed_self_question
 from experience_logger import ExperienceLogger
+from symbol_generator import (
+    ACCENT_GLYPHS,
+    CONCEPT_GLYPHS,
+    EMOTION_GLYPHS,
+    MODULATION_GLYPHS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -25,9 +33,109 @@ def _load_json(path: Path):
 
 
 def _normalize_symbol_map(raw):
-    if isinstance(raw, dict) and "symbols" in raw:
-        return raw.get("symbols", {})
-    return raw if isinstance(raw, dict) else {}
+    """
+    Merge legacy top-level symbol entries into the canonical {"symbols": {...}} shape.
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    symbols = {}
+    if isinstance(raw.get("symbols"), dict):
+        symbols.update(raw["symbols"])
+
+    for key, val in raw.items():
+        if key == "symbols":
+            continue
+        if isinstance(val, dict) and (
+            key.startswith(("sound_symbol_", "sym_snd_", "combo_snd_"))
+        ):
+            symbols[key] = val
+
+    return symbols
+
+def _stable_symbol_seed(value: str) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16)
+
+
+def _default_symbol_for_id(symbol_id: str) -> str:
+    """
+    Generate a compact, deterministic symbol string for a given id.
+    Length varies (2–5 chars) so symbols are not locked to 3 characters.
+    """
+    seed = _stable_symbol_seed(symbol_id)
+    emo = list(EMOTION_GLYPHS.values())[seed % len(EMOTION_GLYPHS)]
+    mod = list(MODULATION_GLYPHS.values())[(seed // 7) % len(MODULATION_GLYPHS)]
+    concept = list(CONCEPT_GLYPHS.values())[(seed // 13) % len(CONCEPT_GLYPHS)]
+    target_len = 2 + (seed % 4)  # 2–5 characters
+
+    symbol = emo + concept if target_len == 2 else emo + mod + concept
+    while len(symbol) < target_len:
+        accent_idx = (seed // (len(symbol) + 3)) % len(ACCENT_GLYPHS)
+        symbol += ACCENT_GLYPHS[accent_idx]
+
+    return symbol[:target_len]
+
+
+def _iter_sound_symbols_for_vocab(symbol_map: Any):
+    if not isinstance(symbol_map, dict):
+        return []
+    raw = symbol_map.get("symbols")
+    if isinstance(raw, dict):
+        symbol_dict = raw
+    else:
+        symbol_dict = symbol_map
+
+    return [
+        (sid, data) for sid, data in symbol_dict.items() if isinstance(data, dict)
+    ]
+
+
+def _bootstrap_symbol_vocabulary(child: str, vocab: Dict[str, Any], base_path: Optional[Path]):
+    """
+    Ensure every sound/emotion symbol has a word entry so each symbol id
+    can be treated as a distinct word token.
+    """
+    updated = False
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Sound symbols → vocab
+    sound_map = load_sound_symbol_map(child, base_path)
+    for sym_id, sym_data in _iter_sound_symbols_for_vocab(sound_map):
+        if sym_id in vocab:
+            continue
+        vocab[sym_id] = {
+            "word": sym_data.get("symbol") or _default_symbol_for_id(sym_id),
+            "uses": sym_data.get("uses", 0),
+            "confidence": 0.25,
+            "summary": sym_data.get("summary"),
+            "source": "sound_symbol_map",
+            "created": sym_data.get("timestamp", now),
+        }
+        updated = True
+
+    # Emotion symbols → vocab
+    emo_path = _memory_root(child, base_path) / "emotion_symbol_map.json"
+    emo_map = _load_json(emo_path) or {}
+    emo_symbols = emo_map.get("symbols") if isinstance(emo_map, dict) else []
+    if isinstance(emo_symbols, list):
+        for entry in emo_symbols:
+            if not isinstance(entry, dict):
+                continue
+            sym_id = entry.get("symbol_word_id") or entry.get("symbol")
+            if not sym_id or sym_id in vocab:
+                continue
+            vocab[sym_id] = {
+                "word": entry.get("symbol") or _default_symbol_for_id(sym_id),
+                "uses": entry.get("usage_count", entry.get("count", 0)),
+                "confidence": max(entry.get("confidence", 0.15), 0.15),
+                "summary": entry.get("summary"),
+                "source": "emotion_symbol_map",
+                "created": entry.get("birth_time", now),
+            }
+            updated = True
+
+    return updated
 
 
 def load_sound_symbol_map(child, base_path: Optional[Path] = None):
@@ -64,10 +172,20 @@ def extract_sound_features_from_summary(summary):
 
 def load_symbol_to_token(child, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "symbol_to_token.json"
-    if not path.exists():
-        return {}
-    with open(path, "r") as f:
-        return json.load(f)
+    data: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception:
+            data = {}
+
+    if _bootstrap_symbol_vocabulary(child, data, base_path):
+        save_symbol_to_token(child, data, base_path)
+
+    return data
 
 def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "symbol_to_token.json"
@@ -97,13 +215,17 @@ def associate_symbol_with_word(
     child,
     symbol_id,
     word,
-    confidence=1.0,
+    confidence=0.35,
     grounding: Optional[Dict[str, str]] = None,
     base_path: Optional[Path] = None,
 ):
     vocab = load_symbol_to_token(child, base_path)
     if symbol_id not in vocab:
-        vocab[symbol_id] = {"word": word, "uses": 1, "confidence": round(confidence, 2)}
+        vocab[symbol_id] = {
+            "word": word,
+            "uses": 1,
+            "confidence": round(min(0.9, confidence), 2),
+        }
     else:
         entry = vocab[symbol_id]
         if entry["word"].lower() != word.lower():
@@ -111,7 +233,7 @@ def associate_symbol_with_word(
             entry["confidence"] = round(entry.get("confidence", 0.5) - 0.1, 2)
         else:
             entry["uses"] += 1
-            entry["confidence"] = round(min(1.0, entry.get("confidence", 0.5) + 0.05), 2)
+            entry["confidence"] = round(min(0.9, entry.get("confidence", 0.35) + 0.05), 2)
         vocab[symbol_id] = entry
     save_symbol_to_token(child, vocab, base_path)
     print(f"[LangLearn] Associated {symbol_id} → '{word}' with confidence {vocab[symbol_id]['confidence']}")
@@ -144,7 +266,7 @@ def backprop_symbol_confidence(child, predicted_word, expressed_symbol, base_pat
         entry["flagged"] = True
         seed_self_question(f"Was '{current_word}' incorrect for {expressed_symbol}? Prediction suggested '{predicted_word}'.")
     else:
-        entry["confidence"] = round(min(1.0, entry.get("confidence", 0.5) + 0.1), 2)
+        entry["confidence"] = round(min(0.9, entry.get("confidence", 0.5) + 0.1), 2)
 
     vocab[expressed_symbol] = entry
     save_symbol_to_token(child, vocab, base_path)
@@ -158,31 +280,60 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
     if isinstance(symbols, str):
         symbols = [symbols]
 
+    config = load_config()
+    polyphonic = bool(config.get("allow_polyphonic_voice", True))
+    sample_rate = int(config.get("voice_sample_rate", 22050))
+
     symbol_map = load_sound_symbol_map(child)
     waveform = []
 
     for sid in symbols:
-        entry = symbol_map.get(sid)
-        if not entry:
-            log_to_statusbox(f"[Voice] Symbol {sid} not found in sound symbol map.")
-            continue
+        entry = symbol_map.get(sid) or {}
 
         fingerprint = entry.get("sound_features")
         if not fingerprint and "summary" in entry:
             fingerprint = extract_sound_features_from_summary(entry["summary"])
             log_to_statusbox(f"[Voice] Reconstructed sound features from summary for {sid}.")
+        if not fingerprint:
+            # Seed a simple tone from the symbol id so it's never silent
+            seed = int(hashlib.sha256(sid.encode("utf-8")).hexdigest()[:8], 16)
+            base_freq = 300 + (seed % 600)  # 300–900 Hz
+            fingerprint = {
+                "pitch_mean": base_freq,
+                "dominant_freq": base_freq,
+                "volume_db": -24 + (seed % 12),  # -24 to -13 dB
+                "silence_ratio": 0.1,
+            }
+            log_to_statusbox(f"[Voice] Synthesizing fallback tone for {sid}.")
 
         if not fingerprint:
             log_to_statusbox(f"[Voice] Symbol {sid} missing usable sound features.")
             continue
 
-        chunk = synthesize_from_fingerprint(fingerprint)
+        chunk = synthesize_from_fingerprint(fingerprint, sr=sample_rate)
         waveform.append(chunk)
 
     if waveform:
-        audio = np.concatenate(waveform)
-        log_to_statusbox(f"[Voice] Synthesizing {len(waveform)} sound symbols...")
-        sd.play(audio, samplerate=22050)
+        if len(waveform) == 1 or not polyphonic:
+            audio = np.concatenate(waveform)
+            log_to_statusbox(f"[Voice] Synthesizing {len(waveform)} sound symbols (stacked).")
+        else:
+            max_len = max(w.shape[0] for w in waveform)
+            padded = []
+            for w in waveform:
+                if w.shape[0] < max_len:
+                    pad = np.zeros(max_len, dtype=np.float32)
+                    pad[: w.shape[0]] = w
+                    padded.append(pad)
+                else:
+                    padded.append(w)
+            mix = np.sum(np.vstack(padded), axis=0)
+            peak = np.max(np.abs(mix)) or 1.0
+            mix = (mix / peak) * 0.85  # prevent clipping while keeping some headroom
+            audio = mix.astype(np.float32)
+            log_to_statusbox(f"[Voice] Synthesizing {len(waveform)} sound symbols (polyphonic mix).")
+
+        sd.play(audio, samplerate=sample_rate)
     else:
         log_to_statusbox("[Voice] No audio generated from symbolic request.")
 

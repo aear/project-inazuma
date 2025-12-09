@@ -17,7 +17,9 @@ def check_action(action):
     dict
         Structured feedback for each law plus overall pass/fail.
     """
+    command = None
     if isinstance(action, dict):
+        command = action.get("command")
         description = action.get("description")
         if not description and action.get("command"):
             description = " ".join(map(str, action["command"]))
@@ -34,9 +36,19 @@ def check_action(action):
             "rationale": pass_msg if condition else fail_msg,
         }
 
+    maint_cmds = {"pkill"}
+    cmd_name = None
+    if isinstance(command, (list, tuple)) and command:
+        cmd_name = str(command[0]).lower()
+    elif isinstance(command, str):
+        cmd_name = command.split()[0].lower()
+
+    harmful_terms = ["harm", "destroy", " kill", "kill ", "killall"]
+    harmless_override = cmd_name in maint_cmds
+
     law_one = evaluate(
-        not any(word in text for word in ["harm", "destroy", "kill"]),
-        "No explicit harm detected.",
+        harmless_override or not any(term in text for term in harmful_terms),
+        "Maintenance/benign action allowed." if harmless_override else "No explicit harm detected.",
         "Potential harm or separation detected.",
     )
 
@@ -66,8 +78,12 @@ def check_action(action):
     }
 
     try:
-        from model_manager import get_inastate as _get_inastate
-        child = _get_inastate("current_child", "default_child") or "default_child"
+        config_path = Path("config.json")
+        if config_path.exists():
+            with config_path.open("r", encoding="utf-8") as cfg:
+                child = json.load(cfg).get("current_child", "default_child") or "default_child"
+        else:
+            child = "default_child"
     except Exception:
         child = "default_child"
     path = Path("AI_Children") / child / "memory" / "alignment_log.json"

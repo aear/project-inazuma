@@ -10,28 +10,37 @@ from pathlib import Path
 from model_manager import get_inastate, update_inastate, load_config
 from gui_hook import log_to_statusbox
 
+
+def _call_local(script):
+    path = Path(script)
+    if not path.exists():
+        log_to_statusbox(f"[Boredom] Skipping missing module: {script}")
+        return
+    subprocess.call(["python", str(path)])
+
+
 def boredom_still_active():
     return get_inastate("emotion_boredom") and get_inastate("emotion_boredom") > 0.3
 
 def generate_symbols():
-    subprocess.call(["python", "symbol_generator.py"])
+    _call_local("symbol_generator.py")
     print("[Boredom] Symbols generated.")
 
 def render_symbol_images():
-    subprocess.call(["python", "symbol_visualiser.py"])
+    _call_local("symbol_visualiser.py")
     print("[Boredom] Symbol images rendered.")
 
 def read_raw_files():
-    subprocess.call(["python", "raw_file_manager.py"])
+    _call_local("raw_file_manager.py")
     print("[Boredom] Raw project files explored.")
 
 def evolve_logic():
-    subprocess.call(["python", "logic_engine.py"])
+    _call_local("logic_engine.py")
     print("[Boredom] Logic patterns explored.")
 
 def do_visual_and_audio_exploration():
-    subprocess.call(["python", "audio_listener.py"])
-    subprocess.call(["python", "vision_window.py"])
+    _call_local("audio_listener.py")
+    _call_local("vision_window.py")
 
 def load_impulse_preferences():
     config = load_config()

@@ -11,14 +11,10 @@ from audio_digest import analyze_audio_clip, generate_fragment
 from fragmentation_engine import fragment_device_log
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
-LABELS = ["mic_headset", "mic_webcam", "output_headset", "output_TV"]
+
+LABELS_DEFAULT = ["mic_headset", "mic_webcam", "output_headset", "output_TV"]
 FLUSH_INTERVAL = 60  # seconds
 FRAGMENT_INTERVAL = 3600  # seconds
-
-# === Global buffer tracking ===
-audio_buffers = {label: [] for label in LABELS}
-last_flush = {label: time.time() for label in LABELS}
-last_fragmentation = time.time()
 
 transformer = FractalTransformer()
 config = load_config()
@@ -26,7 +22,39 @@ child = config.get("current_child", "default_child")
 save_path = Path("AI_Children") / child / "memory" / "audio_session"
 save_path.mkdir(parents=True, exist_ok=True)
 
-def resolve_plughw_device(label_name, fallback="hw:0,0"):
+# Allow the user to slim down or reroute capture labels (e.g., to an OBS mix).
+LABELS = config.get("audio_labels") or LABELS_DEFAULT
+device_overrides = config.get("audio_device_overrides", {})
+stereo_labels = set(config.get("stereo_audio_labels", []))
+
+# === Global buffer tracking ===
+audio_buffers = {label: [] for label in LABELS}
+last_flush = {label: time.time() for label in LABELS}
+last_fragmentation = time.time()
+
+# Preferred index keys per label (includes old misspellings for outputs)
+INDEX_KEYS = {
+    "mic_headset": ["mic_headset_index"],
+    "mic_webcam": ["mic_webcam_index"],
+    "output_headset": ["output_headset_index", "ouput_headset_index"],
+    "output_TV": ["output_TV_index", "ouput_TV_index"],
+}
+
+def _index_for_label(label):
+    for key in INDEX_KEYS.get(label, []):
+        raw = config.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def resolve_plughw_device(label_name, fallback="default"):
+    """
+    Resolve device via aplay when available; otherwise use provided fallback.
+    """
     try:
         result = subprocess.run(["aplay", "-l"], capture_output=True, text=True)
         output = result.stdout
@@ -40,11 +68,17 @@ def resolve_plughw_device(label_name, fallback="hw:0,0"):
                     resolved = f"plughw:{card},{device}"
                     log_to_statusbox(f"[Audio] Resolved {label_name} to {resolved}")
                     return resolved
+    except FileNotFoundError:
+        log_to_statusbox("[Audio] aplay not found; using configured indices.")
     except Exception as e:
         log_to_statusbox(f"[Audio] Failed to resolve {label_name}: {e}")
     return fallback
 
 def record_clip(label, device_string):
+    # Prefer plughw for automatic format conversion to avoid channel errors
+    if device_string.startswith("hw:"):
+        device_string = "plughw:" + device_string.split(":", 1)[1]
+
     timestamp = datetime.now(timezone.utc).isoformat().replace(":", "_")
     filename = f"{label}_{timestamp}.mp3"
     output_path = save_path / filename
@@ -55,7 +89,7 @@ def record_clip(label, device_string):
         "-t", str(FLUSH_INTERVAL),
         "-acodec", "libmp3lame",
         "-ar", "44100",
-        "-ac", "2" if "output" in label else "1",
+        "-ac", "2" if ("output" in label or label in stereo_labels) else "1",
         str(output_path)
     ]
     try:
@@ -63,7 +97,17 @@ def record_clip(label, device_string):
         log_to_statusbox(f"[Audio] {label} saved {filename}")
         return output_path
     except subprocess.CalledProcessError as e:
-        log_to_statusbox(f"[Audio] {label} failed: {e}")
+        log_to_statusbox(f"[Audio] {label} failed on {device_string}: {e}")
+        # Retry once with default if we were using plughw
+        if device_string != "default":
+            fallback_cmd = list(ffmpeg_cmd)
+            fallback_cmd[fallback_cmd.index(device_string)] = "default"
+            try:
+                subprocess.run(fallback_cmd, check=True)
+                log_to_statusbox(f"[Audio] {label} saved {filename} via default device fallback.")
+                return output_path
+            except subprocess.CalledProcessError as e2:
+                log_to_statusbox(f"[Audio] {label} fallback failed: {e2}")
         return None
 
 
@@ -102,10 +146,16 @@ def flush_and_digest(label, device_string):
 
 
 def run_audio_loop():
-    devices = {
-        label: resolve_plughw_device(config.get(f"{label}_name", label))
-        for label in LABELS
-    }
+    devices = {}
+    for label in LABELS:
+        if label in device_overrides:
+            devices[label] = device_overrides[label]
+            log_to_statusbox(f"[Audio] {label} using override device '{devices[label]}'")
+            continue
+        name_hint = config.get(f"{label}_name", label)
+        idx = _index_for_label(label)
+        fallback = f"plughw:{idx},0" if idx is not None else "default"
+        devices[label] = resolve_plughw_device(name_hint, fallback=fallback)
 
     while True:
         now = time.time()

@@ -14,6 +14,18 @@ from memory_graph import build_fractal_memory
 import platform
 from birth_system import boot
 
+def append_status(msg, tag=None):
+    """Safely append to the status box from any thread."""
+    def _append():
+        if tag:
+            status_box.insert(tk.END, msg, tag)
+        else:
+            status_box.insert(tk.END, msg)
+        status_box.see(tk.END)
+    # Guard against early calls before the UI exists
+    if "root" in globals():
+        root.after(0, _append)
+
 
 # === Pipe config for cross-module logging ===
 IS_WINDOWS = platform.system() == "Windows"
@@ -35,24 +47,15 @@ def status_log_server():
                             msg = pipe.readline()
                             if msg:
                                 tag = "error" if msg.startswith("[ERROR]") else None
-                                if tag:
-                                    status_box.insert(tk.END, msg, tag)
-                                else:
-                                    status_box.insert(tk.END, msg)
-                                status_box.see(tk.END)
+                                append_status(msg, tag)
                 else:
                     with open(STATUS_PIPE_PATH, "r") as pipe:
                         for msg in pipe:
                             if msg.strip():
                                 tag = "error" if msg.startswith("[ERROR]") else None
-                                if tag:
-                                    status_box.insert(tk.END, msg, tag)
-                                else:
-                                    status_box.insert(tk.END, msg)
-                                status_box.see(tk.END)
+                                append_status(msg, tag)
             except Exception as e:
-                status_box.insert(tk.END, f"[Pipe Error] {e}\n")
-                status_box.see(tk.END)
+                append_status(f"[Pipe Error] {e}\n")
                 time.sleep(2)
 
     threading.Thread(target=run_pipe, daemon=True).start()
@@ -82,16 +85,13 @@ def clear_status_log():
 
 def stream_subprocess_to_status(command, label="Process"):
     def stream_output():
-        status_box.insert(tk.END, f"[{label}] Starting...\n")
-        status_box.see(tk.END)
+        append_status(f"[{label}] Starting...\n")
         process = safe_popen(command, label=label, verbose=True)
         if process is not None:
             process.wait()
-            status_box.insert(tk.END, f"[{label}] Completed.\n")
-            status_box.see(tk.END)
+            append_status(f"[{label}] Completed.\n")
         else:
-            status_box.insert(tk.END, f"[{label}] Failed to start.\n", "error")
-            status_box.see(tk.END)
+            append_status(f"[{label}] Failed to start.\n", "error")
 
     threading.Thread(target=stream_output, daemon=True).start()
 
@@ -107,13 +107,6 @@ book_path_var = None
 music_path_var = None
 model_running = False
 
-
-def safe_popen(cmd):
-    try:
-        subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception as e:
-        status_box.insert(tk.END, f"[ERROR] Failed to start {' '.join(map(str, cmd))}: {e}\n")
-        status_box.see(tk.END)
 
 def refresh_config():
     global config
@@ -279,27 +272,28 @@ def open_timers_config():
     status_box.see(tk.END)
     safe_popen([sys.executable, "timers_window.py"], verbose=True)
 
+def open_audio_devices_window():
+    status_box.insert(tk.END, "Opening Audio Devices window.\n")
+    status_box.see(tk.END)
+    safe_popen([sys.executable, "audio_device_window.py"], verbose=True)
+
 
 def pretrain_mode():
-    status_box.insert(tk.END, "Entering Pretrain mode...\n")
-    status_box.see(tk.END)
+    append_status("Entering Pretrain mode...\n")
 
     def stream_pretrain():
         # Fetch child from the current configuration
         config = load_config()
         child = config.get("current_child", "Inazuma_Yagami")
 
-        status_box.insert(tk.END, f"[Pretrain] Using child: {child}\n")
-        status_box.see(tk.END)
+        append_status(f"[Pretrain] Using child: {child}\n")
 
         process = safe_popen([sys.executable, "pretrain_logic.py", child], label="Pretrain", verbose=True)
         if process is not None:
             process.wait()
-            status_box.insert(tk.END, "[Pretrain] Finished pretraining.\n")
-            status_box.see(tk.END)
+            append_status("[Pretrain] Finished pretraining.\n")
         else:
-            status_box.insert(tk.END, "[Pretrain] Failed to start pretraining.\n", "error")
-            status_box.see(tk.END)
+            append_status("[Pretrain] Failed to start pretraining.\n", "error")
             
     threading.Thread(target=stream_pretrain, daemon=True).start()
 
@@ -476,6 +470,7 @@ options_menu.add_command(label="Save/Load Config", command=save_load_config)
 options_menu.add_command(label="Exceptions List", command=exceptions_list)
 options_menu.add_command(label="Precision Settings", command=precision_settings)
 options_menu.add_command(label="Timers", command=open_timers_config)
+options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
 menu_bar.add_cascade(label="Options", menu=options_menu)
 
 root.config(menu=menu_bar)
@@ -545,6 +540,5 @@ tk.Button(button_frame, text="View Self Questions", command=open_logs, width=20)
 
 
 root.protocol("WM_DELETE_WINDOW", quit_program)
-root.mainloop()
-# After root.mainloop setup
 status_log_server()
+root.mainloop()

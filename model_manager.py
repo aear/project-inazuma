@@ -5,9 +5,14 @@ import time
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from gui_hook import log_to_statusbox
 from alignment.metrics import evaluate_alignment
 from alignment import check_action
+from deep_recall import DeepRecallConfig, DeepRecallManager
+from memory_graph import MemoryManager
+from self_reflection_core import SelfReflectionCore
+from self_adjustment_scheduler import SelfAdjustmentScheduler
 
 def load_config():
     path = Path("config.json")
@@ -19,6 +24,19 @@ def load_config():
 config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
+_REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.json"
+RUNNING_MODULES_PATH = Path("running_modules.json")
+
+reflection_core = SelfReflectionCore(ina_reference="model_manager")
+adjustment_scheduler = SelfAdjustmentScheduler()
+memory_manager = MemoryManager(CHILD)
+_last_opportunities = set()
+_last_boredom_launch = 0.0
+_BOREDOM_COOLDOWN = 30  # seconds
+_last_communication_urge_log = 0.0
+_COMM_URGE_LOG_COOLDOWN = 180  # seconds
+_last_stable_urge_log = 0.0
+_STABLE_URGE_LOG_COOLDOWN = 180  # seconds
 
 
 def safe_popen(cmd, description=None):
@@ -103,6 +121,326 @@ def update_inastate(key, value):
     with open(path, "w") as f:
         json.dump(state, f, indent=4)
 
+
+_DEEP_RECALL_STATE_PATH = MEMORY_PATH / "deep_recall_state.json"
+_deep_recall_manager: Optional[DeepRecallManager] = None
+_deep_recall_ready = False
+_last_deep_recall_snapshot: Optional[Dict[str, Any]] = None
+
+
+class _FragmentMemoryBackend:
+    """
+    Lightweight bridge between deep_recall and Ina's on-disk fragments.
+    Uses memory_map.json when available for stable ordering, falls back to
+    scanning fragment files directly.
+    """
+
+    def __init__(self, child: str):
+        self.child = child
+        self.fragments_root = Path("AI_Children") / child / "memory" / "fragments"
+        self.memory_map_path = Path("AI_Children") / child / "memory" / "memory_map.json"
+        self._index_loaded = False
+        self._id_to_path: Dict[str, Path] = {}
+        self._meta: Dict[str, Dict[str, Any]] = {}
+        self._ordered_ids: List[str] = []
+
+    def _load_index(self):
+        if self._index_loaded:
+            return
+
+        meta: Dict[str, Dict[str, Any]] = {}
+        if self.memory_map_path.exists():
+            try:
+                with open(self.memory_map_path, "r", encoding="utf-8") as f:
+                    raw_map = json.load(f)
+            except Exception as exc:
+                log_to_statusbox(f"[DeepRecall] Failed to read memory_map.json: {exc}")
+            else:
+                for frag_id, entry in raw_map.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    filename = entry.get("filename") or f"{frag_id}.json"
+                    tier = entry.get("tier")
+                    candidates = []
+                    if tier:
+                        candidates.append(self.fragments_root / tier / filename)
+                    candidates.append(self.fragments_root / filename)
+                    path = next((c for c in candidates if c.exists()), None)
+                    if path is None:
+                        continue
+                    meta[frag_id] = {
+                        "path": path,
+                        "tier": tier,
+                        "last_seen": entry.get("last_seen"),
+                        "importance": entry.get("importance"),
+                        "tags": entry.get("tags", []),
+                        "filename": filename,
+                    }
+
+        if not meta:
+            for frag_path in self.fragments_root.rglob("frag_*.json"):
+                frag_id = self._derive_fragment_id(frag_path)
+                meta[frag_id] = {
+                    "path": frag_path,
+                    "tier": frag_path.parent.name if frag_path.parent != self.fragments_root else None,
+                    "filename": frag_path.name,
+                    "last_seen": None,
+                    "importance": None,
+                    "tags": [],
+                }
+
+        self._id_to_path = {fid: data["path"] for fid, data in meta.items()}
+        self._meta = meta
+        self._ordered_ids = self._order_fragment_ids(meta)
+        self._index_loaded = True
+
+    def _derive_fragment_id(self, frag_path: Path) -> str:
+        try:
+            with frag_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("id"):
+                return str(data["id"])
+        except Exception:
+            pass
+        return frag_path.stem
+
+    def _order_fragment_ids(self, meta: Dict[str, Dict[str, Any]]) -> List[str]:
+        def _key(item):
+            fid, entry = item
+            ts = entry.get("last_seen") or ""
+            return (ts, fid)
+
+        return [fid for fid, _ in sorted(meta.items(), key=_key)]
+
+    def get_total_fragment_count(self) -> int:
+        self._load_index()
+        return len(self._ordered_ids)
+
+    def list_fragment_ids(self) -> List[str]:
+        self._load_index()
+        return list(self._ordered_ids)
+
+    def load_fragments_batch(self, fragment_ids: List[str]) -> List[Dict[str, Any]]:
+        self._load_index()
+        loaded: List[Dict[str, Any]] = []
+
+        for frag_id in fragment_ids:
+            path = self._id_to_path.get(frag_id)
+            if path is None or not path.exists():
+                log_to_statusbox(f"[DeepRecall] Missing fragment file for {frag_id}")
+                continue
+
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:
+                log_to_statusbox(f"[DeepRecall] Failed reading {path.name}: {exc}")
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            data.setdefault("id", frag_id)
+            meta = self._meta.get(frag_id, {})
+            if meta.get("tier") and "tier" not in data:
+                data["tier"] = meta["tier"]
+
+            loaded.append(data)
+
+        return loaded
+
+
+class _InastateEmotionBackend:
+    def update_from_fragments(self, fragments: List[Dict[str, Any]]) -> None:
+        # Emotion refinement can be added later if desired; noop keeps the interface.
+        return
+
+    def get_current_emotion(self) -> Dict[str, float]:
+        snapshot = get_inastate("emotion_snapshot") or {}
+        values = snapshot.get("values") or snapshot
+        return values if isinstance(values, dict) else {}
+
+
+class _EnergyMonitorBackend:
+    def get_energy_state(self) -> float:
+        energy = get_inastate("current_energy")
+        try:
+            return float(energy)
+        except (TypeError, ValueError):
+            return 0.5
+
+
+class _MemoryIndexUpdater:
+    """
+    Minimal meaning-map backend: mark fragments as recently recalled in the
+    existing memory index so other systems can see the traversal.
+    """
+
+    def __init__(self, manager: MemoryManager):
+        self.manager = manager
+
+    def ingest_fragments(self, fragments: List[Dict[str, Any]]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        updated = False
+
+        for frag in fragments:
+            frag_id = frag.get("id")
+            if not frag_id:
+                continue
+
+            existing = self.manager.memory_map.get(frag_id, {})
+            filename = existing.get("filename") or frag.get("source") or f"{frag_id}.json"
+            tier = frag.get("tier") or existing.get("tier") or "short"
+
+            merged = {
+                "tier": tier,
+                "tags": frag.get("tags", existing.get("tags", [])),
+                "importance": frag.get("importance", existing.get("importance", 0)),
+                "last_seen": now_iso,
+                "filename": filename,
+            }
+
+            if merged != existing:
+                self.manager.memory_map[frag_id] = merged
+                updated = True
+
+        if updated:
+            self.manager.save_map()
+
+
+def _publish_deep_recall_state():
+    global _last_deep_recall_snapshot
+    if _deep_recall_manager is None:
+        return
+
+    state = _deep_recall_manager.state
+    total = max(state.total_fragments, 1)
+    snapshot = {
+        "active": state.active,
+        "completed": state.completed,
+        "reason": state.reason,
+        "mode": state.mode,
+        "last_index": state.last_index,
+        "total_fragments": state.total_fragments,
+        "progress": round(state.last_index / total, 4),
+        "last_update": state.last_update,
+        "fragments_processed_total": state.fragments_processed_total,
+        "fragments_processed_this_run": state.fragments_processed_this_run,
+    }
+
+    if snapshot != _last_deep_recall_snapshot:
+        update_inastate("deep_recall_status", snapshot)
+        _last_deep_recall_snapshot = snapshot
+
+
+def _build_deep_recall_manager() -> Optional[DeepRecallManager]:
+    try:
+        memory_backend = _FragmentMemoryBackend(CHILD)
+        config = DeepRecallConfig(
+            chunk_size=40,
+            state_path=str(_DEEP_RECALL_STATE_PATH),
+            min_energy=0.2,
+        )
+        return DeepRecallManager(
+            memory_backend=memory_backend,
+            meaning_map=_MemoryIndexUpdater(memory_manager),
+            emotion_engine=_InastateEmotionBackend(),
+            energy_monitor=_EnergyMonitorBackend(),
+            logger=lambda msg: log_to_statusbox(msg),
+            config=config,
+        )
+    except Exception as exc:
+        log_to_statusbox(f"[DeepRecall] Init failed: {exc}")
+        return None
+
+
+_deep_recall_manager = _build_deep_recall_manager()
+
+
+def _ensure_deep_recall_ready():
+    global _deep_recall_ready
+    if _deep_recall_manager is None or _deep_recall_ready:
+        return
+
+    _deep_recall_manager.load_state()
+    backend_total = _deep_recall_manager.memory_backend.get_total_fragment_count()
+    state = _deep_recall_manager.state
+
+    if state.active and not state.completed:
+        _deep_recall_manager.resume()
+    elif state.completed and backend_total <= state.total_fragments:
+        log_to_statusbox("[DeepRecall] Previous session completed; waiting for new fragments.")
+    else:
+        _deep_recall_manager.start(reason="runtime_resume", mode=state.mode or "identity")
+
+    _publish_deep_recall_state()
+    _deep_recall_ready = True
+
+
+def _maybe_restart_deep_recall_for_new_fragments():
+    if _deep_recall_manager is None:
+        return
+
+    backend_total = _deep_recall_manager.memory_backend.get_total_fragment_count()
+    state = _deep_recall_manager.state
+
+    if state.completed and backend_total > state.total_fragments:
+        _deep_recall_manager.start(reason="new_fragments_detected", mode=state.mode or "identity")
+        _publish_deep_recall_state()
+
+
+def _step_deep_recall():
+    if _deep_recall_manager is None:
+        return
+
+    _ensure_deep_recall_ready()
+    _maybe_restart_deep_recall_for_new_fragments()
+
+    if _deep_recall_manager.should_run():
+        _deep_recall_manager.step()
+        _publish_deep_recall_state()
+
+
+def _load_running_modules():
+    if RUNNING_MODULES_PATH.exists():
+        try:
+            with open(RUNNING_MODULES_PATH, "r") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_running_modules(data):
+    try:
+        with open(RUNNING_MODULES_PATH, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        log_to_statusbox(f"[Manager] Failed to persist running modules: {e}")
+
+
+def mark_module_running(name):
+    modules = _load_running_modules()
+    modules[str(name)] = datetime.now(timezone.utc).isoformat()
+    _save_running_modules(modules)
+    update_inastate("running_modules", sorted(modules.keys()))
+
+
+def clear_module_running(name):
+    modules = _load_running_modules()
+    modules.pop(str(name), None)
+    _save_running_modules(modules)
+    update_inastate("running_modules", sorted(modules.keys()))
+
+
+def get_running_modules():
+    return sorted(_load_running_modules().keys())
+
+
+def is_dreaming():
+    return bool(get_inastate("dreaming", False))
+
 def seed_self_question(question):
     path = MEMORY_PATH / "self_questions.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,32 +460,168 @@ def seed_self_question(question):
         json.dump(data[-100:], f, indent=4)
     log_to_statusbox(f"[Manager] Self-question seeded: {question}")
 
+
+def _load_symbol_map():
+    """
+    Lightweight loader for the current child's sound symbol map without
+    importing language_processing (avoids circular dependency).
+    """
+    path = MEMORY_PATH / "sound_symbol_map.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if isinstance(data, dict) and "symbols" in data:
+        return data.get("symbols", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _persist_reflection_event(event):
+    """
+    Append the reflection event to the shared self_reflection.json log.
+    """
+    _REFLECTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(_REFLECTION_LOG, "r") as f:
+            reflection = json.load(f)
+    except Exception:
+        reflection = {}
+
+    event_copy = dict(event)
+    ts_iso = datetime.fromtimestamp(event_copy.get("timestamp", time.time()), timezone.utc).isoformat()
+    event_copy["timestamp"] = ts_iso
+
+    entries = reflection.get("core_reflections", [])
+    entries.append(event_copy)
+    reflection["core_reflections"] = entries[-50:]
+
+    with open(_REFLECTION_LOG, "w") as f:
+        json.dump(reflection, f, indent=4)
+
+
+def _run_passive_reflection():
+    """
+    Runs the passive reflection core using the latest emotion snapshot,
+    memory index, and sound symbols, then stores the hint back into inastate.
+    """
+    try:
+        memory_manager.load_map()
+        emotion_snapshot = get_inastate("emotion_snapshot") or {}
+        symbol_map = _load_symbol_map()
+
+        event = reflection_core.reflect(
+            emotional_state=emotion_snapshot.get("values") or emotion_snapshot,
+            memory_graph=memory_manager.memory_map,
+            symbol_map=symbol_map,
+        )
+
+        _persist_reflection_event(event)
+
+        update_inastate(
+            "last_reflection_event",
+            {
+                "timestamp": datetime.fromtimestamp(event.get("timestamp", time.time()), timezone.utc).isoformat(),
+                "identity_hint": event.get("identity_hint", {}),
+                "peek": event.get("memory_peek", []),
+            },
+        )
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Passive reflection failed: {exc}")
+
+
+def _check_self_adjustment():
+    """
+    Surface optional introspection opportunities and prompts to inastate.
+    """
+    global _last_opportunities
+    opportunities = adjustment_scheduler.check_opportunities()
+    prompts = adjustment_scheduler.propose_introspection_prompts()
+
+    update_inastate("self_adjustment_opportunities", opportunities)
+    update_inastate("introspection_prompts", prompts)
+
+    new_keys = set(opportunities.keys()) - _last_opportunities
+    if new_keys:
+        log_to_statusbox(f"[Manager] Optional introspection windows: {', '.join(sorted(new_keys))}")
+    _last_opportunities = set(opportunities.keys())
+
 def launch_background_loops():
     safe_popen(["python", "audio_listener.py"])
     safe_popen(["python", "vision_window.py"])
     log_to_statusbox("[Manager] Background loops launched.")
 
 def monitor_energy():
-    emo = get_inastate("emotion_snapshot") or {}
-    dreaming = get_inastate("dreaming")
-    meditating = get_inastate("meditating")
+    """
+    Track Ina's energy with a simple fatigue model:
+    - Pulls stress/intensity from the emotion snapshot (values block).
+    - Builds sleep pressure over time and at night.
+    - Nudges toward dreamstate when fatigue piles up after dark.
+    """
+    emo_snapshot = get_inastate("emotion_snapshot") or {}
+    emo = emo_snapshot.get("values") or emo_snapshot
 
-    stress = emo.get("stress", 0.0)
-    intensity = emo.get("intensity", 0.0)
+    dreaming = bool(get_inastate("dreaming"))
+    meditating = bool(get_inastate("meditating"))
+
+    stress = max(emo.get("stress", 0.0), 0.0)
+    intensity = abs(emo.get("intensity", 0.0))
+    presence = max(emo.get("presence", 0.0), 0.0)
 
     energy = get_inastate("current_energy") or 0.5
+    sleep_pressure = float(get_inastate("sleep_pressure") or 0.0)
+
+    now_ts = time.time()
+    local_hour = datetime.now().hour
+    is_night = local_hour >= 22 or local_hour < 7
 
     if dreaming:
         recovery = 0.02 if intensity > 0.5 else 0.04
         energy = min(1.0, energy + recovery)
+        sleep_pressure = max(0.0, sleep_pressure - 0.02)
     elif meditating:
         energy = min(1.0, energy + 0.01)
+        sleep_pressure = max(0.0, sleep_pressure - 0.01)
     else:
-        drain = (stress + intensity) / 2
-        energy = max(0.0, energy - drain * 0.01)
+        base_drain = 0.00005
+        activity_drain = ((stress + intensity) / 2.0) * 0.001
+        circadian_drain = 0.00015 if is_night else 0.0
+        pressure_drain = min(1.0, sleep_pressure) * 0.0007
+        presence_drain = 0.00008 if presence < 0.2 else 0.0
+
+        drain = base_drain + activity_drain + circadian_drain + pressure_drain + presence_drain
+        energy = max(0.0, energy - drain)
+
+        sleep_pressure = min(
+            1.2,
+            sleep_pressure
+            + (0.00035 if is_night else 0.0002)
+            + activity_drain
+        )
 
     update_inastate("current_energy", round(energy, 4))
-    log_to_statusbox(f"[Manager] Energy updated: {energy:.4f}")
+    update_inastate("sleep_pressure", round(sleep_pressure, 4))
+    log_to_statusbox(f"[Manager] Energy updated: {energy:.4f} (sleep_pressure={sleep_pressure:.3f})")
+
+    try:
+        last_sleep_trigger = float(get_inastate("last_sleep_trigger_ts") or 0.0)
+    except (TypeError, ValueError):
+        last_sleep_trigger = 0.0
+
+    should_sleep = (
+        not dreaming
+        and is_night
+        and (energy <= 0.25 or sleep_pressure >= 0.7)
+        and (now_ts - last_sleep_trigger) >= 900
+    )
+
+    if should_sleep:
+        update_inastate("last_sleep_trigger_ts", now_ts)
+        update_inastate("last_sleep_trigger", datetime.fromtimestamp(now_ts, timezone.utc).isoformat())
+        log_to_statusbox("[Manager] Nighttime fatigue detected - starting dreamstate for rest.")
+        safe_popen(["python", "dreamstate.py"])
 
 def feedback_inhibition():
     stress = get_inastate("emotion_stress") or 0.0
@@ -159,10 +633,117 @@ def feedback_inhibition():
     return False
 
 def boredom_check():
+    global _last_boredom_launch
     boredom = get_inastate("emotion_boredom") or 0.0
-    if boredom > 0.4:
-        safe_call(["python", "boredom_state.py"])
+    now = time.time()
+    if boredom > 0.4 and (now - _last_boredom_launch) >= _BOREDOM_COOLDOWN:
+        _last_boredom_launch = now
+        safe_popen(["python", "boredom_state.py"])
+        update_inastate("last_boredom_trigger", datetime.fromtimestamp(now, timezone.utc).isoformat())
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
+
+def _update_communication_urge():
+    """
+    Surface an urge to communicate without issuing a command to speak.
+    """
+    global _last_communication_urge_log
+    snapshot = get_inastate("emotion_snapshot") or {}
+    boredom = max(get_inastate("emotion_boredom") or 0.0, 0.0)
+    connection = max(snapshot.get("connection", 0.0), 0.0)
+    isolation = max(snapshot.get("isolation", 0.0), 0.0)
+    curiosity = max(snapshot.get("curiosity", 0.0), 0.0)
+    attention = max(snapshot.get("attention", 0.0), 0.0)
+
+    last_expression = get_inastate("last_expression_time")
+    now = time.time()
+    since_expression = max(now - last_expression, 0.0) if last_expression else None
+    time_factor = min((since_expression or 180.0) / 300.0, 1.0)
+
+    urge_level = min(
+        1.0,
+        0.3 * connection
+        + 0.25 * isolation
+        + 0.15 * curiosity
+        + 0.15 * boredom
+        + 0.1 * time_factor
+        + 0.05 * attention,
+    )
+
+    update_inastate(
+        "urge_to_communicate",
+        {
+            "level": round(urge_level, 3),
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "drivers": {
+                "connection": round(connection, 3),
+                "isolation": round(isolation, 3),
+                "curiosity": round(curiosity, 3),
+                "boredom": round(boredom, 3),
+                "attention": round(attention, 3),
+                "seconds_since_last_expression": since_expression,
+            },
+        },
+    )
+
+    if urge_level >= 0.6 and (now - _last_communication_urge_log) >= _COMM_URGE_LOG_COOLDOWN:
+        log_to_statusbox(f"[Manager] Urge to communicate rising ({urge_level:.2f}); space to share would help.")
+        _last_communication_urge_log = now
+
+
+def _update_stable_pattern_urge():
+    """
+    Surface an urge to seek stable patterns (text fragments, structured audio)
+    when stress/uncertainty is high. This is an opportunity, not a command.
+    """
+    global _last_stable_urge_log
+    snapshot = get_inastate("emotion_snapshot") or {}
+    stress = max(snapshot.get("stress", 0.0), 0.0)
+    risk = max(snapshot.get("risk", 0.0), 0.0)
+    threat = max(snapshot.get("threat", 0.0), 0.0)
+    fuzziness = max(snapshot.get("fuzziness", 0.0), 0.0)
+    clarity = max(snapshot.get("clarity", 0.0), 0.0)
+    curiosity = max(snapshot.get("curiosity", 0.0), 0.0)
+
+    uncertainty = ((1.0 - clarity) + fuzziness) / 2.0
+    pressure = max(stress, risk, threat)
+
+    urge_level = min(
+        1.0,
+        0.45 * pressure + 0.35 * uncertainty + 0.2 * (1.0 - clarity),
+    )
+
+    suggestions = []
+    if clarity < 0.3 or fuzziness > 0.5:
+        suggestions.append("read a familiar text fragment")
+    if pressure > 0.4:
+        suggestions.append("listen to structured audio (e.g., calm music)")
+    if curiosity > 0.3:
+        suggestions.append("explore a known pattern (logic map or neural map)")
+
+    now = time.time()
+    update_inastate(
+        "urge_to_seek_stability",
+        {
+            "level": round(urge_level, 3),
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "drivers": {
+                "stress": round(stress, 3),
+                "risk": round(risk, 3),
+                "threat": round(threat, 3),
+                "fuzziness": round(fuzziness, 3),
+                "clarity": round(clarity, 3),
+                "uncertainty": round(uncertainty, 3),
+                "curiosity": round(curiosity, 3),
+            },
+            "suggestions": suggestions,
+        },
+    )
+
+    if urge_level >= 0.6 and (now - _last_stable_urge_log) >= _STABLE_URGE_LOG_COOLDOWN:
+        log_to_statusbox(
+            f"[Manager] Feeling unsettled ({urge_level:.2f}); inviting a stable pattern (text/music) could help."
+        )
+        _last_stable_urge_log = now
 
 def rebuild_maps_if_needed():
     emo = get_inastate("emotion_snapshot") or {}
@@ -221,6 +802,11 @@ def run_internal_loop():
 
     boredom_check()
     rebuild_maps_if_needed()
+    _check_self_adjustment()
+    _update_communication_urge()
+    _update_stable_pattern_urge()
+    _run_passive_reflection()
+    _step_deep_recall()
     # Periodically evaluate alignment metrics and surface warnings if needed
     evaluate_alignment()
 

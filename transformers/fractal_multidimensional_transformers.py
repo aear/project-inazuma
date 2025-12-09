@@ -2,7 +2,36 @@
 
 import math
 import hashlib
-import numpy as np
+from statistics import median
+from typing import Iterable, List, Sequence
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    # Lightweight fallback to keep transforms working without numpy
+    class _NPFallback:
+        @staticmethod
+        def abs(seq):
+            return [abs(x) for x in seq]
+
+        @staticmethod
+        def mean(seq):
+            return sum(seq) / len(seq) if seq else 0.0
+
+        @staticmethod
+        def std(seq):
+            mu = _NPFallback.mean(seq)
+            return math.sqrt(sum((x - mu) ** 2 for x in seq) / max(len(seq), 1))
+
+        @staticmethod
+        def percentile(seq, q):
+            if not seq:
+                return 0.0
+            data = sorted(seq)
+            k = int((q / 100.0) * (len(data) - 1))
+            return data[k]
+
+    np = _NPFallback()
 
 def load_precision_profile(child="Inazuma_Yagami"):
     """Return stored precision profile for a given child."""
@@ -38,11 +67,12 @@ class FractalLayer:
         return output
 
 class FractalTransformer:
-    def __init__(self, depth=3, length=7):
+    def __init__(self, depth=3, length=7, embed_dim=64):
         self.structure = [FractalLayer(length) for _ in range(depth)]
         self.depth = depth
         self.length = length
         self.precision = 0.5
+        self.embed_dim = embed_dim
 
     def encode(self, fragment):
         if "image_features" in fragment:
@@ -76,16 +106,15 @@ class FractalTransformer:
                 "importance": round(avg, 4),
                 "tags": frag.get("tags", []),
                 "timestamp": frag.get("timestamp", ""),
-                "summary": frag.get("summary", "")
+                "summary": frag.get("summary", ""),
+                "features_used": len(inputs),
             }
             batch_vectors.append(encoded)
         return batch_vectors
 
     # === New: Specific encoders ===
     def encode_audio_fragment(self, fragment):
-        base = fragment.get("summary") or fragment.get("id") or str(fragment)
-        digest = hashlib.sha256(base.encode()).digest()
-        vec = [((b - 128) / 128.0) * self.precision for b in digest[:64]]
+        vec = self._numeric_embedding(fragment.get("audio_features", []))
         return {
             "vector": vec,
             "importance": round(np.mean(np.abs(vec)), 4),
@@ -101,29 +130,91 @@ class FractalTransformer:
         return self.encode(fragment)
 
     def encode_symbolic_fragment(self, fragment):
-        return self.encode_audio_fragment(fragment)  # for now, same logic
+        vec = self._text_emotion_embedding(fragment)
+        return {
+            "vector": vec,
+            "importance": round(np.mean(np.abs(vec)), 4),
+            "source": "FractalTransformer"
+        }
     
     def process_inputs(self, fragment):
         # Determine modality and fallback
         if fragment.get("modality") == "audio":
-            features = fragment.get("audio_features", [])
+            features = self._numeric_embedding(fragment.get("audio_features", []))
         elif fragment.get("modality") == "image":
-            features = fragment.get("image_features", [])
+            features = self._numeric_embedding(fragment.get("image_features", []))
         elif fragment.get("modality") == "video":
-            features = fragment.get("video_features", [])
+            features = self._numeric_embedding(fragment.get("video_features", []))
+        elif "audio_features" in fragment:
+            features = self._numeric_embedding(fragment.get("audio_features", []))
+        elif "image_features" in fragment:
+            features = self._numeric_embedding(fragment.get("image_features", []))
         else:
-            features = self._default_text_emotion_input(fragment)
+            features = self._text_emotion_embedding(fragment)
 
         return features if features else [0.0]
 
-    def _default_text_emotion_input(self, fragment):
+    def _text_emotion_embedding(self, fragment):
+        summary = str(fragment.get("summary") or fragment.get("id") or "")
+        tags = fragment.get("tags", [])
         emotions = fragment.get("emotions", {})
-        summary = fragment.get("summary", "")
-        text_features = [ord(c) / 255 for c in summary[:64]]
-        emotion_values = [float(v or 0.0) for v in emotions.values()]
-        if not emotion_values:
-            emotion_values = [0.0] * 3
-        return emotion_values + text_features
+
+        # Character trigram hashing (deterministic, order-aware)
+        clean = summary.lower()
+        trigram_vec = [0.0] * self.embed_dim
+        for i in range(len(clean) - 2):
+            tri = clean[i : i + 3]
+            h = int(hashlib.sha256(tri.encode()).hexdigest()[:8], 16)
+            trigram_vec[h % self.embed_dim] += 1.0
+
+        # Emotion sliders as context
+        emo_values = [float(v or 0.0) for v in emotions.values()]
+        if emo_values:
+            emo_stats = self._describe_numeric(emo_values)
+        else:
+            emo_stats = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+        # Tag presence hashed
+        tag_vec = [0.0] * (self.embed_dim // 4)
+        for tag in tags:
+            h = int(hashlib.sha256(str(tag).encode()).hexdigest()[:8], 16)
+            tag_vec[h % len(tag_vec)] += 1.0
+
+        combined = trigram_vec + emo_stats + tag_vec
+        return self._normalize_vector(combined)
+
+    def _numeric_embedding(self, values: Sequence[float] | None) -> List[float]:
+        seq = [float(v) for v in (values or [])]
+        if not seq:
+            return [0.0] * self.embed_dim
+
+        stats = self._describe_numeric(seq)
+        hashed = self._hash_project(seq, self.embed_dim - len(stats))
+        return self._normalize_vector(stats + hashed)
+
+    def _describe_numeric(self, seq: Sequence[float]) -> List[float]:
+        if not seq:
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
+        mean = np.mean(seq)
+        std = np.std(seq)
+        mn = min(seq)
+        mx = max(seq)
+        med = median(seq)
+        return [float(round(x, 6)) for x in (mean, std, mn, mx, med)]
+
+    def _hash_project(self, seq: Sequence[float], dim: int) -> List[float]:
+        if dim <= 0:
+            return []
+        projected = [0.0] * dim
+        for i, v in enumerate(seq):
+            idx = (i * 1315423911) % dim
+            projected[idx] += float(v)
+        return projected
+
+    def _normalize_vector(self, vec: Iterable[float]) -> List[float]:
+        vec = list(vec)
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [round((v / norm) * self.precision, 6) for v in vec]
     
     def load_precision_profile(self, child="Inazuma_Yagami"):
         import os
@@ -156,5 +247,3 @@ class FractalTransformer:
         log_to_statusbox(f"[Precision] Applied precision: {self.precision:.4f} ({int(self.precision * 64)}-bit)")
 
         return True
-
-

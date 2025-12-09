@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import load_config, get_inastate, seed_self_question
 from transformers.fractal_multidimensional_transformers import FractalTransformer
+from logic_map_builder import run_logic_map_builder
 
 # === Logic & Math Blocks ===
 def basic_math_ops(a, b):
@@ -131,6 +132,10 @@ def log_logic_event(child, logic_entry):
     with open(path, "w") as f:
         json.dump(history, f, indent=4)
     print(f"[Logic] Logged to logic_memory.json: {logic_entry['description']}")
+    try:
+        run_logic_map_builder()
+    except Exception as e:
+        print(f"[Logic] Failed to update logic map: {e}")
 
 def suggest_precision_override(score, reason="logic insight"):
     hint = {

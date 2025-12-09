@@ -15,6 +15,26 @@ if TYPE_CHECKING:  # pragma: no cover
 MEMORY_TIERS = ["short", "working", "long", "cold"]
 
 
+def _load_config():
+    path = Path("config.json")
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _neural_settings():
+    cfg = _load_config()
+    cluster = float(cfg.get("neural_cluster_threshold", 0.88))
+    synapse = float(cfg.get("neural_synapse_threshold", 0.84))
+    tag_weight = float(cfg.get("neural_tag_weight", 0.25))
+    tag_weight = max(0.0, min(1.0, tag_weight))
+    return cluster, synapse, tag_weight
+
+
 # === Experience Graph Utilities ===
 def _experience_base(child: str, base_path: Optional[Path] = None) -> Path:
     root = Path(base_path) if base_path else Path("AI_Children")
@@ -129,6 +149,39 @@ def vector_average(vectors):
             avg[i] += vec[i]
     return [round(x / len(vectors), 6) for x in avg]
 
+
+def tag_similarity(tags_a, tags_b):
+    a = set(tags_a or [])
+    b = set(tags_b or [])
+    union = a.union(b)
+    if not union:
+        return 0.0
+    return len(a.intersection(b)) / len(union)
+
+
+def _slim_fragment(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Keep only the fields needed for encoding/clustering to reduce memory pressure.
+    """
+    if not data or "id" not in data:
+        return None
+    keep_keys = {
+        "id",
+        "tags",
+        "emotions",
+        "summary",
+        "modality",
+        "audio_features",
+        "image_features",
+        "video_features",
+        "timestamp",
+        "source",
+    }
+    slim = {k: data.get(k) for k in keep_keys if k in data}
+    # Preserve modality hints embedded in tags (e.g., "audio" / "vision") for clustering.
+    return slim
+
+
 def load_fragments(child):
     base = Path("AI_Children") / child / "memory" / "fragments"
     files = list(base.glob("frag_*.json"))
@@ -136,38 +189,62 @@ def load_fragments(child):
         try:
             with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)
-                if "emotions" in data:
-                    return data
+                slim = _slim_fragment(data)
+                if slim and "emotions" in data:
+                    return slim
         except:
             return None
     with ThreadPoolExecutor(max_workers=8) as pool:
         return [f for f in pool.map(load, files) if f]
 
-def cluster_fragments(fragments, transformer, cache, threshold=0.92):
+def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
     clusters = []
+    tag_weight = max(0.0, min(1.0, tag_weight))
     for frag in fragments:
         frag_id = frag["id"]
         vec = cache.get(frag_id)
-        matched = False
+        if vec is None:
+            continue
+
+        frag_tags = set(frag.get("tags", []))
+        best = None
+        best_score = 0.0
+
         for node in clusters:
-            node_vec = vector_average([cache[fid] for fid in node["fragments"]])
-            score = cosine_similarity(vec, node_vec)
-            if score >= threshold:
-                node["fragments"].append(frag_id)
-                matched = True
-                break
-        if not matched:
-            clusters.append({"fragments": [frag_id]})
+            node_vec = [
+                val / node["count"] for val in node["vector_sum"]
+            ]
+            vec_score = cosine_similarity(vec, node_vec)
+            tag_score = tag_similarity(frag_tags, node["tags"])
+            score = ((1 - tag_weight) * vec_score) + (tag_weight * tag_score)
+            if score >= threshold and score > best_score:
+                best_score = score
+                best = node
+
+        if best:
+            best["fragments"].append(frag_id)
+            best["tags"].update(frag_tags)
+            best["count"] += 1
+            best["vector_sum"] = [
+                a + b for a, b in zip(best["vector_sum"], vec)
+            ]
+        else:
+            clusters.append({
+                "fragments": [frag_id],
+                "tags": set(frag_tags),
+                "vector_sum": list(vec),
+                "count": 1
+            })
     return clusters
 
-def build_synaptic_links(neurons, cache, threshold=0.91):
+def build_synaptic_links(neurons, threshold=0.91):
     synapses = []
     for i, source in enumerate(neurons):
         for j, target in enumerate(neurons):
             if j <= i:
                 continue
-            vec_a = cache.get(source["id"])
-            vec_b = cache.get(target["id"])
+            vec_a = source.get("vector")
+            vec_b = target.get("vector")
             if vec_a and vec_b:
                 sim = cosine_similarity(vec_a, vec_b)
                 if sim >= threshold:
@@ -182,19 +259,33 @@ def build_fractal_memory(child):
     start_time = datetime.now()
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
+    cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
     transformer = FractalTransformer()
     fragments = load_fragments(child)
     log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
     encoded = transformer.encode_many(fragments)
     cache = {e["id"]: e["vector"] for e in encoded}
-    clusters = cluster_fragments(fragments, transformer, cache)
-    log_to_statusbox(f"[NeuralMap] Clustered into {len(clusters)} neurons.")
+    clusters = cluster_fragments(
+        fragments,
+        cache,
+        threshold=cluster_threshold,
+        tag_weight=tag_weight,
+    )
+    log_to_statusbox(
+        f"[NeuralMap] Clustered into {len(clusters)} neurons "
+        f"(threshold={cluster_threshold:.2f}, tag_weight={tag_weight:.2f})."
+    )
 
     neurons = []
     for i, group in enumerate(clusters):
         fragment_ids = group["fragments"]
-        tags = [t for fid in fragment_ids for t in next((f["tags"] for f in fragments if f["id"] == fid), [])]
-        avg_vec = vector_average([cache[fid] for fid in fragment_ids])
+        tags = sorted(group["tags"]) if isinstance(group.get("tags"), set) else list(group.get("tags", []))
+        vector_sum = group.get("vector_sum")
+        count = group.get("count", len(fragment_ids))
+        if vector_sum and count:
+            avg_vec = [round(v / count, 6) for v in vector_sum]
+        else:
+            avg_vec = vector_average([cache[fid] for fid in fragment_ids if fid in cache])
         node_id = f"node_{i:04}"
 
         neurons.append({
@@ -207,7 +298,7 @@ def build_fractal_memory(child):
             "last_used": datetime.now(timezone.utc).isoformat()
         })
 
-    synapses = build_synaptic_links(neurons, cache)
+    synapses = build_synaptic_links(neurons, threshold=synapse_threshold)
     result = {
         "neurons": neurons,
         "synapses": synapses,
@@ -215,13 +306,15 @@ def build_fractal_memory(child):
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
-    out_path = Path.home() / "Projects" / "Project Inazuma" / "AI_Children" / child / "memory" / "neural" / "neural_memory_map.json"
+    out_path = Path("AI_Children") / child / "memory" / "neural" / "neural_memory_map.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=4)
 
     duration = datetime.now() - start_time
-    log_to_statusbox(f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | Saved to neural map.")
+    log_to_statusbox(
+        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | Saved to neural map."
+    )
     log_to_statusbox(f"[NeuralMap] Mapping time: {duration}.")
 
 # === MemoryManager Class ===
@@ -236,6 +329,30 @@ class MemoryManager:
     def ensure_tier_directories(self):
         for tier in MEMORY_TIERS:
             (self.base_path / tier).mkdir(parents=True, exist_ok=True)
+
+    def index_legacy_root(self):
+        """
+        Legacy fragments lived directly under memory/fragments without tier folders.
+        Scan them so counts are accurate even if tiers are unused.
+        """
+        root_files = list(self.base_path.glob("frag_*.json"))
+        for frag in root_files:
+            try:
+                with open(frag, "r") as f:
+                    data = json.load(f)
+                existing = self.memory_map.get(data["id"], {})
+                self.memory_map[data["id"]] = {
+                    "tier": existing.get("tier", "short"),
+                    "tags": data.get("tags", []),
+                    "importance": data.get("importance", 0),
+                    "last_seen": existing.get(
+                        "last_seen",
+                        data.get("timestamp", datetime.now(timezone.utc).isoformat())
+                    ),
+                    "filename": frag.name,
+                }
+            except Exception:
+                continue
 
     def load_map(self):
         if self.index_path.exists():
@@ -274,6 +391,7 @@ class MemoryManager:
                 continue
 
     def reindex_all(self):
+        self.index_legacy_root()
         for tier in MEMORY_TIERS:
             self.index_tier(tier)
         self.save_map()
@@ -282,6 +400,7 @@ class MemoryManager:
 
     def reindex(self, new_only=True):
         added = 0
+        self.index_legacy_root()
         for tier in MEMORY_TIERS:
             tier_path = self.base_path / tier
             if not tier_path.exists():

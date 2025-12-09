@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Dict, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, Optional, Union
 
 try:
     from gui_hook import log_to_statusbox
@@ -48,7 +49,20 @@ def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return x
 
 
-def normalise_state(raw_state: Dict[str, float]) -> Dict[str, float]:
+def _as_mapping(raw_state: Union[Dict[str, float], Any]) -> Mapping[str, Any]:
+    """
+    Accept either a plain dict or an EmotionSnapshot-like object
+    with a `.values` mapping; return a mapping for downstream use.
+    """
+    if isinstance(raw_state, Mapping):
+        return raw_state
+    values = getattr(raw_state, "values", None)
+    if isinstance(values, Mapping):
+        return values
+    return {}
+
+
+def normalise_state(raw_state: Union[Dict[str, float], Any]) -> Dict[str, float]:
     """
     Ensure:
     - All sliders present.
@@ -56,8 +70,9 @@ def normalise_state(raw_state: Dict[str, float]) -> Dict[str, float]:
     - Non-finite values replaced with 0.0.
     """
     state: Dict[str, float] = {}
+    source = _as_mapping(raw_state)
     for key in SLIDERS:
-        v = float(raw_state.get(key, 0.0) or 0.0)
+        v = float(source.get(key, 0.0) or 0.0)
         if math.isnan(v) or math.isinf(v):
             v = 0.0
         state[key] = _clamp(v)
@@ -222,7 +237,7 @@ def regulate_state(
 
 
 def process_emotion(
-    raw_state: Dict[str, float],
+    raw_state: Union[Dict[str, float], Any],
     *,
     mode: str = "awake",
     previous_state: Optional[Dict[str, float]] = None,
@@ -231,7 +246,7 @@ def process_emotion(
     """
     Main entry point.
 
-    - raw_state: a dict of 24 sliders from emotion_engine.calculate_emotion_state().
+    - raw_state: a dict of 24 sliders or an EmotionSnapshot (values are read from `.values`).
     - mode: "awake" | "dream" | "meditation" | "boredom" | etc.
     - previous_state: optional, for future use (trait drift, hysteresis, etc.).
     - rng: optional random.Random for deterministic testing.

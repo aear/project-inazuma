@@ -17,3 +17,13 @@ This repo shares the **runtime, transformers, and GUI**, not the private dataset
 - **Ethics built‑in.** Sealed outputs, right‑to‑sleep, reversible drifts, transparent logs (see MANIFESTO).
 
 > This repository contains Ina’s structural code and transformer behaviors. Without her unique training environment, voice data, and lived symbolic history, this will not produce “Ina” — only a new, distinct AI. Even identical code will lead to a different personality and cognition when shaped by a different context.
+
+## Vision capture via OBS (optional)
+- Enable OBS WebSocket in OBS (default port 4455) and set `obs_websocket` in `config.json`.
+- Install `simpleobsws` (see `requirements.txt`) to allow Ina to pull composited screenshots from the current program scene.
+- If OBS/WebSocket is unavailable, vision falls back to the existing desktop capture path automatically.
+- Optional: set `obs_websocket.record_directory` to point OBS recordings somewhere specific (Ina will ask OBS to switch to that path at startup).
+
+## Audio capture routing
+- `audio_labels` in `config.json` controls which devices are sampled; trim this list to avoid conflicts.
+- Use `audio_device_overrides` to point a label at a specific PipeWire/ALSA device (e.g., an OBS monitor mix), and `stereo_audio_labels` to force stereo on non-output labels.

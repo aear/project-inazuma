@@ -153,11 +153,13 @@ class MemoryGatekeeper:
         The current rule set is deliberately simple and based on:
           - attention_state
           - metadata.flags
+          - lightweight intent tags (action/communication vs thought/logic)
           - modality
           - optional heuristic fields in metadata.extra
         """
         meta = fragment.get("metadata", {})
         flags: List[str] = meta.get("flags", [])
+        tags: List[str] = meta.get("tags", []) or fragment.get("tags", [])
         modality_str: str = meta.get("modality", "")
         attention_state_str: str = meta.get("attention_state", AttentionState.PERIPHERAL.value)
 
@@ -172,6 +174,14 @@ class MemoryGatekeeper:
         except ValueError:
             attention_state = AttentionState.PERIPHERAL
 
+        # Lightweight intent classification
+        is_action = self._has_any_flag(flags, ["action", "communication", "speech", "comm"]) or any(
+            t in {"action", "communication", "comm", "speech"} for t in tags
+        )
+        is_thought = self._has_any_flag(flags, ["logic", "thought"]) or any(
+            t in {"logic", "thought", "reasoning"} for t in tags
+        )
+
         # ------------------------------------------------------------------
         # 1. Hard drop rules
         # ------------------------------------------------------------------
@@ -184,7 +194,9 @@ class MemoryGatekeeper:
 
         if self.config.drop_ignored and attention_state == AttentionState.IGNORED:
             # Unless explicitly protected by some flag, we discard ignored noise.
-            if not self._has_any_flag(flags, ["high_emotion", "system_event", "self_voice"]):
+            if not self._has_any_flag(
+                flags, ["high_emotion", "system_event", "self_voice"]
+            ) and not (is_action or is_thought):
                 return GateDecision(
                     action=GateAction.DROP,
                     target_shard=None,
@@ -199,6 +211,12 @@ class MemoryGatekeeper:
         extra: Dict[str, Any] = meta.get("extra", {}) or {}
         emotion_intensity = float(extra.get("emotion_intensity", 0.0))  # [-1, 1] if you adopt that convention
         novelty_score = float(extra.get("novelty_score", 0.0))          # [0, 1] heuristic
+        category = str(extra.get("category", "")).lower()
+
+        if category in {"action", "communication"} and not is_action:
+            is_action = True
+        if category in {"thought", "logic"} and not is_thought:
+            is_thought = True
 
         # Example heuristic thresholds – adjust later:
         HIGH_EMOTION = 0.6
@@ -217,6 +235,22 @@ class MemoryGatekeeper:
                 action=GateAction.STORE,
                 target_shard=self.config.long_term_shard,
                 reason="Self-reflection fragment",
+            )
+
+        # Explicit thought/logic gets long-term priority
+        if is_thought:
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.long_term_shard,
+                reason="Logic/thought fragment",
+            )
+
+        # Explicit communication/action goes to working tier
+        if is_action:
+            return GateDecision(
+                action=GateAction.STORE,
+                target_shard=self.config.working_shard,
+                reason="Communication/action fragment",
             )
 
         if emotion_intensity >= HIGH_EMOTION or self._has_flag(flags, "high_emotion"):

@@ -136,9 +136,17 @@ def save_boot_summary_fragment(child, duration, flickers):
 
 def launch_symbolic_startup(child):
     modules = ["meaning_map.py", "logic_map_builder.py", "emotion_map.py", "predictive_layer.py", "memory_graph.py"]
+
+    def _call_local(script_name):
+        script_path = Path(script_name)
+        if not script_path.exists():
+            log_to_statusbox(f"[Birth] Skipping missing module: {script_name}")
+            return
+        subprocess.call(["python", str(script_path)])
+
     for script in modules:
         start = datetime.now(timezone.utc).isoformat()
-        subprocess.call(["python", script])
+        _call_local(script)
         end = datetime.now(timezone.utc).isoformat()
         update_birth_metrics(child, f"{script.replace('.py', '')}_boot", {
             "start": start,
