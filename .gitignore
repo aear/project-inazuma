@@ -4,6 +4,7 @@ AI_Children*/
 
 
 # --- LOGS ---
+logs/
 *.log
 
 
@@ -20,6 +21,7 @@ AI_Children*/
 *.json
 *.txt
 *.odt
+*.jsonl
 
 
 # --- WORK DIRECTORIES ---
