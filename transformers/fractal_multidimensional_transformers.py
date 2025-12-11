@@ -168,7 +168,17 @@ class FractalTransformer:
             trigram_vec[h % self.embed_dim] += 1.0
 
         # Emotion sliders as context
-        emo_values = [float(v or 0.0) for v in emotions.values()]
+        emo_values = []
+        for v in emotions.values():
+            if isinstance(v, dict):
+                emo_values.extend(float(val or 0.0) for val in v.values())
+            elif isinstance(v, (list, tuple)):
+                emo_values.extend(float(val or 0.0) for val in v)
+            else:
+                try:
+                    emo_values.append(float(v or 0.0))
+                except Exception:
+                    continue
         if emo_values:
             emo_stats = self._describe_numeric(emo_values)
         else:

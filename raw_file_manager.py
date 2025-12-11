@@ -13,6 +13,7 @@ import tarfile
 import gzip
 import bz2
 import lzma
+import uuid
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from PIL import Image
 import numpy as np
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
+from text_memory import update_text_vocab
 
 _VIDEO_IMPORT_ERROR = None
 try:
@@ -204,15 +206,31 @@ def fragment_text(text, source, transformer):
     chunks = [text[i:i+400] for i in range(0, len(text), 400)]
     fragments = []
     for chunk in chunks[:5]:
+        frag_id = f"frag_text_{uuid.uuid4().hex[:10]}"
+        tags = ["text", "self_read"]
+        if source.endswith(".py"):
+            tags.append("code")
+        else:
+            tags.append("text")
+        tags = list(dict.fromkeys(tags))
+
         frag = {
+            "id": frag_id,
+            "modality": "text",
             "summary": chunk,
-            "tags": ["self_read", "code" if source.endswith(".py") else "text"],
+            "text": chunk,
+            "length": len(chunk),
+            "tags": tags,
             "source": source,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"curiosity": 0.6, "focus": 0.4}
         }
         vec = transformer.encode(frag)
         frag["importance"] = vec["importance"]
+        try:
+            update_text_vocab(chunk, child=child, tags=frag["tags"], emotions=frag.get("emotions"))
+        except Exception:
+            pass
         fragments.append(frag)
     return fragments
 
@@ -595,6 +613,15 @@ def self_read_and_train():
         return
     log_to_statusbox(f"[SelfRead] Loaded {len(history) + len(legacy_history)} previously seen files.")
 
+    # Resolve roots once for provenance tagging
+    def _safe_resolve(p):
+        try:
+            return p.resolve()
+        except Exception:
+            return None
+
+    resolved_book_root = _safe_resolve(book_folder_path) if book_folder_path and book_folder_path.exists() else None
+
     transformer = FractalTransformer()
     count = 0
 
@@ -602,6 +629,10 @@ def self_read_and_train():
 
     for base_root, audio_only in roots:
         log_to_statusbox(f"[SelfRead] Scanning: {base_root}")
+        try:
+            base_resolved = base_root.resolve()
+        except Exception:
+            base_resolved = None
 
         if audio_only:
             file_iter = itertools.chain.from_iterable(base_root.rglob(pattern) for pattern in audio_patterns)
@@ -665,8 +696,17 @@ def self_read_and_train():
 
                 if result:
                     for frag in result:
-                        frag_id = f"frag_selfread_{abs(hash(frag['summary'])) % 10**12}"
+                        frag_id = frag.get("id") or f"frag_text_{uuid.uuid4().hex[:10]}"
                         frag["id"] = frag_id
+
+                        # Mark external book-library material so Ina knows it was not authored by her.
+                        if resolved_book_root and base_resolved == resolved_book_root:
+                            tags = frag.get("tags", [])
+                            for extra in ("book_library", "external_source"):
+                                if extra not in tags:
+                                    tags.append(extra)
+                            frag["tags"] = tags
+                            frag.setdefault("provenance", "guardian_book_collection")
 
                         frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag_id}.json"
                         frag_path.parent.mkdir(parents=True, exist_ok=True)

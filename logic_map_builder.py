@@ -17,6 +17,56 @@ def cosine_similarity(v1, v2):
     norm2 = math.sqrt(sum(b * b for b in v2))
     return dot / (norm1 * norm2 + 1e-8)
 
+def _flatten_numeric(value):
+    """
+    Collect numeric scalars from nested dicts/lists so old logic entries without
+    prediction vectors still produce a usable embedding.
+    """
+    if isinstance(value, bool):
+        return [1.0 if value else 0.0]
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, dict):
+        items = []
+        for v in value.values():
+            items.extend(_flatten_numeric(v))
+        return items
+    if isinstance(value, (list, tuple)):
+        items = []
+        for v in value:
+            items.extend(_flatten_numeric(v))
+        return items
+    return []
+
+def extract_logic_vector(entry):
+    """
+    Robustly derive a vector from whatever data the logic entry carries.
+    """
+    prediction = entry.get("prediction", {})
+    vector = []
+
+    if isinstance(prediction, dict) and prediction:
+        vector = [prediction.get(k, 0.0) for k in sorted(prediction.keys())]
+    elif isinstance(prediction, list):
+        vector = [float(v) for v in prediction if isinstance(v, (int, float))]
+
+    if not vector:
+        alt = entry.get("prediction_vector") or entry.get("predicted_vector")
+        if isinstance(alt, dict):
+            vector = [alt.get(k, 0.0) for k in sorted(alt.keys())]
+        elif isinstance(alt, list):
+            vector = [float(v) for v in alt if isinstance(v, (int, float))]
+
+    if not vector:
+        traces = entry.get("trace_tests", [])
+        flat = []
+        for test in traces:
+            for step in test.get("trace", []):
+                flat.extend(_flatten_numeric(step.get("result")))
+        vector = flat
+
+    return vector
+
 def load_logic_memory(child):
     path = Path("AI_Children") / child / "memory" / "logic_memory.json"
     if not path.exists():
@@ -30,8 +80,7 @@ def build_logic_neural_map(logic_entries):
     edges = []
 
     for i, entry in enumerate(logic_entries):
-        prediction = entry.get("prediction", {})
-        vector = [prediction.get(k, 0.0) for k in sorted(prediction.keys())]
+        vector = extract_logic_vector(entry)
         if not vector:
             continue
 

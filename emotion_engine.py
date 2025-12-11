@@ -379,6 +379,24 @@ def compute_emotion_snapshot(
 # Fragment tagging
 # ---------------------------------------------------------------------------
 
+def tag_fragment_emotions(
+    fragment: Dict[str, Any],
+    child: Optional[str] = None,
+    context_tags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper: compute a fresh snapshot and tag the fragment with it.
+
+    If ``child`` is not provided, it will use the current child from config.
+    Context tags default to the fragment's tags to bias drift.
+    """
+    config = load_config()
+    active_child = child or config.get("current_child", "default_child")
+    tags = context_tags or fragment.get("tags") or []
+    snapshot = compute_emotion_snapshot(active_child, context_tags=list(tags))
+    return tag_fragment(fragment, snapshot)
+
+
 def tag_fragment(fragment: Dict[str, Any], snapshot: EmotionSnapshot) -> Dict[str, Any]:
     """
     Attach the current emotional vector to a fragment.

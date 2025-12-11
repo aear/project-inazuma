@@ -8,17 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from model_manager import load_config
-
-def load_generated_symbols(child):
-    path = Path("AI_Children") / child / "identity" / "self_reflection.json"
-    if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-            return data.get("self_generated_symbols", [])
-        except:
-            return []
+from language_processing import load_generated_symbols
 
 def render_symbol_to_image(symbol_text, font_size=128, image_size=(256, 256)):
     image = Image.new("L", image_size, color=255)

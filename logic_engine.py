@@ -13,6 +13,26 @@ from model_manager import load_config, get_inastate, seed_self_question
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from logic_map_builder import run_logic_map_builder
 
+
+def _json_safe(value):
+    """
+    Make values safe for json serialization (e.g., complex numbers).
+    """
+    if isinstance(value, complex):
+        return {
+            "_type": "complex",
+            "real": value.real,
+            "imag": value.imag,
+            "magnitude": math.hypot(value.real, value.imag),
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
 # === Logic & Math Blocks ===
 def basic_math_ops(a, b):
     return {
@@ -126,7 +146,7 @@ def log_logic_event(child, logic_entry):
     else:
         history = []
 
-    history.append(logic_entry)
+    history.append(_json_safe(logic_entry))
     history = history[-250:]
 
     with open(path, "w") as f:
@@ -180,7 +200,12 @@ def logic_session():
     transformer = FractalTransformer()
     symbol_words = load_symbol_words(child)
 
-    predicted_emotion = prediction.get("inferred_emotion", {})
+    # Prefer a structured emotion vector; fall back to the raw prediction vector
+    predicted_emotion = prediction.get("emotion_snapshot", {}).get("values", {})
+    if not predicted_emotion:
+        pv = prediction.get("predicted_vector", {}).get("vector", [])
+        predicted_emotion = {f"dim_{i}": v for i, v in enumerate(pv)} if pv else {}
+    predicted_vector = prediction.get("predicted_vector", {}).get("vector", [])
     symbol_word_id, sim = test_prediction_against_logic(prediction, symbol_words, transformer)
 
     # Run some symbolic tests
@@ -188,6 +213,7 @@ def logic_session():
     logic_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "prediction": predicted_emotion,
+        "prediction_vector": predicted_vector,
         "symbol_word_id": symbol_word_id,
         "similarity": round(sim, 4),
         "trace_tests": samples,

@@ -15,6 +15,14 @@ if TYPE_CHECKING:  # pragma: no cover
 MEMORY_TIERS = ["short", "working", "long", "cold"]
 
 
+DEFAULT_TIER_POLICY = {
+    "short": {"max_age_hours": 18.0, "target_count": 5000},
+    "working": {"max_age_hours": 72.0, "target_count": 12000},
+    "long": {"max_age_hours": 24.0 * 30.0, "target_count": 40000},
+    "cold": {},
+}
+
+
 def _load_config():
     path = Path("config.json")
     if path.exists():
@@ -33,6 +41,43 @@ def _neural_settings():
     tag_weight = float(cfg.get("neural_tag_weight", 0.25))
     tag_weight = max(0.0, min(1.0, tag_weight))
     return cluster, synapse, tag_weight
+
+
+def _memory_policy():
+    """
+    Pull tier policy (age caps + target counts) from config.json when present.
+    Falls back to defaults tuned for keeping short-term lean.
+    """
+    cfg = _load_config()
+    user_policy = cfg.get("memory_policy", {}) if isinstance(cfg, dict) else {}
+    policy = {}
+
+    def _coerce_positive_int(value: Any) -> Optional[int]:
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    def _coerce_positive_float(value: Any) -> Optional[float]:
+        try:
+            fvalue = float(value)
+        except (TypeError, ValueError):
+            return None
+        return fvalue if fvalue > 0 else None
+
+    for tier in MEMORY_TIERS:
+        tier_defaults = DEFAULT_TIER_POLICY.get(tier, {}).copy()
+        overrides = user_policy.get(tier, {}) if isinstance(user_policy, dict) else {}
+        if isinstance(overrides, dict):
+            age_override = _coerce_positive_float(overrides.get("max_age_hours"))
+            if age_override is not None:
+                tier_defaults["max_age_hours"] = age_override
+            target_override = _coerce_positive_int(overrides.get("target_count"))
+            if target_override is not None:
+                tier_defaults["target_count"] = target_override
+        policy[tier] = tier_defaults
+    return policy
 
 
 # === Experience Graph Utilities ===
@@ -170,6 +215,7 @@ def _slim_fragment(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "tags",
         "emotions",
         "summary",
+        "tier",
         "modality",
         "audio_features",
         "image_features",
@@ -184,18 +230,34 @@ def _slim_fragment(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def load_fragments(child):
     base = Path("AI_Children") / child / "memory" / "fragments"
-    files = list(base.glob("frag_*.json"))
-    def load(f):
+    search_paths = list(base.glob("frag_*.json"))
+    for tier in MEMORY_TIERS:
+        tier_path = base / tier
+        if tier_path.exists():
+            search_paths.extend(list(tier_path.glob("frag_*.json")))
+
+    seen: Set[str] = set()
+
+    def load(f: Path):
         try:
             with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)
+                if "tier" not in data:
+                    parent_tier = f.parent.name
+                    if parent_tier in MEMORY_TIERS:
+                        data["tier"] = parent_tier
                 slim = _slim_fragment(data)
                 if slim and "emotions" in data:
-                    return slim
-        except:
+                    frag_id = slim.get("id")
+                    if frag_id and frag_id not in seen:
+                        seen.add(frag_id)
+                        return slim
+        except Exception:
             return None
+        return None
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return [f for f in pool.map(load, files) if f]
+        return [frag for frag in pool.map(load, search_paths) if frag]
 
 def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
     clusters = []
@@ -319,11 +381,12 @@ def build_fractal_memory(child):
 
 # === MemoryManager Class ===
 class MemoryManager:
-    def __init__(self, child="Inazuma_Yagami"):
+    def __init__(self, child="Inazuma_Yagami", tier_policy: Optional[Dict[str, Any]] = None):
         self.child = child
         self.base_path = Path("AI_Children") / child / "memory" / "fragments"
         self.index_path = Path("AI_Children") / child / "memory" / "memory_map.json"
         self.memory_map = {}
+        self.policy = tier_policy or _memory_policy()
         self.load_map()
 
     def ensure_tier_directories(self):
@@ -368,6 +431,68 @@ class MemoryManager:
         with open(self.index_path, "w") as f:
             json.dump(self.memory_map, f, indent=2)
 
+    def _resolve_fragment_path(self, frag_id: str, meta: Dict[str, Any]) -> Optional[Path]:
+        """
+        Resolve the on-disk path for a fragment given its metadata entry.
+        """
+        filename = meta.get("filename", f"frag_{frag_id}.json")
+        tier = meta.get("tier")
+        candidates = []
+        if tier:
+            candidates.append(self.base_path / tier / filename)
+        candidates.append(self.base_path / filename)
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    @staticmethod
+    def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            ts = datetime.fromisoformat(value)
+        except Exception:
+            try:
+                ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+
+    def _tier_for_age(self, timestamp: Optional[datetime], now: datetime) -> str:
+        """
+        Decide target tier based on age cutoffs. Defaults to 'short' when unknown.
+        """
+        policy = self.policy or DEFAULT_TIER_POLICY
+        age_hours: Optional[float] = None
+        if timestamp:
+            age_hours = (now - timestamp).total_seconds() / 3600.0
+
+        short_cap = policy.get("short", {}).get("max_age_hours")
+        working_cap = policy.get("working", {}).get("max_age_hours")
+        long_cap = policy.get("long", {}).get("max_age_hours")
+
+        if age_hours is None or short_cap is None:
+            return "short"
+        if age_hours <= short_cap:
+            return "short"
+        if working_cap is not None and age_hours <= working_cap:
+            return "working"
+        if long_cap is not None and age_hours <= long_cap:
+            return "long"
+        return "cold"
+
+    @staticmethod
+    def _timestamp_sort_key(ts: Optional[datetime]) -> datetime:
+        """
+        Provide a stable sort key, pushing unknown timestamps to the oldest end.
+        """
+        if ts is None:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+        return ts
+
     def index_tier(self, tier="short"):
         tier_path = self.base_path / tier
         if not tier_path.exists():
@@ -390,16 +515,23 @@ class MemoryManager:
             except:
                 continue
 
-    def reindex_all(self):
+    def reindex_all(self, rebalance: bool = True):
+        """
+        Full reindex of all fragments. Optionally rebalance tiers afterward.
+        """
+        self.ensure_tier_directories()
         self.index_legacy_root()
         for tier in MEMORY_TIERS:
             self.index_tier(tier)
         self.save_map()
         log_to_statusbox(f"[Memory] Reindexed all fragments across {len(MEMORY_TIERS)} tiers.")
         log_to_statusbox(f"[Memory] Fragment count: {len(self.memory_map)}")
+        if rebalance:
+            self.rebalance_tiers()
 
     def reindex(self, new_only=True):
         added = 0
+        self.ensure_tier_directories()
         self.index_legacy_root()
         for tier in MEMORY_TIERS:
             tier_path = self.base_path / tier
@@ -483,6 +615,96 @@ class MemoryManager:
                 f"[Memory] Pruned {len(removed)} missing fragment entries from index."
             )
         return len(removed)
+
+    def rebalance_tiers(self, now: Optional[datetime] = None):
+        """
+        Move fragments out of short-term when they age out or exceed target counts.
+        """
+        if not self.memory_map:
+            return {"moved": 0, "missing": 0, "transitions": {}, "counts": {}}
+
+        self.ensure_tier_directories()
+        now = now or datetime.now(timezone.utc)
+        buckets = {tier: [] for tier in MEMORY_TIERS}
+        transitions: Dict[str, int] = {}
+        missing = 0
+
+        for frag_id, meta in self.memory_map.items():
+            ts = self._parse_timestamp(meta.get("last_seen")) or self._parse_timestamp(meta.get("timestamp"))
+            target_tier = self._tier_for_age(ts, now)
+            buckets[target_tier].append(
+                {
+                    "id": frag_id,
+                    "current_tier": meta.get("tier") or "short",
+                    "timestamp": ts,
+                    "path": self._resolve_fragment_path(frag_id, meta),
+                    "last_seen": meta.get("last_seen"),
+                }
+            )
+
+        # Apply target count caps so short/working stay lean.
+        for tier, next_tier in [("short", "working"), ("working", "long"), ("long", "cold")]:
+            try:
+                cap = int(self.policy.get(tier, {}).get("target_count", 0))
+            except (TypeError, ValueError):
+                cap = 0
+            if cap <= 0:
+                continue
+            bucket = buckets[tier]
+            bucket.sort(key=lambda r: self._timestamp_sort_key(r["timestamp"]))
+            if len(bucket) > cap:
+                overflow = bucket[:-cap]
+                buckets[tier] = bucket[-cap:]
+                buckets[next_tier].extend(overflow)
+
+        moved = 0
+        for target_tier, records in buckets.items():
+            for record in records:
+                frag_id = record["id"]
+                current_tier = record["current_tier"]
+                path = record["path"]
+                if path is None or not path.exists():
+                    missing += 1
+                    continue
+
+                dest_dir = self.base_path / target_tier
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = dest_dir / path.name
+
+                if current_tier == target_tier and path.parent == dest_dir:
+                    continue
+
+                try:
+                    path.rename(dest_path)
+                except Exception:
+                    missing += 1
+                    continue
+
+                moved += 1
+                transition_key = f"{current_tier}->{target_tier}"
+                transitions[transition_key] = transitions.get(transition_key, 0) + 1
+
+                meta = self.memory_map.get(frag_id, {})
+                meta["tier"] = target_tier
+                meta["filename"] = dest_path.name
+                if record["last_seen"]:
+                    meta["last_seen"] = record["last_seen"]
+                self.memory_map[frag_id] = meta
+
+        if moved or missing:
+            self.save_map()
+
+        transition_summary = ", ".join(f"{k}:{v}" for k, v in sorted(transitions.items()))
+        if not transition_summary:
+            transition_summary = "none"
+        log_to_statusbox(
+            f"[Memory] Rebalanced tiers: moved {moved} fragment(s); transitions {transition_summary}."
+        )
+        if missing:
+            log_to_statusbox(f"[Memory] Rebalance skipped {missing} missing fragment files.")
+
+        counts = self.stats()
+        return {"moved": moved, "missing": missing, "transitions": transitions, "counts": counts}
 
     def promote(self, frag_id, to_tier, *, touch=True):
         if frag_id not in self.memory_map:

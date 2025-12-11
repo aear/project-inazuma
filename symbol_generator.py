@@ -18,6 +18,8 @@ CONCEPT_GLYPHS = {
 
 # Extra marks used to vary length/texture of generated symbols
 ACCENT_GLYPHS = ["·", ":", "~", "ː", "⁂", "↺", "↯"]
+# Allow occasional ASCII letters/digits so Ina can lean on them if she wants.
+ALPHANUMERIC_GLYPHS = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
 # Procedural map
 def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None):
@@ -43,7 +45,11 @@ def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None):
 
     # Add accent glyphs or repeat base glyphs until we reach the target length
     while len(symbol_parts) < target_len:
-        symbol_parts.append(random.choice(ACCENT_GLYPHS + base_parts))
+        extra_pool = ACCENT_GLYPHS + base_parts
+        # Small chance to mix in letters/numbers; not forced, just available.
+        if random.random() < 0.35:
+            extra_pool = extra_pool + ALPHANUMERIC_GLYPHS
+        symbol_parts.append(random.choice(extra_pool))
 
     return "".join(symbol_parts)
 

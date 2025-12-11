@@ -282,6 +282,138 @@ class ExperienceLogger:
         return {"episode_id": episode_id, "narrative": narration}
 
     # ------------------------------------------------------------------
+    # Cross-modal binding
+    # ------------------------------------------------------------------
+    def _pull_inastate(self, key: str) -> Any:
+        """
+        Best-effort accessor for inastate values without creating a hard dependency.
+        """
+        try:
+            from model_manager import get_inastate  # type: ignore
+        except Exception:
+            return None
+        try:
+            return get_inastate(key)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _emotion_values(emotion: Any) -> Dict[str, float]:
+        if isinstance(emotion, dict):
+            if isinstance(emotion.get("values"), dict):
+                return emotion.get("values", {})
+            return emotion
+        return {}
+
+    def bind_multimodal_event(
+        self,
+        *,
+        cause_hint: str,
+        audio: Optional[Dict[str, Any]] = None,
+        vision: Optional[Dict[str, Any]] = None,
+        symbols: Optional[Iterable[Dict[str, Any]]] = None,
+        prediction: Optional[Dict[str, Any]] = None,
+        emotion: Optional[Dict[str, Any]] = None,
+        extra_tags: Optional[Iterable[str]] = None,
+        narrative: Optional[str] = None,
+        fragments: Optional[Iterable[str]] = None,
+        start_episode_if_missing: bool = True,
+        write_fragment: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """
+        Bind audio + vision (+emotion/symbol/prediction) into one event-object.
+        Returns a mapping with event_id and optional fragment_id.
+        """
+        if start_episode_if_missing and not self._active_episode:
+            self.start_episode(
+                situation_tags=["multimodal", "bound_event"],
+                intent="Cross-modal binding stream",
+            )
+
+        emotion = emotion or self._pull_inastate("emotion_snapshot") or {}
+        symbols = list(symbols) if symbols is not None else (self._pull_inastate("emotion_symbol_matches") or [])
+        prediction = prediction or self._pull_inastate("current_prediction") or {}
+
+        bound_modalities: List[str] = []
+        entities: List[Dict[str, Any]] = []
+
+        def _add_entity(kind: str, payload: Optional[Dict[str, Any]]) -> None:
+            if not payload:
+                return
+            entry = {"type": kind}
+            entry.update(payload)
+            entities.append(entry)
+            bound_modalities.append(kind)
+
+        _add_entity("audio", audio)
+        _add_entity("vision", vision)
+
+        if symbols:
+            entities.append({"type": "symbol_match", "candidates": symbols})
+            bound_modalities.append("symbol")
+        if prediction:
+            entities.append({"type": "prediction", **prediction})
+            bound_modalities.append("prediction")
+
+        emo_values = self._emotion_values(emotion)
+        internal_state = {
+            "emotion_snapshot": emotion,
+            "emotion_values": emo_values,
+            "symbol_matches": symbols,
+            "prediction": prediction,
+            "bound_modalities": bound_modalities,
+            "cause_hint": cause_hint,
+        }
+
+        tags = {"multimodal", "bound_event", "cross_modal", f"cause:{cause_hint}"}
+        if extra_tags:
+            tags.update(extra_tags)
+
+        narrative_text = narrative or f"Bound {', '.join(bound_modalities) or 'signals'} around '{cause_hint}'."
+        event_id = self.log_event(
+            situation_tags=sorted(tags),
+            perceived_entities=entities,
+            internal_state=internal_state,
+            narrative=narrative_text,
+        )
+
+        fragment_id: Optional[str] = None
+        if write_fragment:
+            try:
+                from fragmentation_engine import make_fragment, store_fragment  # type: ignore
+
+                payload = {
+                    "event_id": event_id,
+                    "bound_modalities": bound_modalities,
+                    "cause_hint": cause_hint,
+                    "constituent_fragments": list(fragments or []),
+                    "entities": entities,
+                }
+                frag = make_fragment(
+                    frag_type="experience",
+                    source="cross_modal_binder",
+                    summary=narrative_text,
+                    tags=sorted(tags),
+                    emotions=emo_values,
+                    symbols=[s.get("symbol_word_id") for s in symbols if isinstance(s, dict) and s.get("symbol_word_id")],
+                    payload=payload,
+                    context={
+                        "prediction": prediction,
+                        "symbol_matches": symbols,
+                        "emotion_snapshot": emotion,
+                    },
+                )
+                stored_path = store_fragment(frag, reason="cross_modal_binding")
+                fragment_id = frag.get("id")
+                if stored_path:
+                    internal_state["fragment_path"] = str(stored_path)
+            except Exception:
+                # Non-critical: binding still logged as an event.
+                fragment_id = None
+
+        return {"event_id": event_id, "fragment_id": fragment_id}
+
+    # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
     def _event_path(self, event_id: str) -> Path:

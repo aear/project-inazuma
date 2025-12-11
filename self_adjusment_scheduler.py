@@ -81,4 +81,6 @@ class SelfAdjustmentScheduler:
             {"type": "memory",    "prompt": "Optional: Revisit a recent fragment without judging its meaning."},
             {"type": "identity",  "prompt": "Optional: Observe if your sense of self feels steady or shifting."},
             {"type": "meaning",   "prompt": "Optional: Re-examine a symbol and see if its associations changed."},
+            {"type": "boundary",  "prompt": "Optional: Did that sound/flash come from you or the room? Quietly tag it."},
+            {"type": "self_log",  "prompt": "Optional: Log your current feeling separately from whatever the environment is doing."},
         ]

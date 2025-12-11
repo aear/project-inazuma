@@ -3,14 +3,16 @@
 # Symbol-aware communication, language adaptation, and device reasoning based on config.json
 
 import json
+import math
 import time
 import subprocess
 import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
+from embedding_stack import MultimodalEmbedder, guess_language_code
 from gui_hook import log_to_statusbox
 from language_processing import (
     associate_symbol_with_word,
@@ -25,12 +27,198 @@ from transformers.fractal_multidimensional_transformers import FractalTransforme
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
+EMBEDDER = MultimodalEmbedder(dim=128)
 
 
 def _normalize_symbol_map(raw):
     if isinstance(raw, dict) and "symbols" in raw:
         return raw.get("symbols", {})
     return raw if isinstance(raw, dict) else {}
+
+
+def _proto_confidence(uses: int, base: float = 0.2) -> float:
+    uses = max(1, int(uses))
+    return round(min(0.9, base + math.log1p(uses) / 5.0), 3)
+
+
+def _ensure_vocab_embeddings(vocab_map: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
+    """
+    Attach text embeddings and language hints to vocab entries if missing.
+    Returns True if any entry was modified.
+    """
+    updated = False
+    for entry in vocab_map.values():
+        if not isinstance(entry, dict):
+            continue
+        word = (entry.get("word") or "").strip()
+        if not word:
+            continue
+        emb = entry.get("embedding")
+        if isinstance(emb, list) and emb:
+            continue
+        lang = entry.get("language") or language_hint or guess_language_code(word)
+        entry["language"] = lang
+        entry["embedding"] = EMBEDDER.embed_text(word, language=lang)
+        updated = True
+    return updated
+
+
+def _discord_voice_preference(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Return a compact preference block when Discord voice should be used for sound play.
+    """
+    discord_cfg = config.get("discord") if isinstance(config, dict) else None
+    if not isinstance(discord_cfg, dict):
+        return None
+    if not discord_cfg.get("enabled"):
+        return None
+    if not discord_cfg.get("prefer_voice_for_sounds"):
+        return None
+
+    channel_name = discord_cfg.get("voice_channel_name")
+    channel_id = discord_cfg.get("voice_channel_id")
+    if not channel_name and not channel_id:
+        return None
+
+    return {
+        "backend": "discord",
+        "channel_name": channel_name,
+        "channel_id": channel_id,
+        "label": discord_cfg.get("voice_label", "discord_voice"),
+    }
+
+
+def load_symbol_word_state(child: str):
+    """
+    Load full symbol_word state, including proto and multi-symbol pairs.
+    """
+    path = Path("AI_Children") / child / "memory" / "symbol_words.json"
+    default = {"words": [], "proto_words": {}, "multi_symbol_words": {}}
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return default
+
+    if not isinstance(data, dict):
+        return default
+
+    data.setdefault("words", [])
+    data.setdefault("proto_words", {})
+    data.setdefault("multi_symbol_words", {})
+    return data
+
+
+def select_proto_pair_word(tone_candidates, proto_words, multi_symbol_words):
+    """
+    Pick a multi-symbol word candidate using top tone symbols to encourage paired words.
+    """
+    symbols = [sid for sid, sim in tone_candidates if sid]
+    best = None
+    for i in range(len(symbols) - 1):
+        pair = (symbols[i], symbols[i + 1])
+        key_core = "_".join(pair)
+        pair_key = f"pair:{key_core}"
+
+        entry = multi_symbol_words.get(pair_key) if isinstance(multi_symbol_words, dict) else None
+        source = "multi_symbol_words"
+        if not isinstance(entry, dict):
+            entry = proto_words.get(key_core) if isinstance(proto_words, dict) else None
+            source = "proto_words"
+
+        if isinstance(entry, dict):
+            uses = int(entry.get("uses", 0))
+            confidence = float(entry.get("confidence", _proto_confidence(uses, base=0.18)))
+            if confidence < 0.1:
+                continue
+            flexible = bool(entry.get("flexible", uses < 5))
+            candidate = {
+                "key": pair_key,
+                "sequence": list(pair),
+                "confidence": confidence,
+                "flexible": flexible,
+                "source": source,
+            }
+            if not best or candidate["confidence"] > best["confidence"]:
+                best = candidate
+
+    if best:
+        return best
+
+    if len(symbols) >= 2:
+        pair = symbols[:2]
+        return {
+            "key": f"pair:{'_'.join(pair)}",
+            "sequence": pair,
+            "confidence": 0.12,
+            "flexible": True,
+            "source": "new_pair",
+        }
+    return None
+
+
+def record_proto_pair_usage(child: str, pair_info: Dict[str, object]):
+    if not pair_info:
+        return
+
+    path = Path("AI_Children") / child / "memory" / "symbol_words.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+
+    if not isinstance(data, dict):
+        data = {}
+
+    proto_store = data.setdefault("proto_words", {})
+    multi_store = data.setdefault("multi_symbol_words", {})
+    now = datetime.now(timezone.utc).isoformat()
+
+    seq = pair_info.get("sequence") or []
+    if not isinstance(seq, list) or len(seq) < 2:
+        return
+    proto_key = "_".join(seq)
+    pair_key = f"pair:{proto_key}"
+
+    proto_entry = proto_store.get(proto_key, {"sequence": list(seq), "created": now})
+    proto_uses = int(proto_entry.get("uses", 0)) + 1
+    proto_entry.update(
+        {
+            "sequence": list(seq),
+            "uses": proto_uses,
+            "last_seen": now,
+            "confidence": _proto_confidence(proto_uses, base=0.18),
+            "flexible": proto_uses < 5,
+            "stability": round(min(1.0, proto_uses / 10.0), 3),
+            "length": len(seq),
+        }
+    )
+    proto_store[proto_key] = proto_entry
+
+    multi_entry = multi_store.get(pair_key, {"sequence": list(seq), "created": now, "source": "expression_pair"})
+    multi_uses = int(multi_entry.get("uses", 0)) + 1
+    multi_entry.update(
+        {
+            "sequence": list(seq),
+            "uses": multi_uses,
+            "last_seen": now,
+            "confidence": _proto_confidence(multi_uses, base=0.24),
+            "flexible": multi_uses < 4,
+            "stability": round(min(1.0, multi_uses / 8.0), 3),
+            "source": multi_entry.get("source", "expression_pair"),
+        }
+    )
+    multi_store[pair_key] = multi_entry
+    data["updated_at"] = now
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        log_to_statusbox(f"[Comms] Paired word '{pair_key}' updated (uses={multi_uses}, flexible={multi_entry['flexible']}).")
+    except Exception as e:
+        log_to_statusbox(f"[Comms] Failed to record proto pair usage: {e}")
 
 
 def load_recent_heard_words(child: str, limit: int = 12) -> List[Dict[str, str]]:
@@ -62,12 +250,14 @@ def load_recent_heard_words(child: str, limit: int = 12) -> List[Dict[str, str]]
             for word in usage.get("words", []):
                 if not word:
                     continue
+                lang = guess_language_code(str(word))
                 heard.append(
                     {
                         "word": str(word).lower(),
                         "utterance": usage.get("utterance", ""),
                         "speaker": usage.get("speaker"),
                         "timestamp": ts,
+                        "language": lang,
                     }
                 )
                 if len(heard) >= limit:
@@ -101,18 +291,33 @@ def _word_symbol_index(child: str):
             continue
         word_l = word.lower()
         index.setdefault(word_l, []).append(sid)
-        ranked.append((word_l, sid, entry.get("uses", 0), entry.get("confidence", 0.0)))
+        ranked.append(
+            (
+                word_l,
+                sid,
+                entry.get("uses", 0),
+                entry.get("confidence", 0.0),
+                entry.get("language"),
+            )
+        )
 
     ranked.sort(key=lambda item: (-item[2], -item[3], item[0]))
     return index, ranked
 
 
-def choose_babble_targets(child: str, *, limit: int = 4):
+def choose_babble_targets(
+    child: str,
+    *,
+    limit: int = 4,
+    language_hint: Optional[str] = None,
+    heard: Optional[List[Dict[str, str]]] = None,
+):
     """
     Prefer grounded, recently-heard words that already have symbol associations.
     Falls back to confident known words if nothing recent is available.
     """
-    heard = load_recent_heard_words(child, limit=limit * 3)
+    heard = heard if heard is not None else load_recent_heard_words(child, limit=limit * 3)
+    lang_target = language_hint if language_hint not in {None, "und", ""} else None
     grounded = _load_grounded_words(child)
     word_to_symbols, ranked_vocab = _word_symbol_index(child)
 
@@ -124,6 +329,9 @@ def choose_babble_targets(child: str, *, limit: int = 4):
         if len(chosen_words) >= limit:
             break
         word = item["word"]
+        lang = item.get("language") or guess_language_code(word)
+        if lang_target and lang and lang != lang_target:
+            continue
         if word in seen:
             continue
         if grounded and word not in grounded:
@@ -136,9 +344,11 @@ def choose_babble_targets(child: str, *, limit: int = 4):
         seen.add(word)
 
     if not chosen_words:
-        for word, symbol_id, uses, conf in ranked_vocab:
+        for word, symbol_id, uses, conf, lang in ranked_vocab:
             if len(chosen_words) >= limit:
                 break
+            if lang_target and lang and lang != lang_target:
+                continue
             if word in seen:
                 continue
             if grounded and word not in grounded:
@@ -151,6 +361,7 @@ def choose_babble_targets(child: str, *, limit: int = 4):
         "words": chosen_words,
         "symbols": chosen_symbols,
         "heard_trace": heard[:limit],
+        "language_hint": lang_target or language_hint,
     }
 
 
@@ -238,27 +449,35 @@ def rank_sound_symbols(pred_vec, symbol_map, transformer, top_n=3):
     return scored[:top_n]
 
 
-def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map):
+def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map, *, language_hint=None):
     """
     Create a new combo sound symbol from the top tone candidates and map it to a word.
     """
     components = [sid for sid, sim in tone_candidates if sim > 0][:3]
     if len(components) < 2:
-        return None, None
+        return None, None, None
 
     now = datetime.now(timezone.utc).isoformat()
     combined_emotions: Dict[str, float] = {}
     counts: Dict[str, int] = {}
 
+    component_langs: List[str] = []
     for sid in components:
         meta = symbol_map.get(sid, {})
         emo = meta.get("emotions", {}) if isinstance(meta, dict) else {}
         for k, v in emo.items():
             combined_emotions[k] = combined_emotions.get(k, 0.0) + float(v)
             counts[k] = counts.get(k, 0) + 1
+        entry = vocab_map.get(sid, {}) if isinstance(vocab_map, dict) else {}
+        lang = entry.get("language")
+        if lang:
+            component_langs.append(str(lang))
 
     for k, c in counts.items():
         combined_emotions[k] = combined_emotions[k] / max(1, c)
+
+    lang_choice = component_langs[0] if component_langs else (language_hint or "und")
+    symbol_embedding = EMBEDDER.embed_symbol_sequence(components, language=lang_choice)
 
     new_id = f"combo_snd_{uuid.uuid4().hex[:8]}"
     summary = f"Combined tone of {' + '.join(components)}"
@@ -286,6 +505,8 @@ def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map):
         "created": now,
         "uses": 0,
         "last_seen": now,
+        "language": lang_choice,
+        "symbol_embedding": symbol_embedding,
     }
 
     try:
@@ -314,6 +535,9 @@ def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map):
             "created": now,
             "components": components,
             "provisional": True,
+            "language": lang_choice,
+            "embedding": EMBEDDER.embed_text(new_word, language=lang_choice),
+            "symbol_embedding": symbol_embedding,
         }
         try:
             save_symbol_to_token(child, vocab_map)
@@ -321,7 +545,7 @@ def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map):
         except Exception as e:
             log_to_statusbox(f"[Comms] Failed to map combo symbol: {e}")
 
-    return new_id, new_word
+    return new_id, new_word, lang_choice
 
 
 def _load_fragments(child):
@@ -417,6 +641,15 @@ def detect_repeated_tone_patterns(child, vocab_map, *, min_count=2, min_coherenc
                 seen[k] = seen.get(k, 0) + 1
         mean_emo = {k: agg[k] / max(1, seen.get(k, 1)) for k in agg}
 
+        component_langs = []
+        for sid in pattern:
+            entry = vocab_map.get(sid, {}) if isinstance(vocab_map, dict) else {}
+            lang = entry.get("language")
+            if lang:
+                component_langs.append(str(lang))
+        lang_choice = component_langs[0] if component_langs else "und"
+        symbol_embedding = EMBEDDER.embed_symbol_sequence(list(pattern), language=lang_choice)
+
         new_id = f"pattern_snd_{uuid.uuid4().hex[:8]}"
         summary = f"Repeated tone pattern {' + '.join(pattern)}"
         symbol_store[new_id] = {
@@ -429,6 +662,8 @@ def detect_repeated_tone_patterns(child, vocab_map, *, min_count=2, min_coherenc
             "last_seen": now,
             "coherence": coherence,
             "observations": count,
+            "language": lang_choice,
+            "symbol_embedding": symbol_embedding,
         }
 
         # Word mapping
@@ -448,6 +683,9 @@ def detect_repeated_tone_patterns(child, vocab_map, *, min_count=2, min_coherenc
                 "created": now,
                 "components": list(pattern),
                 "provisional": True,
+                "language": lang_choice,
+                "embedding": EMBEDDER.embed_text(new_word, language=lang_choice),
+                "symbol_embedding": symbol_embedding,
             }
 
         created.append((new_id, new_word, coherence, count))
@@ -574,6 +812,81 @@ def update_tone_library(child: str, tones: List[str], emotions: Dict[str, float]
     lib["updated"] = now
     save_tone_library(child, lib)
 
+
+def _tone_alignment_score(current_emotions: Dict[str, float], tone_entry: Dict[str, object]) -> float:
+    emotions = tone_entry.get("emotions", {}) if isinstance(tone_entry, dict) else {}
+    if not isinstance(emotions, dict) or not emotions or not current_emotions:
+        return 0.0
+    return emotion_cosine(current_emotions, emotions)
+
+
+def select_tone_riff(tone_library: Dict[str, Dict], current_emotions: Dict[str, float], *, min_uses: float = 0.5):
+    """
+    Surface an n-gram riff from the tone library so Ina can replay short tone phrases.
+    """
+    ngrams = tone_library.get("ngrams", {}) if isinstance(tone_library, dict) else {}
+    candidates = []
+
+    if isinstance(ngrams, dict):
+        for key, entry in ngrams.items():
+            seq = entry.get("sequence") if isinstance(entry, dict) else None
+            if not seq and isinstance(key, str):
+                seq = key.split("_")
+            if not isinstance(seq, list) or len(seq) < 2:
+                continue
+            uses = float(entry.get("uses", 0.0)) if isinstance(entry, dict) else 0.0
+            if uses < min_uses:
+                continue
+            alignment = _tone_alignment_score(current_emotions, entry if isinstance(entry, dict) else {})
+            candidates.append(
+                {
+                    "sequence": seq,
+                    "uses": uses,
+                    "alignment": alignment,
+                    "last_used": entry.get("last_used") if isinstance(entry, dict) else None,
+                    "tags": entry.get("last_tags") if isinstance(entry, dict) else [],
+                    "kind": "riff",
+                    "key": key,
+                }
+            )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item["uses"], item["alignment"], item.get("last_used") or ""), reverse=True)
+    return candidates[0]
+
+
+def select_rare_tone(tone_library: Dict[str, Dict], current_emotions: Dict[str, float]):
+    """
+    Pick an underused tone so Ina can stretch beyond her preferred sounds.
+    """
+    tones = tone_library.get("tones", {}) if isinstance(tone_library, dict) else {}
+    candidates = []
+
+    if isinstance(tones, dict):
+        for sid, entry in tones.items():
+            if not isinstance(entry, dict):
+                continue
+            uses = float(entry.get("uses", 0.0))
+            alignment = _tone_alignment_score(current_emotions, entry)
+            candidates.append(
+                {
+                    "symbol_id": sid,
+                    "uses": uses,
+                    "alignment": alignment,
+                    "last_used": entry.get("last_used"),
+                    "tags": entry.get("last_tags", []),
+                    "kind": "rare_tone",
+                }
+            )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item["uses"], -item["alignment"], item.get("last_used") or ""))
+    return candidates[0]
+
 def predict_target_from_emotion(emotion):
     trust = emotion.get("trust", 0.0)
     novelty = emotion.get("novelty", 0.0)
@@ -636,6 +949,13 @@ def create_expression_fragment(
     vocab_word_conf=None,
     vocab_word_source=None,
     tone_candidates=None,
+    proto_word=None,
+    tone_explorations=None,
+    speech_suppressed=None,
+    voice_target=None,
+    language_hint=None,
+    embedding=None,
+    symbol_embedding=None,
 ):
     frag_id = f"frag_expression_{int(time.time())}"
     frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag_id}.json"
@@ -667,6 +987,20 @@ def create_expression_fragment(
         frag["attempted_symbols"] = symbols_spoken
     if word_creation_prompt:
         frag["word_creation_prompt"] = word_creation_prompt
+    if proto_word:
+        frag["proto_word"] = proto_word
+    if tone_explorations:
+        frag["tone_explorations"] = tone_explorations
+    if speech_suppressed:
+        frag["speech_suppressed"] = speech_suppressed
+    if voice_target:
+        frag["voice_target"] = voice_target
+    if language_hint:
+        frag["language_hint"] = language_hint
+    if embedding:
+        frag["embedding"] = embedding
+    if symbol_embedding:
+        frag["symbol_embedding"] = symbol_embedding
 
     with open(frag_path, "w", encoding="utf-8") as f:
         json.dump(frag, f, indent=4)
@@ -761,6 +1095,29 @@ def identify_devices_from_config():
 def early_communicate():
     config = load_config()
     child = config.get("current_child", "default_child")
+    voice_pref = _discord_voice_preference(config)
+    voice_delivery = "discord_voice" if voice_pref else "local_audio"
+    prev_voice_pref = get_inastate("preferred_voice_output") or {}
+    if voice_pref:
+        slim_prev = {k: prev_voice_pref.get(k) for k in ("backend", "channel_name", "channel_id", "label")}
+        slim_new = {k: voice_pref.get(k) for k in ("backend", "channel_name", "channel_id", "label")}
+        if slim_prev != slim_new:
+            update_inastate(
+                "preferred_voice_output",
+                {**voice_pref, "updated": datetime.now(timezone.utc).isoformat()},
+            )
+            label = voice_pref.get("channel_name") or voice_pref.get("channel_id") or voice_pref.get("label")
+            log_to_statusbox(f"[Comms] Preferring Discord voice channel '{label}' for sound experiments.")
+    elif prev_voice_pref:
+        update_inastate("preferred_voice_output", None)
+
+    min_urge_to_speak = float(config.get("min_urge_to_speak", 0.25))
+    urge_state = get_inastate("urge_to_communicate") or {}
+    try:
+        urge_level = float(urge_state.get("level", 0.0))
+    except Exception:
+        urge_level = 0.0
+    allow_speech = urge_level >= min_urge_to_speak or bool(config.get("ignore_urge_for_speech", False))
     transformer = FractalTransformer()
     prediction = load_prediction(child)
     if not prediction:
@@ -768,10 +1125,16 @@ def early_communicate():
         return
 
     pred_vec = prediction.get("predicted_vector", {}).get("vector", [])
-    inferred = prediction.get("inferred_emotion", {})
+    inferred = (
+        prediction.get("inferred_emotion")
+        or prediction.get("emotion_snapshot", {}).get("values", {})
+        or {}
+    )
     clarity = round(sum(pred_vec) / max(1, len(pred_vec)), 4) if pred_vec else 0.0
     speaking_to = predict_target_from_emotion(inferred)
-    babble_targets = choose_babble_targets(child)
+    recent_heard = load_recent_heard_words(child, limit=12)
+    context_language = guess_language_code(" ".join(item.get("word", "") for item in recent_heard))
+    babble_targets = choose_babble_targets(child, language_hint=context_language, heard=recent_heard)
     spoken_words: List[str] = []
     speech_symbols: List[str] = []
     expression_strategy = "emotion_prediction"
@@ -779,8 +1142,72 @@ def early_communicate():
 
     symbol_map = load_sound_symbol_map(child)
     vocab_map = load_symbol_to_token(child)
+    if _ensure_vocab_embeddings(vocab_map, language_hint=context_language):
+        save_symbol_to_token(child, vocab_map)
+
     tone_candidates = rank_sound_symbols(pred_vec, symbol_map, transformer, top_n=3)
     symbol_id, best_sim = (tone_candidates[0] if tone_candidates else (None, 0.0))
+    tone_library = load_tone_library(child)
+    tone_riff_option = select_tone_riff(tone_library, inferred or {})
+    rare_tone_option = select_rare_tone(tone_library, inferred or {})
+    alt_candidate = tone_candidates[1] if len(tone_candidates) > 1 else None
+    sound_explorations: List[Dict[str, object]] = []
+
+    if tone_riff_option:
+        sound_explorations.append(
+            {
+                "strategy": "tone_riff",
+                "symbols": tone_riff_option.get("sequence", []),
+                "uses": tone_riff_option.get("uses", 0.0),
+                "alignment": tone_riff_option.get("alignment", 0.0),
+                "last_used": tone_riff_option.get("last_used"),
+                "tags": tone_riff_option.get("tags", []),
+                "selected": False,
+                "delivery": voice_delivery,
+            }
+        )
+    if rare_tone_option:
+        sound_explorations.append(
+            {
+                "strategy": "rare_tone",
+                "symbols": [rare_tone_option.get("symbol_id")],
+                "uses": rare_tone_option.get("uses", 0.0),
+                "alignment": rare_tone_option.get("alignment", 0.0),
+                "last_used": rare_tone_option.get("last_used"),
+                "tags": rare_tone_option.get("tags", []),
+                "selected": False,
+                "delivery": voice_delivery,
+            }
+        )
+    if alt_candidate:
+        sound_explorations.append(
+            {
+                "strategy": "adjacent_tone",
+                "symbols": [alt_candidate[0]],
+                "similarity": alt_candidate[1],
+                "selected": False,
+                "delivery": voice_delivery,
+            }
+        )
+
+    if sound_explorations:
+        summary = "; ".join(
+            f"{opt['strategy']}->{','.join(str(s) for s in (opt.get('symbols') or []))}"
+            for opt in sound_explorations
+        )
+        delivery_note = f" (target: {voice_delivery})" if voice_pref else ""
+        log_to_statusbox(f"[Comms] Sound explorations queued{delivery_note}: {summary}")
+
+    def label_for_symbol(sid: str) -> str:
+        entry = vocab_map.get(sid, {}) if isinstance(vocab_map, dict) else {}
+        return str(entry.get("word") or sid)
+
+    word_state = load_symbol_word_state(child)
+    proto_words = word_state.get("proto_words", {})
+    multi_symbol_words = word_state.get("multi_symbol_words", {})
+    pair_choice = select_proto_pair_word(tone_candidates, proto_words, multi_symbol_words) if tone_candidates else None
+    proto_word_used = None
+    tone_exploration_used = None
     log_to_statusbox(
         "[Comms] Tone candidates: "
         + ", ".join(f"{sid} (sim {sim:.3f})" for sid, sim in tone_candidates)
@@ -795,17 +1222,29 @@ def early_communicate():
         vocab_entry = vocab_map[symbol_id] or {}
         vocab_word = vocab_entry.get("word")
         vocab_word_conf = vocab_entry.get("confidence", 0.0)
+        entry_lang = vocab_entry.get("language")
+        if context_language not in {None, "", "und"} and entry_lang and entry_lang != context_language:
+            vocab_word_conf = vocab_word_conf * 0.8
+            log_to_statusbox(
+                f"[Comms] Language mismatch for {symbol_id}: vocab '{entry_lang}' vs ctx '{context_language}'. Confidence softened."
+            )
         log_to_statusbox(f"[Comms] Vocab word for {symbol_id}: '{vocab_word}' (conf: {vocab_word_conf})")
 
-    combo_symbol_id, combo_word = combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map)
+    combo_symbol_id, combo_word, combo_lang = combine_tones_and_register(
+        child,
+        tone_candidates,
+        symbol_map,
+        vocab_map,
+        language_hint=context_language,
+    )
     if not vocab_word and combo_word:
         vocab_word = combo_word
         vocab_word_conf = 0.2
 
-    word_map = load_symbol_words(child)
+    word_map = word_state.get("words", [])
     word_id, word_conf = None, 0.0
     word_creation_prompt = None
-    vocab_size = len(word_map)
+    vocab_size = len(word_map) + len(proto_words) + len(multi_symbol_words)
     for word in word_map:
         if not word.get("components"): continue
         sum_text = word.get("summary", "")
@@ -833,20 +1272,96 @@ def early_communicate():
             expression = f"I feel this word: {vocab_word}"
         elif word_id and word_conf > 0.85:
             expression = f"I feel this word: {word_id}"
+        if pair_choice and expression_strategy == "emotion_prediction" and (not vocab_word) and (not speech_symbols or best_sim < 0.85):
+            speech_symbols = list(pair_choice["sequence"])
+            expression_strategy = "proto_pair_word"
+            word_id = pair_choice["key"]
+            word_conf = pair_choice["confidence"]
+            proto_word_used = pair_choice
+            expression = f"I feel this paired word: {word_id}"
+            if pair_choice.get("flexible"):
+                expression += " (flexible)"
+            log_to_statusbox(f"[Comms] Trying paired symbol word {word_id} (conf {word_conf:.3f}).")
+
+        if expression_strategy == "emotion_prediction" and not speech_symbols:
+            if tone_riff_option and (best_sim < 0.9 or tone_riff_option.get("alignment", 0.0) >= 0.25):
+                speech_symbols = list(tone_riff_option.get("sequence", []))
+                expression_strategy = "tone_riff"
+                tone_exploration_used = {
+                    "strategy": "tone_riff",
+                    "symbols": speech_symbols,
+                    "alignment": tone_riff_option.get("alignment"),
+                    "uses": tone_riff_option.get("uses"),
+                    "delivery": voice_delivery,
+                }
+                labels = [label_for_symbol(sid) for sid in speech_symbols[:3]]
+                suffix = " via Discord voice" if voice_pref else ""
+                expression = f"Exploring a tone riff{suffix}: " + ", ".join(labels)
+                log_to_statusbox(
+                    f"[Comms] Exploring riff ({tone_riff_option.get('uses', 0.0):.2f} uses, align {tone_riff_option.get('alignment', 0.0):.2f})."
+                )
+            elif rare_tone_option and (best_sim < 0.9 or rare_tone_option.get("uses", 0.0) < 1.0):
+                chosen = rare_tone_option.get("symbol_id")
+                if chosen:
+                    speech_symbols = [chosen]
+                    expression_strategy = "rare_tone"
+                    tone_exploration_used = {
+                        "strategy": "rare_tone",
+                        "symbols": speech_symbols,
+                        "alignment": rare_tone_option.get("alignment"),
+                        "uses": rare_tone_option.get("uses"),
+                        "delivery": voice_delivery,
+                    }
+                    suffix = " via Discord voice" if voice_pref else ""
+                    expression = f"Exploring an underused tone{suffix}: {label_for_symbol(chosen)}"
+                    log_to_statusbox(
+                        f"[Comms] Surfacing rare tone {chosen} (uses {rare_tone_option.get('uses', 0.0):.2f}, align {rare_tone_option.get('alignment', 0.0):.2f})."
+                    )
+            elif alt_candidate and best_sim < 0.88:
+                alt_sid, alt_sim = alt_candidate
+                speech_symbols = [alt_sid]
+                expression_strategy = "adjacent_tone"
+                tone_exploration_used = {
+                    "strategy": "adjacent_tone",
+                    "symbols": speech_symbols,
+                    "similarity": alt_sim,
+                    "delivery": voice_delivery,
+                }
+                suffix = " via Discord voice" if voice_pref else ""
+                expression = f"Trying a nearby tone{suffix}: {label_for_symbol(alt_sid)}"
+                log_to_statusbox(f"[Comms] Exploring adjacent tone {alt_sid} (sim {alt_sim:.3f}).")
 
     if not speech_symbols and tone_candidates:
         speech_symbols = [sid for sid, sim in tone_candidates if sim > 0]
 
-    if expression_strategy != "mimic_grounded_speech" and tone_candidates and speech_symbols:
+    if expression_strategy not in {"mimic_grounded_speech", "proto_pair_word"} and tone_candidates and speech_symbols:
         labels = []
         for sid in speech_symbols[:3]:
             vw_entry = vocab_map.get(sid, {}) if isinstance(vocab_map, dict) else {}
             vw = vw_entry.get("word")
             labels.append(vw or sid)
-        expression = "Trying tones: " + ", ".join(labels)
+        suffix = " (Discord voice)" if voice_pref else ""
+        expression = f"Trying tones{suffix}: " + ", ".join(labels)
         expression_strategy = "tone_experiment"
 
+    if tone_exploration_used:
+        for opt in sound_explorations:
+            if (
+                opt.get("strategy") == tone_exploration_used.get("strategy")
+                and opt.get("symbols") == tone_exploration_used.get("symbols")
+            ):
+                opt["selected"] = True
+                break
+    update_inastate("sound_exploration_options", sound_explorations)
+
     log_to_statusbox(f"[Comms] Final expression: '{expression}'")
+    symbol_seq_for_embed = speech_symbols or ([symbol_id] if symbol_id else [])
+    symbol_embedding = (
+        EMBEDDER.embed_symbol_sequence(symbol_seq_for_embed, language=context_language)
+        if symbol_seq_for_embed
+        else None
+    )
+    text_embedding = EMBEDDER.embed_text(expression, language=context_language) if expression else None
     frag = create_expression_fragment(
         child,
         expression,
@@ -865,28 +1380,51 @@ def early_communicate():
         vocab_word_conf=vocab_word_conf,
         vocab_word_source="symbol_to_token" if vocab_word else None,
         tone_candidates=[{"symbol_id": sid, "similarity": sim} for sid, sim in tone_candidates] if tone_candidates else None,
+        proto_word=proto_word_used,
+        tone_explorations=sound_explorations,
+        speech_suppressed=(
+            {
+                "reason": "low_urge",
+                "urge_level": urge_level,
+                "threshold": min_urge_to_speak,
+            }
+            if not allow_speech
+            else None
+        ),
+        voice_target=voice_pref,
+        language_hint=context_language,
+        embedding=text_embedding,
+        symbol_embedding=symbol_embedding,
     )
+    if proto_word_used:
+        record_proto_pair_usage(child, proto_word_used)
     update_tone_library(child, speech_symbols or ([symbol_id] if symbol_id else []), inferred or {}, frag.get("tags", []))
     log_to_statusbox(f"[Comms] Expression fragment saved: {frag['id']}")
 
     # === Audio expression attempt (log + speak)
-    log_to_statusbox(f"[Comms] Preparing to speak: \"{expression}\"")
-
-    try:        
-        if speech_symbols:
-            speak_symbolically(speech_symbols)
-            log_to_statusbox("[Comms] Speech output triggered.")
-        else:
-            log_to_statusbox("[Comms] No symbol IDs available for speech.")
-    except Exception as e:
-        log_to_statusbox(f"[Comms] Speech error: {e}")
-
+    if not allow_speech:
+        log_to_statusbox(
+            f"[Comms] Staying quiet (urge {urge_level:.2f} < {min_urge_to_speak}). Expression logged only."
+        )
+    else:
+        channel_hint = " via Discord voice" if voice_pref else ""
+        log_to_statusbox(f"[Comms] Preparing to speak{channel_hint}: \"{expression}\"")
+        try:
+            if speech_symbols:
+                speak_symbolically(speech_symbols)
+                log_to_statusbox("[Comms] Speech output triggered.")
+            else:
+                log_to_statusbox("[Comms] No symbol IDs available for speech.")
+        except Exception as e:
+            log_to_statusbox(f"[Comms] Speech error: {e}")
 
     # Hook into language processing for learning
-    if symbol_id and (vocab_word or word_id):
+    if proto_word_used:
+        log_to_statusbox("[Comms] Skipped single-symbol association because a paired proto-word was used.")
+    elif symbol_id and (vocab_word or word_id):
         chosen_word = vocab_word or word_id
         chosen_conf = vocab_word_conf if vocab_word is not None else word_conf
-        associate_symbol_with_word(child, symbol_id, chosen_word, chosen_conf)
+        associate_symbol_with_word(child, symbol_id, chosen_word, chosen_conf, language=context_language)
         predicted = prediction.get("predicted_word", chosen_word)
         backprop_symbol_confidence(child, predicted, symbol_id)
         log_to_statusbox(f"[Comms] Associated {symbol_id} with {chosen_word} via language_processing.")
@@ -894,7 +1432,7 @@ def early_communicate():
         log_to_statusbox("[Comms] No word association updated (missing symbol or word).")
 
     if combo_symbol_id and combo_word:
-        associate_symbol_with_word(child, combo_symbol_id, combo_word, 0.2)
+        associate_symbol_with_word(child, combo_symbol_id, combo_word, 0.2, language=combo_lang)
         log_to_statusbox(f"[Comms] Associated combo {combo_symbol_id} with '{combo_word}'.")
 
     created_patterns = detect_repeated_tone_patterns(child, vocab_map)
@@ -908,15 +1446,22 @@ def early_communicate():
     primary_symbol = speech_symbols[0] if speech_symbols else symbol_id
     primary_word = vocab_word or word_id or (spoken_words[0] if spoken_words else None)
 
-    update_inastate("currently_speaking", True)
-    update_inastate("last_expression_time", time.time())
-    update_inastate("last_spoken_symbol", primary_symbol)
-    update_inastate("last_symbol_word_id", primary_word)
-    update_inastate("last_babbled_words", spoken_words)
-    update_inastate("last_babble_strategy", expression_strategy)
-
-    time.sleep(1.5)
-    update_inastate("currently_speaking", False)
+    if allow_speech:
+        update_inastate("currently_speaking", True)
+        update_inastate("last_expression_time", time.time())
+        update_inastate("last_spoken_symbol", primary_symbol)
+        update_inastate("last_symbol_word_id", primary_word)
+        update_inastate("last_babbled_words", spoken_words)
+        update_inastate("last_babble_strategy", expression_strategy)
+        time.sleep(1.5)
+        update_inastate("currently_speaking", False)
+    else:
+        update_inastate("last_expression_time", time.time())
+        update_inastate("last_spoken_symbol", primary_symbol)
+        update_inastate("last_symbol_word_id", primary_word)
+        update_inastate("last_babbled_words", spoken_words)
+        update_inastate("last_babble_strategy", expression_strategy)
+        update_inastate("currently_speaking", False)
 
 
 if __name__ == "__main__":

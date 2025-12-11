@@ -1,13 +1,16 @@
 import os
+import re
 import json
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
+from embedding_stack import MultimodalEmbedder, guess_language_code
 from model_manager import load_config, seed_self_question
 from experience_logger import ExperienceLogger
 from symbol_generator import (
     ACCENT_GLYPHS,
+    ALPHANUMERIC_GLYPHS,
     CONCEPT_GLYPHS,
     EMOTION_GLYPHS,
     MODULATION_GLYPHS,
@@ -22,6 +25,7 @@ def _memory_root(child: str, base_path: Optional[Path] = None) -> Path:
     return base / child / "memory"
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
+_EMBEDDER = MultimodalEmbedder(dim=128)
 
 
 def _load_json(path: Path):
@@ -53,6 +57,86 @@ def _normalize_symbol_map(raw):
 
     return symbols
 
+def load_generated_symbols(child: str, base_path: Optional[Path] = None):
+    """
+    Load Ina's self-generated symbols with any available vision features.
+    Prefers the rendered manifest under vision_session/generated_symbols and
+    falls back to identity/self_reflection.json entries.
+    """
+    base = Path(base_path) if base_path else Path("AI_Children")
+    vision_dir = base / child / "memory" / "vision_session" / "generated_symbols"
+    manifest_path = vision_dir / "manifest.json"
+    identity_path = base / child / "identity" / "self_reflection.json"
+
+    symbols: Dict[str, Dict[str, Any]] = {}
+
+    def _attach_image_features(entry: Dict[str, Any]) -> Dict[str, Any]:
+        img_name = entry.get("image")
+        if not img_name:
+            return entry
+        img_path = vision_dir / img_name
+        if not img_path.exists():
+            return entry
+        try:
+            import cv2  # Lazy import so modules without CV2 still import.
+
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                flat = img.flatten().tolist()
+                entry["image_features"] = flat[:512]
+        except Exception:
+            # Best-effort; keep entry even if feature extraction fails.
+            pass
+        return entry
+
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f) or []
+            for row in manifest:
+                symbol = row.get("symbol")
+                if not symbol:
+                    continue
+                sid = row.get("id") or row.get("symbol_id") or symbol
+                entry = {
+                    "id": sid,
+                    "symbol": symbol,
+                    "image": row.get("image"),
+                    "summary": row.get("summary"),
+                    "meaning": row.get("summary"),
+                    "timestamp": row.get("timestamp"),
+                    "source": row.get("source", "vision_generated"),
+                }
+                symbols.setdefault(sid, _attach_image_features(entry))
+        except Exception:
+            pass
+
+    if identity_path.exists():
+        try:
+            with open(identity_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for row in data.get("self_generated_symbols", []):
+                symbol = row.get("symbol")
+                if not symbol:
+                    continue
+                sid = row.get("id") or symbol
+                entry = symbols.get(sid, {"id": sid, "symbol": symbol})
+                entry.setdefault("summary", row.get("meaning"))
+                entry.setdefault("meaning", row.get("meaning"))
+                entry.setdefault("timestamp", row.get("timestamp"))
+                entry.setdefault("emotions", row.get("emotions"))
+                entry.setdefault("clarity", row.get("clarity"))
+                entry.setdefault("tags", row.get("tags"))
+                entry.setdefault("components", row.get("components"))
+                entry.setdefault("source", row.get("origin", "self_generated"))
+                if "image_features" not in entry and "image_features" in row:
+                    entry["image_features"] = row["image_features"]
+                symbols[sid] = entry
+        except Exception:
+            pass
+
+    return list(symbols.values())
+
 def _stable_symbol_seed(value: str) -> int:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return int(digest[:12], 16)
@@ -70,9 +154,10 @@ def _default_symbol_for_id(symbol_id: str) -> str:
     target_len = 2 + (seed % 4)  # 2–5 characters
 
     symbol = emo + concept if target_len == 2 else emo + mod + concept
+    filler_pool = ACCENT_GLYPHS + ALPHANUMERIC_GLYPHS
     while len(symbol) < target_len:
-        accent_idx = (seed // (len(symbol) + 3)) % len(ACCENT_GLYPHS)
-        symbol += ACCENT_GLYPHS[accent_idx]
+        accent_idx = (seed // (len(symbol) + 3)) % len(filler_pool)
+        symbol += filler_pool[accent_idx]
 
     return symbol[:target_len]
 
@@ -193,6 +278,28 @@ def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
 
+
+def _ensure_vocab_embeddings(vocab: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
+    """
+    Attach deterministic text embeddings and language hints to vocab entries
+    when missing. Returns True if any entry was updated.
+    """
+    updated = False
+    for entry in vocab.values():
+        if not isinstance(entry, dict):
+            continue
+        word = (entry.get("word") or "").strip()
+        if not word:
+            continue
+        emb = entry.get("embedding")
+        if isinstance(emb, list) and emb:
+            continue
+        lang = entry.get("language") or language_hint or guess_language_code(word)
+        entry["language"] = lang
+        entry["embedding"] = _EMBEDDER.embed_text(word, language=lang)
+        updated = True
+    return updated
+
 def match_sound_symbol_to_input(input_vector, symbol_map, transformer):
     best_match = None
     best_sim = 0.0
@@ -217,23 +324,33 @@ def associate_symbol_with_word(
     word,
     confidence=0.35,
     grounding: Optional[Dict[str, str]] = None,
+    language: Optional[str] = None,
     base_path: Optional[Path] = None,
 ):
     vocab = load_symbol_to_token(child, base_path)
+    lang = language or guess_language_code(word)
+    text_embedding = _EMBEDDER.embed_text(word, language=lang)
     if symbol_id not in vocab:
         vocab[symbol_id] = {
             "word": word,
             "uses": 1,
             "confidence": round(min(0.9, confidence), 2),
+            "language": lang,
+            "embedding": text_embedding,
         }
     else:
         entry = vocab[symbol_id]
         if entry["word"].lower() != word.lower():
             seed_self_question(f"Was '{entry['word']}' the wrong word for {symbol_id}? Now seen as '{word}'?")
             entry["confidence"] = round(entry.get("confidence", 0.5) - 0.1, 2)
+            entry["language"] = lang
+            entry["embedding"] = text_embedding
         else:
             entry["uses"] += 1
             entry["confidence"] = round(min(0.9, entry.get("confidence", 0.35) + 0.05), 2)
+            entry.setdefault("language", lang)
+            if not entry.get("embedding"):
+                entry["embedding"] = text_embedding
         vocab[symbol_id] = entry
     save_symbol_to_token(child, vocab, base_path)
     print(f"[LangLearn] Associated {symbol_id} → '{word}' with confidence {vocab[symbol_id]['confidence']}")
@@ -283,6 +400,21 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
     config = load_config()
     polyphonic = bool(config.get("allow_polyphonic_voice", True))
     sample_rate = int(config.get("voice_sample_rate", 22050))
+    feedback_heard_voice = bool(config.get("feedback_heard_voice", True))
+
+    def _harmonic_summary(audio: np.ndarray, sr: int, top_k: int = 5):
+        if audio.size == 0:
+            return []
+        spec = np.abs(np.fft.rfft(audio))
+        freqs = np.fft.rfftfreq(audio.shape[0], 1 / sr)
+        if spec.size == 0:
+            return []
+        top_idx = np.argpartition(spec, -top_k)[-top_k:]
+        peaks = sorted(zip(freqs[top_idx], spec[top_idx]), key=lambda x: -x[1])
+        return [
+            {"freq_hz": round(float(f), 2), "mag": round(float(m), 4)}
+            for f, m in peaks[:top_k]
+        ]
 
     symbol_map = load_sound_symbol_map(child)
     waveform = []
@@ -334,6 +466,32 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
             log_to_statusbox(f"[Voice] Synthesizing {len(waveform)} sound symbols (polyphonic mix).")
 
         sd.play(audio, samplerate=sample_rate)
+        if feedback_heard_voice:
+            try:
+                logger = ExperienceLogger(child=child)
+                harmonic_profile = _harmonic_summary(audio, sample_rate)
+                event_id = logger.log_event(
+                    situation_tags=["self_voice", "audio", "feedback"],
+                    perceived_entities=[
+                        {
+                            "type": "self_voice",
+                            "symbols": symbols,
+                            "polyphonic": polyphonic and len(waveform) > 1,
+                            "harmonics": harmonic_profile,
+                        }
+                    ],
+                    internal_state={"sample_rate": sample_rate, "polyphonic": polyphonic},
+                    narrative="Ina listened to her own synthesized voice.",
+                )
+                logger.attach_word_usage(
+                    event_id,
+                    speaker=child,
+                    utterance=" ".join(str(s) for s in symbols),
+                    words=[str(s) for s in symbols],
+                )
+                log_to_statusbox(f"[Voice] Logged self-voice feedback as event {event_id}.")
+            except Exception as e:
+                log_to_statusbox(f"[Voice] Failed to log self-voice feedback: {e}")
     else:
         log_to_statusbox("[Voice] No audio generated from symbolic request.")
 
@@ -491,6 +649,86 @@ def respond_to_word(child, word, *, base_path: Optional[Path] = None):
             describe_word_grounding(child, word, base_path=base_path, verbose=True)
             return
     print(f"[LangLearn] No audio response found for: '{word}'")
+
+
+def generate_symbolic_reply_from_text(
+    text: str,
+    *,
+    child: str = "Inazuma_Yagami",
+    base_path: Optional[Path] = None,
+    max_symbols: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """
+    Try to reply to a text prompt using Ina's known symbol vocabulary.
+    Returns a dict with {"text", "symbols", "unknown"} or None if no match found.
+    """
+    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text)]
+    if not tokens:
+        return None
+
+    vocab = load_symbol_to_token(child, base_path=base_path)
+    lang_hint = guess_language_code(text)
+    if _ensure_vocab_embeddings(vocab, language_hint=lang_hint):
+        save_symbol_to_token(child, vocab, base_path)
+
+    word_to_symbol = {
+        (entry.get("word") or "").lower(): symbol
+        for symbol, entry in vocab.items()
+        if entry.get("word")
+    }
+
+    embedding_index = []
+    for sym, entry in vocab.items():
+        if not isinstance(entry, dict):
+            continue
+        emb = entry.get("embedding")
+        if isinstance(emb, list) and emb:
+            embedding_index.append((sym, emb, entry.get("language")))
+
+    matched: List[str] = []
+    unknown: List[str] = []
+    seen = set()
+
+    for tok in tokens:
+        sym = word_to_symbol.get(tok)
+        if sym and sym not in seen:
+            matched.append(sym)
+            seen.add(sym)
+        else:
+            tok_emb = _EMBEDDER.embed_text(tok, language=lang_hint)
+            best_sym = None
+            best_sim = 0.0
+            for sym_id, emb, lang in embedding_index:
+                if sym_id in seen:
+                    continue
+                if lang_hint != "und" and lang and lang != lang_hint:
+                    continue
+                sim = _EMBEDDER.cosine(tok_emb, emb)
+                if sim > 0.42 and sim > best_sim:
+                    best_sim = sim
+                    best_sym = sym_id
+            if best_sym:
+                matched.append(best_sym)
+                seen.add(best_sym)
+            elif tok not in unknown:
+                unknown.append(tok)
+
+    if unknown:
+        seed_self_question(
+            "What symbols align with the word(s): " + ", ".join(unknown[:6])
+        )
+
+    if not matched:
+        return None
+
+    symbols_to_speak = matched[:max_symbols]
+    try:
+        speak_symbolically(symbols_to_speak, child=child)
+    except Exception:
+        pass
+
+    labels = [(vocab.get(sym, {}) or {}).get("word") or sym for sym in symbols_to_speak]
+    return {"text": " ".join(labels), "symbols": symbols_to_speak, "unknown": unknown}
 
 
 def ensure_word_grounded(

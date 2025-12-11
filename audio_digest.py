@@ -4,6 +4,7 @@
 # audio pipeline suitable for Ina's brain architecture.
 #
 import json
+import math
 import uuid
 import numpy as np
 from pathlib import Path
@@ -13,6 +14,7 @@ from pydub import AudioSegment
 from emotion_engine import get_current_emotion_state     # soft dependency
 from gui_hook import log_to_statusbox
 from fragmentation_engine import fragment_audio_digest
+from embedding_stack import MultimodalEmbedder, guess_language_code
 from model_manager import load_config
 
 try:  # optional meaning map hook
@@ -27,6 +29,12 @@ SYMBOL_WORDS_PATH = Path("symbol_words.json")
 
 # Sample rate used across the pipeline
 TARGET_SR = 44100
+EMBEDDER = MultimodalEmbedder(dim=160)
+
+
+def _proto_confidence(uses: int, base: float = 0.2) -> float:
+    uses = max(1, int(uses))
+    return round(min(0.9, base + math.log1p(uses) / 5.0), 4)
 
 # ------------------------------------------------------------
 # Audio loading (numba/librosa free)
@@ -118,6 +126,46 @@ def _mel_spectrogram(wave, sr, n_mels=32, hop_length=256, n_fft=512):
     mel_db = 10.0 * np.log10(mel_spec)
     mel_db -= np.max(mel_db)  # normalize peak to 0 dB
     return mel_db.tolist()  # frame-major: [frames][mel bins]
+
+
+def _texture_signature(wave, sr):
+    if wave.size == 0:
+        return {
+            "rms": 0.0,
+            "crest_factor": 0.0,
+            "zero_cross_rate": 0.0,
+            "env_variation": 0.0,
+            "dynamic_range": 0.0,
+        }
+
+    abs_wave = np.abs(wave)
+    rms = float(np.sqrt(np.mean(abs_wave ** 2)))
+    crest = float(np.max(abs_wave) / max(rms, 1e-6))
+    zero_cross = float(np.mean(np.abs(np.diff(np.sign(wave)))) * 0.5)
+
+    chunk = max(int(sr * 0.05), 1)
+    env = [float(np.mean(abs_wave[i : i + chunk])) for i in range(0, len(abs_wave), chunk)]
+    env_var = float(np.std(env)) if env else 0.0
+
+    dyn_range = float(np.percentile(abs_wave, 95) - np.percentile(abs_wave, 5))
+
+    return {
+        "rms": round(rms, 6),
+        "crest_factor": round(crest, 6),
+        "zero_cross_rate": round(zero_cross, 6),
+        "env_variation": round(env_var, 6),
+        "dynamic_range": round(dyn_range, 6),
+    }
+
+
+def _diversity_boost_from_texture(texture):
+    spread = float(texture.get("env_variation", 0.0))
+    zcr = float(texture.get("zero_cross_rate", 0.0))
+    dyn = float(texture.get("dynamic_range", 0.0))
+    crest = float(texture.get("crest_factor", 0.0))
+
+    score = (spread * 3.0) + (zcr * 0.8) + (min(dyn, 1.0) * 0.5) + (min(crest / 8.0, 0.4))
+    return round(min(1.0, score), 4)
 
 # ------------------------------------------------------------
 # Path helpers
@@ -280,7 +328,7 @@ def extract_cochlear_features(wave, sr):
 # 2. FRAME → SYMBOL ASSIGNMENT
 # ------------------------------------------------------------
 
-def assign_sound_symbols(feature_frames, symbol_map):
+def assign_sound_symbols(feature_frames, symbol_map, *, diversity_boost=0.0, texture_hint=None):
     """
     A simple online clustering approach.
     - Compares frame to existing centroids
@@ -305,7 +353,8 @@ def assign_sound_symbols(feature_frames, symbol_map):
         return np.array(frame, dtype=float)
 
     symbols = []
-    threshold = 50.0  # distance threshold for new cluster; tunable
+    base_threshold = 50.0
+    threshold = max(18.0, base_threshold - (22.0 * max(0.0, float(diversity_boost))))
 
     seen_ts = datetime.now(timezone.utc).isoformat()
 
@@ -331,23 +380,47 @@ def assign_sound_symbols(feature_frames, symbol_map):
                 log_to_statusbox(f"[AudioDigest] Skipped symbol {sym_id}: {e}")
                 continue
 
-        # If far from all existing centroids → create new symbol
-        if best_dist > threshold or best_id is None:
+        dominant_usage = False
+        if best_id:
+            try:
+                best_meta = symbol_map["symbols"].get(best_id, {})
+                dominant_usage = best_meta.get("uses", 0) > 500 and best_dist > threshold * 0.6
+            except Exception:
+                dominant_usage = False
+
+        # If far from all existing centroids or dominant cluster fatigue → create new symbol
+        if best_dist > threshold or best_id is None or dominant_usage:
             new_id = f"sym_snd_{uuid.uuid4().hex[:8]}"
             symbol_map["symbols"][new_id] = {
                 "centroid": frame,
                 "uses": 1,
                 "last_seen": seen_ts,
+                "texture": texture_hint if texture_hint else {},
+                "diversity_hint": diversity_boost,
             }
             symbols.append(new_id)
         else:
             # Update centroid (online mean)
             sym = symbol_map["symbols"][best_id]
+            prev_uses = sym.get("uses", 1)
             old = np.array(sym.get("centroid", frame))
-            new = (old * sym.get("uses", 1) + f) / (sym.get("uses", 1) + 1)
+            new = (old * prev_uses + f) / (prev_uses + 1)
             sym["centroid"] = new.tolist()
-            sym["uses"] = sym.get("uses", 1) + 1
+            sym["uses"] = prev_uses + 1
             sym["last_seen"] = seen_ts
+            if texture_hint:
+                texture = sym.get("texture", {})
+                if isinstance(texture, dict):
+                    for k, v in texture_hint.items():
+                        texture[k] = round(
+                            (texture.get(k, 0.0) * prev_uses + float(v))
+                            / max(1, prev_uses + 1),
+                            6,
+                        )
+                else:
+                    texture = dict(texture_hint)
+                sym["texture"] = texture
+            sym["diversity_hint"] = diversity_boost
             symbol_map["symbols"][best_id] = sym
             symbols.append(best_id)
 
@@ -368,21 +441,72 @@ def derive_proto_words(symbol_sequence, symbol_words):
         symbol_words["proto_words"] = proto_store
 
     candidates = []
+    now = datetime.now(timezone.utc).isoformat()
 
     for n in [2, 3, 4]:
         for i in range(len(symbol_sequence) - n + 1):
             seq = tuple(symbol_sequence[i : i + n])
             key = "_".join(seq)
 
-            if key not in proto_store:
-                proto_store[key] = {
-                    "sequence": list(seq),
-                    "uses": 1,
-                }
-            else:
-                proto_store[key]["uses"] = proto_store.get(key, {}).get("uses", 0) + 1
+            entry = proto_store.get(key, {})
+            uses = int(entry.get("uses", 0)) + 1
+            entry = {
+                "sequence": list(seq),
+                "uses": uses,
+                "last_seen": now,
+                "created": entry.get("created", now),
+                "length": n,
+                "confidence": _proto_confidence(uses, base=0.18 if n > 2 else 0.22),
+                "flexible": uses < 5,
+                "stability": round(min(1.0, uses / 10.0), 3),
+            }
+            proto_store[key] = entry
 
             candidates.append(key)
+
+    return candidates, symbol_words
+
+
+def update_multi_symbol_words(symbol_sequence, symbol_words, proto_store=None, *, flexible_threshold=4):
+    """
+    Track recurring adjacent symbol pairs as multi-symbol word candidates.
+    """
+    multi_store = symbol_words.setdefault("multi_symbol_words", {})
+    if not isinstance(multi_store, dict):
+        multi_store = {}
+        symbol_words["multi_symbol_words"] = multi_store
+
+    now = datetime.now(timezone.utc).isoformat()
+    candidates = []
+
+    for i in range(len(symbol_sequence) - 1):
+        pair = (symbol_sequence[i], symbol_sequence[i + 1])
+        if not pair[0] or not pair[1]:
+            continue
+        proto_key = "_".join(pair)
+        key = f"pair:{proto_key}"
+
+        base = multi_store.get(key, {})
+        uses = int(base.get("uses", 0)) + 1
+        if proto_store and proto_key in proto_store:
+            try:
+                uses = max(uses, int(proto_store[proto_key].get("uses", uses)))
+            except Exception:
+                pass
+
+        entry = {
+            "sequence": list(pair),
+            "uses": uses,
+            "last_seen": now,
+            "created": base.get("created", now),
+            "confidence": _proto_confidence(uses, base=0.24),
+            "flexible": uses < flexible_threshold,
+            "stability": round(min(1.0, uses / float(flexible_threshold * 2)), 3),
+            "source": base.get("source", "audio_bigrams"),
+        }
+
+        multi_store[key] = entry
+        candidates.append(key)
 
     return candidates, symbol_words
 
@@ -401,13 +525,24 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
     child = _current_child(child)
     try:
         wave, sr, duration = _load_waveform(clip_path, target_sr=TARGET_SR)
+        texture = _texture_signature(wave, sr)
+        diversity_boost = _diversity_boost_from_texture(texture)
         features = extract_cochlear_features(wave, sr)
 
         symbol_map, symbol_map_path = load_sound_symbol_map(child)
-        symbol_sequence, symbol_map = assign_sound_symbols(features, symbol_map)
+        symbol_sequence, symbol_map = assign_sound_symbols(
+            features, symbol_map, diversity_boost=diversity_boost, texture_hint=texture
+        )
 
         symbol_words, symbol_words_path = load_symbol_words(child)
         proto_word_candidates, symbol_words = derive_proto_words(symbol_sequence, symbol_words)
+        multi_word_candidates, symbol_words = update_multi_symbol_words(
+            symbol_sequence, symbol_words, proto_store=symbol_words.get("proto_words")
+        )
+
+        language_hint = guess_language_code(label or "")
+        audio_embedding = EMBEDDER.embed_audio_frames(features, texture=texture)
+        symbol_embedding = EMBEDDER.embed_symbol_sequence(symbol_sequence, language=language_hint)
 
         save_sound_symbol_map(symbol_map, child)
         save_symbol_words(symbol_words, child)
@@ -419,9 +554,12 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
                 log_to_statusbox(f"[AudioDigest] Proto-word hook failed: {hook_err}")
 
         clarity = round(float(np.mean(np.abs(wave))) if wave.size else 0.0, 4)
+        unique_symbols = len(set(symbol_sequence))
         summary = (
-            f"{label} audio: {len(symbol_sequence)} symbols, "
-            f"{len(proto_word_candidates)} proto-words, {duration:.1f}s"
+            f"{label} audio: {len(symbol_sequence)} symbols ({unique_symbols} unique), "
+            f"{len(proto_word_candidates)} proto-words, "
+            f"{len(multi_word_candidates)} pairs, "
+            f"{duration:.1f}s (diversity {diversity_boost:.2f})"
         )
 
         return {
@@ -429,12 +567,19 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
             "frames": features,
             "symbols": symbol_sequence,
             "proto_words": proto_word_candidates,
+            "multi_symbol_pairs": multi_word_candidates,
+            "texture_signature": texture,
+            "diversity_boost": diversity_boost,
+            "unique_symbols": unique_symbols,
             "summary": summary,
             "clarity": clarity,
             "tags": ["audio", "digest", label] if label else ["audio", "digest"],
             "symbol_map_path": str(symbol_map_path),
             "symbol_words_path": str(symbol_words_path),
             "child": child,
+            "language_hint": language_hint,
+            "embedding": audio_embedding,
+            "symbol_embedding": symbol_embedding,
         }
 
     except Exception as e:
@@ -495,6 +640,9 @@ def generate_fragment(clip_path, analysis, child=None, label="unknown"):
         "duration": analysis.get("duration", 0) if isinstance(analysis, dict) else 0,
         "emotion": emotion_snapshot,
         "child": child,
+        "language_hint": analysis.get("language_hint") if isinstance(analysis, dict) else None,
+        "embedding": analysis.get("embedding") if isinstance(analysis, dict) else None,
+        "symbol_embedding": analysis.get("symbol_embedding") if isinstance(analysis, dict) else None,
     })
     frag.setdefault("summary", summary)
 

@@ -23,7 +23,7 @@ as Ina's emotion + meaning systems mature.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -77,7 +77,7 @@ class MemoryGatekeeperConfig:
                       unless explicitly forced by flags.
     """
 
-    archiver_config: FragmentArchiverConfig = FragmentArchiverConfig()
+    archiver_config: FragmentArchiverConfig = field(default_factory=FragmentArchiverConfig)
 
     short_term_shard: str = "short_term"
     working_shard: str = "working"

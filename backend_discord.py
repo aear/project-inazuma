@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Callable
 
@@ -65,7 +66,16 @@ def register_discord_backend(
     the actual Discord API call on the client's event loop.
     """
 
-    loop = client.loop
+    def _get_loop():
+        # discord.py 2.x discourages accessing .loop directly; use internal connection or running loop.
+        conn = getattr(client, "_connection", None)
+        loop = getattr(conn, "loop", None)
+        if loop:
+            return loop
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
 
     def send_fn(msg: CommsMessage) -> None:
         """Send an outbound CommsMessage using discord.py."""
@@ -95,7 +105,11 @@ def register_discord_backend(
                 )
 
         # Schedule the send on the Discord event loop
-        loop.create_task(_send_async())
+        loop = _get_loop()
+        if not loop:
+            logger.error("No Discord event loop available; dropping outbound message %s", msg.id)
+            return
+        asyncio.run_coroutine_threadsafe(_send_async(), loop)
 
     comms.register_backend(backend_name, send_fn)
     logger.info("Discord backend registered with CommsCore as '%s'", backend_name)

@@ -9,6 +9,7 @@ from model_manager import load_config, seed_self_question
 from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts
 import random
+from text_memory import build_text_symbol_links
 
 
 def load_base_model(child):
@@ -116,9 +117,23 @@ def cluster_symbols_and_generate_words(child):
         words.append(word)
 
     out_path = Path("AI_Children") / child / "memory" / "symbol_words.json"
+    preserved = {}
+    if out_path.exists():
+        try:
+            with open(out_path, "r") as prev_f:
+                existing = json.load(prev_f)
+            if isinstance(existing, dict):
+                for key in ("proto_words", "multi_symbol_words"):
+                    if key in existing:
+                        preserved[key] = existing[key]
+        except Exception:
+            preserved = {}
+
     try:
+        payload = {"words": words, "updated_at": datetime.now(timezone.utc).isoformat()}
+        payload.update(preserved)
         with open(out_path, "w") as f:
-            json.dump({"words": words, "updated_at": datetime.now(timezone.utc).isoformat()}, f, indent=4)
+            json.dump(payload, f, indent=4)
         log_to_statusbox(f"[Symbols] Generated {len(words)} symbol words.")
     except Exception as e:
         log_to_statusbox(f"[Symbols] Failed to save symbol words: {e}")
@@ -134,6 +149,7 @@ def run_meaning_map():
         child = config.get("current_child", "default_child")
         log_to_statusbox("[Symbols] Meaning map update starting...")
         cluster_symbols_and_generate_words(child)
+        build_text_symbol_links(child)
         log_to_statusbox("[Symbols] Meaning map update finished.")
     except Exception as e:
         log_to_statusbox(f"[Symbols] Error: {e}")

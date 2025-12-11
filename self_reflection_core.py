@@ -50,7 +50,7 @@ class SelfReflectionCore:
             "emotional_snapshot": {"vector": emo_vector, "raw": emo_raw},
             "symbolic_snapshot": self._light_symbolic_scan(symbol_map),
             "memory_peek": self._peek_recent_memory(memory_graph),
-            "identity_hint": self._identity_vector(emo_vector),
+            "identity_hint": self._identity_vector(emo_vector, emo_raw),
             "note": "Reflection occurred. Interpretation belongs to Ina."
         }
 
@@ -112,10 +112,10 @@ class SelfReflectionCore:
     # ----------------------------------------------------------------------
     # IDENTITY HINT
     # ----------------------------------------------------------------------
-    def _identity_vector(self, emotional_state):
+    def _identity_vector(self, emotional_state, raw_state=None):
         """
-        Produces a crude identity-stability vector.
-        Ina chooses what it means.
+        Produces a crude identity-stability vector and a gentle self/other hint.
+        Ina decides what, if anything, to do with it.
         """
         if not emotional_state:
             return {
@@ -124,10 +124,45 @@ class SelfReflectionCore:
             }
 
         intensity = sum(abs(v) for v in emotional_state) / max(1, len(emotional_state))
-        return {
+        hint = {
             "identity_stability_hint": 1.0 - min(intensity, 1.0),
             "note": "Lower value suggests internal turbulence; interpretation is Ina's."
         }
+
+        # Optional: surface a subtle self/other balance without prescribing meaning.
+        raw_values = {}
+        if isinstance(raw_state, dict):
+            if isinstance(raw_state.get("values"), dict):
+                raw_values = raw_state.get("values", {})
+            else:
+                raw_values = raw_state
+
+        if raw_values:
+            def _clamp(val):
+                try:
+                    return max(-1.0, min(1.0, float(val)))
+                except Exception:
+                    return 0.0
+
+            self_claim = _clamp(raw_values.get("ownership", 0.0))
+            world_claim = _clamp(raw_values.get("externality", 0.0))
+            gap = round(self_claim - world_claim, 4)
+            contact = round((self_claim + world_claim) / 2.0, 4)
+            blur = round(1.0 - min(1.0, abs(self_claim - world_claim)), 4)
+
+            hint.update({
+                "self_claim": self_claim,
+                "world_claim": world_claim,
+                "boundary_gap": gap,         # >0 leans toward self-attribution, <0 leans toward world-attribution
+                "boundary_contact": contact, # shared involvement with the world
+                "boundary_blur_hint": blur,  # higher value means less separation felt
+                "note": (
+                    "Lower stability suggests turbulence. "
+                    "Gap>0 self-lean, gap<0 world-lean; higher blur means self/other mix."
+                ),
+            })
+
+        return hint
 
     # ----------------------------------------------------------------------
     # EMOTION NORMALIZATION

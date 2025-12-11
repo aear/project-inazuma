@@ -76,19 +76,44 @@ class LMStudioAdapter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def handle_prompt(self, prompt: str) -> str:
-        """Process an operator utterance and craft a grounded reply."""
+    def handle_prompt(
+        self,
+        prompt: str,
+        *,
+        speaker: str = "operator",
+        tags: Optional[Iterable[str]] = None,
+        entity_links: Optional[Iterable[Dict[str, Any]]] = None,
+        response_tags: Optional[Iterable[str]] = None,
+    ) -> str:
+        """Process an utterance and craft a grounded reply, logging both turns."""
+
+        base_tags = ["conversation", "lmstudio"]
+        inbound_tags = list(base_tags)
+        if tags:
+            inbound_tags.extend(list(tags))
+        inbound_tags = list(dict.fromkeys(inbound_tags))  # preserve order, drop dupes
+
+        entity_payload = list(entity_links) if entity_links else None
 
         event_id = self.bridge.log_conversation_turn(
             prompt,
-            speaker="operator",
-            tags=["lmstudio", "conversation"],
+            speaker=speaker,
+            tags=inbound_tags,
+            entity_links=entity_payload,
         )
         response = self._compose_reply(prompt)
+
+        outbound_tags = list(base_tags)
+        if response_tags:
+            outbound_tags.extend(list(response_tags))
+        outbound_tags = list(dict.fromkeys(outbound_tags))
+
         self.bridge.log_conversation_turn(
             response,
             speaker=self.child,
-            tags=["lmstudio", "response"],
+            tags=outbound_tags,
+            entity_links=entity_payload,
+            event_id=event_id,
         )
         return response
 

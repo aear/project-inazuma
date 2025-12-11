@@ -3,16 +3,19 @@ from tkinter import Menu, messagebox, filedialog
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from safe_popen import safe_popen
 import psutil
 import shutil
 from pathlib import Path
-from model_manager import update_inastate
+from model_manager import get_inastate, update_inastate
 import threading
 import time
 from memory_graph import build_fractal_memory
 import platform
 from birth_system import boot
+from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
+from emotion_processor import process_emotion
 
 def append_status(msg, tag=None):
     """Safely append to the status box from any thread."""
@@ -106,6 +109,11 @@ config = dict(CONFIG_DEFAULTS)
 book_path_var = None
 music_path_var = None
 model_running = False
+vitals_window = None
+_usage_labels = {}
+energy_var = None
+energy_status_var = None
+emotion_vars = {}
 
 
 def refresh_config():
@@ -309,13 +317,28 @@ def update_ai_count_label():
     canvas.itemconfig(ai_text_id, text=str(ai_count))
 
 def start_model():
-    status_box.insert(tk.END, "Start Button clicked.\n")
-    status_box.insert(tk.END, "Launching Birth System...\n")
-    status_box.see(tk.END)
+    global model_running
+    if model_running:
+        append_status("[GUI] Model already running.\n")
+        return
+
+    append_status("Start Button clicked.\n")
+    append_status("Launching Birth System...\n")
     child = config.get("current_child", "default_child")
 
-    boot(child)
+    def _boot():
+        global model_running
+        try:
+            boot(child)
+            model_running = True
+            append_status("[GUI] Birth sequence returned.\n")
+        except Exception as exc:
+            model_running = False
+            append_status(f"[GUI ERROR] Birth sequence failed: {exc}\n", tag="error")
+        update_ai_count_label()
 
+    threading.Thread(target=_boot, daemon=True).start()
+    model_running = True
     update_ai_count_label()
 
 
@@ -325,6 +348,222 @@ def load_config():
         return {}
     with open(path, "r") as f:
         return json.load(f)
+
+def _clamp_value(value, lo=-1.0, hi=1.0):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+def _ina_processes():
+    try:
+        root_proc = psutil.Process(os.getpid())
+    except psutil.Error:
+        return []
+    try:
+        children = root_proc.children(recursive=True)
+    except psutil.Error:
+        children = []
+    return [root_proc] + children
+
+def _prime_usage_counters():
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
+    for proc in _ina_processes():
+        try:
+            proc.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+def _collect_usage_snapshot():
+    stats = {
+        "cpu": 0.0,
+        "mem_bytes": 0,
+        "threads": 0,
+        "processes": 0,
+        "system_cpu": 0.0,
+        "system_mem": 0.0,
+    }
+
+    for proc in _ina_processes():
+        try:
+            stats["cpu"] += proc.cpu_percent(interval=None)
+            stats["mem_bytes"] += proc.memory_info().rss
+            stats["threads"] += proc.num_threads()
+            stats["processes"] += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    try:
+        stats["system_cpu"] = psutil.cpu_percent(interval=None)
+    except Exception:
+        stats["system_cpu"] = 0.0
+
+    try:
+        stats["system_mem"] = psutil.virtual_memory().percent
+    except Exception:
+        stats["system_mem"] = 0.0
+
+    return stats
+
+def _refresh_energy_label():
+    if energy_status_var is None:
+        return
+    current = _clamp_value(get_inastate("current_energy") or 0.0, 0.0, 1.0)
+    energy_status_var.set(f"Current energy: {current:.3f}")
+
+def _apply_energy_value(value=None, reason="manual"):
+    if energy_var is None:
+        return
+    val = _clamp_value(value if value is not None else energy_var.get(), 0.0, 1.0)
+    energy_var.set(round(val, 3))
+    update_inastate("current_energy", round(val, 3))
+    _refresh_energy_label()
+    append_status(f"[Vitals] Energy set to {val:.3f} ({reason}).\n")
+
+def _nudge_energy(delta):
+    if energy_var is None:
+        return
+    current = _clamp_value(energy_var.get(), 0.0, 1.0)
+    _apply_energy_value(current + delta, reason="nudge")
+
+def _current_emotion_seed():
+    snapshot = get_inastate("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else None
+    if not isinstance(values, dict):
+        values = snapshot if isinstance(snapshot, dict) else {}
+    if not values:
+        try:
+            cfg = load_config()
+            child = cfg.get("current_child", "Inazuma_Yagami")
+            values = load_baseline(child)
+        except Exception:
+            values = {}
+    cleaned = {}
+    for key in EMOTION_SLIDERS:
+        cleaned[key] = _clamp_value(values.get(key, 0.0), -1.0, 1.0)
+    return cleaned
+
+def _reload_emotion_sliders():
+    if not emotion_vars:
+        return
+    seed = _current_emotion_seed()
+    for key, var in emotion_vars.items():
+        var.set(seed.get(key, 0.0))
+
+def _apply_emotion_sliders():
+    if not emotion_vars:
+        return
+    values = {name: _clamp_value(var.get(), -1.0, 1.0) for name, var in emotion_vars.items()}
+    mode = get_inastate("mode", "awake") or "awake"
+    processed = process_emotion(values, mode=mode)
+    ts = datetime.now(timezone.utc).isoformat()
+
+    update_inastate("emotion_snapshot", {"timestamp": ts, "mode": mode, "values": processed})
+    update_inastate("last_emotion_update", ts)
+    append_status(f"[Vitals] Emotion sliders applied (mode={mode}).\n")
+
+def _update_usage_labels():
+    if vitals_window is None or not vitals_window.winfo_exists():
+        return
+
+    stats = _collect_usage_snapshot()
+    mem_mb = stats["mem_bytes"] / (1024 * 1024) if stats["mem_bytes"] else 0
+
+    if _usage_labels.get("ina_cpu"):
+        _usage_labels["ina_cpu"].config(text=f"Ina CPU (sum): {stats['cpu']:.1f}%")
+    if _usage_labels.get("ina_mem"):
+        _usage_labels["ina_mem"].config(text=f"Ina RAM: {mem_mb:.1f} MB")
+    if _usage_labels.get("ina_threads"):
+        _usage_labels["ina_threads"].config(text=f"Threads: {stats['threads']}  ·  Processes: {stats['processes']}")
+    if _usage_labels.get("sys_cpu"):
+        _usage_labels["sys_cpu"].config(text=f"System CPU: {stats['system_cpu']:.1f}%")
+    if _usage_labels.get("sys_mem"):
+        _usage_labels["sys_mem"].config(text=f"System RAM: {stats['system_mem']:.1f}%")
+
+    _refresh_energy_label()
+    vitals_window.after(1500, _update_usage_labels)
+
+def open_vitals_window():
+    global vitals_window, _usage_labels, energy_var, energy_status_var, emotion_vars
+
+    if vitals_window is not None and vitals_window.winfo_exists():
+        vitals_window.lift()
+        return
+
+    vitals_window = tk.Toplevel(root)
+    vitals_window.title("Ina Vitals & Control")
+    vitals_window.geometry("700x720")
+
+    usage_frame = tk.LabelFrame(vitals_window, text="Resource usage (Ina process tree)")
+    usage_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+    _usage_labels = {
+        "ina_cpu": tk.Label(usage_frame, text="Ina CPU (sum): --"),
+        "ina_mem": tk.Label(usage_frame, text="Ina RAM: --"),
+        "ina_threads": tk.Label(usage_frame, text="Threads: --"),
+        "sys_cpu": tk.Label(usage_frame, text="System CPU: --"),
+        "sys_mem": tk.Label(usage_frame, text="System RAM: --"),
+    }
+
+    _usage_labels["ina_cpu"].pack(anchor="w")
+    _usage_labels["ina_mem"].pack(anchor="w")
+    _usage_labels["ina_threads"].pack(anchor="w")
+    _usage_labels["sys_cpu"].pack(anchor="w", pady=(4, 0))
+    _usage_labels["sys_mem"].pack(anchor="w")
+
+    energy_frame = tk.LabelFrame(vitals_window, text="Energy")
+    energy_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
+
+    energy_var = tk.DoubleVar(value=_clamp_value(get_inastate("current_energy") or 0.5, 0.0, 1.0))
+    energy_status_var = tk.StringVar(value="Current energy: --")
+
+    energy_row = tk.Frame(energy_frame)
+    energy_row.pack(fill=tk.X, padx=5, pady=4)
+    tk.Label(energy_row, text="Energy (0-1)").pack(side=tk.LEFT)
+    tk.Scale(energy_row, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
+             variable=energy_var, length=320).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+    tk.Label(energy_row, textvariable=energy_status_var).pack(side=tk.LEFT, padx=5)
+
+    energy_buttons = tk.Frame(energy_frame)
+    energy_buttons.pack(fill=tk.X, padx=5, pady=(0, 4))
+    tk.Button(energy_buttons, text="Nudge -0.05", command=lambda: _nudge_energy(-0.05)).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text="Apply", command=lambda: _apply_energy_value(reason="slider")).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text="Nudge +0.05", command=lambda: _nudge_energy(0.05)).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text="Reload", command=lambda: energy_var.set(_clamp_value(get_inastate("current_energy") or 0.5, 0.0, 1.0))).pack(side=tk.LEFT, padx=4)
+
+    emotion_frame = tk.LabelFrame(vitals_window, text="Emotion sliders (-1 to 1)")
+    emotion_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 10))
+
+    emotion_vars = {}
+    seed = _current_emotion_seed()
+    for idx, slider_name in enumerate(EMOTION_SLIDERS):
+        col = idx // 12
+        row = idx % 12
+        tk.Label(emotion_frame, text=slider_name).grid(row=row, column=col * 2, sticky="w", padx=4, pady=2)
+        var = tk.DoubleVar(value=seed.get(slider_name, 0.0))
+        emotion_vars[slider_name] = var
+        tk.Scale(emotion_frame, from_=-1.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
+                 variable=var, length=240).grid(row=row, column=col * 2 + 1, sticky="ew", padx=4, pady=2)
+
+    for col in range(4):
+        emotion_frame.columnconfigure(col, weight=1)
+
+    controls_row = tk.Frame(emotion_frame)
+    controls_row.grid(row=12, column=0, columnspan=4, sticky="ew", padx=4, pady=(8, 2))
+    tk.Button(controls_row, text="Reload from state", command=_reload_emotion_sliders).pack(side=tk.LEFT, padx=4)
+    tk.Button(controls_row, text="Apply to Ina", command=_apply_emotion_sliders).pack(side=tk.LEFT, padx=4)
+
+    _prime_usage_counters()
+    _refresh_energy_label()
+    vitals_window.after(500, _update_usage_labels)
 
 def open_logs():
     log_path = Path("AI_Children") / load_config().get("current_child", "Inazuma_Yagami") / "memory" / "self_questions.json"
@@ -471,6 +710,7 @@ options_menu.add_command(label="Exceptions List", command=exceptions_list)
 options_menu.add_command(label="Precision Settings", command=precision_settings)
 options_menu.add_command(label="Timers", command=open_timers_config)
 options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
+options_menu.add_command(label="Vitals / Emotions", command=open_vitals_window)
 menu_bar.add_cascade(label="Options", menu=options_menu)
 
 root.config(menu=menu_bar)
@@ -534,7 +774,8 @@ tk.Button(button_frame, text="Reboot", command=reboot_model, width=15).grid(row=
 tk.Button(button_frame, text="Tuck In", command=tuck_in, width=15).grid(row=0, column=1, padx=5)
 tk.Button(button_frame, text="Wake Up", command=wake_up, width=15).grid(row=0, column=2, padx=5)
 tk.Button(button_frame, text="Clear Log", command=clear_status_log, width=15).grid(row=0, column=3, padx=5)
-tk.Button(button_frame, text="View Self Questions", command=open_logs, width=20)
+tk.Button(button_frame, text="Vitals + Sliders", command=open_vitals_window, width=17).grid(row=0, column=4, padx=5)
+tk.Button(button_frame, text="View Self Questions", command=open_logs, width=20).grid(row=0, column=5, padx=5)
 
 
 

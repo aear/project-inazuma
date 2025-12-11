@@ -10,6 +10,11 @@ from pathlib import Path
 import threading
 import uuid
 
+try:
+    from text_memory import record_text_observation
+except Exception:  # pragma: no cover - optional dependency
+    record_text_observation = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,10 +97,12 @@ class CommsCore:
         instance_name: str = "ina",
         log_dir: Optional[Path] = None,
         process_inbound: Optional[Callable[[CommsMessage], CommsResponse]] = None,
+        raw_fallback: Optional[Callable[[CommsMessage], None]] = None,
     ) -> None:
         self.instance_name = instance_name
         self._backends: Dict[str, Callable[[CommsMessage], None]] = {}
         self._process_inbound = process_inbound or self._default_process_inbound
+        self._raw_fallback = raw_fallback
 
         # basic log file setup
         self.log_dir = log_dir or Path("logs")
@@ -158,6 +165,21 @@ class CommsCore:
                 **metadata,
             },
         )
+
+        if record_text_observation and text:
+            try:
+                tags = [backend, "inbound"]
+                if metadata.get("is_dm"):
+                    tags.append("dm")
+                if metadata.get("is_owner_friend"):
+                    tags.append("owner_friend")
+                record_text_observation(
+                    text=text,
+                    source=f"{backend}:{channel.name}",
+                    tags=tags,
+                )
+            except Exception:
+                logger.exception("Failed to record text fragment for inbound message %s", backend_message_id)
 
         self._log_message(msg)
 
@@ -236,12 +258,23 @@ class CommsCore:
         backend = msg.backend
         send_fn = self._backends.get(backend)
         if not send_fn:
-            logger.error("No backend registered for %s; dropping message %s", backend, msg.id)
+            self._fallback_outbound(msg, reason="no backend registered")
             return
         try:
             send_fn(msg)
         except Exception:
             logger.exception("Error while dispatching message %s via backend %s", msg.id, backend)
+            self._fallback_outbound(msg, reason="send failed")
+
+    def _fallback_outbound(self, msg: CommsMessage, *, reason: str) -> None:
+        """Optional fallback path when no backend is available or send fails."""
+        if self._raw_fallback:
+            try:
+                self._raw_fallback(msg)
+                return
+            except Exception:
+                logger.exception("Raw fallback failed for message %s (reason=%s)", msg.id, reason)
+        logger.error("Dropping outbound message %s (reason=%s, text=%s)", msg.id, reason, msg.text)
 
     # ------------------------------------------------------------------
     # Logging

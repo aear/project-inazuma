@@ -10,7 +10,7 @@ from gui_hook import log_to_statusbox
 from alignment.metrics import evaluate_alignment
 from alignment import check_action
 from deep_recall import DeepRecallConfig, DeepRecallManager
-from memory_graph import MemoryManager
+from memory_graph import MEMORY_TIERS, MemoryManager
 from self_reflection_core import SelfReflectionCore
 from self_adjustment_scheduler import SelfAdjustmentScheduler
 
@@ -33,6 +33,8 @@ memory_manager = MemoryManager(CHILD)
 _last_opportunities = set()
 _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
+_last_self_read_launch = 0.0
+_SELF_READ_COOLDOWN = 300  # seconds
 _last_communication_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
 _last_stable_urge_log = 0.0
@@ -143,6 +145,7 @@ class _FragmentMemoryBackend:
         self._id_to_path: Dict[str, Path] = {}
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._ordered_ids: List[str] = []
+        self._tier_names = set(MEMORY_TIERS)
 
     def _load_index(self):
         if self._index_loaded:
@@ -161,13 +164,10 @@ class _FragmentMemoryBackend:
                         continue
                     filename = entry.get("filename") or f"{frag_id}.json"
                     tier = entry.get("tier")
-                    candidates = []
-                    if tier:
-                        candidates.append(self.fragments_root / tier / filename)
-                    candidates.append(self.fragments_root / filename)
-                    path = next((c for c in candidates if c.exists()), None)
+                    path = self._resolve_fragment_path(filename, tier)
                     if path is None:
                         continue
+                    tier = self._tier_from_path(path) or tier
                     meta[frag_id] = {
                         "path": path,
                         "tier": tier,
@@ -178,11 +178,15 @@ class _FragmentMemoryBackend:
                     }
 
         if not meta:
+            skip_dirs = {"pending", "archived"}
             for frag_path in self.fragments_root.rglob("frag_*.json"):
+                if any(part in skip_dirs for part in frag_path.parts):
+                    continue
                 frag_id = self._derive_fragment_id(frag_path)
+                tier = self._tier_from_path(frag_path)
                 meta[frag_id] = {
                     "path": frag_path,
-                    "tier": frag_path.parent.name if frag_path.parent != self.fragments_root else None,
+                    "tier": tier,
                     "filename": frag_path.name,
                     "last_seen": None,
                     "importance": None,
@@ -207,8 +211,13 @@ class _FragmentMemoryBackend:
     def _order_fragment_ids(self, meta: Dict[str, Dict[str, Any]]) -> List[str]:
         def _key(item):
             fid, entry = item
-            ts = entry.get("last_seen") or ""
-            return (ts, fid)
+            ts_raw = entry.get("last_seen") or ""
+            ts_key = ts_raw
+            try:
+                ts_key = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).isoformat()
+            except Exception:
+                pass
+            return (ts_key, fid)
 
         return [fid for fid, _ in sorted(meta.items(), key=_key)]
 
@@ -227,27 +236,75 @@ class _FragmentMemoryBackend:
         for frag_id in fragment_ids:
             path = self._id_to_path.get(frag_id)
             if path is None or not path.exists():
-                log_to_statusbox(f"[DeepRecall] Missing fragment file for {frag_id}")
-                continue
+                path = self._refresh_path(frag_id)
+                if path is None or not path.exists():
+                    log_to_statusbox(f"[DeepRecall] Missing fragment file for {frag_id}")
+                    continue
 
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception as exc:
-                log_to_statusbox(f"[DeepRecall] Failed reading {path.name}: {exc}")
-                continue
+                path = self._refresh_path(frag_id)
+                if path is None or not path.exists():
+                    log_to_statusbox(f"[DeepRecall] Failed reading {frag_id}: {exc}")
+                    continue
+                try:
+                    with path.open("r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception as exc2:
+                    log_to_statusbox(f"[DeepRecall] Failed reading {frag_id}: {exc2}")
+                    continue
 
             if not isinstance(data, dict):
                 continue
 
             data.setdefault("id", frag_id)
             meta = self._meta.get(frag_id, {})
-            if meta.get("tier") and "tier" not in data:
-                data["tier"] = meta["tier"]
+            tier = meta.get("tier") or self._tier_from_path(path)
+            if tier and "tier" not in data:
+                data["tier"] = tier
 
             loaded.append(data)
 
         return loaded
+
+    def _refresh_path(self, frag_id: str) -> Optional[Path]:
+        """
+        Resolve a fragment path again after tiers move; update caches if found.
+        """
+        meta = self._meta.get(frag_id, {})
+        filename = meta.get("filename") or f"{frag_id}.json"
+        tier_hint = meta.get("tier")
+        path = self._resolve_fragment_path(filename, tier_hint)
+        if path:
+            meta = {
+                "path": path,
+                "tier": self._tier_from_path(path) or tier_hint,
+                "last_seen": meta.get("last_seen"),
+                "importance": meta.get("importance"),
+                "tags": meta.get("tags", []),
+                "filename": filename,
+            }
+            self._meta[frag_id] = meta
+            self._id_to_path[frag_id] = path
+        return path
+
+    def _tier_from_path(self, frag_path: Path) -> Optional[str]:
+        parent = frag_path.parent.name
+        return parent if parent in self._tier_names else None
+
+    def _resolve_fragment_path(self, filename: str, tier_hint: Optional[str]) -> Optional[Path]:
+        candidates = []
+        if tier_hint:
+            candidates.append(self.fragments_root / tier_hint / filename)
+        candidates.append(self.fragments_root / filename)
+        for tier in self._tier_names:
+            candidates.append(self.fragments_root / tier / filename)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
 
 class _InastateEmotionBackend:
@@ -642,32 +699,94 @@ def boredom_check():
         update_inastate("last_boredom_trigger", datetime.fromtimestamp(now, timezone.utc).isoformat())
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
+def _maybe_self_read():
+    """
+    Launch self-reading when curiosity spikes, clarity drops (confused), or
+    familiarity is high enough to want to revisit known files.
+    """
+    global _last_self_read_launch
+    snapshot = get_inastate("emotion_snapshot") or {}
+    emo = snapshot.get("values") or snapshot
+
+    curiosity = max(emo.get("curiosity", 0.0), 0.0)
+    attention = max(emo.get("attention", 0.0), 0.0)
+    clarity = emo.get("clarity", 0.5)
+    fuzziness = max(emo.get("fuzziness", emo.get("fuzz_level", 0.0)), 0.0)
+    familiarity = max(emo.get("familiarity", 0.0), 0.0)
+
+    curious = curiosity >= 0.55 and attention >= 0.25
+    confused = clarity < 0.35 or fuzziness > 0.6
+    familiar_pull = familiarity > 0.75 and curiosity >= 0.3
+
+    now = time.time()
+    if (now - _last_self_read_launch) < _SELF_READ_COOLDOWN:
+        return
+
+    reason = None
+    if curious:
+        reason = f"curiosity {curiosity:.2f} w/ attention {attention:.2f}"
+    elif confused:
+        reason = f"confused: clarity {clarity:.2f}, fuzz {fuzziness:.2f}"
+    elif familiar_pull:
+        reason = f"familiar files: familiarity {familiarity:.2f}"
+
+    if not reason:
+        return
+
+    _last_self_read_launch = now
+    trigger = {
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "reason": reason,
+        "drivers": {
+            "curiosity": round(curiosity, 3),
+            "attention": round(attention, 3),
+            "clarity": round(clarity, 3) if clarity is not None else None,
+            "fuzziness": round(fuzziness, 3),
+            "familiarity": round(familiarity, 3),
+        },
+    }
+    update_inastate("last_self_read_trigger", trigger)
+    log_to_statusbox(f"[Manager] Self-read triggered ({reason}).")
+    safe_popen(["python", "raw_file_manager.py"])
+
 def _update_communication_urge():
     """
     Surface an urge to communicate without issuing a command to speak.
     """
     global _last_communication_urge_log
     snapshot = get_inastate("emotion_snapshot") or {}
-    boredom = max(get_inastate("emotion_boredom") or 0.0, 0.0)
+    values = snapshot.get("values") if isinstance(snapshot, dict) else {}
+    if isinstance(values, dict) and values:
+        snapshot = values
+
+    boredom = max(get_inastate("emotion_boredom") or snapshot.get("boredom", 0.0) or 0.0, 0.0)
     connection = max(snapshot.get("connection", 0.0), 0.0)
     isolation = max(snapshot.get("isolation", 0.0), 0.0)
     curiosity = max(snapshot.get("curiosity", 0.0), 0.0)
     attention = max(snapshot.get("attention", 0.0), 0.0)
+    positivity = max(snapshot.get("positivity", 0.0), 0.0)
+    negativity = max(snapshot.get("negativity", 0.0), 0.0)
+    intensity = max(snapshot.get("intensity", 0.0), 0.0)
+    stress = max(snapshot.get("stress", 0.0), 0.0)
+    threat = max(snapshot.get("threat", 0.0), 0.0)
+    sleep_pressure = max(get_inastate("sleep_pressure") or 0.0, 0.0)
 
     last_expression = get_inastate("last_expression_time")
     now = time.time()
     since_expression = max(now - last_expression, 0.0) if last_expression else None
     time_factor = min((since_expression or 180.0) / 300.0, 1.0)
 
-    urge_level = min(
-        1.0,
-        0.3 * connection
-        + 0.25 * isolation
-        + 0.15 * curiosity
-        + 0.15 * boredom
-        + 0.1 * time_factor
-        + 0.05 * attention,
-    )
+    social_drive = (0.32 * connection) + (0.24 * isolation * (1.0 - connection))
+    curiosity_drive = 0.16 * curiosity + 0.12 * boredom
+    salience_drive = 0.1 * attention + 0.1 * intensity
+    reward_drive = 0.15 * positivity - 0.1 * negativity
+    temporal_drive = 0.1 * time_factor
+
+    base_urge = social_drive + curiosity_drive + salience_drive + reward_drive + temporal_drive
+
+    inhibition = min(0.7, (0.5 * stress) + (0.5 * threat) + (0.4 * sleep_pressure))
+    inhibition = max(0.0, inhibition)
+    urge_level = min(1.0, max(0.0, base_urge * (1.0 - inhibition)))
 
     update_inastate(
         "urge_to_communicate",
@@ -680,7 +799,15 @@ def _update_communication_urge():
                 "curiosity": round(curiosity, 3),
                 "boredom": round(boredom, 3),
                 "attention": round(attention, 3),
+                "positivity": round(positivity, 3),
+                "negativity": round(negativity, 3),
+                "intensity": round(intensity, 3),
+                "stress": round(stress, 3),
+                "threat": round(threat, 3),
+                "sleep_pressure": round(sleep_pressure, 3),
                 "seconds_since_last_expression": since_expression,
+                "inhibition": round(inhibition, 3),
+                "base_urge": round(base_urge, 3),
             },
         },
     )
@@ -801,6 +928,7 @@ def run_internal_loop():
         safe_popen(["python", "logic_engine.py"])
 
     boredom_check()
+    _maybe_self_read()
     rebuild_maps_if_needed()
     _check_self_adjustment()
     _update_communication_urge()
