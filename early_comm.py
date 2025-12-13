@@ -22,11 +22,13 @@ from language_processing import (
     save_symbol_to_token,
     speak_symbolically,
 )
-from model_manager import load_config, seed_self_question, update_inastate, get_inastate
+from model_manager import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
+from social_map import get_high_trust_contacts, get_owner_user_id
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
+TYPE_CONTACT_COOLDOWN = 180  # seconds between proactive typed contacts
 EMBEDDER = MultimodalEmbedder(dim=128)
 
 
@@ -1112,12 +1114,26 @@ def early_communicate():
         update_inastate("preferred_voice_output", None)
 
     min_urge_to_speak = float(config.get("min_urge_to_speak", 0.25))
-    urge_state = get_inastate("urge_to_communicate") or {}
+    voice_urge_state = get_inastate("urge_to_voice") or get_inastate("urge_to_communicate") or {}
     try:
-        urge_level = float(urge_state.get("level", 0.0))
+        voice_urge_level = float(voice_urge_state.get("level", 0.0))
     except Exception:
-        urge_level = 0.0
-    allow_speech = urge_level >= min_urge_to_speak or bool(config.get("ignore_urge_for_speech", False))
+        voice_urge_level = 0.0
+    allow_speech = voice_urge_level >= min_urge_to_speak or bool(config.get("ignore_urge_for_speech", False))
+    min_urge_to_type = float(config.get("min_urge_to_type", 0.35))
+    type_contact_cooldown = int(config.get("type_contact_cooldown", TYPE_CONTACT_COOLDOWN))
+    type_urge_state = get_inastate("urge_to_type") or {}
+    try:
+        type_urge_level = float(type_urge_state.get("level", 0.0))
+    except Exception:
+        type_urge_level = 0.0
+    last_typed_contact = get_inastate("last_typed_contact")
+    since_last_typed = (time.time() - last_typed_contact) if last_typed_contact else None
+    allow_high_trust_dm = bool(config.get("allow_high_trust_dm", True))
+    try:
+        owner_user_id = int(get_owner_user_id(config) or 0)
+    except Exception:
+        owner_user_id = None
     transformer = FractalTransformer()
     prediction = load_prediction(child)
     if not prediction:
@@ -1385,7 +1401,7 @@ def early_communicate():
         speech_suppressed=(
             {
                 "reason": "low_urge",
-                "urge_level": urge_level,
+                "urge_level": voice_urge_level,
                 "threshold": min_urge_to_speak,
             }
             if not allow_speech
@@ -1401,10 +1417,136 @@ def early_communicate():
     update_tone_library(child, speech_symbols or ([symbol_id] if symbol_id else []), inferred or {}, frag.get("tags", []))
     log_to_statusbox(f"[Comms] Expression fragment saved: {frag['id']}")
 
+    # === Optional typed contact (volitional, minimal payload)
+    allow_symbol_autotype = bool(config.get("allow_symbol_autotype", True))
+    typed_payload = get_inastate("typed_contact_payload") or {}
+    payload_text = typed_payload.get("text") if isinstance(typed_payload, dict) else None
+    payload_kind = typed_payload.get("kind") if isinstance(typed_payload, dict) else None
+    payload_allow_empty = bool(typed_payload.get("allow_empty")) if isinstance(typed_payload, dict) else False
+    ready_to_type = type_urge_level >= min_urge_to_type or bool(config.get("ignore_urge_for_typing", False))
+    cooled_down = since_last_typed is None or since_last_typed >= type_contact_cooldown
+    payload_target_user = typed_payload.get("target_user_id") if isinstance(typed_payload, dict) else None
+    payload_target_label = typed_payload.get("target") if isinstance(typed_payload, dict) else None
+    high_trust_contacts = get_high_trust_contacts(config=config, min_level="high", limit=3) if allow_high_trust_dm else []
+
+    # Prefer human-friendly labels over raw symbol ids when crafting typed text.
+    symbol_labels = [label_for_symbol(sid) for sid in speech_symbols[:3] if sid]
+    symbol_text = " ".join(symbol_labels) if symbol_labels else None
+    fallback_text = vocab_word or word_id or symbol_text
+    queued_id = None
+    audio_clip_path = None
+    if allow_symbol_autotype and speech_symbols:
+        try:
+            audio_dm_dir = Path("AI_Children") / child / "memory" / "comm_output" / "typed_audio"
+            audio_dm_dir.mkdir(parents=True, exist_ok=True)
+            audio_clip_path = audio_dm_dir / f"ina_sound_{uuid.uuid4().hex[:8]}.mp3"
+            speak_symbolically(
+                speech_symbols,
+                child=child,
+                record_path=audio_clip_path,
+                playback=False,
+                record_format="mp3",
+            )
+            if not audio_clip_path.exists():
+                audio_clip_path = None
+        except Exception as exc:
+            audio_clip_path = None
+            log_to_statusbox(f"[Comms] Failed to render DM audio clip: {exc}")
+
+    if ready_to_type and cooled_down:
+        chosen_text = None
+        chosen_source = None
+        target_user_id = None
+        target_label = payload_target_label or "owner_dm"
+
+        if isinstance(payload_text, str):
+            chosen_text = payload_text
+            chosen_source = payload_kind or "typed_payload"
+        elif allow_symbol_autotype and fallback_text:
+            chosen_text = fallback_text
+            chosen_source = "symbol_sequence" if speech_symbols else "word_hint"
+
+        if payload_target_user:
+            target_user_id = str(payload_target_user)
+            target_label = payload_target_label or "user_dm"
+        elif allow_high_trust_dm and high_trust_contacts:
+            candidates = [
+                contact for contact in high_trust_contacts if str(contact.get("user_id")) != str(owner_user_id)
+            ] or high_trust_contacts
+            if candidates:
+                target_user_id = str(candidates[0].get("user_id"))
+                target_label = "trusted_dm"
+        elif owner_user_id:
+            target_user_id = str(owner_user_id)
+            target_label = "owner_dm"
+
+        rationale = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "urge_level": type_urge_level,
+            "urge_threshold": min_urge_to_type,
+            "cooled_down": cooled_down,
+            "target_label": target_label,
+            "target_user_id": target_user_id,
+            "selected_source": chosen_source or "unspecified",
+            "symbol_autotype_enabled": allow_symbol_autotype,
+            "payload_kind": payload_kind,
+            "audio_clip_path": str(audio_clip_path) if audio_clip_path else None,
+            "candidates": {
+                "speech_symbols": speech_symbols[:3] if speech_symbols else None,
+                "vocab_word": vocab_word,
+                "word_id": word_id,
+                "high_trust_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
+                "owner_user_id": owner_user_id,
+            },
+        }
+
+        if chosen_text is not None and (chosen_text.strip() or payload_allow_empty):
+            queued_id = append_typed_outbox_entry(
+                chosen_text,
+                target=target_label,
+                user_id=target_user_id,
+                metadata={
+                    "source": chosen_source or "unspecified",
+                    "strategy": expression_strategy,
+                    "urge_to_type": type_urge_level,
+                    "urge_to_voice": voice_urge_level,
+                },
+                allow_empty=payload_allow_empty,
+                attachment_path=str(audio_clip_path) if audio_clip_path else None,
+            )
+            if queued_id:
+                update_inastate("last_typed_contact", time.time())
+                update_inastate(
+                    "last_contact_rationale",
+                    {
+                        **rationale,
+                        "queued_id": queued_id,
+                        "payload_text_preview": (chosen_text or "")[:160],
+                        "allow_empty": payload_allow_empty,
+                    },
+                )
+                if payload_text is not None:
+                    update_inastate("typed_contact_payload", None)
+                log_to_statusbox(f"[Comms] Queued typed contact ({chosen_source or 'freeform'}): {queued_id}")
+        elif ready_to_type and chosen_text is None:
+            update_inastate(
+                "typing_contact_intent",
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "urge_level": type_urge_level,
+                    "note": "urge high; waiting for volitional text (silence is okay)",
+                    "candidates": {
+                        "symbols": speech_symbols[:3] if speech_symbols else None,
+                        "word": vocab_word or word_id,
+                        "trusted_user_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
+                    },
+                },
+            )
+
     # === Audio expression attempt (log + speak)
     if not allow_speech:
         log_to_statusbox(
-            f"[Comms] Staying quiet (urge {urge_level:.2f} < {min_urge_to_speak}). Expression logged only."
+            f"[Comms] Staying quiet (urge {voice_urge_level:.2f} < {min_urge_to_speak}). Expression logged only."
         )
     else:
         channel_hint = " via Discord voice" if voice_pref else ""

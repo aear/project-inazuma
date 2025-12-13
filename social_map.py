@@ -301,3 +301,73 @@ def is_owner_friend(
         return False
     tag_set = _normalize_tags(entry.get("tags"))
     return bool(OWNER_FRIEND_TAGS.intersection(tag_set))
+
+
+def _trust_score(trust_hint: Any) -> int:
+    """
+    Map textual trust hints into a simple score for ordering.
+    """
+    if trust_hint is None:
+        return -1
+    hint = str(trust_hint).strip().lower()
+    table = {
+        "very_high": 3,
+        "very high": 3,
+        "high": 2,
+        "medium": 1,
+        "med": 1,
+        "low": 0,
+        "unknown": -1,
+    }
+    return table.get(hint, 0 if hint else -1)
+
+
+def is_high_trust(
+    user_id: str | int,
+    *,
+    social_map: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[dict] = None,
+    min_level: str = "high",
+) -> bool:
+    """
+    Returns True if the user meets or exceeds the min_level trust hint.
+    """
+    entry = find_social_entry(str(user_id), social_map=social_map, config=config)
+    if not entry:
+        return False
+    score = _trust_score(entry.get("trust_hint"))
+    min_score = _trust_score(min_level)
+    if score >= min_score and min_score >= 0:
+        return True
+    tags = _normalize_tags(entry.get("tags"))
+    return "trusted" in tags and min_score <= _trust_score("high")
+
+
+def get_high_trust_contacts(
+    *,
+    social_map: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[dict] = None,
+    min_level: str = "high",
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return entries meeting the min_level trust threshold, sorted by trust then recency.
+    """
+    entries = social_map if social_map is not None else load_social_map(config)
+    min_score = _trust_score(min_level)
+
+    def _entry_key(entry: Dict[str, Any]):
+        score = _trust_score(entry.get("trust_hint"))
+        ts_raw = entry.get("last_interaction")
+        try:
+            ts_val = datetime.fromisoformat(ts_raw).timestamp() if ts_raw else 0.0
+        except Exception:
+            ts_val = 0.0
+        return (-score, -ts_val, entry.get("display_name") or entry.get("user_id") or "")
+
+    filtered = [
+        entry for entry in entries
+        if _trust_score(entry.get("trust_hint")) >= min_score or "trusted" in _normalize_tags(entry.get("tags"))
+    ]
+    filtered.sort(key=_entry_key)
+    return filtered[:limit] if limit else filtered

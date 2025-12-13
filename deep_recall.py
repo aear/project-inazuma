@@ -303,6 +303,7 @@ class DeepRecallManager:
             f"[DeepRecall] Resuming session at index {self.state.last_index}/"
             f"{self.state.total_fragments} (reason={self.state.reason}, mode={self.state.mode})"
         )
+        self._burst_resume_at = 0.0
 
     def stop(self, mark_completed: bool = False) -> None:
         self.state.active = False
@@ -310,6 +311,7 @@ class DeepRecallManager:
             self.state.completed = True
         self.state.last_update = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.save_state()
+        self._burst_resume_at = 0.0
         self.log(
             f"[DeepRecall] Stopped session. completed={self.state.completed}, "
             f"fragments_processed_total={self.state.fragments_processed_total}"
@@ -332,6 +334,9 @@ class DeepRecallManager:
             if self.state.fragments_processed_this_run >= self.config.max_fragments_per_run:
                 self.log("[DeepRecall] Hit max_fragments_per_run; pausing.")
                 return False
+
+        if self.config.burst_cooldown_sec > 0 and time.time() < self._burst_resume_at:
+            return False
 
         # Memory check
         if not self._memory_ok():
@@ -376,14 +381,11 @@ class DeepRecallManager:
         if not self.state.active or self.state.completed:
             return
 
-        if not self._fragment_ids:
-            self._fragment_ids = self.memory_backend.list_fragment_ids()
-            self.state.total_fragments = len(self._fragment_ids)
+        self._ensure_fragment_ids()
 
         start_idx = self.state.last_index
-        end_idx = min(
-            start_idx + self.config.chunk_size, self.state.total_fragments
-        )
+        chunk_span = self._effective_chunk_span()
+        end_idx = min(start_idx + chunk_span, self.state.total_fragments)
 
         if start_idx >= self.state.total_fragments:
             self.log("[DeepRecall] Reached end of fragment list; marking completed.")
@@ -405,6 +407,11 @@ class DeepRecallManager:
 
         # Plug into subsystems
         self._process_fragments(fragments)
+        if self.config.burst_collect_garbage:
+            try:
+                gc.collect()
+            except Exception:
+                pass
 
         # Update progress
         processed_count = len(batch_ids)
@@ -413,6 +420,10 @@ class DeepRecallManager:
         self.state.fragments_processed_this_run += processed_count
         self.state.last_update = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.save_state()
+        if self.config.burst_cooldown_sec > 0:
+            self._burst_resume_at = time.time() + self.config.burst_cooldown_sec
+        else:
+            self._burst_resume_at = 0.0
 
         if end_idx >= self.state.total_fragments:
             self.log("[DeepRecall] Completed full sweep.")

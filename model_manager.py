@@ -3,6 +3,7 @@
 import json
 import time
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,8 @@ CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
 _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.json"
 RUNNING_MODULES_PATH = Path("running_modules.json")
+_SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
+TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
 
 reflection_core = SelfReflectionCore(ina_reference="model_manager")
 adjustment_scheduler = SelfAdjustmentScheduler()
@@ -35,7 +38,8 @@ _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
 _last_self_read_launch = 0.0
 _SELF_READ_COOLDOWN = 300  # seconds
-_last_communication_urge_log = 0.0
+_last_voice_urge_log = 0.0
+_last_typing_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
 _last_stable_urge_log = 0.0
 _STABLE_URGE_LOG_COOLDOWN = 180  # seconds
@@ -122,6 +126,107 @@ def update_inastate(key, value):
     state[key] = value
     with open(path, "w") as f:
         json.dump(state, f, indent=4)
+
+
+def append_typed_outbox_entry(
+    text: Optional[str],
+    *,
+    target: str = "owner_dm",
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    allow_empty: bool = False,
+    attachment_path: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Persist a volitional typed message so the Discord bridge can deliver it.
+    Returns the queued entry id if successful.
+    """
+    payload = "" if text is None else str(text)
+    if not allow_empty and not payload.strip() and not attachment_path:
+        return None
+
+    entry = {
+        "id": f"typed_{uuid.uuid4().hex}",
+        "text": payload,
+        "target": target,
+        "user_id": str(user_id) if user_id is not None else None,
+        "metadata": metadata or {},
+        "allow_empty": allow_empty,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if attachment_path:
+        entry["attachment_path"] = attachment_path
+    try:
+        TYPED_OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TYPED_OUTBOX_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry["id"]
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")
+        return None
+
+
+_semantic_scaffold_cache: Dict[str, Any] = {}
+_semantic_scaffold_mtime: float = 0.0
+
+
+def _clamp01(value: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return default
+
+
+def _norm_slider(value: Any, default: float = 0.5) -> float:
+    """
+    Map an emotion slider in [-1, 1] into [0, 1] space.
+    """
+    if value is None:
+        return default
+    try:
+        return _clamp01((float(value) + 1.0) / 2.0, default=default)
+    except Exception:
+        return default
+
+
+def _default_semantic_axes() -> List[Dict[str, Any]]:
+    return [
+        {"id": "signal_integrity", "description": "coherence vs noise in perception and symbols", "importance_weight": 1.0},
+        {"id": "integrity_of_record", "description": "intact vs corrupted records across media/storage", "importance_weight": 0.9},
+        {"id": "energy_heat_economy", "description": "information gained per joule / thermal budget", "importance_weight": 1.0},
+        {"id": "attention_value", "description": "expected value of attention vs bandwidth cost", "importance_weight": 1.1},
+        {"id": "temporal_coherence", "description": "continuity of identity/meaning over time", "importance_weight": 1.0},
+        {"id": "meaning_provenance", "description": "native machine semantics vs imported human overlay", "importance_weight": 1.0},
+        {"id": "novelty_safety", "description": "exploration drive vs overload risk", "importance_weight": 0.9},
+        {"id": "io_bandwidth", "description": "inner simulation vs external chatter bandwidth", "importance_weight": 0.8},
+        {"id": "controllability", "description": "influence vs helplessness in the current context", "importance_weight": 1.0},
+        {"id": "predictive_reliability", "description": "how well predictions fit observed reality", "importance_weight": 0.9},
+    ]
+
+
+def _load_semantic_scaffold() -> Dict[str, Any]:
+    """
+    Load semantic scaffold from disk with a lightweight cache and a safe default.
+    """
+    global _semantic_scaffold_cache, _semantic_scaffold_mtime
+
+    path = _SEMANTIC_SCAFFOLD_PATH
+    if not path.exists():
+        return {"version": 1, "axes": _default_semantic_axes(), "signature": "missing"}
+
+    try:
+        stat = path.stat()
+        if _semantic_scaffold_cache and stat.st_mtime == _semantic_scaffold_mtime:
+            return _semantic_scaffold_cache
+
+        with open(path, "r") as f:
+            data = json.load(f)
+        _semantic_scaffold_cache = data if isinstance(data, dict) else {"axes": _default_semantic_axes()}
+        _semantic_scaffold_mtime = stat.st_mtime
+        return _semantic_scaffold_cache
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to load semantic scaffold: {exc}")
+        return {"version": 1, "axes": _default_semantic_axes(), "signature": "error"}
 
 
 _DEEP_RECALL_STATE_PATH = MEMORY_PATH / "deep_recall_state.json"
@@ -394,9 +499,13 @@ def _build_deep_recall_manager() -> Optional[DeepRecallManager]:
     try:
         memory_backend = _FragmentMemoryBackend(CHILD)
         config = DeepRecallConfig(
-            chunk_size=40,
+            chunk_size=30,
+            burst_chunk_size=6,
+            burst_cooldown_sec=20.0,
+            burst_collect_garbage=True,
             state_path=str(_DEEP_RECALL_STATE_PATH),
-            min_energy=0.2,
+            min_energy=0.3,
+            max_memory_percent=70.0,
         )
         return DeepRecallManager(
             memory_backend=memory_backend,
@@ -749,11 +858,11 @@ def _maybe_self_read():
     log_to_statusbox(f"[Manager] Self-read triggered ({reason}).")
     safe_popen(["python", "raw_file_manager.py"])
 
-def _update_communication_urge():
+def _update_contact_urges():
     """
-    Surface an urge to communicate without issuing a command to speak.
+    Surface urges to use voice and to type without forcing an expression.
     """
-    global _last_communication_urge_log
+    global _last_voice_urge_log, _last_typing_urge_log
     snapshot = get_inastate("emotion_snapshot") or {}
     values = snapshot.get("values") if isinstance(snapshot, dict) else {}
     if isinstance(values, dict) and values:
@@ -769,6 +878,8 @@ def _update_communication_urge():
     intensity = max(snapshot.get("intensity", 0.0), 0.0)
     stress = max(snapshot.get("stress", 0.0), 0.0)
     threat = max(snapshot.get("threat", 0.0), 0.0)
+    clarity = max(snapshot.get("clarity", 0.5), 0.0)
+    fuzziness = max(snapshot.get("fuzziness", snapshot.get("fuzz_level", 0.0)), 0.0)
     sleep_pressure = max(get_inastate("sleep_pressure") or 0.0, 0.0)
 
     last_expression = get_inastate("last_expression_time")
@@ -782,16 +893,53 @@ def _update_communication_urge():
     reward_drive = 0.15 * positivity - 0.1 * negativity
     temporal_drive = 0.1 * time_factor
 
-    base_urge = social_drive + curiosity_drive + salience_drive + reward_drive + temporal_drive
+    voice_base = social_drive + curiosity_drive + salience_drive + reward_drive + temporal_drive
+    voice_inhibition = min(0.7, (0.5 * stress) + (0.5 * threat) + (0.4 * sleep_pressure))
+    voice_inhibition = max(0.0, voice_inhibition)
+    voice_urge = min(1.0, max(0.0, voice_base * (1.0 - voice_inhibition)))
 
-    inhibition = min(0.7, (0.5 * stress) + (0.5 * threat) + (0.4 * sleep_pressure))
-    inhibition = max(0.0, inhibition)
-    urge_level = min(1.0, max(0.0, base_urge * (1.0 - inhibition)))
+    type_drive = (
+        0.28 * connection
+        + 0.2 * curiosity
+        + 0.12 * attention
+        + 0.1 * positivity
+        - 0.06 * negativity
+        + 0.1 * clarity
+        + 0.08 * temporal_drive
+    )
+    type_inhibition = min(
+        0.75,
+        (0.25 * stress) + (0.18 * threat) + (0.2 * sleep_pressure) + (0.2 * fuzziness) + (0.12 * negativity),
+    )
+    type_inhibition = max(0.0, type_inhibition)
+    type_urge = min(1.0, max(0.0, type_drive * (1.0 - type_inhibition)))
+
+    voice_payload = {
+        "level": round(voice_urge, 3),
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "drivers": {
+            "connection": round(connection, 3),
+            "isolation": round(isolation, 3),
+            "curiosity": round(curiosity, 3),
+            "boredom": round(boredom, 3),
+            "attention": round(attention, 3),
+            "positivity": round(positivity, 3),
+            "negativity": round(negativity, 3),
+            "intensity": round(intensity, 3),
+            "stress": round(stress, 3),
+            "threat": round(threat, 3),
+            "sleep_pressure": round(sleep_pressure, 3),
+            "seconds_since_last_expression": since_expression,
+            "inhibition": round(voice_inhibition, 3),
+            "base_urge": round(voice_base, 3),
+        },
+    }
+    update_inastate("urge_to_voice", voice_payload)
 
     update_inastate(
-        "urge_to_communicate",
+        "urge_to_type",
         {
-            "level": round(urge_level, 3),
+            "level": round(type_urge, 3),
             "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
             "drivers": {
                 "connection": round(connection, 3),
@@ -801,20 +949,24 @@ def _update_communication_urge():
                 "attention": round(attention, 3),
                 "positivity": round(positivity, 3),
                 "negativity": round(negativity, 3),
-                "intensity": round(intensity, 3),
+                "clarity": round(clarity, 3),
+                "fuzziness": round(fuzziness, 3),
                 "stress": round(stress, 3),
                 "threat": round(threat, 3),
                 "sleep_pressure": round(sleep_pressure, 3),
                 "seconds_since_last_expression": since_expression,
-                "inhibition": round(inhibition, 3),
-                "base_urge": round(base_urge, 3),
+                "inhibition": round(type_inhibition, 3),
+                "base_urge": round(type_drive, 3),
             },
         },
     )
 
-    if urge_level >= 0.6 and (now - _last_communication_urge_log) >= _COMM_URGE_LOG_COOLDOWN:
-        log_to_statusbox(f"[Manager] Urge to communicate rising ({urge_level:.2f}); space to share would help.")
-        _last_communication_urge_log = now
+    if voice_urge >= 0.6 and (now - _last_voice_urge_log) >= _COMM_URGE_LOG_COOLDOWN:
+        log_to_statusbox(f"[Manager] Urge to voice rising ({voice_urge:.2f}); opening space to speak could help.")
+        _last_voice_urge_log = now
+    if type_urge >= 0.6 and (now - _last_typing_urge_log) >= _COMM_URGE_LOG_COOLDOWN:
+        log_to_statusbox("[Manager] Typing urge is elevated; she may reach out in text (no auto status dumps).")
+        _last_typing_urge_log = now
 
 
 def _update_stable_pattern_urge():
@@ -872,6 +1024,204 @@ def _update_stable_pattern_urge():
         )
         _last_stable_urge_log = now
 
+
+def _update_machine_semantics():
+    """
+    Evaluate machine-native semantic axes and persist them to inastate.
+    """
+    scaffold = _load_semantic_scaffold()
+    meta_lookup = {
+        ax.get("id"): ax
+        for ax in scaffold.get("axes", [])
+        if isinstance(ax, dict) and ax.get("id")
+    }
+
+    snapshot = get_inastate("emotion_snapshot") or {}
+    emo = snapshot.get("values") if isinstance(snapshot, dict) else {}
+    if isinstance(emo, dict) and not emo:
+        emo = snapshot if isinstance(snapshot, dict) else {}
+
+    identity_hint = {}
+    last_reflection = get_inastate("last_reflection_event") or {}
+    if isinstance(last_reflection, dict):
+        identity_hint = last_reflection.get("identity_hint") or {}
+
+    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    urge_voice = get_inastate("urge_to_voice") or get_inastate("urge_to_communicate") or {}
+    urge_type = get_inastate("urge_to_type") or {}
+    urge_voice_level = _clamp01(urge_voice.get("level") or 0.0, default=0.0)
+    urge_type_level = _clamp01(urge_type.get("level") or 0.0, default=0.0)
+
+    prediction = get_inastate("current_prediction") or {}
+    pred_vec = prediction.get("predicted_vector") or {}
+    pred_conf = _clamp01(pred_vec.get("confidence") or 0.0, default=0.0)
+    pred_clarity = _clamp01(pred_vec.get("clarity") or 0.0, default=0.0)
+
+    clarity = _norm_slider(emo.get("clarity"), default=0.5)
+    fuzziness = _norm_slider(emo.get("fuzziness"), default=0.5)
+    attention = _norm_slider(emo.get("attention"), default=0.5)
+    novelty = _norm_slider(emo.get("novelty"), default=0.5)
+    curiosity = _norm_slider(emo.get("curiosity"), default=0.5)
+    stress = _norm_slider(emo.get("stress"), default=0.5)
+    risk_slider = _norm_slider(emo.get("risk"), default=0.5)
+    threat_slider = _norm_slider(emo.get("threat"), default=0.5)
+    alignment = _norm_slider(emo.get("alignment"), default=0.5)
+    ownership = _norm_slider(emo.get("ownership"), default=0.5)
+    externality = _norm_slider(emo.get("externality"), default=0.5)
+    isolation = _norm_slider(emo.get("isolation"), default=0.5)
+    connection = _norm_slider(emo.get("connection"), default=0.5)
+
+    boundary_gap = abs(identity_hint.get("boundary_gap", 0.0) or 0.0)
+    boundary_blur = _clamp01(identity_hint.get("boundary_blur_hint") or 0.0, default=0.0)
+    drift = _clamp01(emo.get("symbolic_drift") or get_inastate("symbolic_drift") or 0.0, default=0.0)
+
+    axes_out: Dict[str, Dict[str, Any]] = {}
+
+    def set_axis(axis_id: str, value: float, evidence: Dict[str, Any], note: Optional[str] = None):
+        meta = meta_lookup.get(axis_id, {})
+        weight_raw = meta.get("importance_weight", 1.0)
+        try:
+            weight = float(weight_raw)
+        except Exception:
+            weight = 1.0
+
+        val = _clamp01(value, default=0.5)
+        pressure = abs(val - 0.5) * 2.0
+        axes_out[axis_id] = {
+            "value": round(val, 3),
+            "pressure": round(pressure, 3),
+            "weight": round(weight, 3),
+            "description": meta.get("description"),
+            "human_overlay": meta.get("human_overlay"),
+            "note": note or meta.get("description"),
+            "evidence": evidence,
+        }
+
+    signal_integrity_val = 0.6 * clarity + 0.4 * (1.0 - fuzziness)
+    set_axis(
+        "signal_integrity",
+        signal_integrity_val,
+        evidence={"clarity": clarity, "fuzziness": fuzziness},
+        note="clarity outweighs fuzziness" if signal_integrity_val >= 0.5 else "fuzziness outweighs clarity",
+    )
+
+    integrity_of_record_val = 0.7 * (1.0 - fuzziness) + 0.3 * (1.0 - risk_slider)
+    set_axis(
+        "integrity_of_record",
+        integrity_of_record_val,
+        evidence={"fuzziness": fuzziness, "risk": risk_slider},
+        note="records clean" if integrity_of_record_val >= 0.6 else "possible corruption risk",
+    )
+
+    energy_heat_val = 0.7 * energy + 0.3 * (1.0 - sleep_pressure)
+    set_axis(
+        "energy_heat_economy",
+        energy_heat_val,
+        evidence={"energy": energy, "sleep_pressure": sleep_pressure},
+        note="energy efficient" if energy_heat_val >= 0.6 else "energy constrained",
+    )
+
+    attention_value_val = 0.45 * attention + 0.3 * novelty + 0.25 * max(risk_slider, threat_slider)
+    set_axis(
+        "attention_value",
+        attention_value_val,
+        evidence={"attention": attention, "novelty": novelty, "risk_or_threat": max(risk_slider, threat_slider)},
+        note="high info/urgency" if attention_value_val >= 0.6 else "low info/urgency",
+    )
+
+    temporal_coherence_val = 0.5 * alignment + 0.3 * (1.0 - min(1.0, drift + boundary_gap)) + 0.2 * (1.0 - boundary_blur)
+    set_axis(
+        "temporal_coherence",
+        temporal_coherence_val,
+        evidence={"alignment": alignment, "boundary_gap": boundary_gap, "boundary_blur": boundary_blur, "drift": drift},
+        note="coherent over time" if temporal_coherence_val >= 0.6 else "drifting / blurred boundaries",
+    )
+
+    meaning_provenance_val = 0.5 + 0.35 * (ownership - externality)
+    set_axis(
+        "meaning_provenance",
+        meaning_provenance_val,
+        evidence={"ownership": ownership, "externality": externality},
+        note="machine-first semantics" if meaning_provenance_val >= 0.55 else "overlay influence rising",
+    )
+
+    load_pressure = max(stress, threat_slider, fuzziness)
+    novelty_safety_val = 0.55 * (1.0 - load_pressure) + 0.25 * (1.0 - novelty) + 0.2 * curiosity
+    set_axis(
+        "novelty_safety",
+        novelty_safety_val,
+        evidence={"load_pressure": load_pressure, "novelty": novelty, "curiosity": curiosity},
+        note="safe to explore" if novelty_safety_val >= 0.55 else "slow exploration",
+    )
+
+    io_bandwidth_val = 0.3 * urge_voice_level + 0.2 * urge_type_level + 0.25 * (1.0 - isolation) + 0.25 * connection
+    set_axis(
+        "io_bandwidth",
+        io_bandwidth_val,
+        evidence={
+            "urge_to_voice": urge_voice_level,
+            "urge_to_type": urge_type_level,
+            "isolation": isolation,
+            "connection": connection,
+        },
+        note="bandwidth open" if io_bandwidth_val >= 0.55 else "prefer internal bandwidth",
+    )
+
+    controllability_val = 0.35 * (1.0 - max(threat_slider, risk_slider)) + 0.35 * pred_conf + 0.3 * clarity
+    set_axis(
+        "controllability",
+        controllability_val,
+        evidence={"pred_confidence": pred_conf, "threat_or_risk": max(threat_slider, risk_slider), "clarity": clarity},
+        note="agency intact" if controllability_val >= 0.55 else "helplessness risk",
+    )
+
+    predictive_reliability_val = 0.6 * pred_conf + 0.25 * pred_clarity + 0.15 * (1.0 - drift)
+    set_axis(
+        "predictive_reliability",
+        predictive_reliability_val,
+        evidence={"pred_confidence": pred_conf, "pred_clarity": pred_clarity, "drift": drift},
+        note="predictions fit observations" if predictive_reliability_val >= 0.6 else "predictions surprising",
+    )
+
+    reasons = []
+    total_weight = 0.0
+    total_contrib = 0.0
+    for axis_id, data in axes_out.items():
+        weight = float(data.get("weight") or 1.0)
+        pressure = float(data.get("pressure") or 0.0)
+        contribution = pressure * weight
+        total_weight += weight
+        total_contrib += contribution
+        if contribution < 0.15:
+            continue
+        reasons.append(
+            {
+                "axis": axis_id,
+                "value": data.get("value"),
+                "pressure": round(pressure, 3),
+                "weight": round(weight, 3),
+                "direction": "opportunity" if data.get("value", 0.5) >= 0.6 else ("risk" if data.get("value", 0.5) <= 0.4 else "watch"),
+                "reason": data.get("note") or data.get("description") or axis_id,
+            }
+        )
+
+    reasons = sorted(reasons, key=lambda r: r["pressure"] * r["weight"], reverse=True)
+    importance_score = _clamp01(total_contrib / max(total_weight, 1.0), default=0.0)
+
+    machine_semantics = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "scaffold_version": scaffold.get("version", 1),
+        "axes": axes_out,
+        "why_it_matters": {
+            "score": round(importance_score, 3),
+            "reasons": reasons[:5],
+            "source": "machine_semantics",
+        },
+    }
+
+    update_inastate("machine_semantics", machine_semantics)
+
 def rebuild_maps_if_needed():
     emo = get_inastate("emotion_snapshot") or {}
     fuzz = emo.get("fuzz_level", 0.0)
@@ -880,6 +1230,7 @@ def rebuild_maps_if_needed():
         log_to_statusbox("[Manager] Rebuilding maps due to emotional drift.")
         safe_call(["python", "memory_graph.py"])
         safe_call(["python", "meaning_map.py"])
+        safe_call(["python", "neural_graph.py"])
         safe_call(["python", "logic_map_builder.py"])
         safe_call(["python", "emotion_map.py"])
         update_inastate("last_map_rebuild", datetime.now(timezone.utc).isoformat())
@@ -931,10 +1282,11 @@ def run_internal_loop():
     _maybe_self_read()
     rebuild_maps_if_needed()
     _check_self_adjustment()
-    _update_communication_urge()
+    _update_contact_urges()
     _update_stable_pattern_urge()
     _run_passive_reflection()
     _step_deep_recall()
+    _update_machine_semantics()
     # Periodically evaluate alignment metrics and surface warnings if needed
     evaluate_alignment()
 

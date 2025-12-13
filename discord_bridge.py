@@ -8,6 +8,7 @@ import os
 import re
 from pathlib import Path
 from datetime import datetime, timezone
+import asyncio
 
 import discord
 
@@ -17,18 +18,19 @@ from backend_discord import (
     make_channel_info_from_discord,
     register_discord_backend,
 )
-from social_map import get_owner_user_id, is_owner_friend, record_dm_attempt
+from social_map import (
+    get_owner_user_id,
+    is_owner_friend,
+    is_high_trust,
+    get_high_trust_contacts,
+    record_dm_attempt,
+)
 from language_processing import generate_symbolic_reply_from_text
 from live_experience_bridge import LiveExperienceBridge
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
     LMStudioAdapter = None  # type: ignore
-
-try:
-    from discord import sinks
-except Exception:
-    sinks = None
 
 # ---------------------------------------------------------------------------
 # Basic logging setup
@@ -41,6 +43,91 @@ logging.basicConfig(
 logger = logging.getLogger("discord_bridge")
 CONFIG_PATH = Path("config.json")
 _CHAT_ADAPTER = None
+
+
+def _load_discord_sinks():
+    """
+    Attempt to import Discord voice sinks, falling back to the legacy
+    discord.ext.voice_recv extension if present. Emits a targeted warning with
+    install guidance if neither is available.
+    """
+    version = getattr(discord, "__version__", "unknown")
+    try:
+        from discord import sinks as discord_sinks  # type: ignore
+        return discord_sinks
+    except Exception as first_exc:
+        try:
+            from discord.ext import voice_recv as voice_sinks  # type: ignore
+        except Exception as exc:
+            logger.warning(
+                "discord voice receive modules not available (discord.py %s); voice capture disabled. "
+                "Install py-cord[voice] (or discord-ext-voice-recv) to enable discord.sinks. import errors: %s / %s",
+                version,
+                first_exc,
+                exc,
+            )
+            return None
+        logger.info(
+            "Loaded discord voice sinks from discord.ext.voice_recv extension (discord.py %s).",
+            version,
+        )
+        return voice_sinks
+
+
+sinks = _load_discord_sinks()
+
+
+def log_discord_voice_capabilities():
+    """Emit a one-time info log about discord voice support to aid debugging."""
+    version = getattr(discord, "__version__", "unknown")
+    sink_path = getattr(sinks, "__file__", None) if sinks else None
+    has_start_recording = hasattr(getattr(discord, "VoiceClient", None), "start_recording")
+    logger.info(
+        "Discord voice capabilities: version=%s sinks=%s start_recording=%s sink_path=%s",
+        version,
+        bool(sinks),
+        has_start_recording,
+        sink_path,
+    )
+
+
+def _install_voice_debug_hooks():
+    """
+    Add lightweight logging on voice state/server updates to track session/token details.
+    """
+    try:
+        vc_cls = discord.VoiceClient
+    except Exception:
+        return
+    if getattr(vc_cls, "_ina_voice_hooks", False):
+        return
+
+    vc_cls._ina_voice_hooks = True
+
+    orig_vs = vc_cls.on_voice_state_update
+    orig_vserv = vc_cls.on_voice_server_update
+
+    async def wrapped_vs(self, data, *args, **kwargs):
+        logger.info(
+            "Voice state update: session_id=%s channel_id=%s handshaking=%s reconnecting=%s",
+            data.get("session_id"),
+            data.get("channel_id"),
+            getattr(self, "_handshaking", None),
+            getattr(self, "_potentially_reconnecting", None),
+        )
+        return await orig_vs(self, data, *args, **kwargs)
+
+    async def wrapped_vserv(self, data, *args, **kwargs):
+        logger.info(
+            "Voice server update: token_present=%s endpoint=%s guild_id=%s",
+            bool(data.get("token")),
+            data.get("endpoint"),
+            data.get("guild_id"),
+        )
+        return await orig_vserv(self, data, *args, **kwargs)
+
+    vc_cls.on_voice_state_update = wrapped_vs  # type: ignore
+    vc_cls.on_voice_server_update = wrapped_vserv  # type: ignore
 
 
 def load_root_config() -> dict:
@@ -215,7 +302,47 @@ def process_inbound_message(msg) -> CommsResponse:
     For now, this tries a lightweight grounded-language adapter; if that is
     unavailable, it falls back to an echo so the bridge remains testable.
     """
+    cfg = get_discord_config()
+    if isinstance(cfg, dict) and cfg.get("allow_replies") is False:
+        return CommsResponse(
+            text=None,
+            metadata={
+                "adapter": "disabled",
+                "reason": "discord.allow_replies=false",
+            },
+        )
+
     child = get_current_child()
+
+    # Give Ina the option to stay silent based on her urge to type/communicate.
+    root_cfg: dict = {}
+    try:
+        root_cfg = load_root_config()
+        min_urge = float(root_cfg.get("min_urge_to_type", 0.35))
+    except Exception:
+        min_urge = 0.35
+    try:
+        inastate_path = Path("AI_Children") / child / "memory" / "inastate.json"
+        state = json.loads(inastate_path.read_text(encoding="utf-8")) if inastate_path.exists() else {}
+    except Exception:
+        state = {}
+    urge_state = state.get("urge_to_type") or state.get("urge_to_communicate") or {}
+    try:
+        urge_level = float(urge_state.get("level", 0.0))
+    except Exception:
+        urge_level = 0.0
+    ignore_urge = bool(root_cfg.get("ignore_urge_for_typing", False)) if isinstance(root_cfg, dict) else False
+    if not ignore_urge and urge_level < min_urge:
+        return CommsResponse(
+            text=None,
+            metadata={
+                "adapter": "urge_gate",
+                "reason": "low_urge_to_reply",
+                "urge_level": urge_level,
+                "threshold": min_urge,
+            },
+        )
+
     reply_text = None
     adapter = get_chat_adapter()
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
@@ -329,11 +456,16 @@ class InaDiscordClient(discord.Client):
         self._recording_active = False
         self._active_sink = None
         self.history_bridge = LiveExperienceBridge(child=get_current_child())
+        self._typed_outbox_path = Path("AI_Children") / get_current_child() / "memory" / "typed_outbox.jsonl"
+        self._typed_outbox_seen = set()
+        self._typed_outbox_task = None
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user and self.user.id)
         logger.info("Discord bridge is active. DMs from owner (%s) + configured text channel will be routed.", SAKURA_USER_ID)
         self.text_channel, self.voice_channel = resolve_configured_channels(self)
+        if self._typed_outbox_task is None:
+            self._typed_outbox_task = asyncio.create_task(self._watch_typed_outbox())
 
     async def on_message(self, message: discord.Message) -> None:
         # Ignore messages from ourselves or other bots
@@ -344,6 +476,7 @@ class InaDiscordClient(discord.Client):
         if message.guild is None:
             is_owner = message.author.id == SAKURA_USER_ID
             owner_friend = is_owner_friend(message.author.id)
+            high_trust = is_high_trust(message.author.id)
             added = False
             if not is_owner:
                 try:
@@ -358,7 +491,7 @@ class InaDiscordClient(discord.Client):
                         message.author,
                         message.author.id,
                     )
-            if not (is_owner or owner_friend):
+            if not (is_owner or owner_friend or high_trust):
                 logger.info(
                     "Ignoring DM from untrusted user %s (%s)%s",
                     message.author,
@@ -368,11 +501,15 @@ class InaDiscordClient(discord.Client):
                 return
             logger.info(
                 "Inbound DM from %s: %s (channel %s)",
-                "owner" if is_owner else "trusted friend",
+                "owner"
+                if is_owner
+                else "trusted friend"
+                if owner_friend
+                else "high-trust contact",
                 message.content,
                 message.channel.id,
             )
-            self._route_to_comms(message, is_dm=True, owner_friend=owner_friend)
+            self._route_to_comms(message, is_dm=True, owner_friend=owner_friend, high_trust=high_trust)
             return
 
         # Guild messages: only handle those in the configured text channel
@@ -408,11 +545,24 @@ class InaDiscordClient(discord.Client):
         try:
             await self.ensure_voice_connected(target_channel)
             await message.channel.send(f"Joined voice channel: {target_channel.name}")
+        except discord.errors.ConnectionClosed as exc:
+            logger.exception("Voice gateway closed while joining %s (code=%s)", target_channel, exc.code)
+            await message.channel.send(
+                f"Voice gateway closed with code {exc.code}. "
+                "Make sure only py-cord[voice] is installed (no discord.py mix), then restart Ina."
+            )
         except Exception:
             logger.exception("Failed to join voice channel %s", target_channel)
             await message.channel.send(f"Failed to join voice channel: {target_channel.name}")
 
-    def _route_to_comms(self, message: discord.Message, *, is_dm: bool, owner_friend: bool = False) -> None:
+    def _route_to_comms(
+        self,
+        message: discord.Message,
+        *,
+        is_dm: bool,
+        owner_friend: bool = False,
+        high_trust: bool = False,
+    ) -> None:
         sender = make_sender_info_from_discord(message, backend_name=BACKEND_NAME)
         channel = make_channel_info_from_discord(message, backend_name=BACKEND_NAME)
         metadata = {
@@ -420,6 +570,7 @@ class InaDiscordClient(discord.Client):
             "discord_channel_id": str(message.channel.id),
             "is_dm": is_dm,
             "is_owner_friend": owner_friend,
+            "is_high_trust": high_trust,
         }
         if message.guild:
             metadata["discord_guild_id"] = str(message.guild.id)
@@ -437,6 +588,151 @@ class InaDiscordClient(discord.Client):
             reply_to_backend_id=str(message.id),
             metadata=metadata,
         )
+
+    def _read_typed_outbox(self):
+        if not self._typed_outbox_path.exists():
+            return []
+        entries = []
+        try:
+            with self._typed_outbox_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        logger.exception("Failed to parse typed outbox line: %s", line[:120])
+                        continue
+                    entry_id = str(entry.get("id") or entry.get("uuid") or entry.get("created_at") or len(self._typed_outbox_seen))
+                    if entry_id in self._typed_outbox_seen:
+                        continue
+                    entry["id"] = entry_id
+                    self._typed_outbox_seen.add(entry_id)
+                    entries.append(entry)
+        except Exception:
+            logger.exception("Failed to read typed outbox at %s", self._typed_outbox_path)
+
+        if len(self._typed_outbox_seen) > 5000:
+            # Avoid unbounded growth if the file grows large.
+            self._typed_outbox_seen = set(list(self._typed_outbox_seen)[-2000:])
+        return entries
+
+    async def _deliver_typed_outbox_entry(self, entry: dict) -> None:
+        text = entry.get("text")
+        allow_empty = bool(entry.get("allow_empty"))
+        attachment_path = entry.get("attachment_path")
+
+        def _build_file():
+            if not attachment_path:
+                return None
+            try:
+                path = Path(attachment_path)
+                if not path.exists() or not path.is_file():
+                    logger.debug("Attachment path missing for entry %s: %s", entry.get("id"), attachment_path)
+                    return None
+                return discord.File(str(path), filename=path.name)
+            except Exception:
+                logger.exception("Failed to prepare attachment for entry %s", entry.get("id"))
+                return None
+
+        if text is None:
+            if not allow_empty and not attachment_path:
+                return
+            text = ""
+        text_str = str(text)
+        if not text_str.strip() and not allow_empty and not attachment_path:
+            logger.debug("Skipping empty typed outbox entry %s", entry.get("id"))
+            return
+
+        target = entry.get("target") or "owner_dm"
+        channel_id = entry.get("channel_id")
+        target_user_id = entry.get("user_id")
+        sent = False
+
+        async def _send_dm(user_id: int) -> bool:
+            try:
+                user = self.get_user(user_id) or await self.fetch_user(user_id)
+                if not user:
+                    return False
+                file = _build_file()
+                await user.send(text_str, file=file)
+                return True
+            except Exception:
+                logger.exception("Failed to DM user %s for typed outbox entry %s", user_id, entry.get("id"))
+                return False
+
+        # Explicit user target first (owner or high-trust only)
+        if target_user_id:
+            try:
+                uid = int(target_user_id)
+                if uid == SAKURA_USER_ID or is_high_trust(uid):
+                    sent = await _send_dm(uid)
+                else:
+                    logger.info(
+                        "Typed outbox entry %s targets user %s without high trust; skipping.",
+                        entry.get("id"),
+                        target_user_id,
+                    )
+            except Exception:
+                logger.exception("Invalid user_id on typed outbox entry %s: %s", entry.get("id"), target_user_id)
+
+        # Owner DM fallback
+        if not sent and target == "owner_dm":
+            sent = await _send_dm(SAKURA_USER_ID)
+
+        # High-trust DM selection
+        if not sent and target in {"trusted_dm", "high_trust_dm"}:
+            contacts = get_high_trust_contacts(limit=1)
+            if contacts:
+                try:
+                    uid = int(contacts[0].get("user_id"))
+                    sent = await _send_dm(uid)
+                except Exception:
+                    logger.exception("Failed to DM high-trust contact for entry %s", entry.get("id"))
+
+        # Direct channel id
+        if not sent and channel_id:
+            try:
+                channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+                if channel:
+                    file = _build_file()
+                    await channel.send(text_str, file=file)
+                    sent = True
+            except Exception:
+                logger.exception(
+                    "Failed to send typed outbox entry %s to channel %s", entry.get("id"), channel_id
+                )
+
+        if not sent and target == "text_channel" and self.text_channel:
+            try:
+                file = _build_file()
+                await self.text_channel.send(text_str, file=file)
+                sent = True
+            except Exception:
+                logger.exception(
+                    "Failed to send typed outbox entry %s to configured text channel", entry.get("id")
+                )
+
+        if sent:
+            logger.info(
+                "Delivered typed outbox entry %s (target=%s, meta=%s)",
+                entry.get("id"),
+                target,
+                entry.get("metadata"),
+            )
+        else:
+            logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
+
+    async def _watch_typed_outbox(self):
+        while not self.is_closed():
+            try:
+                pending = self._read_typed_outbox()
+                for entry in pending:
+                    await self._deliver_typed_outbox_entry(entry)
+            except Exception:
+                logger.exception("Typed outbox dispatch loop failed.")
+            await asyncio.sleep(3)
 
     async def _ingest_message_history(self, limit: int = 50) -> None:
         """
@@ -506,7 +802,14 @@ class InaDiscordClient(discord.Client):
         if sinks is None:
             logger.warning("discord.sinks not available; voice capture disabled.")
             return
-        if self._recording_active or not self.voice_client or not self.voice_client.is_connected():
+        if not self.voice_client or not self.voice_client.is_connected():
+            return
+        if not hasattr(self.voice_client, "start_recording"):
+            logger.warning(
+                "Discord client missing start_recording; install py-cord[voice] to enable voice capture support."
+            )
+            return
+        if self._recording_active:
             return
         self._start_recording_segment()
 
@@ -623,6 +926,11 @@ def get_discord_token() -> str:
 
 
 def main() -> None:
+    # Python 3.12+ does not create a default event loop; set one explicitly
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    _install_voice_debug_hooks()
     # Create CommsCore with our custom process_inbound hook
     comms = CommsCore(
         instance_name=INA_INSTANCE_NAME,
@@ -631,10 +939,12 @@ def main() -> None:
     )
 
     # Create Discord client
-    client = InaDiscordClient(comms=comms)
+    client = InaDiscordClient(comms=comms, loop=loop)
 
     # Register Discord backend with CommsCore so outbound messages work
     register_discord_backend(comms, client, backend_name=BACKEND_NAME)
+
+    log_discord_voice_capabilities()
 
     token = get_discord_token()
 

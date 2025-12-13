@@ -3,11 +3,13 @@
 import os
 import json
 import math
+import random
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
 from gui_hook import log_to_statusbox
+from body_schema import get_region_anchors
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -78,6 +80,66 @@ def _memory_policy():
                 tier_defaults["target_count"] = target_override
         policy[tier] = tier_defaults
     return policy
+
+
+# === Spatial helpers (body schema → neural positions) ===
+def _load_body_anchors() -> Dict[str, Dict[str, float]]:
+    anchors = get_region_anchors()
+    if not anchors:
+        return {}
+    return anchors
+
+
+def _guess_region_from_tags(tags: List[str], anchors: Dict[str, Dict[str, float]]) -> str:
+    tagset = {str(t).lower() for t in (tags or [])}
+
+    if {"audio", "sound", "voice", "hearing"} & tagset:
+        return "head" if "head" in anchors else next(iter(anchors.keys()), "head")
+    if {"vision", "image", "video", "sight"} & tagset:
+        return "head" if "head" in anchors else next(iter(anchors.keys()), "head")
+    if {"emotion", "feeling", "heart"} & tagset:
+        return "chest" if "chest" in anchors else next(iter(anchors.keys()), "chest")
+    if {"core", "energy", "stomach", "gut"} & tagset:
+        return "core" if "core" in anchors else next(iter(anchors.keys()), "core")
+    if "left_arm" in tagset and "left_arm" in anchors:
+        return "left_arm"
+    if "right_arm" in tagset and "right_arm" in anchors:
+        return "right_arm"
+    if "left_leg" in tagset and "left_leg" in anchors:
+        return "left_leg"
+    if "right_leg" in tagset and "right_leg" in anchors:
+        return "right_leg"
+
+    # Default to head or first available anchor
+    if "head" in anchors:
+        return "head"
+    return next(iter(anchors.keys()), "head")
+
+
+def _project_vector_to_anchor(vector: List[float], anchor: Dict[str, float], seed: str) -> List[float]:
+    """
+    Map a latent vector into body space using the region's anchor.
+    Keeps placement stable via a hash-based RNG when vectors are missing.
+    """
+    center = anchor.get("center", [0.0, 0.0, 0.0])
+    radius = float(anchor.get("radius", 1.0) or 1.0)
+
+    rng = random.Random(hash(seed) & 0xFFFFFFFF)
+    if vector and len(vector) >= 3:
+        base = [float(v) for v in vector[:3]]
+        norm = math.sqrt(sum(v * v for v in base)) or 1e-6
+        unit = [v / norm for v in base]
+    else:
+        theta = rng.uniform(0, 2 * math.pi)
+        phi = rng.uniform(0, math.pi)
+        unit = [
+            math.sin(phi) * math.cos(theta),
+            math.sin(phi) * math.sin(theta),
+            math.cos(phi),
+        ]
+
+    r = radius * (0.35 + 0.6 * rng.random())
+    return [center[i] + unit[i] * r for i in range(3)]
 
 
 # === Experience Graph Utilities ===
@@ -301,6 +363,8 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
 
 def build_synaptic_links(neurons, threshold=0.91):
     synapses = []
+    position_map = {n["id"]: n.get("position") for n in neurons}
+
     for i, source in enumerate(neurons):
         for j, target in enumerate(neurons):
             if j <= i:
@@ -310,10 +374,20 @@ def build_synaptic_links(neurons, threshold=0.91):
             if vec_a and vec_b:
                 sim = cosine_similarity(vec_a, vec_b)
                 if sim >= threshold:
+                    direction = None
+                    pos_a = position_map.get(source["id"])
+                    pos_b = position_map.get(target["id"])
+                    if pos_a and pos_b:
+                        delta = [pos_b[k] - pos_a[k] for k in range(3)]
+                        norm = math.sqrt(sum(d * d for d in delta))
+                        if norm > 1e-6:
+                            direction = [d / norm for d in delta]
                     synapses.append({
                         "source": source["id"],
                         "target": target["id"],
-                        "weight": round(sim, 4)
+                        "weight": round(sim, 4),
+                        "direction": direction,
+                        "network_type": "memory_graph",
                     })
     return synapses
 
@@ -338,6 +412,9 @@ def build_fractal_memory(child):
         f"(threshold={cluster_threshold:.2f}, tag_weight={tag_weight:.2f})."
     )
 
+    anchors = _load_body_anchors()
+    fallback_anchor = anchors.get("head", {"center": [0.0, 0.0, 0.0], "radius": 2.0})
+
     neurons = []
     for i, group in enumerate(clusters):
         fragment_ids = group["fragments"]
@@ -349,11 +426,16 @@ def build_fractal_memory(child):
         else:
             avg_vec = vector_average([cache[fid] for fid in fragment_ids if fid in cache])
         node_id = f"node_{i:04}"
-
+        region = _guess_region_from_tags(tags, anchors)
+        anchor = anchors.get(region, fallback_anchor)
+        position = _project_vector_to_anchor(avg_vec, anchor, seed=node_id)
         neurons.append({
             "id": node_id,
             "fragments": fragment_ids,
             "vector": avg_vec,
+            "position": position,
+            "region": region,
+            "network_type": "memory_graph",
             "symbolic_density": 0.0,
             "tags": list(set(tags)),
             "activation_history": [],

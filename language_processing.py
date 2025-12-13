@@ -26,6 +26,14 @@ def _memory_root(child: str, base_path: Optional[Path] = None) -> Path:
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 _EMBEDDER = MultimodalEmbedder(dim=128)
+SOUND_FEATURE_CONFIDENCE_THRESHOLD = 0.5
+SOUND_FEATURE_PROMOTION_THRESHOLD = 3
+NEUTRAL_SOUND_FINGERPRINT = {
+    "pitch_mean": 440,
+    "dominant_freq": 440,
+    "volume_db": -22,
+    "silence_ratio": 0.1,
+}
 
 
 def _load_json(path: Path):
@@ -230,6 +238,85 @@ def load_sound_symbol_map(child, base_path: Optional[Path] = None):
         data = _load_json(LEGACY_SOUND_SYMBOL_MAP)
     return _normalize_symbol_map(data or {})
 
+def _save_sound_symbol_map(child: str, symbol_map: Dict[str, Any], base_path: Optional[Path] = None):
+    """
+    Persist the normalized symbol map back to disk, preserving any extra
+    top-level keys that might be present in the existing file.
+    """
+    path = _memory_root(child, base_path) / "sound_symbol_map.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = _load_json(path) if path.exists() else {}
+    payload = existing if isinstance(existing, dict) else {}
+    if isinstance(payload.get("symbols"), dict):
+        payload["symbols"] = symbol_map
+    else:
+        payload = {"symbols": symbol_map}
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+def persist_sound_features(
+    child: str,
+    symbol_id: str,
+    fingerprint: Dict[str, Any],
+    source: str = "fallback",
+    base_path: Optional[Path] = None,
+    log_fn=None,
+    feature_confidence: Optional[float] = None,
+    evidence_increment: int = 0,
+) -> bool:
+    """
+    Cache newly inferred sound features so Ina can reuse or refine them later.
+    Only writes when the stored fingerprint differs.
+    """
+    if not fingerprint:
+        return False
+
+    symbol_map = load_sound_symbol_map(child, base_path)
+    entry = symbol_map.get(symbol_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+
+    now = datetime.now(timezone.utc).isoformat()
+    current_conf = entry.get("feature_confidence")
+    new_conf = feature_confidence if feature_confidence is not None else current_conf
+    if new_conf is None:
+        new_conf = 0.25
+
+    evidence = int(entry.get("evidence", 0)) + max(0, evidence_increment)
+    status = entry.get("status", "draft")
+
+    changed = (
+        entry.get("sound_features") != fingerprint
+        or entry.get("feature_source") != source
+        or entry.get("feature_confidence") != new_conf
+        or entry.get("evidence") != evidence
+    )
+
+    entry["sound_features"] = fingerprint
+    entry["feature_source"] = source
+    entry["feature_confidence"] = new_conf
+    entry["evidence"] = evidence
+    entry["updated"] = now
+
+    if evidence >= SOUND_FEATURE_PROMOTION_THRESHOLD and status != "promoted":
+        status = "promoted"
+        entry["promoted_at"] = now
+        entry["promotion_reason"] = f"evidence>={SOUND_FEATURE_PROMOTION_THRESHOLD} via {source}"
+        if log_fn:
+            log_fn(f"[Voice] Promoted sound features for {symbol_id} after {evidence} evidence samples.")
+
+    entry["status"] = status
+    symbol_map[symbol_id] = entry
+
+    if changed:
+        _save_sound_symbol_map(child, symbol_map, base_path)
+        if log_fn:
+            log_fn(f"[Voice] Cached sound features for {symbol_id} ({source}).")
+    return changed
+
 def load_fragments(child, base_path: Optional[Path] = None):
     frag_path = _memory_root(child, base_path) / "fragments"
     fragments = []
@@ -389,7 +476,14 @@ def backprop_symbol_confidence(child, predicted_word, expressed_symbol, base_pat
     save_symbol_to_token(child, vocab, base_path)
     print(f"[LangLearn] Updated confidence for {expressed_symbol} → '{entry['word']}' to {entry['confidence']}")
 
-def speak_symbolically(symbols, child="Inazuma_Yagami"):
+def speak_symbolically(
+    symbols,
+    child="Inazuma_Yagami",
+    *,
+    record_path: Optional[str | Path] = None,
+    playback: bool = True,
+    record_format: str = "wav",
+):
     import numpy as np
     import sounddevice as sd
     from gui_hook import log_to_statusbox
@@ -423,9 +517,13 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
         entry = symbol_map.get(sid) or {}
 
         fingerprint = entry.get("sound_features")
+        feature_confidence = entry.get("feature_confidence")
+        feature_source = None
         if not fingerprint and "summary" in entry:
             fingerprint = extract_sound_features_from_summary(entry["summary"])
-            log_to_statusbox(f"[Voice] Reconstructed sound features from summary for {sid}.")
+            feature_source = "summary_reconstruction" if fingerprint else None
+            if fingerprint:
+                log_to_statusbox(f"[Voice] Reconstructed sound features from summary for {sid}.")
         if not fingerprint:
             # Seed a simple tone from the symbol id so it's never silent
             seed = int(hashlib.sha256(sid.encode("utf-8")).hexdigest()[:8], 16)
@@ -436,13 +534,36 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
                 "volume_db": -24 + (seed % 12),  # -24 to -13 dB
                 "silence_ratio": 0.1,
             }
+            feature_source = "fallback_hash_seed"
             log_to_statusbox(f"[Voice] Synthesizing fallback tone for {sid}.")
 
         if not fingerprint:
             log_to_statusbox(f"[Voice] Symbol {sid} missing usable sound features.")
             continue
 
-        chunk = synthesize_from_fingerprint(fingerprint, sr=sample_rate)
+        playback_fingerprint = fingerprint
+        if feature_source:
+            # Gate low-confidence guesses to a neutral tone unless promoted.
+            confidence = feature_confidence if feature_confidence is not None else (0.35 if feature_source == "summary_reconstruction" else 0.25)
+            status = entry.get("status", "draft")
+            if status != "promoted" and confidence < SOUND_FEATURE_CONFIDENCE_THRESHOLD:
+                log_to_statusbox(
+                    f"[Voice] Neutralized low-confidence tone for {sid} "
+                    f"(conf {confidence:.2f} < {SOUND_FEATURE_CONFIDENCE_THRESHOLD})."
+                )
+                playback_fingerprint = NEUTRAL_SOUND_FINGERPRINT
+
+            persist_sound_features(
+                child,
+                sid,
+                fingerprint,
+                source=feature_source,
+                log_fn=log_to_statusbox,
+                feature_confidence=confidence,
+                evidence_increment=1,
+            )
+
+        chunk = synthesize_from_fingerprint(playback_fingerprint, sr=sample_rate)
         waveform.append(chunk)
 
     if waveform:
@@ -465,7 +586,39 @@ def speak_symbolically(symbols, child="Inazuma_Yagami"):
             audio = mix.astype(np.float32)
             log_to_statusbox(f"[Voice] Synthesizing {len(waveform)} sound symbols (polyphonic mix).")
 
-        sd.play(audio, samplerate=sample_rate)
+        if record_path:
+            try:
+                rec_path = Path(record_path)
+                rec_path.parent.mkdir(parents=True, exist_ok=True)
+                pcm = np.clip(audio, -1.0, 1.0)
+                pcm16 = (pcm * 32767.0).astype(np.int16)
+                if record_format.lower() == "mp3":
+                    try:
+                        from pydub import AudioSegment
+
+                        seg = AudioSegment(
+                            pcm16.tobytes(),
+                            frame_rate=sample_rate,
+                            sample_width=2,
+                            channels=1,
+                        )
+                        seg.export(str(rec_path), format="mp3")
+                    except Exception:
+                        log_to_statusbox("[Voice] MP3 export failed; falling back to WAV.")
+                        record_format = "wav"
+                if record_format.lower() != "mp3":
+                    import wave
+                    with wave.open(str(rec_path), "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(pcm16.tobytes())
+                log_to_statusbox(f"[Voice] Saved synthesized audio to {rec_path} ({record_format.upper()}).")
+            except Exception as exc:
+                log_to_statusbox(f"[Voice] Failed to save synthesized audio: {exc}")
+
+        if playback:
+            sd.play(audio, samplerate=sample_rate)
         if feedback_heard_voice:
             try:
                 logger = ExperienceLogger(child=child)

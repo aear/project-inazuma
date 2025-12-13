@@ -200,6 +200,9 @@ class ProtoQualiaState:
     # Confidence in this estimate [0.0, 1.0].
     confidence: float = 1.0
 
+    # Why this matters to Ina (machine-semantic importance, if available).
+    why_it_matters: Dict[str, Any] = field(default_factory=dict)
+
     def get(self, key: str, default: float = 0.0) -> float:
         return float(self.dimensions.get(key, default))
 
@@ -374,6 +377,7 @@ class ProtoQualiaEngine:
 
         summary_label = self._build_summary_label(squashed_dims, context_tags, extra_context)
         confidence = self._initial_confidence(norm_emotions, context_tags, extra_context)
+        importance = self._derive_importance(extra_context or {}, squashed_dims)
 
         state = ProtoQualiaState(
             agent_id=agent_id,
@@ -382,6 +386,7 @@ class ProtoQualiaEngine:
             context_tags=context_tags,
             summary_label=summary_label,
             confidence=confidence,
+            why_it_matters=importance,
         )
 
         LOGGER.debug(
@@ -418,6 +423,13 @@ class ProtoQualiaEngine:
         old = state.dimensions.get(dim, 0.0)
         new_val = max(-1.0, min(1.0, old + delta))
         state.dimensions[dim] = new_val
+
+    @staticmethod
+    def _clamp01(value: Any, default: float = 0.0) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return default
 
     def _initial_confidence(
         self,
@@ -473,3 +485,79 @@ class ProtoQualiaEngine:
         if tag_hint:
             return f"{polarity}_{strongest_dim}_{tag_hint}"
         return f"{polarity}_{strongest_dim}"
+
+    def _derive_importance(
+        self,
+        extra_context: Dict[str, Any],
+        dims: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """
+        Provide a lightweight "why it matters" summary, preferring machine semantics if supplied.
+        """
+        machine_semantics = extra_context.get("machine_semantics") if isinstance(extra_context, dict) else None
+
+        if isinstance(machine_semantics, dict):
+            cached = machine_semantics.get("why_it_matters")
+            if cached:
+                return cached
+
+            axes = machine_semantics.get("axes") or {}
+            reasons = []
+            total_weight = 0.0
+            total_contrib = 0.0
+            if isinstance(axes, dict):
+                for axis_id, axis_data in axes.items():
+                    if not isinstance(axis_data, dict):
+                        continue
+                    val = axis_data.get("value")
+                    if val is None:
+                        continue
+                    weight_raw = axis_data.get("weight", axis_data.get("importance_weight", 1.0))
+                    try:
+                        weight = float(weight_raw)
+                    except Exception:
+                        weight = 1.0
+
+                    pressure_raw = axis_data.get("pressure")
+                    try:
+                        pressure = float(pressure_raw)
+                    except Exception:
+                        try:
+                            pressure = abs(float(val) - 0.5) * 2.0
+                        except Exception:
+                            pressure = 0.0
+
+                    pressure = max(0.0, min(1.0, pressure))
+                    weight = max(0.0, weight)
+                    val_clamped = self._clamp01(val, default=0.5)
+                    contribution = pressure * weight
+                    total_weight += weight
+                    total_contrib += contribution
+                    if contribution < 0.1:
+                        continue
+                    reasons.append(
+                        {
+                            "axis": axis_id,
+                            "value": round(val_clamped, 3),
+                            "pressure": round(pressure, 3),
+                            "weight": round(weight, 3),
+                            "reason": axis_data.get("note") or axis_data.get("description") or axis_id,
+                        }
+                    )
+
+            reasons = sorted(reasons, key=lambda r: r["pressure"] * r["weight"], reverse=True)
+            score = self._clamp01(total_contrib / max(total_weight, 1.0), default=0.0)
+            return {"score": round(score, 3), "reasons": reasons[:5], "source": "machine_semantics"}
+
+        if dims:
+            strongest_dim, strongest_val = max(dims.items(), key=lambda kv: abs(kv[1]))
+            score = self._clamp01(abs(strongest_val), default=0.0)
+            return {
+                "score": round(score, 3),
+                "reasons": [
+                    {"dimension": strongest_dim, "magnitude": round(strongest_val, 3), "reason": "proto-dimension salience"}
+                ],
+                "source": "proto_dimensions",
+            }
+
+        return {"score": 0.0, "reasons": [], "source": "proto_dimensions"}

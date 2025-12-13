@@ -16,6 +16,7 @@ Design goals:
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import datetime, timezone
@@ -33,11 +34,18 @@ except Exception:  # noqa: BLE001
 
 
 try:
-    from model_manager import load_config  # type: ignore
+    from model_manager import load_config, get_inastate  # type: ignore
 except Exception:  # noqa: BLE001
     def load_config() -> Dict[str, Any]:  # type: ignore[redefinition]
         # Minimal fallback if model_manager isn't available
         return {"current_child": "default_child"}
+    def get_inastate(key: str, default=None):  # type: ignore[redefinition]
+        return default
+
+try:
+    from body_schema import snapshot_default_body  # type: ignore
+except Exception:  # noqa: BLE001
+    snapshot_default_body = None  # type: ignore
 
 
 try:
@@ -77,6 +85,46 @@ def _make_fragment_id(prefix: str) -> str:
     """
     suffix = uuid.uuid4().hex[:12]
     return f"{prefix}_{suffix}"
+
+
+BODY_INTENSITY_THRESHOLD = 0.6
+
+
+def _emotion_intensity(emotions: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(emotions, dict):
+        return 0.0
+    values = emotions.get("values") if isinstance(emotions.get("values"), dict) else emotions
+    try:
+        return float(values.get("intensity", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _current_body_state() -> Optional[Dict[str, Dict[str, float]]]:
+    """
+    Prefer the live body state from inastate; fall back to a neutral snapshot.
+    """
+    try:
+        state = get_inastate("body_state")
+        if isinstance(state, dict):
+            return copy.deepcopy(state)
+    except Exception:
+        pass
+
+    if snapshot_default_body is not None:
+        try:
+            return snapshot_default_body()
+        except Exception:
+            return None
+    return None
+
+
+def _maybe_attach_body_state(fragment: Dict[str, Any], emotions: Optional[Dict[str, Any]]) -> None:
+    if abs(_emotion_intensity(emotions)) < BODY_INTENSITY_THRESHOLD:
+        return
+    state = _current_body_state()
+    if state is not None:
+        fragment["body_state"] = state
 
 
 # === Gatekeeper integration ===================================================
@@ -199,6 +247,7 @@ def make_fragment(
         "payload": payload,              # lightweight, with file paths not blobs
         "context": context,              # extra metadata, not for indexing
     }
+    _maybe_attach_body_state(fragment, emotions)
     return fragment
 
 

@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import json
 import random
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from body_schema import get_default_body_schema, snapshot_default_body
 from model_manager import (
     load_config,
     update_inastate,
@@ -103,6 +105,7 @@ DEFAULT_BASELINE: Dict[str, float] = {
 # ---------------------------------------------------------------------------
 
 AI_CHILDREN_ROOT = Path("AI_Children")
+BODY_INTENSITY_THRESHOLD = 0.6
 
 
 def _log(msg: str) -> None:
@@ -139,6 +142,67 @@ def _log_path(child: str) -> Path:
     return _emotion_dir(child) / "emotion_log.jsonl"
 
 
+_BODY_STATE_CACHE: Optional[Dict[str, Dict[str, float]]] = None
+_BODY_SCHEMA_WARNED = False
+
+
+def _set_body_state_cache(state: Dict[str, Dict[str, float]]) -> None:
+    global _BODY_STATE_CACHE
+    _BODY_STATE_CACHE = copy.deepcopy(state)
+
+
+def _get_latest_body_state() -> Optional[Dict[str, Dict[str, float]]]:
+    """
+    Try the in-memory cache, fall back to inastate or neutral snapshot.
+    """
+    if _BODY_STATE_CACHE:
+        return copy.deepcopy(_BODY_STATE_CACHE)
+
+    try:
+        state = get_inastate("body_state")
+        if isinstance(state, dict):
+            _set_body_state_cache(state)
+            return copy.deepcopy(state)
+    except Exception:
+        pass
+
+    try:
+        fallback = snapshot_default_body()
+        if fallback:
+            return fallback
+    except Exception:
+        pass
+
+    return None
+
+
+def _update_body_schema_from_emotion(emotion_values: Dict[str, float]) -> Optional[Dict[str, Dict[str, float]]]:
+    """
+    Drive the shared body schema from the current emotional sliders.
+    """
+    global _BODY_SCHEMA_WARNED
+    schema = get_default_body_schema()
+    if schema is None:
+        if not _BODY_SCHEMA_WARNED:
+            _log("Body schema unavailable; skipping body update.")
+            _BODY_SCHEMA_WARNED = True
+        return None
+
+    try:
+        schema.update_from_emotion(emotion_values)
+        snapshot = schema.snapshot()
+        _BODY_SCHEMA_WARNED = False
+        _set_body_state_cache(snapshot)
+        return snapshot
+    except Exception as exc:
+        if not _BODY_SCHEMA_WARNED:
+            _log(f"Failed to update body schema: {exc}")
+            _BODY_SCHEMA_WARNED = True
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data structures
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -379,10 +443,19 @@ def compute_emotion_snapshot(
 # Fragment tagging
 # ---------------------------------------------------------------------------
 
+def _should_attach_body_state(values: Dict[str, float]) -> bool:
+    try:
+        intensity = float(values.get("intensity", 0.0))
+    except Exception:
+        intensity = 0.0
+    return abs(intensity) >= BODY_INTENSITY_THRESHOLD
+
+
 def tag_fragment_emotions(
     fragment: Dict[str, Any],
     child: Optional[str] = None,
     context_tags: Optional[List[str]] = None,
+    body_state: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Convenience wrapper: compute a fresh snapshot and tag the fragment with it.
@@ -394,10 +467,14 @@ def tag_fragment_emotions(
     active_child = child or config.get("current_child", "default_child")
     tags = context_tags or fragment.get("tags") or []
     snapshot = compute_emotion_snapshot(active_child, context_tags=list(tags))
-    return tag_fragment(fragment, snapshot)
+    return tag_fragment(fragment, snapshot, body_state=body_state or _get_latest_body_state())
 
 
-def tag_fragment(fragment: Dict[str, Any], snapshot: EmotionSnapshot) -> Dict[str, Any]:
+def tag_fragment(
+    fragment: Dict[str, Any],
+    snapshot: EmotionSnapshot,
+    body_state: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Any]:
     """
     Attach the current emotional vector to a fragment.
 
@@ -422,10 +499,20 @@ def tag_fragment(fragment: Dict[str, Any], snapshot: EmotionSnapshot) -> Dict[st
     }
 
     fragment["emotions"] = emotions
+
+    if _should_attach_body_state(snapshot.values):
+        state_to_attach = body_state if body_state is not None else _get_latest_body_state()
+        if state_to_attach is not None:
+            fragment["body_state"] = copy.deepcopy(state_to_attach)
+
     return fragment
 
 
-def tag_all_fragments(child: str, snapshot: EmotionSnapshot) -> None:
+def tag_all_fragments(
+    child: str,
+    snapshot: EmotionSnapshot,
+    body_state: Optional[Dict[str, Dict[str, float]]] = None,
+) -> None:
     """
     Walk AI_Children/<child>/memory/fragments and tag any fragment JSON
     that does not yet have an 'emotions' field.
@@ -452,7 +539,7 @@ def tag_all_fragments(child: str, snapshot: EmotionSnapshot) -> None:
             skipped += 1
             continue
 
-        frag = tag_fragment(frag, snapshot)
+        frag = tag_fragment(frag, snapshot, body_state=body_state)
 
         try:
             with fpath.open("w", encoding="utf-8") as f:
@@ -493,6 +580,7 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
     # inside run_emotion_engine(), after snapshot = calculate_emotion_state(fragments)
     processed_values = process_emotion(snapshot, mode=snapshot.mode)
     snapshot.values = processed_values  # keep snapshot metadata/timestamp while using processed sliders
+    body_state_snapshot = _update_body_schema_from_emotion(snapshot.values)
 
     # Map current emotions to nearest symbolic emotions (for multi-neuron style use).
     try:
@@ -501,6 +589,10 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
         update_inastate("emotion_symbol_matches", symbol_matches)
     except Exception as e:
         _log(f"Failed to map emotions to symbols: {e}")
+
+    if body_state_snapshot is not None:
+        update_inastate("body_state", body_state_snapshot)
+        update_inastate("last_body_update", snapshot.timestamp)
 
     # Update inastate
     update_inastate("emotion_snapshot", snapshot.to_dict())
@@ -511,7 +603,7 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
     save_baseline(child, snapshot.values)
 
     # Tag fragments (can be disabled later or made more selective)
-    tag_all_fragments(child, snapshot)
+    tag_all_fragments(child, snapshot, body_state=body_state_snapshot)
 
     _log("Emotion snapshot stored and propagated.")
 
