@@ -129,6 +129,15 @@ class DeepRecallConfig:
     # How many fragments to load per step() call.
     chunk_size: int = 250
 
+    # Optional: limit per-burst payload to a smaller slice (<= chunk_size).
+    burst_chunk_size: Optional[int] = None
+
+    # Optional cooldown between bursts (seconds). 0 disables.
+    burst_cooldown_sec: float = 0.0
+
+    # Force GC after each burst to release large fragment payloads.
+    burst_collect_garbage: bool = False
+
     # Max RAM usage percentage before we pause (if psutil is available).
     max_memory_percent: float = 85.0
 
@@ -217,7 +226,23 @@ class DeepRecallManager:
         self.state = DeepRecallState()
 
         self._fragment_ids: List[str] = []
+        self._burst_resume_at: float = 0.0
         self.log = logger or self._default_logger
+
+    def _ensure_fragment_ids(self) -> None:
+        """
+        Lazily load and cache the ordered fragment ID list, keeping progress aligned.
+        """
+        if self._fragment_ids:
+            return
+
+        fragment_ids = self.memory_backend.list_fragment_ids()
+        self._fragment_ids = fragment_ids
+        total = len(fragment_ids)
+        self.state.total_fragments = total
+        if self.state.last_index > total:
+            self.state.last_index = total
+        self.save_state()
 
     # ------------------------------------------------------------------
     # State persistence

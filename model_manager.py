@@ -499,13 +499,13 @@ def _build_deep_recall_manager() -> Optional[DeepRecallManager]:
     try:
         memory_backend = _FragmentMemoryBackend(CHILD)
         config = DeepRecallConfig(
-            chunk_size=30,
-            burst_chunk_size=6,
-            burst_cooldown_sec=20.0,
+            chunk_size=4,
+            burst_chunk_size=1,
+            burst_cooldown_sec=45.0,
             burst_collect_garbage=True,
             state_path=str(_DEEP_RECALL_STATE_PATH),
-            min_energy=0.3,
-            max_memory_percent=70.0,
+            min_energy=0.35,
+            max_memory_percent=50.0,
         )
         return DeepRecallManager(
             memory_backend=memory_backend,

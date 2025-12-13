@@ -16,7 +16,7 @@ from gui_hook import log_to_statusbox
 from model_manager import load_config, update_inastate
 
 GRAPH_FILENAME = "typed_neural_graph.json"
-DEFAULT_BURST = 200  # number of expression fragments to fold in per run
+DEFAULT_BURST = 40  # number of expression fragments to fold in per run
 
 
 def _now_iso() -> str:

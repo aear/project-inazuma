@@ -4,10 +4,11 @@ import os
 import json
 import math
 import random
+import heapq
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, Set, Tuple, TYPE_CHECKING
 from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
 
@@ -16,6 +17,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 MEMORY_TIERS = ["short", "working", "long", "cold"]
 
+NEURAL_MAP_BURST_DEFAULT = 60
+EXPERIENCE_GRAPH_BURST_DEFAULT = 200
 
 DEFAULT_TIER_POLICY = {
     "short": {"max_age_hours": 18.0, "target_count": 5000},
@@ -148,29 +151,84 @@ def _experience_base(child: str, base_path: Optional[Path] = None) -> Path:
     return root / child / "memory" / "experiences"
 
 
-def load_experience_events(child: str, base_path: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Load structured events previously logged by the experience logger."""
+def load_experience_events(child: str, base_path: Optional[Path] = None, limit: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
+    """Load structured events previously logged by the experience logger (optionally limited)."""
 
     events_dir = _experience_base(child, base_path) / "events"
     if not events_dir.exists():
-        return []
+        return [], 0
+
+    limit_val = 0
+    if limit is not None:
+        try:
+            limit_val = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit_val = 0
+
+    def _ts_value(payload: Dict[str, Any], path: Path) -> float:
+        raw = payload.get("timestamp") or ""
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            try:
+                return path.stat().st_mtime
+            except Exception:
+                return 0.0
 
     events: List[Dict[str, Any]] = []
-    for path in sorted(events_dir.glob("evt_*.json")):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if "id" in data:
-                    events.append(data)
-        except Exception:
-            continue
-    return events
+    total = 0
+
+    if limit_val > 0:
+        heap: List[tuple] = []
+        for path in sorted(events_dir.glob("evt_*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            if "id" not in data:
+                continue
+            total += 1
+            entry = (_ts_value(data, path), data)
+            if len(heap) < limit_val:
+                heapq.heappush(heap, entry)
+            else:
+                if entry[0] > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+        heap.sort()
+        events = [item[1] for item in heap]
+    else:
+        for path in sorted(events_dir.glob("evt_*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            if "id" not in data:
+                continue
+            events.append(data)
+        total = len(events)
+
+    return events, total
 
 
 def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict[str, Any]:
     """Construct a graph over events grounded in shared entities and words."""
 
-    events = load_experience_events(child, base_path)
+    cfg = _load_config()
+    burst_limit = cfg.get("experience_graph_burst")
+    try:
+        burst_limit = int(burst_limit)
+    except (TypeError, ValueError):
+        burst_limit = EXPERIENCE_GRAPH_BURST_DEFAULT
+    if burst_limit <= 0:
+        burst_limit = EXPERIENCE_GRAPH_BURST_DEFAULT
+
+    events, total_events = load_experience_events(
+        child,
+        base_path=base_path,
+        limit=burst_limit,
+    )
     if not events:
         return {
             "events": [],
@@ -178,6 +236,11 @@ def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict
             "words_index": {},
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    if total_events > len(events):
+        log_to_statusbox(
+            f"[ExperienceGraph] Limiting to {len(events)} most recent events (burst={burst_limit}, total={total_events})."
+        )
 
     nodes: List[Dict[str, Any]] = []
     words_index: Dict[str, Set[str]] = {}
@@ -290,13 +353,46 @@ def _slim_fragment(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return slim
 
 
-def load_fragments(child):
-    base = Path("AI_Children") / child / "memory" / "fragments"
-    search_paths = list(base.glob("frag_*.json"))
+def _iter_fragment_files(base: Path):
+    for path in base.glob("frag_*.json"):
+        yield path
     for tier in MEMORY_TIERS:
         tier_path = base / tier
         if tier_path.exists():
-            search_paths.extend(list(tier_path.glob("frag_*.json")))
+            for path in tier_path.glob("frag_*.json"):
+                yield path
+
+
+def load_fragments(child, limit: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
+    base = Path("AI_Children") / child / "memory" / "fragments"
+    limit_val = 0
+    if limit is not None:
+        try:
+            limit_val = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit_val = 0
+
+    selected_paths: List[Path] = []
+    total = 0
+    if limit_val > 0:
+        heap: List[tuple] = []
+        for path in _iter_fragment_files(base):
+            total += 1
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                continue
+            entry = (mtime, path)
+            if len(heap) < limit_val:
+                heapq.heappush(heap, entry)
+            else:
+                if entry[0] > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+        heap.sort()
+        selected_paths = [item[1] for item in heap]
+    else:
+        selected_paths = list(_iter_fragment_files(base))
+        total = len(selected_paths)
 
     seen: Set[str] = set()
 
@@ -319,7 +415,8 @@ def load_fragments(child):
         return None
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return [frag for frag in pool.map(load, search_paths) if frag]
+        fragments = [frag for frag in pool.map(load, selected_paths) if frag]
+    return fragments, total
 
 def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
     clusters = []
@@ -396,9 +493,28 @@ def build_fractal_memory(child):
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
     cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
+    cfg = _load_config()
+    burst_limit = cfg.get("neural_map_burst")
+    try:
+        burst_limit = int(burst_limit)
+    except (TypeError, ValueError):
+        burst_limit = NEURAL_MAP_BURST_DEFAULT
+    if burst_limit <= 0:
+        burst_limit = NEURAL_MAP_BURST_DEFAULT
+
     transformer = FractalTransformer()
-    fragments = load_fragments(child)
-    log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
+    fragments, total_count = load_fragments(child, limit=burst_limit)
+    if not fragments:
+        log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
+        return
+
+    if total_count > len(fragments):
+        log_to_statusbox(
+            f"[NeuralMap] Limiting to {len(fragments)} recent fragments (burst={burst_limit}, total={total_count})."
+        )
+    else:
+        log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
+
     encoded = transformer.encode_many(fragments)
     cache = {e["id"]: e["vector"] for e in encoded}
     clusters = cluster_fragments(

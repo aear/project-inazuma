@@ -12,6 +12,8 @@ from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts
 from body_schema import get_region_anchors
 
+LOGIC_MAP_BURST_DEFAULT = 150  # neurons per pass before pausing
+
 def cosine_similarity(v1, v2):
     dot = sum(a * b for a, b in zip(v1, v2))
     norm1 = math.sqrt(sum(a * a for a in v1))
@@ -191,12 +193,23 @@ def run_logic_map_builder():
     config = load_config()
     child = config.get("current_child", "default_child")
     logic_entries = load_logic_memory(child)
+    burst_limit = config.get("logic_map_burst") or LOGIC_MAP_BURST_DEFAULT
+    try:
+        burst_limit = int(burst_limit)
+    except (TypeError, ValueError):
+        burst_limit = LOGIC_MAP_BURST_DEFAULT
+    burst_limit = max(10, burst_limit)
 
     if not logic_entries:
         log_to_statusbox("[LogicMap] No logic entries found. Skipping map generation.")
         return
 
-    log_to_statusbox(f"[LogicMap] Loaded {len(logic_entries)} logic entries.")
+    if len(logic_entries) > burst_limit:
+        logic_entries = logic_entries[-burst_limit:]
+        log_to_statusbox(f"[LogicMap] Loaded {len(logic_entries)} recent logic entries (burst limit {burst_limit}).")
+    else:
+        log_to_statusbox(f"[LogicMap] Loaded {len(logic_entries)} logic entries.")
+
     logic_map = build_logic_neural_map(logic_entries)
     save_logic_neural_map(child, logic_map)
     log_to_statusbox("[LogicMap] Logic neural mapping complete.")
