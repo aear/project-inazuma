@@ -47,3 +47,4 @@ __pycache__/
 *.gz
 dist/
 build/
+logs/comms_core.jsonl
