@@ -4,33 +4,39 @@ import json
 import random
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional
 
-# Procedural symbol parts
-EMOTION_GLYPHS = {
-    "calm": "∘", "tension": "∇", "curiosity": "μ", "trust": "λ", "fear": "ψ", "anger": "Ω"
-}
-MODULATION_GLYPHS = {
-    "soft": "·", "moderate": "⇌", "sharp": "∴", "pulse": "∆", "spiral": "⊙"
-}
-CONCEPT_GLYPHS = {
-    "self": "ν", "pattern": "Ξ", "truth": "φ", "change": "∵", "unknown": "∅"
-}
+from symbol_glyphs import get_symbol_glyph_maps
 
 # Extra marks used to vary length/texture of generated symbols
 ACCENT_GLYPHS = ["·", ":", "~", "ː", "⁂", "↺", "↯"]
 # Allow occasional ASCII letters/digits so Ina can lean on them if she wants.
 ALPHANUMERIC_GLYPHS = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
+
+def available_symbol_components(child: Optional[str] = None) -> Dict[str, List[str]]:
+    """
+    Return the list of glyph keys per type for the active child.
+    """
+    maps = get_symbol_glyph_maps(child)
+    return {kind: list(entries.keys()) for kind, entries in maps.items()}
+
+
 # Procedural map
-def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None):
+def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None, *, child=None):
     """
     Build a symbol from emotion/modulation/concept glyphs.
     Length can vary (defaults to 2–5 chars) so symbols are not locked to 3 chars.
     """
+    glyphs = get_symbol_glyph_maps(child)
+    emotion_glyph = glyphs["emotion"].get(emotion_key, str(emotion_key))
+    modulation_glyph = glyphs["modulation"].get(mod_key, str(mod_key))
+    concept_glyph = glyphs["concept"].get(concept_key, str(concept_key))
+
     base_parts = [
-        EMOTION_GLYPHS[emotion_key],
-        MODULATION_GLYPHS[mod_key],
-        CONCEPT_GLYPHS[concept_key],
+        emotion_glyph,
+        modulation_glyph,
+        concept_glyph,
     ]
 
     target_len = length if length is not None else random.choice([2, 3, 3, 4, 4, 5])
@@ -53,12 +59,13 @@ def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None):
 
     return "".join(symbol_parts)
 
-def procedural_combinations():
+def procedural_combinations(child: Optional[str] = None):
     combos = []
-    for e in EMOTION_GLYPHS:
-        for m in MODULATION_GLYPHS:
-            for c in CONCEPT_GLYPHS:
-                symbol = generate_symbol_from_parts(e, m, c)
+    keys = available_symbol_components(child)
+    for e in keys["emotion"]:
+        for m in keys["modulation"]:
+            for c in keys["concept"]:
+                symbol = generate_symbol_from_parts(e, m, c, child=child)
                 meaning = f"{m} {e} about {c}"
                 combos.append({
                     "symbol": symbol,

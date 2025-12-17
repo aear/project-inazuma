@@ -7,7 +7,7 @@ from collections import defaultdict
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config, seed_self_question
 from gui_hook import log_to_statusbox
-from symbol_generator import generate_symbol_from_parts
+from symbol_generator import generate_symbol_from_parts, available_symbol_components
 import random
 from text_memory import build_text_symbol_links
 
@@ -89,15 +89,16 @@ def cluster_symbols_and_generate_words(child):
             clusters.append([enc])
     log_to_statusbox(f"[Symbols] Built {len(clusters)} clusters.")
 
+    component_keys = available_symbol_components(child)
     words = []
     for i, group in enumerate(clusters):
         log_to_statusbox(f"[Symbols] Processing cluster {i+1}/{len(clusters)} with {len(group)} members.")
 
         # Procedurally generate a unique symbol per cluster
-        emotion = random.choice(list(generate_symbol_from_parts.__globals__["EMOTION_GLYPHS"].keys()))
-        modulation = random.choice(list(generate_symbol_from_parts.__globals__["MODULATION_GLYPHS"].keys()))
-        concept = random.choice(list(generate_symbol_from_parts.__globals__["CONCEPT_GLYPHS"].keys()))
-        symbol_id = generate_symbol_from_parts(emotion, modulation, concept)
+        emotion = random.choice(component_keys["emotion"])
+        modulation = random.choice(component_keys["modulation"])
+        concept = random.choice(component_keys["concept"])
+        symbol_id = generate_symbol_from_parts(emotion, modulation, concept, child=child)
 
         word = {
             "symbol_word_id": f"sym_word_{i:04}",

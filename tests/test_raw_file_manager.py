@@ -33,9 +33,9 @@ def test_fragment_audio_wav(tmp_path):
     assert "self_read" in frag["tags"]
 
 
-def test_fragment_audio_mp3(monkeypatch, tmp_path):
-    mp3_path = tmp_path / "clip.mp3"
-    mp3_path.write_bytes(b"fake mp3 data")
+def test_fragment_audio_opus(monkeypatch, tmp_path):
+    opus_path = tmp_path / "clip.opus"
+    opus_path.write_bytes(b"fake opus data")
 
     analysis = {
         "summary": "Synthetic MP3 analysis",
@@ -47,7 +47,7 @@ def test_fragment_audio_mp3(monkeypatch, tmp_path):
     monkeypatch.setattr(rfm, "analyze_audio_clip", lambda path, transformer: analysis)
 
     transformer = FractalTransformer()
-    fragments = rfm.fragment_audio(mp3_path, transformer)
+    fragments = rfm.fragment_audio(opus_path, transformer)
 
     assert fragments, "Expected a fragment for MP3 input"
     frag = fragments[0]

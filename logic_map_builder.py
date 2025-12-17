@@ -9,7 +9,7 @@ from pathlib import Path
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config
 from gui_hook import log_to_statusbox
-from symbol_generator import generate_symbol_from_parts
+from symbol_generator import generate_symbol_from_parts, available_symbol_components
 from body_schema import get_region_anchors
 
 LOGIC_MAP_BURST_DEFAULT = 150  # neurons per pass before pausing
@@ -126,15 +126,16 @@ def build_logic_neural_map(logic_entries):
     neurons = []
     edges = []
 
+    component_keys = available_symbol_components()
     for i, entry in enumerate(logic_entries):
         vector = extract_logic_vector(entry)
         if not vector:
             continue
 
         # Generate procedural symbol per neuron
-        emo = random.choice(["trust", "curiosity", "tension", "anger", "fear"])
-        mod = random.choice(["spiral", "pulse", "soft", "sharp"])
-        con = random.choice(["truth", "pattern", "change", "self", "unknown"])
+        emo = random.choice(component_keys["emotion"])
+        mod = random.choice(component_keys["modulation"])
+        con = random.choice(component_keys["concept"])
         symbol = generate_symbol_from_parts(emo, mod, con)
         node_id = f"neuron_logic_{i:04}"
         region = _guess_region_for_logic(entry, anchors)

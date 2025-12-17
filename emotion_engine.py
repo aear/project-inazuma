@@ -369,6 +369,7 @@ def _drift_vector(
     last_values: Dict[str, float],
     mode: str,
     tags: Optional[List[str]] = None,
+    quantum_bias: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """
     Compute a new emotional vector by gently drifting the last snapshot
@@ -381,6 +382,8 @@ def _drift_vector(
     drift_strength = _drift_amount_for_mode(mode)
 
     result: Dict[str, float] = {}
+    q_bias = quantum_bias or {}
+
     for k in SLIDERS:
         base = float(baseline.get(k, 0.0))
         prev = float(last_values.get(k, base))
@@ -406,7 +409,8 @@ def _drift_vector(
         if "fear" in tags and k in ("risk", "threat", "negativity", "stress"):
             bias += drift_strength * 0.75
 
-        value = _clamp(relaxed + jitter + bias)
+        q_nudge = _clamp(float(q_bias.get(k, 0.0) or 0.0), -0.3, 0.3)
+        value = _clamp(relaxed + jitter + bias + q_nudge)
         result[k] = value
 
     return result
@@ -426,12 +430,15 @@ def compute_emotion_snapshot(
     baseline = load_baseline(child)
     last = load_last_snapshot(child)
     mode = _mode_from_inastate()
+    quantum_bias = get_inastate("quantum_emotion_bias") or {}
+    if not isinstance(quantum_bias, dict):
+        quantum_bias = {}
 
     if last is None:
-        values = {k: _clamp(float(baseline.get(k, 0.0))) for k in SLIDERS}
+        values = {k: _clamp(float(baseline.get(k, 0.0)) + float(quantum_bias.get(k, 0.0) or 0.0)) for k in SLIDERS}
         _log(f"First emotion snapshot for {child} (mode={mode}).")
     else:
-        values = _drift_vector(baseline, last.values, mode, tags=context_tags)
+        values = _drift_vector(baseline, last.values, mode, tags=context_tags, quantum_bias=quantum_bias)
         _log(f"Drifted emotion snapshot for {child} (mode={mode}).")
 
     ts = _now_iso()
@@ -449,6 +456,22 @@ def _should_attach_body_state(values: Dict[str, float]) -> bool:
     except Exception:
         intensity = 0.0
     return abs(intensity) >= BODY_INTENSITY_THRESHOLD
+
+
+def _decay_quantum_bias_state(decay: float = 0.35) -> None:
+    bias = get_inastate("quantum_emotion_bias")
+    if not isinstance(bias, dict) or not bias:
+        return
+    decayed = {}
+    for key, value in bias.items():
+        try:
+            reduced = float(value) * decay
+        except Exception:
+            continue
+        if abs(reduced) < 0.005:
+            continue
+        decayed[key] = round(_clamp(reduced), 4)
+    update_inastate("quantum_emotion_bias", decayed)
 
 
 def tag_fragment_emotions(
@@ -597,6 +620,7 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
     # Update inastate
     update_inastate("emotion_snapshot", snapshot.to_dict())
     update_inastate("last_emotion_update", snapshot.timestamp)
+    _decay_quantum_bias_state()
 
     # Persist
     log_emotion_snapshot(child, snapshot)

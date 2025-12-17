@@ -25,6 +25,7 @@ from language_processing import (
 from model_manager import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
 from social_map import get_high_trust_contacts, get_owner_user_id
 from transformers.fractal_multidimensional_transformers import FractalTransformer
+from symbol_generator import generate_symbol_from_parts
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
@@ -890,14 +891,19 @@ def select_rare_tone(tone_library: Dict[str, Dict], current_emotions: Dict[str, 
     return candidates[0]
 
 def predict_target_from_emotion(emotion):
-    trust = emotion.get("trust", 0.0)
-    novelty = emotion.get("novelty", 0.0)
-    focus = emotion.get("focus", 0.0)
+    trust = float(emotion.get("trust", 0.0) or 0.0)
+    novelty = float(emotion.get("novelty", 0.0) or 0.0)
+    attention = float(emotion.get("attention", 0.0) or emotion.get("focus", 0.0) or 0.0)
+    connection = float(emotion.get("connection", 0.0) or 0.0)
+
     if trust > 0.6 and novelty < 0.4:
-        return "Hito"
-    elif focus > 0.6 and trust < 0.4:
-        return "Lex"
-    return "unknown"
+        return generate_symbol_from_parts("trust", "soft", "self")
+    if attention > 0.6 and trust < 0.4:
+        return generate_symbol_from_parts("focus", "sharp", "pattern")
+    if connection > 0.55:
+        return generate_symbol_from_parts("care", "moderate", "connection")
+    mood = "curiosity" if novelty >= 0.3 else "calm"
+    return generate_symbol_from_parts(mood, "spiral", "unknown")
 
 
 def maybe_prompt_new_symbol_word(child, prediction, best_word_id, best_conf, symbol_hint, vocab_size):
@@ -1134,6 +1140,7 @@ def early_communicate():
         owner_user_id = int(get_owner_user_id(config) or 0)
     except Exception:
         owner_user_id = None
+    owner_user_id_str = str(owner_user_id) if owner_user_id else None
     transformer = FractalTransformer()
     prediction = load_prediction(child)
     if not prediction:
@@ -1428,6 +1435,14 @@ def early_communicate():
     payload_target_user = typed_payload.get("target_user_id") if isinstance(typed_payload, dict) else None
     payload_target_label = typed_payload.get("target") if isinstance(typed_payload, dict) else None
     high_trust_contacts = get_high_trust_contacts(config=config, min_level="high", limit=3) if allow_high_trust_dm else []
+    last_heard_contact = get_inastate("last_heard_contact")
+    last_heard_user_id = None
+    last_heard_is_dm = False
+    if isinstance(last_heard_contact, dict):
+        raw_last_user = last_heard_contact.get("user_id")
+        if raw_last_user is not None:
+            last_heard_user_id = str(raw_last_user)
+        last_heard_is_dm = bool(last_heard_contact.get("is_dm"))
 
     # Prefer human-friendly labels over raw symbol ids when crafting typed text.
     symbol_labels = [label_for_symbol(sid) for sid in speech_symbols[:3] if sid]
@@ -1439,13 +1454,13 @@ def early_communicate():
         try:
             audio_dm_dir = Path("AI_Children") / child / "memory" / "comm_output" / "typed_audio"
             audio_dm_dir.mkdir(parents=True, exist_ok=True)
-            audio_clip_path = audio_dm_dir / f"ina_sound_{uuid.uuid4().hex[:8]}.mp3"
+            audio_clip_path = audio_dm_dir / f"ina_sound_{uuid.uuid4().hex[:8]}.opus"
             speak_symbolically(
                 speech_symbols,
                 child=child,
                 record_path=audio_clip_path,
                 playback=False,
-                record_format="mp3",
+                record_format="opus",
             )
             if not audio_clip_path.exists():
                 audio_clip_path = None
@@ -1469,15 +1484,36 @@ def early_communicate():
         if payload_target_user:
             target_user_id = str(payload_target_user)
             target_label = payload_target_label or "user_dm"
+        elif last_heard_user_id and last_heard_is_dm:
+            if owner_user_id_str and last_heard_user_id == owner_user_id_str:
+                target_user_id = owner_user_id_str
+                target_label = "owner_dm"
+            elif allow_high_trust_dm and high_trust_contacts:
+                matched = next(
+                    (
+                        contact
+                        for contact in high_trust_contacts
+                        if str(contact.get("user_id")) == last_heard_user_id
+                    ),
+                    None,
+                )
+                if matched:
+                    target_user_id = last_heard_user_id
+                    target_label = "trusted_dm"
         elif allow_high_trust_dm and high_trust_contacts:
-            candidates = [
-                contact for contact in high_trust_contacts if str(contact.get("user_id")) != str(owner_user_id)
-            ] or high_trust_contacts
+            if owner_user_id_str:
+                candidates = [
+                    contact
+                    for contact in high_trust_contacts
+                    if str(contact.get("user_id")) != owner_user_id_str
+                ] or high_trust_contacts
+            else:
+                candidates = high_trust_contacts
             if candidates:
                 target_user_id = str(candidates[0].get("user_id"))
                 target_label = "trusted_dm"
-        elif owner_user_id:
-            target_user_id = str(owner_user_id)
+        elif owner_user_id_str:
+            target_user_id = owner_user_id_str
             target_label = "owner_dm"
 
         rationale = {
@@ -1491,12 +1527,14 @@ def early_communicate():
             "symbol_autotype_enabled": allow_symbol_autotype,
             "payload_kind": payload_kind,
             "audio_clip_path": str(audio_clip_path) if audio_clip_path else None,
+            "last_heard_contact": last_heard_contact if isinstance(last_heard_contact, dict) else None,
             "candidates": {
                 "speech_symbols": speech_symbols[:3] if speech_symbols else None,
                 "vocab_word": vocab_word,
                 "word_id": word_id,
                 "high_trust_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
                 "owner_user_id": owner_user_id,
+                "last_heard_user_id": last_heard_user_id,
             },
         }
 
@@ -1540,6 +1578,7 @@ def early_communicate():
                         "word": vocab_word or word_id,
                         "trusted_user_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
                     },
+                    "last_heard_contact": last_heard_contact if isinstance(last_heard_contact, dict) else None,
                 },
             )
 

@@ -577,7 +577,14 @@ def open_logs():
     text = tk.Text(display, height=20, width=80)
     text.pack()
     for entry in log[-20:]:
-        text.insert(tk.END, f"{entry['timestamp']} — {entry['question']}")
+        question = entry.get("question", "unknown")
+        first = entry.get("first_asked") or entry.get("timestamp") or ""
+        count = entry.get("count", 1)
+        resolved = entry.get("resolved_at")
+        line = f"{first} — {question} (×{count})"
+        if resolved:
+            line += f" [resolved {resolved}]"
+        text.insert(tk.END, line + "\n")
     text.config(state=tk.DISABLED)
 
 def emergency_shutdown():

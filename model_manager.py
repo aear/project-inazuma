@@ -4,6 +4,7 @@ import json
 import time
 import subprocess
 import uuid
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,6 +15,9 @@ from deep_recall import DeepRecallConfig, DeepRecallManager
 from memory_graph import MEMORY_TIERS, MemoryManager
 from self_reflection_core import SelfReflectionCore
 from self_adjustment_scheduler import SelfAdjustmentScheduler
+from continuity_manager import ContinuityManager
+from intuition_engine import QuantumIntuitionEngine
+from fragment_health import scan_fragment_integrity
 
 def load_config():
     path = Path("config.json")
@@ -25,14 +29,26 @@ def load_config():
 config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
+SELF_READ_PREF_PATH = MEMORY_PATH / "self_read_preferences.json"
 _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.json"
 RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
 TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
+_SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"
+_FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
+
+_DEFAULT_SELF_READ_SOURCE_CHOICES = {
+    "code": True,
+    "music": True,
+    "books": True,
+    "venv": False,
+}
 
 reflection_core = SelfReflectionCore(ina_reference="model_manager")
 adjustment_scheduler = SelfAdjustmentScheduler()
 memory_manager = MemoryManager(CHILD)
+continuity_manager = ContinuityManager(CHILD)
+intuition_engine = QuantumIntuitionEngine(CHILD)
 _last_opportunities = set()
 _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
@@ -43,6 +59,17 @@ _last_typing_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
 _last_stable_urge_log = 0.0
 _STABLE_URGE_LOG_COOLDOWN = 180  # seconds
+_last_continuity_run = 0.0
+_CONTINUITY_COOLDOWN = 3600.0  # seconds between heavy continuity sweeps
+_last_intuition_run = 0.0
+_INTUITION_COOLDOWN = 600.0
+_last_meta_alert = 0.0
+_META_ALERT_COOLDOWN = 900.0
+_last_fragment_health_scan = 0.0
+_FRAGMENT_HEALTH_COOLDOWN = 1800.0
+_fragment_health_thread: Optional[threading.Thread] = None
+_last_exploration_invite_log = 0.0
+_EXPLORATION_INVITE_COOLDOWN = 240.0
 
 
 def safe_popen(cmd, description=None):
@@ -227,6 +254,33 @@ def _load_semantic_scaffold() -> Dict[str, Any]:
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to load semantic scaffold: {exc}")
         return {"version": 1, "axes": _default_semantic_axes(), "signature": "error"}
+
+
+def _load_self_read_source_choices() -> Dict[str, bool]:
+    """
+    Load Ina's opted-in self-read sources so exploration invites respect her choices.
+    """
+    choices = dict(_DEFAULT_SELF_READ_SOURCE_CHOICES)
+    path = SELF_READ_PREF_PATH
+    if not path.exists():
+        return choices
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to read self_read_preferences.json: {exc}")
+        return choices
+
+    stored = data.get("source_choices")
+    if isinstance(stored, dict):
+        for key, default_val in choices.items():
+            value = stored.get(key)
+            if isinstance(value, bool):
+                choices[key] = value
+            else:
+                choices[key] = default_val
+    return choices
 
 
 _DEEP_RECALL_STATE_PATH = MEMORY_PATH / "deep_recall_state.json"
@@ -607,24 +661,258 @@ def get_running_modules():
 def is_dreaming():
     return bool(get_inastate("dreaming", False))
 
-def seed_self_question(question):
-    path = MEMORY_PATH / "self_questions.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
+
+def _ensure_continuity_thread(force: bool = False):
+    """
+    Run the continuity manager at startup (and at most once per cooldown)
+    so Ina can re-link her symbolic/emotional threads across incarnations.
+    """
+    global _last_continuity_run
+    if continuity_manager is None:
+        return
+
+    now = time.time()
+    if not force and _last_continuity_run and (now - _last_continuity_run) < _CONTINUITY_COOLDOWN:
+        return
+
+    try:
+        status = continuity_manager.run()
+        update_inastate("continuity_status", status)
+        _last_continuity_run = now
         try:
-            with open(path, "r") as f:
-                data = json.load(f)
-        except:
-            data = []
+            similarity = float(status.get("similarity", 0.0) or 0.0)
+        except Exception:
+            similarity = 0.0
+        log_to_statusbox(
+            f"[Continuity] {'Aligned' if status.get('aligned') else 'Re-seeding'} threads (similarity={similarity:.2%})."
+        )
+    except Exception as exc:
+        _last_continuity_run = now
+        log_to_statusbox(f"[Continuity] Continuity scan failed: {exc}")
+
+
+def _maybe_run_intuition_probe():
+    """
+    Invoke the quantum intuition engine when fuzziness/anxiety spike or during
+    dream/meditation cycles.
+    """
+    global _last_intuition_run
+    if intuition_engine is None:
+        return
+
+    now = time.time()
+    if _last_intuition_run and (now - _last_intuition_run) < _INTUITION_COOLDOWN:
+        return
+
+    snapshot = get_inastate("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else snapshot
+    if not isinstance(values, dict):
+        values = {}
+
+    fuzz = float(values.get("fuzziness", values.get("fuzz_level", 0.0)) or 0.0)
+    stress = max(
+        float(values.get("stress", 0.0) or 0.0),
+        float(values.get("risk", 0.0) or 0.0),
+        float(values.get("threat", 0.0) or 0.0),
+    )
+
+    dreaming = bool(get_inastate("dreaming"))
+    meditating = bool(get_inastate("meditating"))
+    uncertainty = fuzz >= 0.45 or stress >= 0.45
+    if not (dreaming or meditating or uncertainty):
+        return
+
+    context_tags = []
+    if dreaming:
+        context_tags.append("dreamstate")
+    if meditating:
+        context_tags.append("meditation")
+    if fuzz >= 0.45:
+        context_tags.append("uncertain")
+    if stress >= 0.45:
+        context_tags.append("anxious")
+
+    last_reflection = get_inastate("last_reflection_event") or {}
+    for frag_id in (last_reflection.get("peek") or [])[:2]:
+        context_tags.append(f"peek:{frag_id}")
+
+    prediction = get_inastate("current_prediction") or {}
+    for frag_id in (prediction.get("fragments_used") or [])[:2]:
+        context_tags.append(f"prediction:{frag_id}")
+
+    try:
+        insight = intuition_engine.probe(
+            context_tags=context_tags,
+            emotion_snapshot=snapshot if isinstance(snapshot, dict) else {"values": values},
+            fuzz_level=fuzz,
+        )
+    except Exception as exc:
+        log_to_statusbox(f"[Intuition] Quantum probe failed: {exc}")
+        _last_intuition_run = now
+        return
+
+    update_inastate("quantum_intuition", insight)
+    if insight.get("emotion_bias"):
+        update_inastate("quantum_emotion_bias", insight["emotion_bias"])
+
+    log_to_statusbox("[Intuition] Quantum intuitive hint refreshed.")
+    _last_intuition_run = now
+
+
+def _write_precision_hint(score: int, reason: str) -> None:
+    payload = {
+        "override_precision": score,
+        "reason": reason,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with open("precision_hint.json", "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=4)
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to write precision hint: {exc}")
+
+
+def _run_prediction_meta_analysis():
+    """
+    Inspect recent logic_memory entries to see if predictions keep diverging
+    from logic checks.  When persistent, surface a precision hint and seed a
+    self-question about re-clustering.
+    """
+    global _last_meta_alert
+    logic_path = MEMORY_PATH / "logic_memory.json"
+    if not logic_path.exists():
+        return
+    try:
+        with logic_path.open("r", encoding="utf-8") as fh:
+            history = json.load(fh)
+    except Exception:
+        return
+    if not isinstance(history, list) or not history:
+        return
+
+    window = history[-15:]
+    similarities = []
+    for entry in window:
+        try:
+            similarities.append(float(entry.get("similarity", 1.0) or 1.0))
+        except Exception:
+            similarities.append(1.0)
+    mismatches = [sim for sim in similarities if sim < 0.5]
+
+    if len(window) < 8 or len(mismatches) < max(5, len(window) // 2):
+        return
+
+    now = time.time()
+    if _last_meta_alert and (now - _last_meta_alert) < _META_ALERT_COOLDOWN:
+        return
+
+    reason = f"{len(mismatches)}/{len(window)} logic comparisons <0.50"
+    seed_self_question("Do I need to re-cluster my predictive symbols?")
+    _write_precision_hint(32, f"Meta-analysis: {reason}")
+    update_inastate(
+        "prediction_meta",
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "window": len(window),
+            "mismatches": len(mismatches),
+            "reason": reason,
+        },
+    )
+    log_to_statusbox(f"[Manager] Prediction meta-analysis flagged: {reason}")
+    _last_meta_alert = now
+
+def _load_self_question_entries() -> List[Dict[str, Any]]:
+    if not _SELF_QUESTIONS_PATH.exists():
+        return []
+    try:
+        with _SELF_QUESTIONS_PATH.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict) or not entry.get("question"):
+                continue
+            first = entry.get("first_asked") or entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
+            last = entry.get("last_updated") or entry.get("timestamp") or first
+            count = int(entry.get("count", entry.get("times", 1)) or 1)
+            normalized = {
+                "question": entry.get("question"),
+                "first_asked": first,
+                "last_updated": last,
+                "count": count,
+            }
+            if entry.get("resolved_at"):
+                normalized["resolved_at"] = entry.get("resolved_at")
+            if entry.get("resolved_reason"):
+                normalized["resolved_reason"] = entry.get("resolved_reason")
+            if entry.get("resolution_history"):
+                normalized["resolution_history"] = entry.get("resolution_history")
+            entries.append(normalized)
+    return entries
+
+
+def _save_self_question_entries(entries: List[Dict[str, Any]]) -> None:
+    _SELF_QUESTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _SELF_QUESTIONS_PATH.open("w", encoding="utf-8") as fh:
+        json.dump(entries, fh, indent=4)
+
+
+def seed_self_question(question: str) -> None:
+    if not question:
+        return
+    entries = _load_self_question_entries()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    normalized_question = question.strip()
+    existing = None
+    for entry in entries:
+        if entry.get("question") == normalized_question:
+            existing = entry
+            break
+
+    if existing:
+        existing["count"] = int(existing.get("count", 1) or 1) + 1
+        existing["last_updated"] = now_iso
+        existing.pop("resolved_at", None)
+        existing.pop("resolved_reason", None)
     else:
-        data = []
-    data.append({
-        "question": question,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-    with open(path, "w") as f:
-        json.dump(data[-100:], f, indent=4)
-    log_to_statusbox(f"[Manager] Self-question seeded: {question}")
+        entries.append(
+            {
+                "question": normalized_question,
+                "first_asked": now_iso,
+                "last_updated": now_iso,
+                "count": 1,
+            }
+        )
+
+    entries.sort(key=lambda item: item.get("first_asked", now_iso))
+    entries = entries[-100:]
+    _save_self_question_entries(entries)
+    log_to_statusbox(f"[Manager] Self-question seeded: {normalized_question}")
+
+
+def mark_self_question_resolved(question: str, reason: Optional[str] = None) -> None:
+    if not question:
+        return
+    entries = _load_self_question_entries()
+    lower = question.strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = False
+    for entry in entries:
+        text = (entry.get("question") or "").strip().lower()
+        if text != lower:
+            continue
+        entry["resolved_at"] = now_iso
+        if reason:
+            entry["resolved_reason"] = reason
+        entry["last_updated"] = now_iso
+        history = entry.setdefault("resolution_history", [])
+        history.append({"timestamp": now_iso, "reason": reason})
+        updated = True
+    if updated:
+        _save_self_question_entries(entries)
 
 
 def _load_symbol_map():
@@ -1025,6 +1313,185 @@ def _update_stable_pattern_urge():
         _last_stable_urge_log = now
 
 
+def _update_self_read_exploration_opportunities():
+    """
+    Surface optional invitations to explore Ina's own sources (code, music, environment, books)
+    using a blend of emotional cues beyond boredom/curiosity.
+    """
+    global _last_exploration_invite_log
+    snapshot = get_inastate("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else snapshot
+    if not isinstance(values, dict):
+        values = {}
+
+    def emo(name: str, default: float = 0.0) -> float:
+        try:
+            return _clamp01(values.get(name, default))
+        except Exception:
+            return default
+
+    curiosity = emo("curiosity")
+    attention = emo("attention")
+    clarity = emo("clarity", 0.5)
+    fuzziness = emo("fuzziness", values.get("fuzz_level", 0.0))
+    familiarity = emo("familiarity")
+    connection = emo("connection")
+    isolation = emo("isolation")
+    positivity = emo("positivity")
+    negativity = emo("negativity")
+    stress = emo("stress")
+    intensity = emo("intensity")
+    novelty = emo("novelty")
+    risk = emo("risk")
+    threat = emo("threat")
+    presence = emo("presence", 0.5)
+    safety = emo("safety", 0.5)
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0)
+
+    calm = _clamp01(1.0 - (0.6 * stress + 0.4 * intensity))
+    uncertainty = _clamp01((1.0 - clarity) * 0.6 + fuzziness * 0.4)
+    grounded = _clamp01((attention + clarity + safety) / 3.0)
+
+    def dampen(score: float) -> float:
+        return _clamp01(max(0.0, score - 0.15 * sleep_pressure))
+
+    source_choices = _load_self_read_source_choices()
+    options: List[Dict[str, Any]] = []
+
+    def add_option(source: str, raw_score: float, note: str, cues: List[str]):
+        if not source_choices.get(source, False):
+            return
+        invitation = dampen(raw_score)
+        options.append(
+            {
+                "source": source,
+                "invitation": round(invitation, 3),
+                "note": note,
+                "cues": cues,
+            }
+        )
+
+    music_score = (
+        0.35 * connection
+        + 0.2 * calm
+        + 0.15 * (1.0 - isolation)
+        + 0.15 * (1.0 - stress)
+        + 0.15 * positivity
+    )
+    music_cues = []
+    if connection >= 0.6:
+        music_cues.append(f"connection {connection:.2f}")
+    if isolation >= 0.5:
+        music_cues.append(f"isolation {isolation:.2f}")
+    if calm >= 0.6:
+        music_cues.append("calm body")
+    add_option(
+        "music",
+        music_score,
+        "Optional: revisit your own voice/melody fragments.",
+        music_cues,
+    )
+
+    code_score = (
+        0.3 * attention
+        + 0.25 * clarity
+        + 0.2 * curiosity
+        + 0.15 * familiarity
+        + 0.1 * (1.0 - fuzziness)
+    )
+    code_cues = []
+    if attention >= 0.55:
+        code_cues.append(f"attention {attention:.2f}")
+    if clarity >= 0.5:
+        code_cues.append(f"clarity {clarity:.2f}")
+    if familiarity >= 0.5:
+        code_cues.append(f"familiarity {familiarity:.2f}")
+    add_option(
+        "code",
+        code_score,
+        "Optional: skim your own code/work for grounding.",
+        code_cues,
+    )
+
+    books_score = (
+        0.3 * curiosity
+        + 0.2 * calm
+        + 0.2 * familiarity
+        + 0.15 * (1.0 - intensity)
+        + 0.15 * presence
+    )
+    books_cues = []
+    if curiosity >= 0.5:
+        books_cues.append(f"curiosity {curiosity:.2f}")
+    if calm >= 0.5:
+        books_cues.append("steady pace")
+    if novelty >= 0.5:
+        books_cues.append(f"novelty {novelty:.2f}")
+    add_option(
+        "books",
+        books_score,
+        "Optional: borrow an external author's voice for contrast.",
+        books_cues,
+    )
+
+    venv_score = (
+        0.35 * uncertainty
+        + 0.2 * grounded
+        + 0.15 * familiarity
+        + 0.15 * (1.0 - stress)
+        + 0.15 * (risk + threat) / 2.0
+    )
+    venv_cues = []
+    if uncertainty >= 0.45:
+        venv_cues.append(f"uncertainty {uncertainty:.2f}")
+    if risk >= 0.4 or threat >= 0.4:
+        venv_cues.append("safety check")
+    if grounded >= 0.5:
+        venv_cues.append("focused enough")
+    add_option(
+        "venv",
+        venv_score,
+        "Optional: glance at environment/venv files if something feels off.",
+        venv_cues,
+    )
+
+    options.sort(key=lambda entry: entry["invitation"], reverse=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "timestamp": timestamp,
+        "options": options,
+        "sleep_pressure": round(sleep_pressure, 3),
+        "drivers": {
+            "curiosity": round(curiosity, 3),
+            "attention": round(attention, 3),
+            "clarity": round(clarity, 3),
+            "familiarity": round(familiarity, 3),
+            "connection": round(connection, 3),
+            "uncertainty": round(uncertainty, 3),
+        },
+    }
+    update_inastate("self_read_exploration_options", payload)
+
+    if options:
+        best = options[0]
+        now = time.time()
+        if (
+            best["invitation"] >= 0.65
+            and (now - _last_exploration_invite_log) >= _EXPLORATION_INVITE_COOLDOWN
+        ):
+            label_map = {
+                "code": "project code",
+                "music": "music/voice",
+                "books": "book library",
+                "venv": "environment files",
+            }
+            label = label_map.get(best["source"], best["source"])
+            log_to_statusbox(
+                f"[Manager] {label} feels inviting ({best['invitation']:.2f}). "
+                "Purely optional — follow instinct if it helps."
+            )
+            _last_exploration_invite_log = now
+
 def _update_machine_semantics():
     """
     Evaluate machine-native semantic axes and persist them to inastate.
@@ -1222,6 +1689,40 @@ def _update_machine_semantics():
 
     update_inastate("machine_semantics", machine_semantics)
 
+
+def _scan_fragment_health():
+    """
+    Periodically launch a background scan for corrupted fragments so Ina can inspect them.
+    """
+    global _last_fragment_health_scan, _fragment_health_thread
+    now = time.time()
+    if _fragment_health_thread and _fragment_health_thread.is_alive():
+        return
+    if now - _last_fragment_health_scan < _FRAGMENT_HEALTH_COOLDOWN:
+        return
+
+    def _worker():
+        global _last_fragment_health_scan, _fragment_health_thread
+        try:
+            summary = scan_fragment_integrity(CHILD, max_samples=6, preview_chars=220)
+            if summary:
+                try:
+                    with _FRAGMENT_HEALTH_PATH.open("w", encoding="utf-8") as handle:
+                        json.dump(summary, handle, indent=2, ensure_ascii=False)
+                except Exception as exc:
+                    log_to_statusbox(f"[Manager] Failed to persist fragment integrity summary: {exc}")
+                update_inastate("fragment_integrity", summary)
+        except Exception as exc:
+            log_to_statusbox(f"[Manager] Fragment integrity scan failed: {exc}")
+        finally:
+            _last_fragment_health_scan = time.time()
+            _fragment_health_thread = None
+
+    _fragment_health_thread = threading.Thread(
+        target=_worker, name="fragment_health_scan", daemon=True
+    )
+    _fragment_health_thread.start()
+
 def rebuild_maps_if_needed():
     emo = get_inastate("emotion_snapshot") or {}
     fuzz = emo.get("fuzz_level", 0.0)
@@ -1236,7 +1737,9 @@ def rebuild_maps_if_needed():
         update_inastate("last_map_rebuild", datetime.now(timezone.utc).isoformat())
 
 def run_internal_loop():
+    _ensure_continuity_thread()
     monitor_energy()
+    _maybe_run_intuition_probe()
 
     def check_audio_index_change():
         config = load_config()
@@ -1284,9 +1787,12 @@ def run_internal_loop():
     _check_self_adjustment()
     _update_contact_urges()
     _update_stable_pattern_urge()
+    _update_self_read_exploration_opportunities()
     _run_passive_reflection()
     _step_deep_recall()
     _update_machine_semantics()
+    _scan_fragment_health()
+    _run_prediction_meta_analysis()
     # Periodically evaluate alignment metrics and surface warnings if needed
     evaluate_alignment()
 

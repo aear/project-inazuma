@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 import json
+import hashlib
 import numpy as np
 from pathlib import Path
 
@@ -129,6 +130,7 @@ class SoulDriftTransformer:
         self._focus_symbols: List[SymbolId] = []
         self._history: List[DriftState] = []
         self._last_trigger: Optional[str] = None
+        self._last_telemetry: Dict[str, object] = {}
         self.log_dir = Path(cfg.log_dir or ".")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.log_dir / "drift_log.ndjson"
@@ -157,6 +159,7 @@ class SoulDriftTransformer:
         s = self.state
         symbols = list(s.symbol_weights.keys())
         vec = _vec(s.symbol_weights, symbols)
+        prev_entropy = s.entropy_score
 
         noise = self.rng.normal(0, self.cfg.fuzz_sigma, size=len(vec))
         if self._resolve_decay_counter > 0:
@@ -189,6 +192,20 @@ class SoulDriftTransformer:
         s.step += 1
         if self.cfg.log_history:
             self._append_history(s)
+
+        try:
+            serialized = json.dumps(sorted(s.symbol_weights.items()), separators=(",", ":"))
+            delta_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        except Exception:
+            delta_hash = "unknown"
+        entropy_bump = round(s.entropy_score - prev_entropy, 4)
+        self._last_telemetry = {
+            "intent": "creative_entropy",
+            "entropy_bump": entropy_bump,
+            "fuzz_level": round(s.fuzz_level, 4),
+            "delta_graph_hash": delta_hash,
+            "step": s.step,
+        }
         return s
 
     def run_session(self, steps: int, silence: bool = True) -> DriftState:
@@ -233,3 +250,5 @@ class SoulDriftTransformer:
     def snapshot(self) -> DriftState:
         return replace(self.state)
 
+    def intent_telemetry(self) -> Dict[str, object]:
+        return dict(self._last_telemetry)

@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import base64
 import cv2
 import numpy as np
 from pathlib import Path
@@ -63,7 +64,30 @@ def run_text_recognition(image, child="Inazuma_Yagami"):
 
     return matches
 
-def generate_fragment(path, features, modality, child, summary="vision digest", tags=None):
+def _encode_partial_preview(image):
+    if image is None or image.size == 0:
+        return None
+    h, w = image.shape[:2]
+    size = min(64, h, w)
+    if size <= 0:
+        return None
+    start_y = max((h - size) // 2, 0)
+    start_x = max((w - size) // 2, 0)
+    patch = image[start_y:start_y + size, start_x:start_x + size]
+    success, buffer = cv2.imencode(".png", patch)
+    if not success:
+        return None
+    encoded = base64.b64encode(buffer).decode("ascii")
+    return {
+        "encoding": "base64",
+        "format": "png",
+        "data": encoded,
+        "shape": [int(size), int(size)],
+        "center": [int(start_y + size / 2), int(start_x + size / 2)],
+    }
+
+
+def generate_fragment(path, features, modality, child, summary="vision digest", tags=None, preview=None):
     frag_id = f"frag_vision_digest_{int(time.time())}"
     vision_symbol = "vision_symbol_" + frag_id[-6:]
 
@@ -80,6 +104,8 @@ def generate_fragment(path, features, modality, child, summary="vision digest", 
         "vision_symbol": vision_symbol,
         "emotions": {"curiosity": 0.4, "focus": 0.3}
     }
+    if preview:
+        fragment["vision_preview"] = preview
 
     # Save to fragments
     frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag_id}.json"
@@ -122,7 +148,8 @@ def process_image(path, transformer, child, symbol_map):
         if texts:
             tags += [f"text:{t}" for t in texts]
 
-        frag = generate_fragment(path, features, "image", child, summary="image memory", tags=tags)
+        preview = _encode_partial_preview(image)
+        frag = generate_fragment(path, features, "image", child, summary="image memory", tags=tags, preview=preview)
         log_vision_digest(path, frag["id"], tags)
         os.remove(path)
 
@@ -155,7 +182,8 @@ def process_video(path, transformer, child, symbol_map):
         if texts:
             tags += [f"text:{t}" for t in texts]
 
-        frag = generate_fragment(path, features, "video", child, summary="motion memory", tags=tags)
+        preview = _encode_partial_preview(last)
+        frag = generate_fragment(path, features, "video", child, summary="motion memory", tags=tags, preview=preview)
         log_vision_digest(path, frag["id"], tags)
         os.remove(path)
 

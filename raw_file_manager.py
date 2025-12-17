@@ -14,6 +14,7 @@ import gzip
 import bz2
 import lzma
 import uuid
+import fnmatch
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,7 +43,7 @@ except Exception as e:  # pragma: no cover - import guard
 FRAG_LIMIT = 1000
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".webm"}
 SIMPLE_COMPRESSED_EXTENSIONS = {".gz", ".bz2", ".xz"}
 
@@ -55,6 +56,257 @@ FILE_SIZE_LIMITS = {
 }
 
 ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
+
+SELF_READ_PREF_FILENAME = "self_read_preferences.json"
+SELF_READ_SKIP_REQUESTS = "self_read_skip_requests.json"
+VALID_SOURCE_KEYS = {"code", "music", "books", "venv"}
+
+DEFAULT_SELF_READ_PREFS = {
+    "source_choices": {
+        "code": True,
+        "music": True,
+        "books": True,
+        "venv": False,
+    },
+    "skip_files": [],
+}
+
+SOURCE_ANNOTATIONS = {
+    "code": {
+        "tags": ["self_code", "project_source"],
+        "flags": ["self_authored"],
+        "provenance": "ina_project_work",
+        "ownership": "self_creation",
+    },
+    "music": {
+        "tags": ["ina_music", "self_voice", "audio_memory"],
+        "flags": ["self_voice", "music"],
+        "provenance": "ina_voice_library",
+        "ownership": "self_voice",
+    },
+    "books": {
+        "tags": ["book_library", "external_source"],
+        "flags": ["reading", "external"],
+        "provenance": "guardian_book_collection",
+        "ownership": "external_author",
+    },
+    "venv": {
+        "tags": ["environment", "dependency", "external_source"],
+        "flags": ["environment", "external"],
+        "provenance": "project_environment",
+        "ownership": "environment_dependency",
+    },
+}
+
+
+def _default_self_read_prefs():
+    return {
+        "source_choices": dict(DEFAULT_SELF_READ_PREFS["source_choices"]),
+        "skip_files": list(DEFAULT_SELF_READ_PREFS["skip_files"]),
+    }
+
+
+def _self_read_pref_path(child):
+    return Path("AI_Children") / child / "memory" / SELF_READ_PREF_FILENAME
+
+
+def _skip_requests_path(child):
+    return Path("AI_Children") / child / "memory" / SELF_READ_SKIP_REQUESTS
+
+
+def save_self_read_preferences(child, prefs):
+    path = _self_read_pref_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, indent=4)
+
+
+def load_self_read_preferences(child):
+    prefs = _default_self_read_prefs()
+    path = _self_read_pref_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_save = not path.exists()
+    data = {}
+
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception as e:
+            log_to_statusbox(f"[SelfRead] Failed to load {path.name}: {e}")
+            needs_save = True
+
+    loaded_choices = data.get("source_choices", {})
+    if isinstance(loaded_choices, dict):
+        for key, default_value in DEFAULT_SELF_READ_PREFS["source_choices"].items():
+            value = loaded_choices.get(key)
+            if isinstance(value, bool):
+                prefs["source_choices"][key] = value
+            else:
+                prefs["source_choices"][key] = default_value
+    else:
+        needs_save = True
+
+    skip_files = data.get("skip_files", [])
+    if isinstance(skip_files, list):
+        sanitized = []
+        for entry in skip_files:
+            entry_str = str(entry).strip()
+            if entry_str:
+                sanitized.append(entry_str)
+        if sanitized:
+            prefs["skip_files"] = sanitized
+    else:
+        needs_save = True
+
+    if needs_save:
+        save_self_read_preferences(child, prefs)
+
+    return prefs
+
+
+def _apply_skip_requests(child, prefs):
+    request_path = _skip_requests_path(child)
+    if not request_path.exists():
+        return prefs
+
+    try:
+        with open(request_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        log_to_statusbox(f"[SelfRead] Failed to read skip requests: {e}")
+        return prefs
+
+    if isinstance(payload, dict):
+        candidates = payload.get("skip_files") or payload.get("skip") or []
+    else:
+        candidates = payload
+
+    if not isinstance(candidates, list):
+        log_to_statusbox("[SelfRead] Skip requests ignored due to invalid format.")
+        try:
+            request_path.unlink()
+        except OSError:
+            pass
+        return prefs
+
+    new_entries = []
+    for entry in candidates:
+        entry_str = str(entry).strip()
+        if entry_str and entry_str not in prefs["skip_files"]:
+            prefs["skip_files"].append(entry_str)
+            new_entries.append(entry_str)
+
+    if new_entries:
+        log_to_statusbox(
+            "[SelfRead] New skip rules added: " + ", ".join(new_entries[:5])
+            + ("..." if len(new_entries) > 5 else "")
+        )
+        save_self_read_preferences(child, prefs)
+
+    try:
+        request_path.unlink()
+    except OSError:
+        pass
+
+    return prefs
+
+
+def _match_skip_pattern(path, relative_label, skip_patterns):
+    if not skip_patterns:
+        return None
+
+    normalized_rel = relative_label.replace("\\", "/") if relative_label else ""
+    absolute = str(path)
+    filename = path.name
+
+    for pattern in skip_patterns:
+        pat = str(pattern).strip()
+        if not pat:
+            continue
+        if (
+            fnmatch.fnmatch(normalized_rel, pat)
+            or fnmatch.fnmatch(filename, pat)
+            or fnmatch.fnmatch(absolute, pat)
+        ):
+            return pat
+    return None
+
+
+def _derive_book_author_hint(relative_label):
+    if not relative_label:
+        return None
+
+    clean = relative_label.strip().strip("/")
+    if not clean:
+        return None
+
+    parts = [segment for segment in clean.split("/") if segment]
+    if not parts:
+        return None
+
+    if len(parts) > 1:
+        return parts[0]
+
+    stem = Path(parts[0]).stem
+    return stem or None
+
+
+def annotate_fragment_source(fragment, source_key, relative_label, base_root):
+    fragment["self_read_origin"] = source_key
+    context = fragment.setdefault("source_context", {})
+    context.setdefault("self_read_origin", source_key)
+    context.setdefault("relative_path", relative_label)
+    context.setdefault("root_path", str(base_root))
+
+    annotations = SOURCE_ANNOTATIONS.get(source_key)
+    if not annotations:
+        return
+
+    tags = fragment.setdefault("tags", [])
+    for tag in annotations.get("tags", []):
+        if tag not in tags:
+            tags.append(tag)
+
+    annotation_flags = annotations.get("flags", [])
+    if annotation_flags:
+        metadata = fragment.get("metadata")
+        if isinstance(metadata, dict):
+            meta_flags = metadata.get("flags") or []
+            for flag in annotation_flags:
+                if flag not in meta_flags:
+                    meta_flags.append(flag)
+            metadata["flags"] = meta_flags
+        else:
+            frag_flags = fragment.setdefault("flags", [])
+            for flag in annotation_flags:
+                if flag not in frag_flags:
+                    frag_flags.append(flag)
+
+    provenance = annotations.get("provenance")
+    if provenance and not fragment.get("provenance"):
+        fragment["provenance"] = provenance
+
+    ownership = annotations.get("ownership")
+    if ownership:
+        context.setdefault("ownership_hint", ownership)
+
+    if source_key == "books":
+        hint = _derive_book_author_hint(relative_label)
+        if hint:
+            context.setdefault("external_author_hint", hint)
+    elif source_key == "venv":
+        component = (relative_label.split("/", 1)[0] if relative_label else "").strip()
+        if component:
+            context.setdefault("environment_component", component)
+        env_file = Path(relative_label).name if relative_label else ""
+        if env_file:
+            context.setdefault("environment_file", env_file)
+    elif source_key == "music":
+        context.setdefault("self_voice_hint", "ina_voice_reference")
+        voice_name = Path(relative_label).stem if relative_label else ""
+        if voice_name:
+            context.setdefault("self_voice_reference", voice_name)
 
 
 def _read_limited(stream, limit):
@@ -91,6 +343,9 @@ def _load_path_from_config(key):
 book_folder_path = _load_path_from_config("book_folder_path")
 music_folder_path = _load_path_from_config("music_folder_path")
 ina_work_path = _load_path_from_config("ina_work_path")
+venv_path = _load_path_from_config("venv_path")
+if venv_path is None:
+    venv_path = Path("venv")
 
 def get_child():
     log_to_statusbox("[RawFileManager] Attempting to retrieve 'child'...")
@@ -274,7 +529,7 @@ def fragment_audio(audio_path, transformer):
     ext = audio_path.suffix.lower()
 
     analysis = None
-    if analyze_audio_clip is not None and ext in {".wav", ".mp3"}:
+    if analyze_audio_clip is not None and ext in {".wav", ".mp3", ".opus"}:
         try:
             analysis = analyze_audio_clip(audio_path, transformer, child=child, label="self_read")
         except Exception as e:
@@ -329,16 +584,16 @@ def fragment_audio(audio_path, transformer):
 
         return [frag]
 
-    if ext == ".mp3":
+    if ext in {".mp3", ".opus"}:
         if analysis is None:
             if analyze_audio_clip is None:
                 log_to_statusbox(
-                    "[RawFileManager] MP3 decoding unavailable: "
+                    "[RawFileManager] Compressed audio decoding unavailable: "
                     f"{_AUDIO_DIGEST_IMPORT_ERROR}"
                 )
             else:
                 log_to_statusbox(
-                    f"[RawFileManager] MP3 analysis returned no data for {audio_path.name}."
+                    f"[RawFileManager] Analysis returned no data for {audio_path.name}."
                 )
             return []
 
@@ -566,6 +821,10 @@ def process_archive(path, transformer):
 def self_read_and_train():
     child = get_child()
     default_root = Path.home() / "Projects" / "Project Inazuma"
+    prefs = load_self_read_preferences(child)
+    prefs = _apply_skip_requests(child, prefs)
+    source_choices = prefs.get("source_choices", DEFAULT_SELF_READ_PREFS["source_choices"])
+    skip_patterns = prefs.get("skip_files", [])
 
     raw_history = load_history(child)
     history = {entry for entry in raw_history if "/" in entry}
@@ -575,7 +834,9 @@ def self_read_and_train():
     roots = []
     seen_roots = set()
 
-    def add_root(path, audio_only=False):
+    def add_root(path, audio_only=False, source_key="code"):
+        if path is None:
+            return
         try:
             resolved = path.resolve()
         except FileNotFoundError:
@@ -583,31 +844,50 @@ def self_read_and_train():
         if resolved in seen_roots:
             return
         seen_roots.add(resolved)
-        roots.append((path, audio_only))
+        roots.append((path, audio_only, source_key))
 
-    if default_root.exists():
-        add_root(default_root, audio_only=False)
+    if source_choices.get("code", True):
+        if default_root.exists():
+            add_root(default_root, audio_only=False, source_key="code")
+        else:
+            log_to_statusbox(f"[SelfRead] Project root not found: {default_root}")
     else:
-        log_to_statusbox(f"[SelfRead] Project root not found: {default_root}")
+        log_to_statusbox("[SelfRead] Preference: project code scan disabled.")
 
-    if book_folder_path and book_folder_path.exists():
-        add_root(book_folder_path, audio_only=False)
+    if source_choices.get("books", True):
+        if book_folder_path and book_folder_path.exists():
+            add_root(book_folder_path, audio_only=False, source_key="books")
+        elif book_folder_path:
+            log_to_statusbox(f"[SelfRead] Book folder not found: {book_folder_path}")
     elif book_folder_path:
-        log_to_statusbox(f"[SelfRead] Book folder not found: {book_folder_path}")
+        log_to_statusbox("[SelfRead] Preference: book folder skipped by choice.")
 
-    if music_folder_path and music_folder_path.exists():
-        add_root(music_folder_path, audio_only=True)
+    if source_choices.get("music", True):
+        if music_folder_path and music_folder_path.exists():
+            add_root(music_folder_path, audio_only=True, source_key="music")
+        elif music_folder_path:
+            log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
     elif music_folder_path:
-        log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
+        log_to_statusbox("[SelfRead] Preference: music folder skipped by choice.")
 
-    if ina_work_path and ina_work_path.exists():
-        add_root(ina_work_path, audio_only=False)
-    elif ina_work_path:
-        log_to_statusbox(f"[SelfRead] Ina work folder not found: {ina_work_path}")
+    if source_choices.get("code", True):
+        if ina_work_path and ina_work_path.exists():
+            add_root(ina_work_path, audio_only=False, source_key="code")
+        elif ina_work_path:
+            log_to_statusbox(f"[SelfRead] Ina work folder not found: {ina_work_path}")
+
+    if source_choices.get("venv", False):
+        if venv_path and venv_path.exists():
+            add_root(venv_path, audio_only=False, source_key="venv")
+        elif venv_path:
+            log_to_statusbox(f"[SelfRead] Virtual environment not found: {venv_path}")
 
     log_to_statusbox(f"[SelfRead] Child set to: {child}")
     if roots:
-        log_to_statusbox("[SelfRead] Roots to scan: " + ", ".join(str(path) for path, _ in roots))
+        root_descriptions = ", ".join(
+            f"{str(path)} [{source_key}]" for path, _, source_key in roots
+        )
+        log_to_statusbox("[SelfRead] Roots to scan: " + root_descriptions)
     else:
         log_to_statusbox("[SelfRead] No available roots to scan.")
         return
@@ -620,20 +900,13 @@ def self_read_and_train():
         except Exception:
             return None
 
-    resolved_book_root = _safe_resolve(book_folder_path) if book_folder_path and book_folder_path.exists() else None
-
     transformer = FractalTransformer()
     count = 0
 
-    audio_patterns = ("*.wav", "*.mp3")
+    audio_patterns = ("*.wav", "*.mp3", "*.opus")
 
-    for base_root, audio_only in roots:
+    for base_root, audio_only, source_key in roots:
         log_to_statusbox(f"[SelfRead] Scanning: {base_root}")
-        try:
-            base_resolved = base_root.resolve()
-        except Exception:
-            base_resolved = None
-
         if audio_only:
             file_iter = itertools.chain.from_iterable(base_root.rglob(pattern) for pattern in audio_patterns)
         else:
@@ -655,6 +928,13 @@ def self_read_and_train():
 
             if history_key in history or (base_root == default_root and path.name in legacy_history):
                 log_to_statusbox(f"[SelfRead] SKIP {path.name} — already seen.")
+                continue
+
+            skip_match = _match_skip_pattern(path, rel_str, skip_patterns)
+            if skip_match:
+                log_to_statusbox(
+                    f"[SelfRead] SKIP {path.name} — preference skip rule '{skip_match}'."
+                )
                 continue
 
             category = classify_path(path)
@@ -699,14 +979,7 @@ def self_read_and_train():
                         frag_id = frag.get("id") or f"frag_text_{uuid.uuid4().hex[:10]}"
                         frag["id"] = frag_id
 
-                        # Mark external book-library material so Ina knows it was not authored by her.
-                        if resolved_book_root and base_resolved == resolved_book_root:
-                            tags = frag.get("tags", [])
-                            for extra in ("book_library", "external_source"):
-                                if extra not in tags:
-                                    tags.append(extra)
-                            frag["tags"] = tags
-                            frag.setdefault("provenance", "guardian_book_collection")
+                        annotate_fragment_source(frag, source_key, rel_str, base_root)
 
                         frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag_id}.json"
                         frag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -761,7 +1034,7 @@ def pretrain_audio_digest(paths, child):
             log_to_statusbox(f"[PretrainDigest] File not found: {path}")
             continue
 
-        if not path.suffix.lower() in [".mp3", ".wav"]:
+        if path.suffix.lower() not in [".mp3", ".wav", ".opus"]:
             log_to_statusbox(f"[PretrainDigest] Skipping unsupported file: {path.name}")
             continue
 

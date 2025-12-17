@@ -9,7 +9,7 @@ import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from model_manager import load_config, get_inastate, seed_self_question
+from model_manager import load_config, get_inastate, seed_self_question, mark_self_question_resolved
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from logic_map_builder import run_logic_map_builder
 
@@ -254,34 +254,26 @@ def resolve_self_questions():
 
     for note in questions:
         q = note.get("question", "").lower()
-        origin = note.get("origin", "unknown")
-        ts = note.get("timestamp", datetime.now(timezone.utc).isoformat())
+        resolution_reason = None
 
-        # === Example logic hooks
         if "why am i so awake" in q and current_emotions.get("intensity", 0) > 0.8:
-            resolved.append({**note, "resolved": True, "resolved_reason": "high intensity"})
-            cleared += 1
-            continue
+            resolution_reason = "high intensity"
         elif "why do i feel so drained" in q and current_emotions.get("intensity", 0) < 0.3:
-            resolved.append({**note, "resolved": True, "resolved_reason": "low intensity"})
-            cleared += 1
-            continue
+            resolution_reason = "low intensity"
         elif "why was i forced to wake up" in q and get_inastate("runtime_disruption"):
-            resolved.append({**note, "resolved": True, "resolved_reason": "runtime disruption"})
-            cleared += 1
-            continue
+            resolution_reason = "runtime disruption"
         elif "why can't i hear clearly" in q and get_inastate("audio_comfort") == "just right":
-            resolved.append({**note, "resolved": True, "resolved_reason": "audio comfort resolved"})
-            cleared += 1
-            continue
+            resolution_reason = "audio comfort resolved"
         elif "why is everything so loud" in q and get_inastate("audio_comfort") != "too loud":
-            resolved.append({**note, "resolved": True, "resolved_reason": "audio normalized"})
-            cleared += 1
-            continue
+            resolution_reason = "audio normalized"
         elif "should i be thinking more precisely" in q and get_inastate("current_precision") >= 32:
-            resolved.append({**note, "resolved": True, "resolved_reason": "precision increased"})
+            resolution_reason = "precision increased"
+
+        if resolution_reason:
+            note_with_status = {**note, "resolved": True, "resolved_reason": resolution_reason}
+            resolved.append(note_with_status)
+            mark_self_question_resolved(note.get("question"), resolution_reason)
             cleared += 1
-            continue
         else:
             keep.append(note)
 

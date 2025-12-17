@@ -61,6 +61,7 @@ class ShadowTransformer:
         self.shadow_path.mkdir(parents=True, exist_ok=True)
 
         self.index = self.load_index()
+        self.last_telemetry = {}
 
     # ------------------------------------------------------------------ utils
     def load_index(self):
@@ -169,9 +170,19 @@ class ShadowTransformer:
     def run_sync(self):
         """Process all fragments with shadow tags synchronously."""
         fragments = self.find_shadow_candidates()
+        processed = 0
         for frag in fragments:
             self.process_fragment(frag)
-        log_to_statusbox(f"[Shadow] Processed {len(fragments)} shadow fragments.")
+            processed += 1
+        self.last_telemetry = {
+            "intent": "sealed_truth",
+            "envelopes_created": processed,
+            "shadow_index_size": len(self.index),
+        }
+        log_to_statusbox(f"[Shadow] Processed {processed} shadow fragments.")
+
+    def intent_telemetry(self):
+        return dict(self.last_telemetry)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("config.json")
 DEFAULT_CHILD = "Inazuma_Yagami"
-OWNER_TAGS = {"owner", "mother", "mum", "mom", "mama", "mommy", "guardian"}
+OWNER_TAGS = {"owner", "mother", "mum", "mom", "mama", "mommy", "guardian", "sakura"}
 OWNER_FRIEND_TAGS = {
     "owner_friend",
     "owners_friend",
@@ -211,6 +211,8 @@ def record_dm_attempt(
         if normalized_tags:
             entry["tags"] = _merge_tags(entry.get("tags"), normalized_tags)
             updated = True
+        if entry.get("last_interaction") != timestamp:
+            updated = True
         entry["last_interaction"] = timestamp
         if trust_hint_safe and (trust_hint != "unknown" or not entry.get("trust_hint")):
             entry["trust_hint"] = trust_hint_safe
@@ -267,8 +269,9 @@ def update_social_entry(
         if trust_hint_safe and trust_hint_safe != entry.get("trust_hint"):
             entry["trust_hint"] = trust_hint_safe
             updated = True
-        if updated or last_interaction:
+        if last_interaction is not None or entry.get("last_interaction") != timestamp:
             entry["last_interaction"] = timestamp
+            updated = True
     else:
         entries.append(
             {

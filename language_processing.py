@@ -11,10 +11,8 @@ from experience_logger import ExperienceLogger
 from symbol_generator import (
     ACCENT_GLYPHS,
     ALPHANUMERIC_GLYPHS,
-    CONCEPT_GLYPHS,
-    EMOTION_GLYPHS,
-    MODULATION_GLYPHS,
 )
+from symbol_glyphs import get_symbol_glyph_maps
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -156,9 +154,13 @@ def _default_symbol_for_id(symbol_id: str) -> str:
     Length varies (2–5 chars) so symbols are not locked to 3 characters.
     """
     seed = _stable_symbol_seed(symbol_id)
-    emo = list(EMOTION_GLYPHS.values())[seed % len(EMOTION_GLYPHS)]
-    mod = list(MODULATION_GLYPHS.values())[(seed // 7) % len(MODULATION_GLYPHS)]
-    concept = list(CONCEPT_GLYPHS.values())[(seed // 13) % len(CONCEPT_GLYPHS)]
+    glyphs = get_symbol_glyph_maps()
+    emotion_values = list(glyphs["emotion"].values()) or [symbol_id]
+    modulation_values = list(glyphs["modulation"].values()) or [symbol_id]
+    concept_values = list(glyphs["concept"].values()) or [symbol_id]
+    emo = emotion_values[seed % len(emotion_values)]
+    mod = modulation_values[(seed // 7) % len(modulation_values)]
+    concept = concept_values[(seed // 13) % len(concept_values)]
     target_len = 2 + (seed % 4)  # 2–5 characters
 
     symbol = emo + concept if target_len == 2 else emo + mod + concept
@@ -495,6 +497,9 @@ def speak_symbolically(
     polyphonic = bool(config.get("allow_polyphonic_voice", True))
     sample_rate = int(config.get("voice_sample_rate", 22050))
     feedback_heard_voice = bool(config.get("feedback_heard_voice", True))
+    freq_rep_cfg = config.get("voice_frequency_replication")
+    if not isinstance(freq_rep_cfg, dict):
+        freq_rep_cfg = {}
 
     def _harmonic_summary(audio: np.ndarray, sr: int, top_k: int = 5):
         if audio.size == 0:
@@ -563,7 +568,12 @@ def speak_symbolically(
                 evidence_increment=1,
             )
 
-        chunk = synthesize_from_fingerprint(playback_fingerprint, sr=sample_rate)
+        chunk = synthesize_from_fingerprint(
+            playback_fingerprint,
+            sr=sample_rate,
+            symbol_id=sid,
+            replication_cfg=freq_rep_cfg,
+        )
         waveform.append(chunk)
 
     if waveform:
@@ -685,7 +695,119 @@ def train_from_symbol_images(child):
         vec = transformer.encode_image_fragment(fragment)
         print(f"[LangTrain] Trained on symbol image: {symbol} | Importance: {vec['importance']}")
 
-def synthesize_from_fingerprint(fingerprint, duration_ms=1500, sr=22050):
+def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id):
+    freq_seq = fingerprint.get("frequency_layers")
+    if not isinstance(freq_seq, list):
+        freq_seq = fingerprint.get("partials")
+
+    layers = []
+    if isinstance(freq_seq, list):
+        for idx, entry in enumerate(freq_seq):
+            freq_val = None
+            gain = None
+            if isinstance(entry, dict):
+                freq_val = entry.get("freq") or entry.get("frequency")
+                gain = entry.get("gain") or entry.get("weight") or entry.get("amp")
+            elif isinstance(entry, (int, float)):
+                freq_val = float(entry)
+                gain = 1.0 / (idx + 1)
+
+            if freq_val is None:
+                continue
+            try:
+                freq_val = float(freq_val)
+            except (TypeError, ValueError):
+                continue
+            if freq_val <= 0:
+                continue
+
+            if gain is None:
+                gain = 1.0 / (idx + 1)
+            try:
+                gain = float(gain)
+            except (TypeError, ValueError):
+                gain = 1.0 / (idx + 1)
+
+            layers.append((freq_val, max(0.05, min(1.0, gain))))
+
+    if layers:
+        return layers
+
+    cfg = replication_cfg if isinstance(replication_cfg, dict) else {}
+    if not cfg.get("enabled"):
+        return [(base_freq, 1.0)]
+
+    ratios = cfg.get("ratios")
+    if not isinstance(ratios, list) or not ratios:
+        ratios = [1.0]
+
+    try:
+        amp_decay = float(cfg.get("amplitude_decay", 0.8))
+    except (TypeError, ValueError):
+        amp_decay = 0.8
+    amp_decay = min(0.95, max(0.3, amp_decay))
+
+    try:
+        replicas = int(cfg.get("replicas_per_layer", 1))
+    except (TypeError, ValueError):
+        replicas = 1
+    replicas = max(1, replicas)
+
+    detune_cents = cfg.get("detune_cents", 0.0)
+    try:
+        detune_cents = float(detune_cents)
+    except (TypeError, ValueError):
+        detune_cents = 0.0
+    detune_cents = max(0.0, detune_cents)
+
+    min_freq = cfg.get("min_frequency", 55.0)
+    max_freq = cfg.get("max_frequency", 12000.0)
+    try:
+        min_freq = float(min_freq)
+    except (TypeError, ValueError):
+        min_freq = 55.0
+    try:
+        max_freq = float(max_freq)
+    except (TypeError, ValueError):
+        max_freq = 12000.0
+
+    seed = _stable_symbol_seed(symbol_id) if symbol_id else 0
+
+    def _clamp(freq):
+        return min(max_freq, max(min_freq, freq))
+
+    layers = []
+    for idx, raw_ratio in enumerate(ratios):
+        try:
+            ratio = float(raw_ratio)
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if ratio == 0:
+            ratio = 1.0
+        freq_val = _clamp(base_freq * ratio)
+        gain = 1.0 if idx == 0 else pow(amp_decay, idx)
+        layers.append((freq_val, gain))
+
+        if replicas > 1 and detune_cents > 0:
+            for rep in range(1, replicas):
+                cents = detune_cents * rep
+                bit_idx = (idx * 7) + rep
+                sign = -1 if ((seed >> bit_idx) & 1) == 0 else 1
+                detune_ratio = pow(2.0, (sign * cents) / 1200.0)
+                freq_detuned = _clamp(freq_val * detune_ratio)
+                layers.append((freq_detuned, gain * pow(amp_decay, rep * 0.5)))
+
+    return layers
+
+
+def synthesize_from_fingerprint(
+    fingerprint,
+    duration_ms=1500,
+    sr=22050,
+    *,
+    symbol_id: Optional[str] = None,
+    replication_cfg: Optional[Dict[str, Any]] = None,
+):
     import numpy as np
 
     pitch = fingerprint.get("pitch_mean", 440)
@@ -693,8 +815,16 @@ def synthesize_from_fingerprint(fingerprint, duration_ms=1500, sr=22050):
     volume = min(1.0, max(0.1, (fingerprint.get("volume_db", -40) + 60) / 60))
     silence = fingerprint.get("silence_ratio", 0.1)
 
-    t = np.linspace(0, duration_ms / 1000, int(sr * duration_ms / 1000), False)
-    waveform = np.sin(2 * np.pi * freq * t) * volume
+    duration_s = duration_ms / 1000
+    t = np.linspace(0, duration_s, int(sr * duration_s), False)
+    freq_layers = _resolve_frequency_layers(fingerprint, freq, replication_cfg, symbol_id)
+
+    waveform = np.zeros_like(t)
+    for layer_freq, layer_gain in freq_layers:
+        waveform += np.sin(2 * np.pi * layer_freq * t) * layer_gain
+
+    peak = np.max(np.abs(waveform)) or 1.0
+    waveform = (waveform / peak) * volume
 
     # Optional: shape with envelope
     envelope = np.linspace(0, 1, len(t))
@@ -705,7 +835,7 @@ def synthesize_from_fingerprint(fingerprint, duration_ms=1500, sr=22050):
     waveform[:silence_len] = 0.0
 
     return waveform.astype(np.float32)
-        
+
 
 # === New: Book Text Training ===
 def train_from_books(child):

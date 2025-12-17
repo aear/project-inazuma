@@ -3,6 +3,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict
 from gui_hook import log_to_statusbox
 from model_manager import load_config, update_inastate
 from .fractal_multidimensional_transformers import FractalTransformer
@@ -28,6 +29,7 @@ class HindsightTransformer:
         self.emotion_drift_path = self.memory_path / "emotion_drift_log.json"
         self.pred_evo_path = self.memory_path / "prediction_evolution.json"
         self.transformer = FractalTransformer()
+        self.intent_telemetry: Dict[str, Any] = {}
 
     def load_predictions(self):
         if not self.pred_path.exists():
@@ -229,6 +231,7 @@ class HindsightTransformer:
         trust = round(max(0.0, 1 - avg_error), 4)
         update_inastate("hindsight_trust", trust)
         log_to_statusbox(f"[Hindsight] Updated trust: {trust}")
+        return trust, avg_error
 
     def save_hindsight_map(self, insights):
         try:
@@ -249,10 +252,19 @@ class HindsightTransformer:
         if not insights:
             log_to_statusbox("[Hindsight] No insights generated.")
             return
-        self.adjust_trust(insights)
+        trust_value, avg_error = self.adjust_trust(insights)
         self.save_hindsight_map(insights)
         self.save_predictions(updated_preds)
+        self.intent_telemetry = {
+            "intent": "trust_update",
+            "insights": len(insights),
+            "avg_error": round(avg_error, 4),
+            "trust": trust_value,
+        }
         log_to_statusbox("[Hindsight] Retrospective analysis complete.")
+
+    def get_intent_telemetry(self) -> Dict[str, Any]:
+        return dict(self.intent_telemetry)
 
 if __name__ == "__main__":
     HindsightTransformer().run()

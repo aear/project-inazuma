@@ -40,6 +40,48 @@ INDEX_KEYS = {
     "output_TV": ["output_TV_index", "ouput_TV_index"],
 }
 
+
+def _safe_unlink(path: Path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _transcode_wav_to_opus(wav_path: Path, opus_path: Path, channels: int) -> Path:
+    if not wav_path.exists():
+        return wav_path
+
+    transcode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(wav_path),
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96k",
+        "-ar",
+        "48000",
+        "-ac",
+        str(channels),
+        str(opus_path),
+    ]
+
+    try:
+        subprocess.run(transcode_cmd, check=True)
+        _safe_unlink(wav_path)
+        return opus_path
+    except subprocess.CalledProcessError as exc:
+        log_to_statusbox(f"[Audio] Opus transcode failed for {wav_path.name}: {exc}")
+    except FileNotFoundError as exc:
+        log_to_statusbox(f"[Audio] ffmpeg missing during transcode: {exc}")
+    return wav_path
+
+
 def _index_for_label(label):
     for key in INDEX_KEYS.get(label, []):
         raw = config.get(key)
@@ -80,34 +122,45 @@ def record_clip(label, device_string):
         device_string = "plughw:" + device_string.split(":", 1)[1]
 
     timestamp = datetime.now(timezone.utc).isoformat().replace(":", "_")
-    filename = f"{label}_{timestamp}.mp3"
-    output_path = save_path / filename
+    base_name = f"{label}_{timestamp}"
+    wav_path = save_path / f"{base_name}.wav"
+    opus_path = save_path / f"{base_name}.opus"
+    channels = 2 if ("output" in label or label in stereo_labels) else 1
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-hide_banner", "-loglevel", "error",
-        "-f", "alsa", "-i", device_string,
+        "-fflags", "+genpts",
+        "-f", "alsa",
+        "-use_wallclock_as_timestamps", "1",
+        "-i", device_string,
         "-t", str(FLUSH_INTERVAL),
-        "-acodec", "libmp3lame",
+        "-acodec", "pcm_s16le",
         "-ar", "44100",
-        "-ac", "2" if ("output" in label or label in stereo_labels) else "1",
-        str(output_path)
+        "-ac", str(channels),
+        str(wav_path)
     ]
     try:
         subprocess.run(ffmpeg_cmd, check=True)
-        log_to_statusbox(f"[Audio] {label} saved {filename}")
-        return output_path
+        clip_path = _transcode_wav_to_opus(wav_path, opus_path, channels)
+        log_to_statusbox(f"[Audio] {label} saved {clip_path.name}")
+        return clip_path
     except subprocess.CalledProcessError as e:
         log_to_statusbox(f"[Audio] {label} failed on {device_string}: {e}")
+        _safe_unlink(wav_path)
         # Retry once with default if we were using plughw
         if device_string != "default":
             fallback_cmd = list(ffmpeg_cmd)
             fallback_cmd[fallback_cmd.index(device_string)] = "default"
             try:
                 subprocess.run(fallback_cmd, check=True)
-                log_to_statusbox(f"[Audio] {label} saved {filename} via default device fallback.")
-                return output_path
+                clip_path = _transcode_wav_to_opus(wav_path, opus_path, channels)
+                log_to_statusbox(
+                    f"[Audio] {label} saved {clip_path.name} via default device fallback."
+                )
+                return clip_path
             except subprocess.CalledProcessError as e2:
                 log_to_statusbox(f"[Audio] {label} fallback failed: {e2}")
+                _safe_unlink(wav_path)
         return None
 
 

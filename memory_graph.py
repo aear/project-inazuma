@@ -20,6 +20,15 @@ MEMORY_TIERS = ["short", "working", "long", "cold"]
 NEURAL_MAP_BURST_DEFAULT = 60
 EXPERIENCE_GRAPH_BURST_DEFAULT = 200
 
+DEFAULT_INCREMENTAL_POLICY = {
+    "mode": "incremental",
+    "fragment_batch": None,
+    "position_blend": 0.25,
+    "merge_slack": 0.03,
+    "max_new_neurons": 120,
+    "synapse_refresh_on_idle": True,
+}
+
 DEFAULT_TIER_POLICY = {
     "short": {"max_age_hours": 18.0, "target_count": 5000},
     "working": {"max_age_hours": 72.0, "target_count": 12000},
@@ -46,6 +55,48 @@ def _neural_settings():
     tag_weight = float(cfg.get("neural_tag_weight", 0.25))
     tag_weight = max(0.0, min(1.0, tag_weight))
     return cluster, synapse, tag_weight
+
+
+def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if cfg is None:
+        cfg = _load_config()
+    raw = {}
+    if isinstance(cfg, dict):
+        raw = cfg.get("neural_map_policy", {}) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    policy = DEFAULT_INCREMENTAL_POLICY.copy()
+    policy.update({k: raw.get(k, policy[k]) for k in policy.keys() if k in raw})
+    mode = str(policy.get("mode", "incremental")).lower().strip()
+    incremental = mode not in {"rebuild", "overwrite", "legacy", "full"}
+    fragment_batch = policy.get("fragment_batch")
+    try:
+        fragment_batch = int(fragment_batch) if fragment_batch is not None else None
+    except (TypeError, ValueError):
+        fragment_batch = None
+    def _clamp(val: float, lo: float, hi: float) -> float:
+        try:
+            return max(lo, min(float(val), hi))
+        except (TypeError, ValueError):
+            return lo
+    position_blend = _clamp(policy.get("position_blend", 0.25), 0.0, 1.0)
+    merge_slack = _clamp(policy.get("merge_slack", 0.03), 0.0, 0.25)
+    try:
+        max_new = int(policy.get("max_new_neurons", 120))
+        if max_new < 0:
+            max_new = 0
+    except (TypeError, ValueError):
+        max_new = 0
+    synapse_refresh = bool(policy.get("synapse_refresh_on_idle", True))
+    return {
+        "mode": mode,
+        "incremental": incremental,
+        "fragment_batch": fragment_batch,
+        "position_blend": position_blend,
+        "merge_slack": merge_slack,
+        "max_new_neurons": max_new,
+        "synapse_refresh_on_idle": synapse_refresh,
+    }
 
 
 def _memory_policy():
@@ -488,26 +539,226 @@ def build_synaptic_links(neurons, threshold=0.91):
                     })
     return synapses
 
+
+def _neural_map_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_map.json"
+
+
+def _load_neural_map(child: str) -> Dict[str, Any]:
+    path = _neural_map_path(child)
+    if not path.exists():
+        return {"neurons": [], "synapses": [], "converted_from_legacy": False, "updated_at": None}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {"neurons": [], "synapses": [], "converted_from_legacy": False, "updated_at": None}
+    if "neurons" not in data or "synapses" not in data:
+        data.setdefault("neurons", [])
+        data.setdefault("synapses", [])
+    return data
+
+
+def _save_neural_map(child: str, payload: Dict[str, Any]) -> None:
+    path = _neural_map_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=4)
+
+
+def _existing_fragment_ids(neurons: List[Dict[str, Any]]) -> Set[str]:
+    known: Set[str] = set()
+    for neuron in neurons:
+        for frag_id in neuron.get("fragments", []):
+            known.add(frag_id)
+    return known
+
+
+def _node_id_allocator(neurons: List[Dict[str, Any]]):
+    prefix = "node_"
+    max_idx = -1
+    for neuron in neurons:
+        node_id = str(neuron.get("id") or "")
+        if node_id.startswith(prefix):
+            try:
+                idx = int(node_id[len(prefix):])
+                max_idx = max(max_idx, idx)
+            except ValueError:
+                continue
+    counter = max_idx + 1
+    while True:
+        yield f"{prefix}{counter:04}"
+        counter += 1
+
+
+def _blend_position(old: Optional[List[float]], new: Optional[List[float]], blend: float) -> Optional[List[float]]:
+    if not new and not old:
+        return None
+    if not old:
+        return list(new)
+    if not new:
+        return list(old)
+    blend = max(0.0, min(1.0, blend))
+    return [
+        old[i] + (new[i] - old[i]) * blend for i in range(min(len(old), len(new)))
+    ]
+
+
+def _merge_vectors(base: List[float], base_count: int, new_vec: List[float], new_count: int) -> List[float]:
+    if not base_count:
+        return [round(v, 6) for v in new_vec]
+    if not new_count:
+        return [round(v, 6) for v in base]
+    length = min(len(base), len(new_vec))
+    merged = []
+    total = base_count + new_count
+    for i in range(length):
+        merged.append(round((base[i] * base_count + new_vec[i] * new_count) / total, 6))
+    return merged
+
+
+def _materialize_candidate(node_id: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": node_id,
+        "fragments": list(candidate["fragments"]),
+        "vector": list(candidate["vector"]),
+        "position": list(candidate["position"]),
+        "region": candidate["region"],
+        "network_type": "memory_graph",
+        "symbolic_density": 0.0,
+        "tags": list(candidate["tags"]),
+        "activation_history": [],
+        "last_used": now_iso,
+    }
+
+
+def _update_neuron_from_candidate(neuron: Dict[str, Any], candidate: Dict[str, Any], policy: Dict[str, Any]) -> None:
+    existing_frags = neuron.setdefault("fragments", [])
+    prior_count = len(existing_frags)
+    new_ids = [fid for fid in candidate["fragments"] if fid not in existing_frags]
+    if new_ids:
+        existing_frags.extend(new_ids)
+    base_vec = neuron.get("vector")
+    base_count = prior_count if base_vec else 0
+    base_vec = base_vec or candidate["vector"]
+    new_count = max(len(new_ids), 1)
+    combined_vec = _merge_vectors(
+        base_vec,
+        base_count,
+        candidate["vector"],
+        new_count,
+    )
+    neuron["vector"] = combined_vec
+    neuron["position"] = _blend_position(neuron.get("position"), candidate["position"], policy["position_blend"]) or candidate["position"]
+    tag_union = set(neuron.get("tags", []))
+    tag_union.update(candidate["tags"])
+    neuron["tags"] = sorted(tag_union)
+    if not neuron.get("region"):
+        neuron["region"] = candidate["region"]
+    neuron["last_used"] = datetime.now(timezone.utc).isoformat()
+
+
+def _score_candidate_match(neuron: Dict[str, Any], candidate: Dict[str, Any], tag_weight: float) -> float:
+    vec_a = neuron.get("vector")
+    vec_b = candidate["vector"]
+    if not vec_a or not vec_b:
+        return 0.0
+    vec_score = cosine_similarity(vec_a, vec_b)
+    tag_score = tag_similarity(neuron.get("tags", []), candidate["tags"])
+    tag_weight = max(0.0, min(1.0, tag_weight))
+    return ((1 - tag_weight) * vec_score) + (tag_weight * tag_score)
+
+
+def _prepare_candidates(clusters: List[Dict[str, Any]], cache: Dict[str, List[float]], anchors: Dict[str, Dict[str, float]], fallback_anchor: Dict[str, Any]):
+    candidates: List[Dict[str, Any]] = []
+    for group in clusters:
+        fragment_ids = group["fragments"]
+        if not fragment_ids:
+            continue
+        vector_sum = group.get("vector_sum")
+        count = group.get("count", len(fragment_ids))
+        if vector_sum and count:
+            avg_vec = [round(v / count, 6) for v in vector_sum]
+        else:
+            avg_vec = vector_average([cache[fid] for fid in fragment_ids if fid in cache])
+        if not avg_vec:
+            continue
+        tags = sorted(group["tags"]) if isinstance(group.get("tags"), set) else list(group.get("tags", []))
+        region = _guess_region_from_tags(tags, anchors)
+        anchor = anchors.get(region, fallback_anchor)
+        position = _project_vector_to_anchor(avg_vec, anchor, seed=fragment_ids[0])
+        candidates.append({
+            "fragments": fragment_ids,
+            "tags": tags,
+            "vector": avg_vec,
+            "region": region,
+            "position": position,
+        })
+    return candidates
+
+
+def _merge_candidates_into_neurons(
+    neurons: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    cluster_threshold: float,
+    tag_weight: float,
+    policy: Dict[str, Any],
+) -> Tuple[int, int, int]:
+    if not candidates:
+        return 0, 0, 0
+    merge_threshold = max(0.0, min(1.0, cluster_threshold - policy.get("merge_slack", 0.0)))
+    merged = 0
+    created = 0
+    skipped = 0
+    id_allocator = _node_id_allocator(neurons)
+    for candidate in candidates:
+        best = None
+        best_score = 0.0
+        for neuron in neurons:
+            score = _score_candidate_match(neuron, candidate, tag_weight)
+            if score > best_score:
+                best_score = score
+                best = neuron
+        if best and best_score >= merge_threshold:
+            _update_neuron_from_candidate(best, candidate, policy)
+            merged += 1
+            continue
+        if created < policy.get("max_new_neurons", 0):
+            node_id = next(id_allocator)
+            neurons.append(_materialize_candidate(node_id, candidate))
+            created += 1
+            continue
+        skipped += 1
+    return merged, created, skipped
+
 def build_fractal_memory(child):
     start_time = datetime.now()
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
     cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
     cfg = _load_config()
-    burst_limit = cfg.get("neural_map_burst")
+    policy = _neural_policy(cfg)
+    burst_limit = policy.get("fragment_batch")
+    if burst_limit is None:
+        burst_limit = cfg.get("neural_map_burst")
     try:
-        burst_limit = int(burst_limit)
+        burst_limit = int(burst_limit) if burst_limit is not None else NEURAL_MAP_BURST_DEFAULT
     except (TypeError, ValueError):
         burst_limit = NEURAL_MAP_BURST_DEFAULT
     if burst_limit <= 0:
         burst_limit = NEURAL_MAP_BURST_DEFAULT
 
     transformer = FractalTransformer()
+    incremental = policy.get("incremental", True)
+    existing_map = _load_neural_map(child) if incremental else {"neurons": [], "synapses": [], "converted_from_legacy": False}
+    neurons = existing_map.get("neurons", []) if incremental else []
+    known_fragments = _existing_fragment_ids(neurons) if incremental else set()
+
     fragments, total_count = load_fragments(child, limit=burst_limit)
     if not fragments:
         log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
         return
-
     if total_count > len(fragments):
         log_to_statusbox(
             f"[NeuralMap] Limiting to {len(fragments)} recent fragments (burst={burst_limit}, total={total_count})."
@@ -515,65 +766,76 @@ def build_fractal_memory(child):
     else:
         log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
 
-    encoded = transformer.encode_many(fragments)
+    target_fragments = [
+        frag for frag in fragments if not incremental or frag.get("id") not in known_fragments
+    ]
+    if not target_fragments:
+        if incremental and policy.get("synapse_refresh_on_idle", True):
+            synapses = build_synaptic_links(neurons, threshold=synapse_threshold)
+            existing_map["synapses"] = synapses
+            existing_map["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_neural_map(child, existing_map)
+            log_to_statusbox("[NeuralMap] No new fragments; refreshed synapses to keep map current.")
+        else:
+            log_to_statusbox("[NeuralMap] No new fragments detected; skipping rebuild.")
+        return
+
+    encoded = transformer.encode_many(target_fragments)
+    if not encoded:
+        log_to_statusbox("[NeuralMap] Encoder returned no vectors for the selected fragments.")
+        return
+
     cache = {e["id"]: e["vector"] for e in encoded}
     clusters = cluster_fragments(
-        fragments,
+        target_fragments,
         cache,
         threshold=cluster_threshold,
         tag_weight=tag_weight,
     )
     log_to_statusbox(
-        f"[NeuralMap] Clustered into {len(clusters)} neurons "
+        f"[NeuralMap] Clustered {len(target_fragments)} new fragments into {len(clusters)} nodes "
         f"(threshold={cluster_threshold:.2f}, tag_weight={tag_weight:.2f})."
     )
 
     anchors = _load_body_anchors()
     fallback_anchor = anchors.get("head", {"center": [0.0, 0.0, 0.0], "radius": 2.0})
+    candidates = _prepare_candidates(clusters, cache, anchors, fallback_anchor)
 
-    neurons = []
-    for i, group in enumerate(clusters):
-        fragment_ids = group["fragments"]
-        tags = sorted(group["tags"]) if isinstance(group.get("tags"), set) else list(group.get("tags", []))
-        vector_sum = group.get("vector_sum")
-        count = group.get("count", len(fragment_ids))
-        if vector_sum and count:
-            avg_vec = [round(v / count, 6) for v in vector_sum]
-        else:
-            avg_vec = vector_average([cache[fid] for fid in fragment_ids if fid in cache])
-        node_id = f"node_{i:04}"
-        region = _guess_region_from_tags(tags, anchors)
-        anchor = anchors.get(region, fallback_anchor)
-        position = _project_vector_to_anchor(avg_vec, anchor, seed=node_id)
-        neurons.append({
-            "id": node_id,
-            "fragments": fragment_ids,
-            "vector": avg_vec,
-            "position": position,
-            "region": region,
-            "network_type": "memory_graph",
-            "symbolic_density": 0.0,
-            "tags": list(set(tags)),
-            "activation_history": [],
-            "last_used": datetime.now(timezone.utc).isoformat()
-        })
+    if incremental:
+        merged, created, skipped = _merge_candidates_into_neurons(
+            neurons,
+            candidates,
+            cluster_threshold,
+            tag_weight,
+            policy,
+        )
+        log_to_statusbox(
+            f"[NeuralMap] Incremental update — merged {merged}, added {created}, skipped {skipped} (max_new={policy.get('max_new_neurons')})."
+        )
+    else:
+        neurons = []
+        id_allocator = _node_id_allocator(neurons)
+        for candidate in candidates:
+            neurons.append(_materialize_candidate(next(id_allocator), candidate))
+        merged = len(candidates)
+        created = len(candidates)
+        skipped = 0
 
-    synapses = build_synaptic_links(neurons, threshold=synapse_threshold)
-    result = {
+    needs_synapse_refresh = not incremental or merged > 0 or created > 0 or policy.get("synapse_refresh_on_idle", True)
+    synapses = build_synaptic_links(neurons, threshold=synapse_threshold) if needs_synapse_refresh else existing_map.get("synapses", [])
+
+    result = existing_map if incremental else {}
+    result.update({
         "neurons": neurons,
         "synapses": synapses,
-        "converted_from_legacy": False,
+        "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
         "updated_at": datetime.now(timezone.utc).isoformat()
-    }
-
-    out_path = Path("AI_Children") / child / "memory" / "neural" / "neural_memory_map.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=4)
+    })
+    _save_neural_map(child, result)
 
     duration = datetime.now() - start_time
     log_to_statusbox(
-        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | Saved to neural map."
+        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | Policy={policy.get('mode')} | Saved."
     )
     log_to_statusbox(f"[NeuralMap] Mapping time: {duration}.")
 

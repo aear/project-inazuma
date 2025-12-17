@@ -7,7 +7,8 @@ import logging
 import os
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 import asyncio
 
 import discord
@@ -24,9 +25,11 @@ from social_map import (
     is_high_trust,
     get_high_trust_contacts,
     record_dm_attempt,
+    update_social_entry,
 )
 from language_processing import generate_symbolic_reply_from_text
 from live_experience_bridge import LiveExperienceBridge
+from model_manager import update_inastate
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -165,6 +168,35 @@ def get_voice_io_config() -> dict:
     }
 
 
+def get_outbox_policy() -> dict:
+    cfg = get_discord_config()
+    policy = cfg.get("outbox_policy") if isinstance(cfg, dict) else None
+    defaults = {
+        "max_burst": 5,
+        "max_age_minutes": 5.0,
+        "archive_path": None,
+    }
+    if not isinstance(policy, dict):
+        return defaults
+    result = defaults.copy()
+    if policy.get("max_burst") is not None:
+        try:
+            result["max_burst"] = max(0, int(policy["max_burst"]))
+        except Exception:
+            logger.warning("Invalid discord.outbox_policy.max_burst value; using default %s", defaults["max_burst"])
+    if policy.get("max_age_minutes") is not None:
+        try:
+            result["max_age_minutes"] = max(0.0, float(policy["max_age_minutes"]))
+        except Exception:
+            logger.warning(
+                "Invalid discord.outbox_policy.max_age_minutes; using default %s", defaults["max_age_minutes"]
+            )
+    archive_path = policy.get("archive_path")
+    if archive_path:
+        result["archive_path"] = str(archive_path)
+    return result
+
+
 def get_current_child() -> str:
     cfg = load_root_config()
     return cfg.get("current_child", "Inazuma_Yagami") if isinstance(cfg, dict) else "Inazuma_Yagami"
@@ -258,6 +290,7 @@ def resolve_configured_channels(client: discord.Client):
 # ---------------------------------------------------------------------------
 
 DEFAULT_OWNER_ID = 123456789012345678  # <-- replace via config.json -> discord.owner_user_id
+VOICE_JOIN_COMMANDS = {"/ina join", "/ina voice", "/ina voice join", "/ina join voice"}
 
 
 def _resolve_primary_user_id() -> int:
@@ -447,6 +480,7 @@ class InaDiscordClient(discord.Client):
         self.text_channel = None
         self.voice_channel = None
         self.voice_client = None
+        self.child = get_current_child()
         voice_cfg = get_voice_io_config()
         self.voice_label = voice_cfg["voice_label"]
         self.voice_pipe_path = Path(voice_cfg["voice_pipe_path"]) if voice_cfg.get("voice_pipe_path") else None
@@ -455,9 +489,15 @@ class InaDiscordClient(discord.Client):
         self.voice_chunk_seconds = voice_cfg["voice_chunk_seconds"]
         self._recording_active = False
         self._active_sink = None
-        self.history_bridge = LiveExperienceBridge(child=get_current_child())
-        self._typed_outbox_path = Path("AI_Children") / get_current_child() / "memory" / "typed_outbox.jsonl"
+        self.history_bridge = LiveExperienceBridge(child=self.child)
+        child_memory = Path("AI_Children") / self.child / "memory"
+        self._typed_outbox_path = child_memory / "typed_outbox.jsonl"
+        self._typed_outbox_history_path = child_memory / "typed_outbox_history.jsonl"
+        self._outbox_policy = get_outbox_policy()
+        archive_override = self._outbox_policy.get("archive_path")
+        self._typed_archive_path = Path(archive_override) if archive_override else child_memory / "typed_outbox_archive.jsonl"
         self._typed_outbox_seen = set()
+        self._load_outbox_history()
         self._typed_outbox_task = None
 
     async def on_ready(self) -> None:
@@ -471,6 +511,9 @@ class InaDiscordClient(discord.Client):
         # Ignore messages from ourselves or other bots
         if message.author.bot:
             return
+
+        content = (message.content or "").strip()
+        lower = content.lower()
 
         # DMs stay owner-only
         if message.guild is None:
@@ -509,6 +552,11 @@ class InaDiscordClient(discord.Client):
                 message.content,
                 message.channel.id,
             )
+            self._record_social_contact(message)
+            self._remember_last_dm_contact(message)
+            if lower in VOICE_JOIN_COMMANDS:
+                await self._handle_voice_join(message)
+                return
             self._route_to_comms(message, is_dm=True, owner_friend=owner_friend, high_trust=high_trust)
             return
 
@@ -516,9 +564,9 @@ class InaDiscordClient(discord.Client):
         if self.text_channel is None or message.channel.id != self.text_channel.id:
             return
 
-        content = (message.content or "").strip()
-        lower = content.lower()
-        if lower in {"/ina join", "/ina voice", "/ina voice join", "/ina join voice"}:
+        self._record_social_contact(message)
+
+        if lower in VOICE_JOIN_COMMANDS:
             await self._handle_voice_join(message)
             return
         if lower in {"/ina learn history", "/ina history learn"} and message.author.id == SAKURA_USER_ID:
@@ -535,25 +583,58 @@ class InaDiscordClient(discord.Client):
 
     async def _handle_voice_join(self, message: discord.Message) -> None:
         target_channel = self.voice_channel
-        if target_channel is None and message.author.voice and message.author.voice.channel:
-            target_channel = message.author.voice.channel
+        author_voice = getattr(message.author, "voice", None)
+        if target_channel is None and author_voice and author_voice.channel:
+            target_channel = author_voice.channel
 
         if target_channel is None:
             await message.channel.send("No voice channel configured or detected to join.")
             return
 
-        try:
-            await self.ensure_voice_connected(target_channel)
-            await message.channel.send(f"Joined voice channel: {target_channel.name}")
-        except discord.errors.ConnectionClosed as exc:
-            logger.exception("Voice gateway closed while joining %s (code=%s)", target_channel, exc.code)
-            await message.channel.send(
-                f"Voice gateway closed with code {exc.code}. "
-                "Make sure only py-cord[voice] is installed (no discord.py mix), then restart Ina."
-            )
-        except Exception:
-            logger.exception("Failed to join voice channel %s", target_channel)
-            await message.channel.send(f"Failed to join voice channel: {target_channel.name}")
+        async def _attempt_join(reason: str | None = None) -> tuple[bool, bool]:
+            try:
+                await self.ensure_voice_connected(target_channel)
+                suffix = f" ({reason})" if reason else ""
+                await message.channel.send(f"Joined voice channel: {target_channel.name}{suffix}")
+                return True, True
+            except discord.errors.ConnectionClosed as exc:
+                logger.warning(
+                    "Voice gateway closed while joining %s (code=%s, attempt=%s)",
+                    target_channel,
+                    exc.code,
+                    reason or "initial",
+                )
+                if exc.code == 4006:
+                    await message.channel.send(
+                        "Discord reported an invalid voice session (4006). Resetting the voice client and retrying..."
+                    )
+                    await self._reset_voice_client()
+                    return False, False
+                await message.channel.send(
+                    f"Voice gateway closed with code {exc.code}. "
+                    "Make sure only py-cord[voice] is installed (no discord.py mix), then restart Ina."
+                )
+                return True, True
+            except discord.errors.ClientException as exc:
+                if "Already connected" in str(exc):
+                    logger.info("Already connected to %s. Resetting voice client and retrying.", target_channel)
+                    await message.channel.send(
+                        "Discord thinks I'm still tied to an older voice session. Resetting and trying again..."
+                    )
+                    await self._reset_voice_client()
+                    return False, False
+                logger.exception("Voice client exception while joining %s: %s", target_channel, exc)
+                await message.channel.send(f"Voice client error: {exc}")
+                return True, True
+            except Exception:
+                logger.exception("Failed to join voice channel %s", target_channel)
+                await message.channel.send(f"Failed to join voice channel: {target_channel.name}")
+                return True, True
+
+        completed, terminal = await _attempt_join()
+        if not completed and not terminal:
+            await asyncio.sleep(1.0)
+            await _attempt_join("after reset")
 
     def _route_to_comms(
         self,
@@ -589,10 +670,55 @@ class InaDiscordClient(discord.Client):
             metadata=metadata,
         )
 
+    def _record_social_contact(self, message: discord.Message) -> None:
+        """
+        Touch the social map entry so trust and recency stay fresh.
+        """
+        display_name = (
+            getattr(message.author, "display_name", None)
+            or getattr(message.author, "global_name", None)
+            or getattr(message.author, "name", None)
+            or str(message.author)
+        )
+        try:
+            update_social_entry(
+                message.author.id,
+                display_name=display_name,
+                last_interaction=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            logger.exception("Failed to update social map after contact from %s", message.author)
+
+    def _remember_last_dm_contact(self, message: discord.Message) -> None:
+        """
+        Keep a lightweight hint in Ina's state about who last reached out via DM.
+        """
+        try:
+            channel = message.channel
+            payload = {
+                "user_id": str(message.author.id),
+                "display_name": getattr(message.author, "display_name", None)
+                or getattr(message.author, "global_name", None)
+                or getattr(message.author, "name", None)
+                or str(message.author),
+                "channel_id": str(getattr(channel, "id", "")),
+                "channel_name": getattr(channel, "name", None) or "dm",
+                "is_dm": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            update_inastate("last_heard_contact", payload)
+        except Exception:
+            logger.exception("Failed to record last DM contact in inastate.")
+
     def _read_typed_outbox(self):
         if not self._typed_outbox_path.exists():
             return []
         entries = []
+        max_batch = int(self._outbox_policy.get("max_burst") or 0)
+        max_age_minutes = float(self._outbox_policy.get("max_age_minutes") or 0.0)
+        expiry_cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes) if max_age_minutes > 0 else None
+        )
         try:
             with self._typed_outbox_path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -604,12 +730,19 @@ class InaDiscordClient(discord.Client):
                     except Exception:
                         logger.exception("Failed to parse typed outbox line: %s", line[:120])
                         continue
-                    entry_id = str(entry.get("id") or entry.get("uuid") or entry.get("created_at") or len(self._typed_outbox_seen))
+                    entry_id = str(
+                        entry.get("id") or entry.get("uuid") or entry.get("created_at") or len(self._typed_outbox_seen)
+                    )
                     if entry_id in self._typed_outbox_seen:
                         continue
                     entry["id"] = entry_id
+                    if expiry_cutoff and self._entry_is_stale(entry, expiry_cutoff):
+                        self._archive_outbox_entry(entry, "stale_buffer")
+                        continue
                     self._typed_outbox_seen.add(entry_id)
                     entries.append(entry)
+                    if max_batch and len(entries) >= max_batch:
+                        break
         except Exception:
             logger.exception("Failed to read typed outbox at %s", self._typed_outbox_path)
 
@@ -617,6 +750,96 @@ class InaDiscordClient(discord.Client):
             # Avoid unbounded growth if the file grows large.
             self._typed_outbox_seen = set(list(self._typed_outbox_seen)[-2000:])
         return entries
+
+    def _load_outbox_history(self) -> None:
+        if not self._typed_outbox_history_path.exists():
+            return
+        try:
+            with self._typed_outbox_history_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    entry_id = str(entry.get("id") or entry.get("entry_id") or "")
+                    if entry_id:
+                        self._typed_outbox_seen.add(entry_id)
+        except Exception:
+            logger.exception("Failed to load typed outbox history from %s", self._typed_outbox_history_path)
+
+    def _log_outbox_history(self, entry_id: str, status: str, *, reason: Optional[str] = None) -> None:
+        if not entry_id:
+            return
+        payload = {
+            "id": str(entry_id),
+            "status": status,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._typed_outbox_history_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._typed_outbox_history_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("Failed to append typed outbox history for entry %s", entry_id)
+        self._typed_outbox_seen.add(entry_id)
+
+    def _entry_timestamp(self, entry: dict) -> Optional[datetime]:
+        created_at = entry.get("created_at")
+        if not created_at:
+            return None
+        try:
+            stamp = datetime.fromisoformat(created_at)
+        except Exception:
+            return None
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp
+
+    def _entry_is_stale(self, entry: dict, cutoff: datetime) -> bool:
+        stamp = self._entry_timestamp(entry)
+        if not stamp:
+            return False
+        return stamp < cutoff
+
+    def _archive_outbox_entry(self, entry: dict, reason: str) -> None:
+        entry_id = str(entry.get("id") or entry.get("uuid") or entry.get("created_at") or "")
+        archived = {
+            **entry,
+            "archive_reason": reason,
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._typed_archive_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._typed_archive_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(archived, ensure_ascii=False) + "\n")
+            logger.info("Archived typed outbox entry %s (%s)", entry_id or "<unknown>", reason)
+        except Exception:
+            logger.exception("Failed to archive typed outbox entry %s", entry_id or "<unknown>")
+        if entry.get("text"):
+            try:
+                self.history_bridge.log_conversation_turn(
+                    entry.get("text", ""),
+                    speaker=INA_INSTANCE_NAME,
+                    tags=["typed_outbox", "archive", reason],
+                    entity_links=[
+                        {
+                            "type": "typed_outbox_entry",
+                            "id": entry_id or entry.get("id") or "",
+                            "target": entry.get("target"),
+                            "status": "archived",
+                            "reason": reason,
+                        }
+                    ],
+                    timestamp=entry.get("created_at") or archived["archived_at"],
+                )
+            except Exception:
+                logger.exception("Failed to log archived outbox entry %s to history bridge", entry_id or "<unknown>")
+        if entry_id:
+            self._log_outbox_history(entry_id, "archived", reason=reason)
 
     async def _deliver_typed_outbox_entry(self, entry: dict) -> None:
         text = entry.get("text")
@@ -721,6 +944,9 @@ class InaDiscordClient(discord.Client):
                 target,
                 entry.get("metadata"),
             )
+            entry_id = entry.get("id")
+            if entry_id:
+                self._log_outbox_history(str(entry_id), "sent")
         else:
             logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
 
@@ -780,17 +1006,40 @@ class InaDiscordClient(discord.Client):
             except Exception:
                 logger.exception("Failed to ingest history for %s", label)
 
+    def _guild_voice_client(self, guild: Optional[discord.Guild]) -> Optional[discord.VoiceClient]:
+        if guild is None:
+            return None
+        for vc in getattr(self, "voice_clients", []):
+            try:
+                if vc.guild and vc.guild.id == guild.id:
+                    return vc
+            except Exception:
+                continue
+        return None
+
     async def ensure_voice_connected(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
         """
         Connect or move Ina to the desired voice channel.
         """
+        existing = self._guild_voice_client(channel.guild)
+        if existing and existing is not self.voice_client:
+            self.voice_client = existing
+
         if self.voice_client and self.voice_client.is_connected():
             if self.voice_client.channel and self.voice_client.channel.id == channel.id:
                 await self._ensure_voice_capture()
                 return self.voice_client
             await self.voice_client.move_to(channel)
         else:
-            self.voice_client = await channel.connect(reconnect=True)
+            try:
+                self.voice_client = await channel.connect(reconnect=True)
+            except discord.errors.ClientException as exc:
+                if "Already connected" in str(exc):
+                    logger.info("Discord claims an existing voice session; forcing disconnect before retry.")
+                    await self._reset_voice_client()
+                    self.voice_client = await channel.connect(reconnect=True)
+                else:
+                    raise
         self.voice_channel = channel
         await self._ensure_voice_capture()
         return self.voice_client
@@ -843,6 +1092,28 @@ class InaDiscordClient(discord.Client):
         except Exception:
             logger.exception("Failed to stop recording sink.")
             self._recording_active = False
+
+    async def _reset_voice_client(self):
+        """
+        Forcefully disconnect the current voice client and reset recording state.
+        """
+        targets = set()
+        if self.voice_client:
+            targets.add(self.voice_client)
+        for vc in getattr(self, "voice_clients", []):
+            if vc:
+                targets.add(vc)
+
+        for vc in targets:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                logger.exception("Failed to disconnect voice client during reset.")
+
+        self.voice_client = None
+        self.voice_channel = None
+        self._recording_active = False
+        self._active_sink = None
 
     def _on_record_complete(self, sink, *args):
         """
