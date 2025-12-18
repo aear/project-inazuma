@@ -1,11 +1,20 @@
 import json
+import os
 import re
+import tempfile
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
+from model_manager import increment_inastate_metric, set_inastate_metric
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover
+    fcntl = None
 
 TEXT_VOCAB_LIMIT = 800          # keep only the top-K words to stay RAM-light
 MAX_FRAGMENT_BODY = 1200        # cap stored text per fragment
@@ -54,6 +63,33 @@ def tokenize_text(text: str) -> List[str]:
     return [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text or "") if tok]
 
 
+@contextmanager
+def _json_lock(path: Path):
+    if not fcntl:
+        yield
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _atomic_write_json(path: Path, payload: Any, *, indent: int = 2, ensure_ascii: bool = False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            json.dump(payload, tmp, indent=indent, ensure_ascii=ensure_ascii)
+            tmp.write("\n")
+    finally:
+        os.replace(tmp_path, path)
+
+
 def load_text_vocab(child: Optional[str] = None) -> Dict[str, Any]:
     path = _memory_root(child) / "text_vocab.json"
     if not path.exists():
@@ -77,13 +113,24 @@ def _trim_vocab(vocab: Dict[str, Any], limit: int) -> Dict[str, Any]:
     return {w: data for w, data in items[:limit]}
 
 
-def save_text_vocab(child: Optional[str], data: Dict[str, Any], limit: int = TEXT_VOCAB_LIMIT) -> None:
+def save_text_vocab(
+    child: Optional[str],
+    data: Dict[str, Any],
+    *,
+    limit: int = TEXT_VOCAB_LIMIT,
+    source: Optional[str] = None,
+) -> None:
     vocab = data.get("vocab", {})
     trimmed = _trim_vocab(vocab, limit)
     payload = {"vocab": trimmed, "updated": data.get("updated", _now_iso())}
     path = _memory_root(child) / "text_vocab.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    with _json_lock(path):
+        _atomic_write_json(path, payload, indent=2, ensure_ascii=False)
+    try:
+        increment_inastate_metric("vocab_updates")
+        set_inastate_metric("last_vocab_update_source", source or "unspecified")
+    except Exception:
+        pass
 
 
 def update_text_vocab(
@@ -94,6 +141,7 @@ def update_text_vocab(
     emotions: Optional[Dict[str, float]] = None,
     symbols: Optional[List[str]] = None,
     limit: int = TEXT_VOCAB_LIMIT,
+    source: Optional[str] = None,
 ) -> bool:
     tokens = tokenize_text(text)
     if not tokens:
@@ -142,7 +190,7 @@ def update_text_vocab(
 
     vocab_state["vocab"] = vocab
     vocab_state["updated"] = now
-    save_text_vocab(child, vocab_state, limit=limit)
+    save_text_vocab(child, vocab_state, limit=limit, source=source)
     return True
 
 
@@ -186,7 +234,16 @@ def create_text_fragment(
     frag_path.parent.mkdir(parents=True, exist_ok=True)
     frag_path.write_text(json.dumps(frag, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    update_text_vocab(text_body, child=child_name, tags=frag_tags, emotions=emotions, symbols=symbols, limit=TEXT_VOCAB_LIMIT)
+    vocab_source = source or "text_fragment"
+    update_text_vocab(
+        text_body,
+        child=child_name,
+        tags=frag_tags,
+        emotions=emotions,
+        symbols=symbols,
+        limit=TEXT_VOCAB_LIMIT,
+        source=vocab_source,
+    )
     return frag
 
 
@@ -291,6 +348,10 @@ def build_text_symbol_links(
         json.dumps({"generated": _now_iso(), "links": links}, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    try:
+        increment_inastate_metric("link_pass_runs")
+    except Exception:
+        pass
     return True
 
 

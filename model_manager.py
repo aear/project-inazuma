@@ -5,6 +5,8 @@ import time
 import subprocess
 import uuid
 import threading
+import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -18,6 +20,7 @@ from self_adjustment_scheduler import SelfAdjustmentScheduler
 from continuity_manager import ContinuityManager
 from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
+from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 def load_config():
     path = Path("config.json")
@@ -70,6 +73,106 @@ _FRAGMENT_HEALTH_COOLDOWN = 1800.0
 _fragment_health_thread: Optional[threading.Thread] = None
 _last_exploration_invite_log = 0.0
 _EXPLORATION_INVITE_COOLDOWN = 240.0
+_NUTRITION_TARGET = 0.64
+_NUTRITION_DECAY_PER_SEC = 0.000045
+_NUTRITION_MIN = 0.05
+_NUTRITION_OFFER_TTL = 3600.0
+_MEAL_OPTIONS = {
+    "snack": {
+        "label": "Snack",
+        "hunger_delta": 0.09,
+        "energy_delta": 0.007,
+        "fitness_shift": 0.001,
+        "cooldown": 600,
+        "size": 0.25,
+        "energy_weight": 0.35,
+        "sleep_bias": 0.15,
+        "tags": ["nutrition", "snack", "light"]
+    },
+    "small_meal": {
+        "label": "Small Meal",
+        "hunger_delta": 0.18,
+        "energy_delta": 0.015,
+        "fitness_shift": 0.002,
+        "cooldown": 1200,
+        "size": 0.5,
+        "energy_weight": 0.55,
+        "sleep_bias": 0.25,
+        "tags": ["nutrition", "meal", "light"]
+    },
+    "meal": {
+        "label": "Meal",
+        "hunger_delta": 0.28,
+        "energy_delta": 0.025,
+        "fitness_shift": 0.0,
+        "cooldown": 2100,
+        "size": 0.75,
+        "energy_weight": 0.7,
+        "sleep_bias": 0.4,
+        "tags": ["nutrition", "meal"]
+    },
+    "large_meal": {
+        "label": "Large Meal",
+        "hunger_delta": 0.4,
+        "energy_delta": 0.035,
+        "fitness_shift": -0.002,
+        "cooldown": 3600,
+        "size": 1.0,
+        "energy_weight": 0.85,
+        "sleep_bias": 0.5,
+        "tags": ["nutrition", "meal", "heavy"]
+    },
+}
+_nutrition_transformer = FractalTransformer(depth=2, length=5, embed_dim=48)
+
+
+def _load_offer_store(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    offers = get_inastate("nutrition_offers") or []
+    if not isinstance(offers, list):
+        offers = []
+    now_ts = now or time.time()
+    changed = False
+    for offer in offers:
+        if offer.get("status", "pending") != "pending":
+            continue
+        expires_ts = offer.get("expires_ts")
+        try:
+            expires_ts = float(expires_ts) if expires_ts is not None else None
+        except (TypeError, ValueError):
+            expires_ts = None
+        if expires_ts and now_ts >= expires_ts:
+            offer["status"] = "expired"
+            offer["expired_ts"] = now_ts
+            changed = True
+    if changed:
+        update_inastate("nutrition_offers", offers)
+    return offers
+
+
+def _active_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        offer for offer in offers if offer.get("status", "pending") == "pending"
+    ]
+
+
+def _load_inastate_state() -> Dict[str, Any]:
+    path = MEMORY_PATH / "inastate.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _atomic_write_inastate(state: Dict[str, Any]) -> None:
+    path = MEMORY_PATH / "inastate.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4)
+    os.replace(tmp_path, path)
 
 
 def safe_popen(cmd, description=None):
@@ -130,29 +233,30 @@ def get_sweet_spots():
     }
 
 def get_inastate(key, default=None):
-    path = MEMORY_PATH / "inastate.json"
-    if not path.exists():
-        return default
-    try:
-        with open(path, "r") as f:
-            return json.load(f).get(key, default)
-    except:
-        return default
+    state = _load_inastate_state()
+    return state.get(key, default)
 
 
 def update_inastate(key, value):
-    path = MEMORY_PATH / "inastate.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state = {}
-    if path.exists():
-        try:
-            with open(path, "r") as f:
-                state = json.load(f)
-        except:
-            pass
+    state = _load_inastate_state()
     state[key] = value
-    with open(path, "w") as f:
-        json.dump(state, f, indent=4)
+    _atomic_write_inastate(state)
+
+
+def increment_inastate_metric(metric: str, amount: int = 1):
+    state = _load_inastate_state()
+    metrics = state.get("metrics", {})
+    metrics[metric] = int(metrics.get(metric, 0)) + int(amount)
+    state["metrics"] = metrics
+    _atomic_write_inastate(state)
+
+
+def set_inastate_metric(metric: str, value):
+    state = _load_inastate_state()
+    metrics = state.get("metrics", {})
+    metrics[metric] = value
+    state["metrics"] = metrics
+    _atomic_write_inastate(state)
 
 
 def append_typed_outbox_entry(
@@ -1026,18 +1130,28 @@ def monitor_energy():
 
     energy = get_inastate("current_energy") or 0.5
     sleep_pressure = float(get_inastate("sleep_pressure") or 0.0)
+    hunger = _clamp01(get_inastate("hunger_level") or 0.65, default=0.65)
+    fitness = _clamp01(get_inastate("fitness_level") or 0.55, default=0.55)
+    metabolic_eff = _metabolic_efficiency(hunger, fitness)
 
     now_ts = time.time()
     local_hour = datetime.now().hour
     is_night = local_hour >= 22 or local_hour < 7
 
     if dreaming:
-        recovery = 0.02 if intensity > 0.5 else 0.04
+        rest_need = max(0.1, min(1.2, sleep_pressure))
+        recovery = (0.0006 + rest_need * 0.0024) * metabolic_eff
+        if intensity > 0.6:
+            recovery *= 0.55
+        elif intensity < 0.3:
+            recovery *= 1.1
         energy = min(1.0, energy + recovery)
-        sleep_pressure = max(0.0, sleep_pressure - 0.02)
+        pressure_release = max(0.0008, recovery * 0.9)
+        sleep_pressure = max(0.0, sleep_pressure - pressure_release)
     elif meditating:
-        energy = min(1.0, energy + 0.01)
-        sleep_pressure = max(0.0, sleep_pressure - 0.01)
+        meditation_gain = 0.01 * metabolic_eff
+        energy = min(1.0, energy + meditation_gain)
+        sleep_pressure = max(0.0, sleep_pressure - 0.01 * metabolic_eff)
     else:
         base_drain = 0.00005
         activity_drain = ((stress + intensity) / 2.0) * 0.001
@@ -1046,6 +1160,7 @@ def monitor_energy():
         presence_drain = 0.00008 if presence < 0.2 else 0.0
 
         drain = base_drain + activity_drain + circadian_drain + pressure_drain + presence_drain
+        drain *= 1.0 + max(0.0, 1.0 - metabolic_eff)
         energy = max(0.0, energy - drain)
 
         sleep_pressure = min(
@@ -1054,6 +1169,7 @@ def monitor_energy():
             + (0.00035 if is_night else 0.0002)
             + activity_drain
         )
+        sleep_pressure = min(1.2, sleep_pressure + max(0.0, 1.0 - metabolic_eff) * 0.0002)
 
     update_inastate("current_energy", round(energy, 4))
     update_inastate("sleep_pressure", round(sleep_pressure, 4))
@@ -1085,6 +1201,361 @@ def feedback_inhibition():
         log_to_statusbox("[Manager] Logic inhibited due to stress spike.")
         return True
     return False
+
+
+def _metabolic_efficiency(hunger: float, fitness: float) -> float:
+    hunger_alignment = 1.0 - min(abs(hunger - _NUTRITION_TARGET) * 1.2, 0.65)
+    fitness_alignment = 0.85 + fitness * 0.25
+    return max(0.5, min(1.3, hunger_alignment * fitness_alignment))
+
+
+def _build_nutrition_options(
+    hunger: float,
+    energy: float,
+    fitness: float,
+    intensity: float,
+    sleep_pressure: float,
+) -> List[Dict[str, Any]]:
+    return _build_nutrition_options_with_offers(hunger, energy, fitness, intensity, sleep_pressure, None)
+
+
+def _build_nutrition_options_with_offers(
+    hunger: float,
+    energy: float,
+    fitness: float,
+    intensity: float,
+    sleep_pressure: float,
+    offers: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    status = get_inastate("nutrition_status") or {}
+    last_meal_ts = float(status.get("last_meal_ts") or 0.0)
+    now = time.time()
+    offer_list = offers if offers is not None else _active_offers(_load_offer_store(now))
+    options: List[Dict[str, Any]] = []
+    for name, config in _MEAL_OPTIONS.items():
+        fragment = {
+            "summary": f"nutrition|{name}|{datetime.now(timezone.utc).isoformat()}",
+            "tags": config["tags"] + ["nutrition_decision"],
+            "emotions": {
+                "hunger": hunger,
+                "energy": energy,
+                "fitness": fitness,
+                "intensity": intensity,
+                "sleep_pressure": sleep_pressure,
+                "size": config["size"],
+            },
+        }
+        encoded = _nutrition_transformer.encode(fragment)
+        transformer_value = max(0.0, encoded.get("importance", 0.0))
+        transformer_score = _clamp01(transformer_value / 5.0, default=0.5)
+        hunger_projection = _clamp01(hunger + config["hunger_delta"], default=hunger)
+        hunger_alignment = 1.0 - min(abs(hunger_projection - _NUTRITION_TARGET) * 1.2, 1.0)
+        energy_need = (1.0 - energy) * config["energy_weight"]
+        fitness_balance = 1.0 - min(abs(fitness - 0.55) * 1.1, 1.0)
+        sleep_lift = min(1.0, sleep_pressure + config["sleep_bias"])
+        offer_entry = None
+        offer_bonus = 0.0
+        for pending in offer_list:
+            if pending.get("name") == name:
+                offer_entry = pending
+                offer_bonus = 0.08 + 0.04 * hunger_alignment
+                break
+        score = (
+            0.32 * hunger_alignment
+            + 0.2 * energy_need
+            + 0.18 * transformer_score
+            + 0.15 * sleep_lift
+            + 0.15 * fitness_balance
+        )
+        score = _clamp01(score + offer_bonus + random.uniform(-0.03, 0.03), default=0.5)
+        ready = True
+        if last_meal_ts:
+            ready = (now - last_meal_ts) >= config["cooldown"]
+        options.append(
+            {
+                "name": name,
+                "label": config["label"],
+                "score": round(score, 3),
+                "cooldown_ready": bool(ready),
+                "projected_hunger": round(hunger_projection, 3),
+                "projected_energy": round(_clamp01(energy + config["energy_delta"], default=energy), 3),
+                "cooldown": config["cooldown"],
+                "size": config["size"],
+                "tags": config["tags"],
+                "offered": bool(offer_entry),
+                "offer_note": (offer_entry or {}).get("note"),
+                "offer_id": (offer_entry or {}).get("id"),
+                "offer_expires_at": (offer_entry or {}).get("expires_at"),
+                "offer_offered_at": (offer_entry or {}).get("offered_at"),
+            }
+        )
+    options.sort(key=lambda item: item["score"], reverse=True)
+    return options
+
+
+def _update_nutrition_snapshot(
+    hunger: float,
+    fitness: float,
+    energy: float,
+    intensity: float,
+    sleep_pressure: float,
+    *,
+    options: Optional[List[Dict[str, Any]]] = None,
+    last_meal: Optional[Dict[str, Any]] = None,
+    last_meal_ts: Optional[float] = None,
+    offers_meta: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    status = get_inastate("nutrition_status") or {}
+    snapshot_options = options or _build_nutrition_options(
+        hunger,
+        energy,
+        fitness,
+        intensity,
+        sleep_pressure,
+    )
+    pending_offers = []
+    for offer in offers_meta or []:
+        pending_offers.append(
+            {
+                "name": offer.get("name"),
+                "label": offer.get("label"),
+                "note": offer.get("note"),
+                "offered_at": offer.get("offered_at"),
+                "expires_at": offer.get("expires_at"),
+                "id": offer.get("id"),
+            }
+        )
+    record = {
+        "last_update": datetime.now(timezone.utc).isoformat(),
+        "metabolic_efficiency": round(_metabolic_efficiency(hunger, fitness), 4),
+        "hunger": round(hunger, 4),
+        "fitness": round(fitness, 4),
+        "options": snapshot_options,
+        "intensity_hint": round(float(intensity or 0.0), 3),
+        "sleep_pressure": round(float(sleep_pressure or 0.0), 3),
+        "last_meal": last_meal or status.get("last_meal"),
+        "last_meal_ts": last_meal_ts or status.get("last_meal_ts"),
+        "pending_offers": pending_offers,
+    }
+    update_inastate("nutrition_status", record)
+
+
+def _apply_meal_choice(
+    option_name: str,
+    config: Dict[str, Any],
+    *,
+    reason: str,
+    manual: bool,
+) -> bool:
+    emo_snapshot = get_inastate("emotion_snapshot") or {}
+    emo = emo_snapshot.get("values") or emo_snapshot
+    intensity = abs(float(emo.get("intensity", 0.0) or 0.0))
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    hunger = _clamp01(get_inastate("hunger_level") or 0.65, default=0.65)
+    fitness = _clamp01(get_inastate("fitness_level") or 0.55, default=0.55)
+    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
+    hunger = _clamp01(hunger + config["hunger_delta"], default=hunger)
+    energy = _clamp01(energy + config["energy_delta"], default=energy)
+    balance_bonus = 0.002 * (1.0 - min(abs(hunger - _NUTRITION_TARGET) * 1.4, 1.0))
+    heaviness_penalty = 0.0
+    if hunger > 0.92:
+        heaviness_penalty = (hunger - 0.92) * 0.02
+    fitness = _clamp01(
+        fitness + config.get("fitness_shift", 0.0) + balance_bonus - heaviness_penalty,
+        default=fitness,
+    )
+    now = time.time()
+    update_inastate("hunger_level", round(hunger, 4))
+    update_inastate("fitness_level", round(fitness, 4))
+    update_inastate("current_energy", round(energy, 4))
+    update_inastate("last_hunger_update_ts", now)
+    offers_store = _load_offer_store(now)
+    offer_consumed = False
+    for offer in offers_store:
+        if offer.get("status", "pending") != "pending":
+            continue
+        if offer.get("name") == option_name:
+            offer["status"] = "accepted"
+            offer["decision_ts"] = now
+            offer["decision_reason"] = reason
+            offer_consumed = True
+            break
+    if offer_consumed:
+        update_inastate("nutrition_offers", offers_store)
+    active_offers = _active_offers(offers_store)
+    meal_record = {
+        "name": option_name,
+        "label": config["label"],
+        "reason": reason,
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "manual": manual,
+    }
+    options = _build_nutrition_options_with_offers(
+        hunger,
+        energy,
+        fitness,
+        intensity,
+        sleep_pressure,
+        active_offers,
+    )
+    _update_nutrition_snapshot(
+        hunger,
+        fitness,
+        energy,
+        intensity,
+        sleep_pressure,
+        options=options,
+        last_meal=meal_record,
+        last_meal_ts=now,
+        offers_meta=active_offers,
+    )
+    source = "Manual" if manual else "Autonomic"
+    log_to_statusbox(
+        f"[Nutrition] {source} {config['label']} used ({reason}) — hunger={hunger:.3f}, fitness={fitness:.3f}, energy={energy:.3f}"
+    )
+    return True
+
+
+def request_meal(meal_name: str, reason: str = "manual") -> bool:
+    config = _MEAL_OPTIONS.get(meal_name)
+    if not config:
+        log_to_statusbox(f"[Nutrition] Unknown meal request: {meal_name}")
+        return False
+    return _apply_meal_choice(meal_name, config, reason=reason, manual=True)
+
+
+def offer_meal(meal_name: str, note: Optional[str] = None, expires_in: Optional[float] = None) -> bool:
+    config = _MEAL_OPTIONS.get(meal_name)
+    if not config:
+        log_to_statusbox(f"[Nutrition] Unknown meal offer: {meal_name}")
+        return False
+    now = time.time()
+    offers = _load_offer_store(now)
+    ttl = float(expires_in) if expires_in is not None else _NUTRITION_OFFER_TTL
+    ttl = max(300.0, min(ttl, 4 * _NUTRITION_OFFER_TTL))
+    expires_ts = now + ttl
+    entry = {
+        "id": f"offer_{uuid.uuid4().hex}",
+        "name": meal_name,
+        "label": config["label"],
+        "note": note,
+        "offered_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "expires_ts": expires_ts,
+        "expires_at": datetime.fromtimestamp(expires_ts, timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    offers.append(entry)
+    update_inastate("nutrition_offers", offers)
+    active_offers = _active_offers(offers)
+    hunger = _clamp01(get_inastate("hunger_level") or 0.65, default=0.65)
+    fitness = _clamp01(get_inastate("fitness_level") or 0.55, default=0.55)
+    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    emo_snapshot = get_inastate("emotion_snapshot") or {}
+    emo = emo_snapshot.get("values") or emo_snapshot
+    intensity = abs(float(emo.get("intensity", 0.0) or 0.0))
+    options = _build_nutrition_options_with_offers(
+        hunger,
+        energy,
+        fitness,
+        intensity,
+        sleep_pressure,
+        active_offers,
+    )
+    _update_nutrition_snapshot(
+        hunger,
+        fitness,
+        energy,
+        intensity,
+        sleep_pressure,
+        options=options,
+        offers_meta=active_offers,
+    )
+    log_to_statusbox(
+        f"[Nutrition] Offer queued for {config['label']} (expires {entry['expires_at']})."
+    )
+    return True
+
+
+def _maybe_auto_meal(
+    hunger: float,
+    energy: float,
+    fitness: float,
+    intensity: float,
+    sleep_pressure: float,
+    options: List[Dict[str, Any]],
+) -> bool:
+    triggers = []
+    if hunger < 0.33:
+        triggers.append("low_hunger")
+    if energy < 0.22:
+        triggers.append("low_energy")
+    if fitness < 0.4 and hunger < 0.55:
+        triggers.append("fitness_drift")
+    if sleep_pressure > 0.9 and hunger < 0.55:
+        triggers.append("sleep_buffer")
+    if not triggers:
+        return False
+    ready_options = [opt for opt in options if opt.get("cooldown_ready")]
+    if not ready_options:
+        return False
+    best = max(ready_options, key=lambda opt: opt["score"])
+    if best["score"] < 0.55:
+        return False
+    reason = f"auto:{'/'.join(triggers)}"
+    _apply_meal_choice(best["name"], _MEAL_OPTIONS[best["name"]], reason=reason, manual=False)
+    return True
+
+
+def monitor_hunger():
+    emo_snapshot = get_inastate("emotion_snapshot") or {}
+    emo = emo_snapshot.get("values") or emo_snapshot
+    hunger = _clamp01(get_inastate("hunger_level") or 0.65, default=0.65)
+    fitness = _clamp01(get_inastate("fitness_level") or 0.55, default=0.55)
+    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    intensity = abs(float(emo.get("intensity", 0.0) or 0.0))
+    stress = max(float(emo.get("stress", 0.0) or 0.0), 0.0)
+    now = time.time()
+    offers_store = _load_offer_store(now)
+    active_offers = _active_offers(offers_store)
+    last_update = float(get_inastate("last_hunger_update_ts") or now)
+    dt = max(1.0, now - last_update)
+    activity_multiplier = 1.0 + (stress + intensity) * 0.25
+    hunger = max(
+        _NUTRITION_MIN,
+        hunger - _NUTRITION_DECAY_PER_SEC * dt * activity_multiplier,
+    )
+    deviation = abs(hunger - _NUTRITION_TARGET)
+    if deviation < 0.08:
+        fitness += 0.00012 * dt
+    else:
+        fitness -= (0.00008 + deviation * 0.0003) * dt
+    if hunger < 0.25 or hunger > 0.85:
+        fitness -= 0.00015 * dt
+    fitness = _clamp01(fitness, default=0.55)
+    hunger = _clamp01(hunger, default=0.6)
+    options = _build_nutrition_options_with_offers(
+        hunger,
+        energy,
+        fitness,
+        intensity,
+        sleep_pressure,
+        active_offers,
+    )
+    _update_nutrition_snapshot(
+        hunger,
+        fitness,
+        energy,
+        intensity,
+        sleep_pressure,
+        options=options,
+        offers_meta=active_offers,
+    )
+    update_inastate("hunger_level", round(hunger, 4))
+    update_inastate("fitness_level", round(fitness, 4))
+    update_inastate("last_hunger_update_ts", now)
+    _maybe_auto_meal(hunger, energy, fitness, intensity, sleep_pressure, options)
 
 def boredom_check():
     global _last_boredom_launch
@@ -1738,6 +2209,7 @@ def rebuild_maps_if_needed():
 
 def run_internal_loop():
     _ensure_continuity_thread()
+    monitor_hunger()
     monitor_energy()
     _maybe_run_intuition_probe()
 

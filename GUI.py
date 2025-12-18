@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import Menu, messagebox, filedialog
+from tkinter import Menu, messagebox, filedialog, simpledialog
 import json
 import os
 import sys
@@ -8,7 +8,7 @@ from safe_popen import safe_popen
 import psutil
 import shutil
 from pathlib import Path
-from model_manager import get_inastate, update_inastate
+from model_manager import get_inastate, update_inastate, request_meal, offer_meal
 import threading
 import time
 from memory_graph import build_fractal_memory
@@ -114,6 +114,13 @@ _usage_labels = {}
 energy_var = None
 energy_status_var = None
 emotion_vars = {}
+hunger_status_var = None
+fitness_status_var = None
+nutrition_info_var = None
+last_meal_status_var = None
+metabolic_status_var = None
+offer_status_var = None
+offer_note_var = None
 
 
 def refresh_config():
@@ -419,6 +426,76 @@ def _refresh_energy_label():
     current = _clamp_value(get_inastate("current_energy") or 0.0, 0.0, 1.0)
     energy_status_var.set(f"Current energy: {current:.3f}")
 
+
+def _refresh_nutrition_section():
+    global hunger_status_var, fitness_status_var, nutrition_info_var, last_meal_status_var, metabolic_status_var
+    if hunger_status_var is None:
+        return
+    hunger = _clamp_value(get_inastate("hunger_level") or 0.6, 0.0, 1.0)
+    fitness = _clamp_value(get_inastate("fitness_level") or 0.55, 0.0, 1.0)
+    hunger_status_var.set(f"Hunger: {hunger:.3f}")
+    fitness_status_var.set(f"Fitness: {fitness:.3f}")
+    status = get_inastate("nutrition_status") or {}
+    eff = status.get("metabolic_efficiency")
+    if eff is None:
+        metabolic_status_var.set("Metabolic efficiency: --")
+    else:
+        metabolic_status_var.set(f"Metabolic efficiency: {float(eff):.3f}")
+    last_meal = status.get("last_meal")
+    if last_meal:
+        label = last_meal.get("label") or last_meal.get("name", "--")
+        reason = last_meal.get("reason", "?")
+        timestamp = last_meal.get("timestamp", "--")
+        last_meal_status_var.set(f"Last meal: {label} ({reason}) @ {timestamp}")
+    else:
+        last_meal_status_var.set("Last meal: --")
+    pending_offers = status.get("pending_offers") or []
+    if offer_status_var is not None:
+        if pending_offers:
+            lines = []
+            for offer in pending_offers[:3]:
+                label = offer.get("label") or offer.get("name", "--")
+                note = offer.get("note")
+                stamp = offer.get("offered_at", "--")
+                line = f"{label} @ {stamp}"
+                if note:
+                    line += f" — {note}"
+                lines.append(line)
+            if len(pending_offers) > 3:
+                lines.append(f"...and {len(pending_offers) - 3} more")
+            offer_status_var.set("Offers:\n" + "\n".join(lines))
+        else:
+            offer_status_var.set("Offers: none pending")
+    options = status.get("options") or []
+    if options:
+        summary_lines = []
+        for opt in options[:4]:
+            ready = "✓" if opt.get("cooldown_ready") else "…"
+            summary_lines.append(
+                f"{opt.get('label', opt.get('name'))}: {opt.get('score', 0.0):.2f} {ready}"
+            )
+        nutrition_info_var.set("\n".join(summary_lines))
+    else:
+        nutrition_info_var.set("Meal scores pending…")
+
+
+def _request_meal_from_gui(meal_name: str):
+    if not request_meal(meal_name, reason="gui"):
+        messagebox.showerror("Nutrition", f"Unable to schedule {meal_name} right now.")
+        return
+    append_status(f"[Vitals] Requested {meal_name.replace('_', ' ')} for Ina.\n")
+    _refresh_nutrition_section()
+
+
+def _offer_meal_from_gui(meal_name: str):
+    note = offer_note_var.get().strip() if offer_note_var else ""
+    note_value = note or None
+    if not offer_meal(meal_name, note=note_value):
+        messagebox.showerror("Nutrition", f"Unable to log offer {meal_name}.")
+        return
+    append_status(f"[Vitals] Offered {meal_name.replace('_', ' ')} to Ina.\n")
+    _refresh_nutrition_section()
+
 def _apply_energy_value(value=None, reason="manual"):
     if energy_var is None:
         return
@@ -489,10 +566,12 @@ def _update_usage_labels():
         _usage_labels["sys_mem"].config(text=f"System RAM: {stats['system_mem']:.1f}%")
 
     _refresh_energy_label()
+    _refresh_nutrition_section()
     vitals_window.after(1500, _update_usage_labels)
 
 def open_vitals_window():
     global vitals_window, _usage_labels, energy_var, energy_status_var, emotion_vars
+    global hunger_status_var, fitness_status_var, nutrition_info_var, last_meal_status_var, metabolic_status_var
 
     if vitals_window is not None and vitals_window.winfo_exists():
         vitals_window.lift()
@@ -539,6 +618,47 @@ def open_vitals_window():
     tk.Button(energy_buttons, text="Nudge +0.05", command=lambda: _nudge_energy(0.05)).pack(side=tk.LEFT, padx=4)
     tk.Button(energy_buttons, text="Reload", command=lambda: energy_var.set(_clamp_value(get_inastate("current_energy") or 0.5, 0.0, 1.0))).pack(side=tk.LEFT, padx=4)
 
+    nutrition_frame = tk.LabelFrame(vitals_window, text="Nutrition & Fitness")
+    nutrition_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+    hunger_status_var = tk.StringVar(value="Hunger: --")
+    fitness_status_var = tk.StringVar(value="Fitness: --")
+    metabolic_status_var = tk.StringVar(value="Metabolic efficiency: --")
+    last_meal_status_var = tk.StringVar(value="Last meal: --")
+    nutrition_info_var = tk.StringVar(value="Meal scores pending…")
+    offer_status_var = tk.StringVar(value="Offers: --")
+    offer_note_var = tk.StringVar()
+
+    tk.Label(nutrition_frame, textvariable=hunger_status_var).pack(anchor="w", padx=6, pady=(4, 0))
+    tk.Label(nutrition_frame, textvariable=fitness_status_var).pack(anchor="w", padx=6)
+    tk.Label(nutrition_frame, textvariable=metabolic_status_var).pack(anchor="w", padx=6)
+    tk.Label(nutrition_frame, textvariable=last_meal_status_var, wraplength=420, justify=tk.LEFT).pack(anchor="w", padx=6, pady=(0, 4))
+
+    tk.Label(nutrition_frame, text="Meal gate scores:").pack(anchor="w", padx=6)
+    tk.Label(nutrition_frame, textvariable=nutrition_info_var, justify=tk.LEFT, wraplength=420).pack(anchor="w", padx=6, pady=(0, 4))
+
+    tk.Label(nutrition_frame, textvariable=offer_status_var, justify=tk.LEFT, wraplength=420).pack(anchor="w", padx=6, pady=(0, 4))
+
+    note_row = tk.Frame(nutrition_frame)
+    note_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+    tk.Label(note_row, text="Offer note:").pack(side=tk.LEFT)
+    tk.Entry(note_row, textvariable=offer_note_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+    meal_buttons = tk.Frame(nutrition_frame)
+    meal_buttons.pack(fill=tk.X, padx=6, pady=(0, 4))
+    tk.Button(meal_buttons, text="Snack", command=lambda: _request_meal_from_gui("snack")).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text="Small Meal", command=lambda: _request_meal_from_gui("small_meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text="Meal", command=lambda: _request_meal_from_gui("meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text="Large Meal", command=lambda: _request_meal_from_gui("large_meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text="Reload", command=_refresh_nutrition_section).pack(side=tk.RIGHT, padx=4)
+
+    offer_buttons = tk.Frame(nutrition_frame)
+    offer_buttons.pack(fill=tk.X, padx=6, pady=(0, 4))
+    tk.Button(offer_buttons, text="Offer Snack", command=lambda: _offer_meal_from_gui("snack")).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text="Offer Small Meal", command=lambda: _offer_meal_from_gui("small_meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text="Offer Meal", command=lambda: _offer_meal_from_gui("meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text="Offer Large Meal", command=lambda: _offer_meal_from_gui("large_meal")).pack(side=tk.LEFT, padx=4)
+
     emotion_frame = tk.LabelFrame(vitals_window, text="Emotion sliders (-1 to 1)")
     emotion_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 10))
 
@@ -563,6 +683,7 @@ def open_vitals_window():
 
     _prime_usage_counters()
     _refresh_energy_label()
+    _refresh_nutrition_section()
     vitals_window.after(500, _update_usage_labels)
 
 def open_logs():

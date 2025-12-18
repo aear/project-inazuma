@@ -2,6 +2,8 @@ import os
 import re
 import json
 import hashlib
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
@@ -13,6 +15,11 @@ from symbol_generator import (
     ALPHANUMERIC_GLYPHS,
 )
 from symbol_glyphs import get_symbol_glyph_maps
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX environments
+    fcntl = None
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -62,6 +69,32 @@ def _normalize_symbol_map(raw):
             symbols[key] = val
 
     return symbols
+
+
+@contextmanager
+def _json_lock(path: Path):
+    if not fcntl:
+        yield
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _atomic_write_json(path: Path, payload: Any, *, indent: int = 4, ensure_ascii: bool = True):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            json.dump(payload, tmp, indent=indent, ensure_ascii=ensure_ascii)
+    finally:
+        os.replace(tmp_path, path)
 
 def load_generated_symbols(child: str, base_path: Optional[Path] = None):
     """
@@ -363,9 +396,8 @@ def load_symbol_to_token(child, base_path: Optional[Path] = None):
 
 def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "symbol_to_token.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
+    with _json_lock(path):
+        _atomic_write_json(path, data, indent=4, ensure_ascii=True)
 
 
 def _ensure_vocab_embeddings(vocab: Dict[str, Any], language_hint: Optional[str] = None) -> bool:

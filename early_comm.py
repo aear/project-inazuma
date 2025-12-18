@@ -224,6 +224,78 @@ def record_proto_pair_usage(child: str, pair_info: Dict[str, object]):
         log_to_statusbox(f"[Comms] Failed to record proto pair usage: {e}")
 
 
+def _update_tone_diversity_metrics(
+    child: str,
+    symbols: List[str],
+    *,
+    window_seconds: int = 3600,
+    max_entries: int = 60,
+):
+    """
+    Track recent spoken symbols so Ina can notice repetition patterns herself.
+    Stores both the rolling history and summary stats in inastate.
+    """
+    clean_symbols = [sid for sid in symbols if sid]
+    if not clean_symbols:
+        return
+
+    now = time.time()
+    raw_history = get_inastate("tone_voice_history")
+    history: List[Dict[str, float]] = []
+    if isinstance(raw_history, list):
+        for entry in raw_history:
+            sym = entry.get("symbol")
+            ts = entry.get("ts")
+            if not sym or not isinstance(ts, (int, float)):
+                continue
+            if now - float(ts) <= window_seconds:
+                history.append({"symbol": sym, "ts": float(ts)})
+
+    for sym in clean_symbols:
+        history.append({"symbol": sym, "ts": now})
+
+    history = history[-max_entries:]
+    if not history:
+        update_inastate("tone_voice_history", [])
+        update_inastate("tone_voice_metrics", None)
+        return
+
+    counts: Dict[str, int] = {}
+    for entry in history:
+        sym = entry["symbol"]
+        counts[sym] = counts.get(sym, 0) + 1
+
+    total = len(history)
+    unique_symbols = len(counts)
+    dominant_symbol, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+
+    streak_symbol = history[-1]["symbol"]
+    streak_len = 0
+    for entry in reversed(history):
+        if entry["symbol"] == streak_symbol:
+            streak_len += 1
+        else:
+            break
+
+    metrics = {
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "window_seconds": window_seconds,
+        "samples": total,
+        "unique_symbols": unique_symbols,
+        "unique_ratio": round(unique_symbols / max(1, total), 3),
+        "dominant_symbol": dominant_symbol,
+        "dominant_ratio": round(dominant_count / max(1, total), 3),
+        "current_streak_symbol": streak_symbol,
+        "current_streak_length": streak_len,
+        "recent_symbols": [entry["symbol"] for entry in history[-6:]],
+    }
+    if total >= 5 and metrics["dominant_ratio"] >= 0.8:
+        metrics["observation"] = "single_symbol_dominant"
+
+    update_inastate("tone_voice_history", history)
+    update_inastate("tone_voice_metrics", metrics)
+
+
 def load_recent_heard_words(child: str, limit: int = 12) -> List[Dict[str, str]]:
     """
     Pull the most recent heard words from grounded experience events so babbles
@@ -1643,6 +1715,8 @@ def early_communicate():
         update_inastate("last_babbled_words", spoken_words)
         update_inastate("last_babble_strategy", expression_strategy)
         update_inastate("currently_speaking", False)
+
+    _update_tone_diversity_metrics(child, symbol_seq_for_embed)
 
 
 if __name__ == "__main__":

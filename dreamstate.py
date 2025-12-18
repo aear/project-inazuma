@@ -14,13 +14,19 @@ from transformers.fractal_multidimensional_transformers import FractalTransforme
 from gui_hook import log_to_statusbox
 
 
-def recover_energy(intensity):
-    base_recovery = 0.05
-    if intensity < 0.3:
-        return base_recovery * 2
-    elif intensity < 0.5:
-        return base_recovery * 1.5
-    return base_recovery
+def recover_energy(intensity, sleep_pressure):
+    rest_need = max(0.1, min(1.2, sleep_pressure))
+    recovery = 0.0008 + rest_need * 0.002
+    if intensity > 0.6:
+        recovery *= 0.6
+    elif intensity < 0.3:
+        recovery *= 1.1
+    return recovery
+
+
+def ease_sleep_pressure(sleep_pressure, recovery):
+    pressure_release = max(0.0008, recovery * 0.9)
+    return max(0.0, sleep_pressure - pressure_release)
 
 def hallucinate_symbolic_fragment():
     synthetic = {
@@ -90,11 +96,16 @@ def enter_dreamstate():
         log_to_statusbox(f"[Dreamstate] Loop {loop_count}/8")
 
         state = get_inastate("emotion_snapshot") or {}
-        recovery = recover_energy(state.get("intensity", 0.5))
+        sleep_pressure = float(get_inastate("sleep_pressure") or 0.0)
+        recovery = recover_energy(state.get("intensity", 0.5), sleep_pressure)
         energy = get_inastate("current_energy") or 0.5
         energy = min(1.0, energy + recovery)
-        update_inastate("current_energy", energy)
-        log_to_statusbox(f"[Dreamstate] Energy recovery: +{recovery:.4f}, new total: {energy:.4f}")
+        new_sleep_pressure = ease_sleep_pressure(sleep_pressure, recovery)
+        update_inastate("current_energy", round(energy, 4))
+        update_inastate("sleep_pressure", round(new_sleep_pressure, 4))
+        log_to_statusbox(
+            f"[Dreamstate] Energy +{recovery:.4f} -> {energy:.4f}, sleep_pressure {sleep_pressure:.4f}->{new_sleep_pressure:.4f}"
+        )
 
 
         if maybe_trigger_instincts():

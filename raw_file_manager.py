@@ -483,7 +483,13 @@ def fragment_text(text, source, transformer):
         vec = transformer.encode(frag)
         frag["importance"] = vec["importance"]
         try:
-            update_text_vocab(chunk, child=child, tags=frag["tags"], emotions=frag.get("emotions"))
+            update_text_vocab(
+                chunk,
+                child=child,
+                tags=frag["tags"],
+                emotions=frag.get("emotions"),
+                source="raw_file_manager",
+            )
         except Exception:
             pass
         fragments.append(frag)

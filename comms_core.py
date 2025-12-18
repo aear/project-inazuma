@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 import threading
 import uuid
+import re
+
+from experience_logger import ExperienceLogger
+from model_manager import increment_inastate_metric
 
 try:
     from text_memory import record_text_observation
@@ -16,6 +20,7 @@ except Exception:  # pragma: no cover - optional dependency
     record_text_observation = None
 
 logger = logging.getLogger(__name__)
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +76,12 @@ class CommsResponse:
     """
     text: Optional[str]
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _extract_words_lower(text: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    return [tok.lower() for tok in _WORD_RE.findall(text)]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +161,8 @@ class CommsCore:
         or None if there was no reply.
         """
         metadata = metadata or {}
+        trace_id = metadata.get("trace_id") or f"trace_{uuid.uuid4().hex}"
+        metadata["trace_id"] = trace_id
 
         msg = CommsMessage(
             id=self._new_message_id(),
@@ -181,10 +194,60 @@ class CommsCore:
             except Exception:
                 logger.exception("Failed to record text fragment for inbound message %s", backend_message_id)
 
+        experience_event_id = None
+        try:
+            logger_exp = ExperienceLogger()
+            experience_event_id = logger_exp.log_event(
+                situation_tags=["comm", "inbound", backend],
+                perceived_entities=[
+                    {
+                        "type": "human",
+                        "display_name": sender.display_name,
+                        "backend": backend,
+                        "user_id": sender.backend_id,
+                    }
+                ],
+                internal_state={
+                    "channel": channel.name,
+                    "channel_backend_id": channel.backend_id,
+                    "trace_id": trace_id,
+                },
+                narrative=f"Heard {sender.display_name or sender.backend_id} via {backend}.",
+            )
+            if text:
+                logger_exp.attach_word_usage(
+                    experience_event_id,
+                    speaker=sender.display_name or sender.internal_id,
+                    utterance=text,
+                    words=_extract_words_lower(text),
+                    entity_links=[
+                        {
+                            "type": "channel",
+                            "channel_id": channel.backend_id,
+                            "channel_name": channel.name,
+                        }
+                    ],
+                )
+        except Exception:
+            logger.exception("Failed to log inbound experience for %s", backend_message_id)
+            experience_event_id = None
+
+        if experience_event_id:
+            msg.metadata["experience_event_id"] = experience_event_id
+        try:
+            increment_inastate_metric("inbound_events_logged")
+        except Exception:
+            pass
+
         self._log_message(msg)
 
         # Hand message to Ina's internal pipeline
         response = self._process_inbound(msg)
+        if response is not None:
+            response.metadata = dict(response.metadata or {})
+            response.metadata.setdefault("trace_id", trace_id)
+            if experience_event_id:
+                response.metadata.setdefault("experience_event_id", experience_event_id)
 
         if response is None or response.text is None:
             logger.debug("No response generated for message %s", msg.id)

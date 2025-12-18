@@ -17,6 +17,7 @@ Author: Lumen (for Sakura & Ina)
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import time
@@ -470,6 +471,22 @@ class DeepRecallManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _effective_chunk_span(self) -> int:
+        """Compute how many fragments should be processed this step."""
+        base_chunk = self.config.chunk_size if self.config.chunk_size > 0 else 1
+
+        burst_chunk = self.config.burst_chunk_size
+        if burst_chunk is not None:
+            if burst_chunk <= 0:
+                burst_chunk = 1
+            base_chunk = min(base_chunk, burst_chunk)
+
+        remaining = max(self.state.total_fragments - self.state.last_index, 0)
+        if remaining == 0:
+            return 0
+
+        return min(base_chunk, remaining)
 
     def _process_fragments(self, fragments: List[Dict[str, Any]]) -> None:
         """
