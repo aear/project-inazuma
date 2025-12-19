@@ -1213,6 +1213,8 @@ def early_communicate():
     except Exception:
         owner_user_id = None
     owner_user_id_str = str(owner_user_id) if owner_user_id else None
+    humor_invite = get_inastate("humor_expression_invite") or {}
+    humor_ready = bool(humor_invite.get("ready"))
     transformer = FractalTransformer()
     prediction = load_prediction(child)
     if not prediction:
@@ -1609,6 +1611,13 @@ def early_communicate():
                 "last_heard_user_id": last_heard_user_id,
             },
         }
+        if humor_invite:
+            rationale["humor_bridge"] = {
+                "ready": humor_ready,
+                "level": humor_invite.get("level"),
+                "note": humor_invite.get("note"),
+                "expires_at": humor_invite.get("expires_at"),
+            }
 
         if chosen_text is not None and (chosen_text.strip() or payload_allow_empty):
             queued_id = append_typed_outbox_entry(

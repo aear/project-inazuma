@@ -24,7 +24,9 @@ having to change the core structure.
 from __future__ import annotations
 
 import json
+import math
 import random
+import time
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +40,12 @@ from model_manager import (
     get_inastate,
 )
 from gui_hook import log_to_statusbox
+
+try:
+    from humor_engine import HUMOR_TAGS, record_benign_humor_event
+except Exception:  # pragma: no cover - humor subsystem optional
+    HUMOR_TAGS = ["benign_violation", "resolved_contradiction", "self_parody"]
+    record_benign_humor_event = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Slider definition
@@ -106,6 +114,20 @@ DEFAULT_BASELINE: Dict[str, float] = {
 
 AI_CHILDREN_ROOT = Path("AI_Children")
 BODY_INTENSITY_THRESHOLD = 0.6
+_PLAYFULNESS_STATE_KEY = "emotion_playfulness_state"
+_PLAYFULNESS_LEVEL_KEY = "emotion_playfulness_level"
+_PLAYFULNESS_HALF_LIFE_SECONDS = 240.0
+_DEFAULT_PLAYFULNESS_BASE = 0.05
+_PLAYFULNESS_TRIGGER_SET = {
+    *(tag.lower() for tag in HUMOR_TAGS),
+    "benign_surprise",
+    "benign_surprise_resolved",
+    "category_error",
+    "resolved_category_error",
+}
+_PLAYFULNESS_REWARD_BASE = 0.05
+_PLAYFULNESS_REWARD_BONUS = 0.02
+
 
 
 def _log(msg: str) -> None:
@@ -199,6 +221,109 @@ def _update_body_schema_from_emotion(emotion_values: Dict[str, float]) -> Option
             _log(f"Failed to update body schema: {exc}")
             _BODY_SCHEMA_WARNED = True
         return None
+
+
+# ---------------------------------------------------------------------------
+# Playfulness metric
+# ---------------------------------------------------------------------------
+
+def get_playfulness_state() -> Dict[str, Any]:
+    """
+    Return a copy of the current playfulness/glimmer state tracked in inastate.
+    """
+    state = get_inastate(_PLAYFULNESS_STATE_KEY)
+    if isinstance(state, dict):
+        return copy.deepcopy(state)
+    return {
+        "value": _DEFAULT_PLAYFULNESS_BASE,
+        "last_update": _now_iso(),
+    }
+
+
+def get_playfulness_level(default: float = 0.0) -> float:
+    """
+    Convenience accessor for downstream modules that want Ina's
+    current amusement bias without parsing the full state dict.
+    """
+    state = get_playfulness_state()
+    try:
+        return float(state.get("value", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _filter_playfulness_tags(tags: Optional[List[str]]) -> List[str]:
+    if not tags:
+        return []
+    filtered: List[str] = []
+    seen = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        norm = tag.lower()
+        if norm in _PLAYFULNESS_TRIGGER_SET and norm not in seen:
+            filtered.append(norm)
+            seen.add(norm)
+    return filtered
+
+
+def _update_playfulness(tags: Optional[List[str]] = None, source: str = "emotion_engine") -> float:
+    """
+    Apply natural decay and gently lift the playfulness metric when benign
+    surprises resolve (detected via tagged fragments/context).
+    """
+    now = time.time()
+    state = get_playfulness_state()
+    try:
+        value = float(state.get("value", _DEFAULT_PLAYFULNESS_BASE))
+    except (TypeError, ValueError):
+        value = _DEFAULT_PLAYFULNESS_BASE
+
+    last_ts = state.get("last_update_ts")
+    try:
+        last_ts = float(last_ts) if last_ts is not None else now
+    except (TypeError, ValueError):
+        last_ts = now
+
+    dt = max(0.0, now - last_ts)
+    if dt > 0.0:
+        decay_factor = math.pow(0.5, dt / _PLAYFULNESS_HALF_LIFE_SECONDS)
+        value = max(0.0, value * decay_factor)
+
+    trigger_tags = _filter_playfulness_tags(tags)
+    reward = 0.0
+    if trigger_tags:
+        reward = _PLAYFULNESS_REWARD_BASE + _PLAYFULNESS_REWARD_BONUS * max(len(trigger_tags) - 1, 0)
+        if "resolved_contradiction" in trigger_tags:
+            reward += 0.01
+        value = min(1.0, value + reward)
+        trigger_record = {
+            "timestamp": _now_iso(),
+            "tags": trigger_tags,
+            "source": source,
+            "reward": round(reward, 4),
+        }
+        state["last_trigger"] = trigger_record
+        if callable(record_benign_humor_event):
+            summary = f"Resolved contrast ({', '.join(trigger_tags)})"
+            detail = f"source={source}, reward={reward:.3f}"
+            context = {
+                "trigger_tags": trigger_tags,
+                "source": source,
+                "reward": reward,
+            }
+            try:
+                record_benign_humor_event(summary, detail=detail, context=context)
+            except Exception:
+                pass
+        _log(f"Playfulness lifted by {reward:.3f} (tags: {', '.join(trigger_tags)}).")
+
+    state["value"] = round(value, 4)
+    state["last_update_ts"] = now
+    state["last_update"] = _now_iso()
+    update_inastate(_PLAYFULNESS_STATE_KEY, state)
+    update_inastate(_PLAYFULNESS_LEVEL_KEY, state["value"])
+    return state["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -488,15 +613,22 @@ def tag_fragment_emotions(
     """
     config = load_config()
     active_child = child or config.get("current_child", "default_child")
-    tags = context_tags or fragment.get("tags") or []
+    tags = list(context_tags or fragment.get("tags") or [])
+    playfulness_level = _update_playfulness(tags, source="fragment_tagging")
     snapshot = compute_emotion_snapshot(active_child, context_tags=list(tags))
-    return tag_fragment(fragment, snapshot, body_state=body_state or _get_latest_body_state())
+    return tag_fragment(
+        fragment,
+        snapshot,
+        body_state=body_state or _get_latest_body_state(),
+        playfulness=playfulness_level,
+    )
 
 
 def tag_fragment(
     fragment: Dict[str, Any],
     snapshot: EmotionSnapshot,
     body_state: Optional[Dict[str, Dict[str, float]]] = None,
+    playfulness: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Attach the current emotional vector to a fragment.
@@ -519,6 +651,11 @@ def tag_fragment(
         "stress": snapshot.values.get("stress", 0.0),
         "trust": snapshot.values.get("trust", 0.0),
         "novelty": snapshot.values.get("novelty", 0.0),
+        "playfulness": (
+            float(playfulness)
+            if playfulness is not None
+            else get_playfulness_level()
+        ),
     }
 
     fragment["emotions"] = emotions
@@ -549,6 +686,7 @@ def tag_all_fragments(
 
     updated = 0
     skipped = 0
+    baseline_playfulness = get_playfulness_level()
 
     for fpath in fragments_dir.glob("*.json"):
         try:
@@ -562,7 +700,12 @@ def tag_all_fragments(
             skipped += 1
             continue
 
-        frag = tag_fragment(frag, snapshot, body_state=body_state)
+        frag = tag_fragment(
+            frag,
+            snapshot,
+            body_state=body_state,
+            playfulness=baseline_playfulness,
+        )
 
         try:
             with fpath.open("w", encoding="utf-8") as f:
@@ -595,8 +738,10 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
         config = {}
 
     child = config.get("current_child", "Inazuma_Yagami")
+    tags = list(context_tags or [])
+    _update_playfulness(tags, source="engine_tick")
 
-    snapshot = compute_emotion_snapshot(child, context_tags=context_tags)
+    snapshot = compute_emotion_snapshot(child, context_tags=tags)
 
     from emotion_processor import process_emotion
 

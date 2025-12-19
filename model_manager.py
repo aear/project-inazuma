@@ -73,6 +73,10 @@ _FRAGMENT_HEALTH_COOLDOWN = 1800.0
 _fragment_health_thread: Optional[threading.Thread] = None
 _last_exploration_invite_log = 0.0
 _EXPLORATION_INVITE_COOLDOWN = 240.0
+_last_humor_bridge_log = 0.0
+_HUMOR_BRIDGE_LOG_COOLDOWN = 240.0
+_last_trauma_run = 0.0
+_TRAUMA_COOLDOWN = 900.0
 _NUTRITION_TARGET = 0.64
 _NUTRITION_DECAY_PER_SEC = 0.000045
 _NUTRITION_MIN = 0.05
@@ -1963,6 +1967,51 @@ def _update_self_read_exploration_opportunities():
             )
             _last_exploration_invite_log = now
 
+
+def _update_humor_bridge():
+    """
+    Refresh the humor expression invite so downstream comms can see whether
+    Ina actually feels amused enough to riff.
+    """
+    global _last_humor_bridge_log
+    try:
+        from humor_engine import maybe_prepare_expression_invite
+    except Exception:
+        return
+
+    try:
+        invite = maybe_prepare_expression_invite()
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Humor bridge update failed: {exc}")
+        return
+
+    if not invite or not invite.get("ready"):
+        return
+
+    now = time.time()
+    if (now - _last_humor_bridge_log) < _HUMOR_BRIDGE_LOG_COOLDOWN:
+        return
+
+    level = float(invite.get("level", 0.0) or 0.0)
+    log_to_statusbox(
+        f"[Manager] Ina is amused (playfulness {level:.2f}); humour stays invitation-only."
+    )
+    _last_humor_bridge_log = now
+
+
+def _maybe_run_trauma_processor():
+    """
+    Invoke the trauma processor on a slow cadence so cooling support
+    is available when fragments spike. The processor performs its own
+    energy/stress gating; this function just rate-limits launches.
+    """
+    global _last_trauma_run
+    now = time.time()
+    if (now - _last_trauma_run) < _TRAUMA_COOLDOWN:
+        return
+    _last_trauma_run = now
+    safe_run(["python", "trauma_processor.py"])
+
 def _update_machine_semantics():
     """
     Evaluate machine-native semantic axes and persist them to inastate.
@@ -2260,6 +2309,8 @@ def run_internal_loop():
     _update_contact_urges()
     _update_stable_pattern_urge()
     _update_self_read_exploration_opportunities()
+    _update_humor_bridge()
+    _maybe_run_trauma_processor()
     _run_passive_reflection()
     _step_deep_recall()
     _update_machine_semantics()
