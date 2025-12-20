@@ -42,6 +42,10 @@ def do_visual_and_audio_exploration():
     _call_local("audio_listener.py")
     _call_local("vision_window.py")
 
+def open_paint_window():
+    _call_local("paint_window.py")
+    print("[Boredom] Paint window opened.")
+
 def load_impulse_preferences():
     config = load_config()
     child = config.get("current_child", "default_child")
@@ -83,7 +87,7 @@ def emotion_shift(emotions, signature):
     return min(1.0, total / count)
 
 def choose_exploration(emotions, preferences):
-    weights = {"symbols": 1.0, "render": 1.0, "read": 1.0, "logic": 1.0, "sense": 1.0}
+    weights = {"symbols": 1.0, "render": 1.0, "read": 1.0, "logic": 1.0, "sense": 1.0, "paint": 1.0}
     rationales = []
 
     boredom_level = get_inastate("emotion_boredom") or 0.0
@@ -133,6 +137,7 @@ def choose_exploration(emotions, preferences):
     weights["logic"] += max(focus - boredom_level, 0.0) * 0.6
     weights["symbols"] += boredom_level * 0.5 + curiosity * 0.4
     weights["render"] += boredom_level * 0.3 + (1.0 - intensity) * 0.2
+    weights["paint"] += boredom_level * 0.5 + curiosity * 0.3 + joy * 0.2
 
     options = list(weights.keys())
     weight_values = [max(w, 0.01) for w in weights.values()]
@@ -158,6 +163,8 @@ def boredom_exploration_loop():
             evolve_logic()
         elif choice == "sense":
             do_visual_and_audio_exploration()
+        elif choice == "paint":
+            open_paint_window()
         time.sleep(2)
         loop_counter += 1
 

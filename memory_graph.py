@@ -5,10 +5,11 @@ import json
 import math
 import random
 import heapq
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Dict, Any, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
 
@@ -134,6 +135,696 @@ def _memory_policy():
                 tier_defaults["target_count"] = target_override
         policy[tier] = tier_defaults
     return policy
+
+
+EMOTION_SLIDERS: Tuple[str, ...] = (
+    "intensity",
+    "attention",
+    "trust",
+    "care",
+    "curiosity",
+    "novelty",
+    "familiarity",
+    "stress",
+    "risk",
+    "negativity",
+    "positivity",
+    "simplicity",
+    "complexity",
+    "interest",
+    "clarity",
+    "fuzziness",
+    "alignment",
+    "safety",
+    "threat",
+    "presence",
+    "isolation",
+    "connection",
+    "ownership",
+    "externality",
+)
+
+DEFAULT_NEURAL_SELECTOR = {
+    "enabled": True,
+    "candidate_pool_max": 420,
+    "cooldown_seconds": 900.0,
+    "cooldown_max": 120,
+    "blocked_tags": ["exception", "privacy", "high-risk"],
+    "cost_max_bytes": 5_000_000,
+    "dream_cost_max_bytes": 1_000_000,
+    "risk_max": 0.85,
+    "dream_risk_max": 0.55,
+    "recency_half_life_sec": 21600.0,
+    "weights": {
+        "emotion": 0.35,
+        "symbol": 0.2,
+        "recency": 0.1,
+        "novelty": 0.15,
+        "unresolved": 0.1,
+        "cost": 0.2,
+        "risk": 0.2,
+    },
+    "temperature": 0.85,
+    "temperature_min": 0.2,
+    "temperature_max": 1.8,
+    "lane_weights": {
+        "guided": 0.7,
+        "novelty": 0.2,
+        "wild": 0.1,
+    },
+    "energy_low": 0.35,
+    "stress_high": 0.5,
+    "clarity_low": -0.35,
+}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _parse_iso_timestamp(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    raw = str(value)
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _load_inastate(child: str) -> Dict[str, Any]:
+    path = Path("AI_Children") / child / "memory" / "inastate.json"
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _selector_state_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural_selector_state.json"
+
+
+def _load_selector_state(child: str) -> Dict[str, Any]:
+    path = _selector_state_path(child)
+    if not path.exists():
+        return {"recent": []}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {"recent": []}
+    return data if isinstance(data, dict) else {"recent": []}
+
+
+def _save_selector_state(child: str, state: Dict[str, Any]) -> None:
+    path = _selector_state_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+    except Exception:
+        return
+
+
+def _selector_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    config = DEFAULT_NEURAL_SELECTOR.copy()
+    raw = {}
+    if isinstance(cfg, dict):
+        raw = cfg.get("neural_selector", {}) or {}
+    if isinstance(raw, dict):
+        for key in config.keys():
+            if key in {"weights", "lane_weights"}:
+                continue
+            if key in raw:
+                config[key] = raw.get(key)
+        weights = config["weights"].copy()
+        raw_weights = raw.get("weights") if isinstance(raw, dict) else None
+        if isinstance(raw_weights, dict):
+            for key in weights:
+                if key in raw_weights:
+                    weights[key] = _safe_float(raw_weights.get(key), weights[key])
+        config["weights"] = weights
+        lane_weights = config["lane_weights"].copy()
+        raw_lanes = raw.get("lane_weights") if isinstance(raw, dict) else None
+        if isinstance(raw_lanes, dict):
+            for key in lane_weights:
+                if key in raw_lanes:
+                    lane_weights[key] = _safe_float(raw_lanes.get(key), lane_weights[key])
+        config["lane_weights"] = lane_weights
+    config["candidate_pool_max"] = max(0, int(_safe_float(config.get("candidate_pool_max"), 0)))
+    config["cooldown_seconds"] = max(0.0, _safe_float(config.get("cooldown_seconds"), 0.0))
+    config["cooldown_max"] = max(0, int(_safe_float(config.get("cooldown_max"), 0)))
+    config["cost_max_bytes"] = int(_safe_float(config.get("cost_max_bytes"), 0.0)) or None
+    config["dream_cost_max_bytes"] = int(_safe_float(config.get("dream_cost_max_bytes"), 0.0)) or None
+    config["risk_max"] = _clamp(_safe_float(config.get("risk_max"), 1.0), 0.0, 1.0)
+    config["dream_risk_max"] = _clamp(_safe_float(config.get("dream_risk_max"), 1.0), 0.0, 1.0)
+    config["recency_half_life_sec"] = max(1.0, _safe_float(config.get("recency_half_life_sec"), 21600.0))
+    config["temperature"] = _safe_float(config.get("temperature"), 0.85)
+    config["temperature_min"] = _safe_float(config.get("temperature_min"), 0.2)
+    config["temperature_max"] = _safe_float(config.get("temperature_max"), 1.8)
+    config["energy_low"] = _safe_float(config.get("energy_low"), 0.35)
+    config["stress_high"] = _safe_float(config.get("stress_high"), 0.5)
+    config["clarity_low"] = _safe_float(config.get("clarity_low"), -0.35)
+    blocked = config.get("blocked_tags") or []
+    if isinstance(blocked, (list, tuple)):
+        config["blocked_tags"] = [str(tag).lower() for tag in blocked if tag]
+    else:
+        config["blocked_tags"] = []
+    return config
+
+
+def _collect_recent_symbol_ids(state: Dict[str, Any]) -> List[str]:
+    symbols: List[str] = []
+    metrics = state.get("tone_voice_metrics") or {}
+    recent = metrics.get("recent_symbols") or []
+    if isinstance(recent, list):
+        symbols.extend(str(s) for s in recent if s)
+    history = state.get("tone_voice_history") or []
+    if isinstance(history, list):
+        symbols.extend(str(entry.get("symbol")) for entry in history[-8:] if isinstance(entry, dict) and entry.get("symbol"))
+    for key in ("last_spoken_symbol", "last_symbol_word_id"):
+        if state.get(key):
+            symbols.append(str(state.get(key)))
+    prediction = state.get("current_prediction") or {}
+    if isinstance(prediction, dict):
+        pred_word = prediction.get("predicted_symbol_word") or {}
+        if isinstance(pred_word, dict) and pred_word.get("symbol_word_id"):
+            symbols.append(str(pred_word.get("symbol_word_id")))
+    symbol_matches = state.get("emotion_symbol_matches") or []
+    if isinstance(symbol_matches, list):
+        for entry in symbol_matches:
+            if isinstance(entry, dict) and entry.get("symbol_word_id"):
+                symbols.append(str(entry.get("symbol_word_id")))
+    return list({s for s in symbols if s})
+
+
+def _mode_from_state(state: Dict[str, Any]) -> str:
+    if state.get("dreaming"):
+        return "dream"
+    if state.get("meditating"):
+        return "meditation"
+    mode = state.get("mode") or (state.get("emotion_snapshot") or {}).get("mode")
+    boredom = _safe_float(state.get("emotion_boredom"), 0.0)
+    if boredom > 0.4:
+        return "boredom"
+    return str(mode or "awake").lower()
+
+
+def _emotion_vector_from_state(state: Dict[str, Any]) -> List[float]:
+    snapshot = state.get("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else snapshot
+    if not isinstance(values, dict):
+        return [0.0] * len(EMOTION_SLIDERS)
+    vector = [_clamp(_safe_float(values.get(axis), 0.0), -1.0, 1.0) for axis in EMOTION_SLIDERS]
+    return vector
+
+
+def _emotion_vector_from_fragment(fragment: Dict[str, Any]) -> List[float]:
+    emotions = fragment.get("emotions") or {}
+    if not isinstance(emotions, dict):
+        return [0.0] * len(EMOTION_SLIDERS)
+    sliders = emotions.get("sliders") if isinstance(emotions.get("sliders"), dict) else emotions
+    if not isinstance(sliders, dict):
+        return [0.0] * len(EMOTION_SLIDERS)
+    return [_clamp(_safe_float(sliders.get(axis), 0.0), -1.0, 1.0) for axis in EMOTION_SLIDERS]
+
+
+def _fragment_symbols(fragment: Dict[str, Any]) -> List[str]:
+    symbols: List[str] = []
+    for key in ("symbols", "symbols_spoken", "attempted_symbols"):
+        value = fragment.get(key)
+        if isinstance(value, list):
+            symbols.extend(str(s) for s in value if s)
+        elif isinstance(value, str):
+            symbols.append(value)
+    context = fragment.get("context") or {}
+    if isinstance(context, dict):
+        ctx_symbols = context.get("symbols")
+        if isinstance(ctx_symbols, list):
+            symbols.extend(str(s) for s in ctx_symbols if s)
+    return list({s for s in symbols if s})
+
+
+def _cluster_key(fragment: Dict[str, Any]) -> str:
+    for key in ("cluster_id", "cluster", "cluster_key"):
+        if fragment.get(key):
+            return str(fragment.get(key))
+    tags = fragment.get("tags") or []
+    if isinstance(tags, list) and tags:
+        return str(tags[0])
+    return str(fragment.get("type") or "unknown")
+
+
+def _overlap_score(a: Iterable[str], b: Iterable[str]) -> float:
+    set_a = {str(x).lower() for x in a if x}
+    set_b = {str(x).lower() for x in b if x}
+    if not set_a or not set_b:
+        return 0.0
+    union = set_a | set_b
+    return len(set_a & set_b) / max(len(union), 1)
+
+
+def _resolve_index_path(child: str, frag_id: str, meta: Dict[str, Any]) -> Optional[Path]:
+    base = Path("AI_Children") / child / "memory" / "fragments"
+    filename = meta.get("filename") or f"frag_{frag_id}.json"
+    tier = meta.get("tier")
+    if tier:
+        candidate = base / tier / filename
+        if candidate.exists():
+            return candidate
+    candidate = base / filename
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _load_fragment_from_path(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if "tier" not in data:
+        parent_tier = path.parent.name
+        if parent_tier in MEMORY_TIERS:
+            data["tier"] = parent_tier
+    return data
+
+
+def _candidate_pool_from_index(
+    child: str,
+    index: Dict[str, Any],
+    *,
+    pool_max: int,
+    blocked_tags: Iterable[str],
+    recent_ids: Set[str],
+    known_fragments: Optional[Set[str]],
+    cost_max_bytes: Optional[int],
+) -> List[str]:
+    blocked = {str(tag).lower() for tag in blocked_tags if tag}
+    entries: List[Tuple[float, float, str]] = []
+    for frag_id, meta in index.items():
+        if known_fragments and frag_id in known_fragments:
+            continue
+        tags = meta.get("tags") or []
+        if isinstance(tags, list) and blocked:
+            lowered = {str(tag).lower() for tag in tags if tag}
+            if lowered & blocked:
+                continue
+        if frag_id in recent_ids:
+            continue
+        path = _resolve_index_path(child, frag_id, meta)
+        if path is None:
+            continue
+        if cost_max_bytes is not None:
+            try:
+                if path.stat().st_size > cost_max_bytes:
+                    continue
+            except OSError:
+                continue
+        ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp"))
+        if ts is None:
+            try:
+                ts = path.stat().st_mtime
+            except OSError:
+                ts = 0.0
+        importance = _safe_float(meta.get("importance"), 0.0)
+        entries.append((ts or 0.0, importance, frag_id))
+    entries.sort(reverse=True)
+    return [entry[2] for entry in entries[:pool_max]]
+
+
+def _softmax(scores: List[float], temperature: float) -> List[float]:
+    if not scores:
+        return []
+    temp = max(temperature, 1e-6)
+    scaled = [score / temp for score in scores]
+    peak = max(scaled)
+    weights = [math.exp(val - peak) for val in scaled]
+    total = sum(weights) or 1e-6
+    return [w / total for w in weights]
+
+
+def _weighted_sample(items: List[Dict[str, Any]], weights: List[float], k: int) -> List[Dict[str, Any]]:
+    if k <= 0 or not items:
+        return []
+    selected: List[Dict[str, Any]] = []
+    pool = list(items)
+    pool_weights = list(weights)
+    for _ in range(min(k, len(pool))):
+        total = sum(pool_weights)
+        if total <= 0:
+            choice = random.choice(pool)
+        else:
+            pick = random.random() * total
+            upto = 0.0
+            choice = pool[-1]
+            for item, weight in zip(pool, pool_weights):
+                upto += weight
+                if upto >= pick:
+                    choice = item
+                    break
+        idx = pool.index(choice)
+        selected.append(choice)
+        pool.pop(idx)
+        pool_weights.pop(idx)
+    return selected
+
+
+def _unresolved_intensity(fragment: Dict[str, Any]) -> float:
+    tags = fragment.get("tags") or []
+    tagset = {str(tag).lower() for tag in tags if tag}
+    unresolved = 0.0
+    if tagset & {"unresolved", "suppressed", "high_conflict", "trauma", "shadow"}:
+        unresolved = 0.35
+    emotions = fragment.get("emotions") or {}
+    summary = emotions.get("summary") if isinstance(emotions, dict) else None
+    if isinstance(summary, dict):
+        cooled = summary.get("cooled_intensity")
+        if cooled is not None:
+            unresolved = max(unresolved, min(abs(_safe_float(cooled)), 1.0))
+    intensity = None
+    if isinstance(emotions, dict):
+        intensity = emotions.get("intensity")
+        if intensity is None and isinstance(emotions.get("sliders"), dict):
+            intensity = emotions.get("sliders", {}).get("intensity")
+    if intensity is not None:
+        unresolved = max(unresolved, min(abs(_safe_float(intensity)), 1.0))
+    return _clamp(unresolved, 0.0, 1.0)
+
+
+def _risk_level(fragment: Dict[str, Any]) -> float:
+    emotions = fragment.get("emotions") or {}
+    risk = None
+    if isinstance(emotions, dict):
+        risk = emotions.get("risk")
+        if risk is None and isinstance(emotions.get("sliders"), dict):
+            risk = emotions.get("sliders", {}).get("risk")
+    return _clamp(max(0.0, _safe_float(risk, 0.0)), 0.0, 1.0)
+
+
+def _score_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    emotion_vector: List[float],
+    recent_symbols: List[str],
+    now_ts: float,
+    config: Dict[str, Any],
+    mode: str,
+) -> List[Dict[str, Any]]:
+    cluster_counts: Dict[str, int] = {}
+    for entry in candidates:
+        cluster_key = _cluster_key(entry["fragment"])
+        entry["cluster_key"] = cluster_key
+        cluster_counts[cluster_key] = cluster_counts.get(cluster_key, 0) + 1
+
+    total = max(1, len(candidates))
+    weights = config["weights"]
+    recency_half_life = config["recency_half_life_sec"]
+    cost_scale = config.get("cost_max_bytes") or 5_000_000
+
+    scored: List[Dict[str, Any]] = []
+    for entry in candidates:
+        frag = entry["fragment"]
+        frag_symbols = _fragment_symbols(frag)
+        emo_vec = _emotion_vector_from_fragment(frag)
+        emo_sim = cosine_similarity(emotion_vector, emo_vec)
+        symbol_overlap = _overlap_score(recent_symbols, frag_symbols)
+
+        frag_ts = entry.get("timestamp")
+        if frag_ts is None:
+            frag_ts = now_ts
+        age = max(0.0, now_ts - frag_ts)
+        recency = math.exp(-age / recency_half_life) if recency_half_life else 0.0
+
+        cluster_freq = cluster_counts.get(entry["cluster_key"], 1) / total
+        novelty = 1.0 - cluster_freq
+        unresolved = _unresolved_intensity(frag)
+        risk = entry.get("risk", 0.0)
+
+        bytes_cost = entry.get("bytes", 0)
+        cost_penalty = min(bytes_cost / max(cost_scale, 1), 1.0) if bytes_cost else 0.0
+
+        if mode == "dream" and risk > config["dream_risk_max"]:
+            continue
+        if mode == "dream" and config.get("dream_cost_max_bytes") and bytes_cost > config["dream_cost_max_bytes"]:
+            continue
+        if risk > config["risk_max"]:
+            continue
+
+        contrib = {
+            "emotion_sim": weights["emotion"] * emo_sim,
+            "symbol_overlap": weights["symbol"] * symbol_overlap,
+            "recency": weights["recency"] * recency,
+            "novelty": weights["novelty"] * novelty,
+            "unresolved": weights["unresolved"] * unresolved,
+            "cost": -weights["cost"] * cost_penalty,
+            "risk": -weights["risk"] * risk,
+        }
+        score = sum(contrib.values())
+        score = _clamp(score, -5.0, 5.0)
+        scored.append({
+            **entry,
+            "score": score,
+            "features": {
+                "emotion_sim": emo_sim,
+                "symbol_overlap": symbol_overlap,
+                "recency": recency,
+                "novelty": novelty,
+                "unresolved": unresolved,
+                "cost_penalty": cost_penalty,
+                "risk": risk,
+            },
+            "contrib": contrib,
+        })
+    return scored
+
+
+def _select_with_lanes(
+    scored: List[Dict[str, Any]],
+    *,
+    limit: int,
+    temperature: float,
+    config: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    if not scored or limit <= 0:
+        return [], {"guided": 0, "novelty": 0, "wild": 0}
+    if limit >= len(scored):
+        return scored[:limit], {"guided": len(scored), "novelty": 0, "wild": 0}
+
+    lane_weights = config["lane_weights"]
+    guided_target = int(round(limit * lane_weights.get("guided", 0.7)))
+    novelty_target = int(round(limit * lane_weights.get("novelty", 0.2)))
+    wild_target = max(0, limit - guided_target - novelty_target)
+
+    guided_probs = _softmax([item["score"] for item in scored], temperature)
+    guided = _weighted_sample(scored, guided_probs, guided_target)
+
+    remaining = [item for item in scored if item not in guided]
+    novelty_weights = [item["features"]["novelty"] for item in remaining]
+    novelty = _weighted_sample(remaining, novelty_weights, novelty_target)
+
+    remaining = [item for item in remaining if item not in novelty]
+    wild = random.sample(remaining, min(wild_target, len(remaining))) if remaining else []
+
+    selected = guided + novelty + wild
+    if len(selected) < limit and remaining:
+        refill = [item for item in remaining if item not in wild]
+        selected.extend(refill[: max(0, limit - len(selected))])
+    lane_counts = {"guided": len(guided), "novelty": len(novelty), "wild": len(wild)}
+    return selected[:limit], lane_counts
+
+
+def _log_selector_audit(child: str, payload: Dict[str, Any]) -> None:
+    path = Path("AI_Children") / child / "memory" / "neural_selector_log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def select_fragments_for_neural_map(
+    child: str,
+    limit: int,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+    known_fragments: Optional[Set[str]] = None,
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    config = _selector_config(cfg)
+    if not config.get("enabled", True):
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "disabled"}
+
+    index_path = Path("AI_Children") / child / "memory" / "memory_map.json"
+    if not index_path.exists():
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "fallback"}
+    try:
+        with index_path.open("r", encoding="utf-8") as fh:
+            index = json.load(fh)
+    except Exception:
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "fallback"}
+    if not isinstance(index, dict) or not index:
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "fallback"}
+
+    inastate = _load_inastate(child)
+    mode = _mode_from_state(inastate)
+    emotion_vector = _emotion_vector_from_state(inastate)
+    recent_symbols = _collect_recent_symbol_ids(inastate)
+
+    selector_state = _load_selector_state(child)
+    now_ts = time.time()
+    cooldown_seconds = config["cooldown_seconds"]
+    recent_entries = selector_state.get("recent") or []
+    recent_ids: Set[str] = set()
+    pruned_recent = []
+    for entry in recent_entries:
+        if not isinstance(entry, dict):
+            continue
+        frag_id = entry.get("id")
+        ts = _safe_float(entry.get("ts"), 0.0)
+        if not frag_id:
+            continue
+        if cooldown_seconds and (now_ts - ts) > cooldown_seconds:
+            continue
+        recent_ids.add(str(frag_id))
+        pruned_recent.append({"id": str(frag_id), "ts": ts})
+
+    pool_max = max(config["candidate_pool_max"], max(1, limit) * 6)
+    cost_max = config.get("cost_max_bytes")
+    if mode == "dream" and config.get("dream_cost_max_bytes"):
+        cost_max = min(cost_max or config["dream_cost_max_bytes"], config["dream_cost_max_bytes"])
+
+    candidate_ids = _candidate_pool_from_index(
+        child,
+        index,
+        pool_max=pool_max,
+        blocked_tags=config.get("blocked_tags", []),
+        recent_ids=recent_ids,
+        known_fragments=known_fragments,
+        cost_max_bytes=cost_max,
+    )
+    if not candidate_ids:
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "fallback"}
+
+    candidates: List[Dict[str, Any]] = []
+    for frag_id in candidate_ids:
+        meta = index.get(frag_id, {}) if isinstance(index, dict) else {}
+        path = _resolve_index_path(child, frag_id, meta)
+        if path is None:
+            continue
+        fragment = _load_fragment_from_path(path)
+        if not fragment:
+            continue
+        frag_ts = _parse_iso_timestamp(fragment.get("timestamp"))
+        if frag_ts is None:
+            try:
+                frag_ts = path.stat().st_mtime
+            except OSError:
+                frag_ts = now_ts
+        candidates.append({
+            "fragment": fragment,
+            "fragment_id": frag_id,
+            "timestamp": frag_ts,
+            "bytes": _safe_float(path.stat().st_size, 0.0) if path.exists() else 0.0,
+            "risk": _risk_level(fragment),
+        })
+
+    scored = _score_candidates(
+        candidates,
+        emotion_vector=emotion_vector,
+        recent_symbols=recent_symbols,
+        now_ts=now_ts,
+        config=config,
+        mode=mode,
+    )
+    if not scored:
+        fragments, total = load_fragments(child, limit=limit)
+        return fragments, total, {"mode": "fallback"}
+
+    stress = _safe_float((inastate.get("emotion_snapshot") or {}).get("values", {}).get("stress"), 0.0)
+    clarity = _safe_float((inastate.get("emotion_snapshot") or {}).get("values", {}).get("clarity"), 0.0)
+    energy = _safe_float(inastate.get("current_energy"), 0.5)
+
+    temperature = _safe_float(config["temperature"], 0.85)
+    if energy < config["energy_low"]:
+        temperature *= 0.7
+    if stress > config["stress_high"]:
+        temperature *= 0.7
+    if clarity < config["clarity_low"]:
+        temperature *= 0.85
+    if mode == "boredom":
+        temperature *= 1.2
+    if mode == "dream":
+        temperature *= 1.6
+    if mode == "meditation":
+        temperature *= 0.85
+    temperature = _clamp(temperature, config["temperature_min"], config["temperature_max"])
+
+    selected, lane_counts = _select_with_lanes(
+        scored,
+        limit=limit,
+        temperature=temperature,
+        config=config,
+    )
+
+    selected_ids = [item["fragment_id"] for item in selected]
+    if selected_ids:
+        for frag_id in selected_ids:
+            pruned_recent.append({"id": frag_id, "ts": now_ts})
+        if config["cooldown_max"]:
+            pruned_recent = pruned_recent[-config["cooldown_max"] :]
+        selector_state["recent"] = pruned_recent
+        selector_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_selector_state(child, selector_state)
+
+    audit = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "temperature": round(temperature, 4),
+        "limit": limit,
+        "pool": len(candidate_ids),
+        "scored": len(scored),
+        "lane_counts": lane_counts,
+        "selected_ids": selected_ids[: min(10, len(selected_ids))],
+        "energy": round(energy, 4),
+        "stress": round(stress, 4),
+        "clarity": round(clarity, 4),
+    }
+    top_contrib = []
+    for item in selected[: min(5, len(selected))]:
+        contrib = item.get("contrib", {})
+        sorted_terms = sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True)
+        top_contrib.append({
+            "fragment_id": item.get("fragment_id"),
+            "top_terms": [(term, round(val, 4)) for term, val in sorted_terms[:3]],
+        })
+    audit["top_contributors"] = top_contrib
+    _log_selector_audit(child, audit)
+
+    slim_fragments = []
+    for item in selected:
+        slim = _slim_fragment(item["fragment"])
+        if slim:
+            slim_fragments.append(slim)
+
+    return slim_fragments, len(index), audit
 
 
 # === Spatial helpers (body schema → neural positions) ===
@@ -755,16 +1446,25 @@ def build_fractal_memory(child):
     neurons = existing_map.get("neurons", []) if incremental else []
     known_fragments = _existing_fragment_ids(neurons) if incremental else set()
 
-    fragments, total_count = load_fragments(child, limit=burst_limit)
+    fragments, total_count, selector_meta = select_fragments_for_neural_map(
+        child,
+        burst_limit,
+        cfg=cfg,
+        known_fragments=known_fragments if incremental else None,
+    )
     if not fragments:
         log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
         return
     if total_count > len(fragments):
         log_to_statusbox(
-            f"[NeuralMap] Limiting to {len(fragments)} recent fragments (burst={burst_limit}, total={total_count})."
+            f"[NeuralMap] Limiting to {len(fragments)} selected fragments (burst={burst_limit}, total={total_count})."
         )
     else:
         log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
+    if selector_meta.get("mode") not in {"fallback", "disabled"}:
+        log_to_statusbox(
+            f"[NeuralMap] Selector lanes={selector_meta.get('lane_counts')} temp={selector_meta.get('temperature')} mode={selector_meta.get('mode')}."
+        )
 
     target_fragments = [
         frag for frag in fragments if not incremental or frag.get("id") not in known_fragments

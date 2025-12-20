@@ -7,6 +7,7 @@ import uuid
 import threading
 import os
 import random
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,7 @@ _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
 TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
 _SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"
 _FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
+_INASTATE_LOCK_PATH = MEMORY_PATH / "inastate.lock"
 
 _DEFAULT_SELF_READ_SOURCE_CHOICES = {
     "code": True,
@@ -55,6 +57,8 @@ intuition_engine = QuantumIntuitionEngine(CHILD)
 _last_opportunities = set()
 _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
+_last_paint_launch = 0.0
+_PAINT_COOLDOWN = 600  # seconds
 _last_self_read_launch = 0.0
 _SELF_READ_COOLDOWN = 300  # seconds
 _last_voice_urge_log = 0.0
@@ -159,6 +163,29 @@ def _active_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+@contextmanager
+def _inastate_lock():
+    try:
+        import fcntl  # Unix-only; best-effort on other platforms.
+    except Exception:
+        yield
+        return
+    _INASTATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_INASTATE_LOCK_PATH, "w") as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        except Exception:
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
 def _load_inastate_state() -> Dict[str, Any]:
     path = MEMORY_PATH / "inastate.json"
     if not path.exists():
@@ -242,25 +269,28 @@ def get_inastate(key, default=None):
 
 
 def update_inastate(key, value):
-    state = _load_inastate_state()
-    state[key] = value
-    _atomic_write_inastate(state)
+    with _inastate_lock():
+        state = _load_inastate_state()
+        state[key] = value
+        _atomic_write_inastate(state)
 
 
 def increment_inastate_metric(metric: str, amount: int = 1):
-    state = _load_inastate_state()
-    metrics = state.get("metrics", {})
-    metrics[metric] = int(metrics.get(metric, 0)) + int(amount)
-    state["metrics"] = metrics
-    _atomic_write_inastate(state)
+    with _inastate_lock():
+        state = _load_inastate_state()
+        metrics = state.get("metrics", {})
+        metrics[metric] = int(metrics.get(metric, 0)) + int(amount)
+        state["metrics"] = metrics
+        _atomic_write_inastate(state)
 
 
 def set_inastate_metric(metric: str, value):
-    state = _load_inastate_state()
-    metrics = state.get("metrics", {})
-    metrics[metric] = value
-    state["metrics"] = metrics
-    _atomic_write_inastate(state)
+    with _inastate_lock():
+        state = _load_inastate_state()
+        metrics = state.get("metrics", {})
+        metrics[metric] = value
+        state["metrics"] = metrics
+        _atomic_write_inastate(state)
 
 
 def append_typed_outbox_entry(
@@ -1571,6 +1601,75 @@ def boredom_check():
         update_inastate("last_boredom_trigger", datetime.fromtimestamp(now, timezone.utc).isoformat())
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
+
+def paint_check():
+    global _last_paint_launch
+    if get_inastate("paint_window_open"):
+        return
+
+    now = time.time()
+    if (now - _last_paint_launch) < _PAINT_COOLDOWN:
+        return
+
+    if get_inastate("paint_request"):
+        update_inastate("paint_request", False)
+        _last_paint_launch = now
+        safe_popen(["python", "paint_window.py"])
+        update_inastate(
+            "last_paint_trigger",
+            {
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "reason": "request",
+            },
+        )
+        log_to_statusbox("[Manager] Paint window opened (request).")
+        return
+
+    if get_inastate("dreaming") or get_inastate("meditating"):
+        return
+
+    snapshot = get_inastate("emotion_snapshot") or {}
+    emo = snapshot.get("values") or snapshot
+    curiosity = float(emo.get("curiosity", 0.0) or 0.0)
+    joy = float(emo.get("joy", 0.0) or 0.0)
+    stress = float(emo.get("stress", 0.0) or 0.0)
+    boredom = float(get_inastate("emotion_boredom") or 0.0)
+
+    playfulness = get_inastate("emotion_playfulness_level")
+    if playfulness is None:
+        playfulness = (get_inastate("emotion_playfulness_state") or {}).get("value", 0.0)
+    playfulness = float(playfulness or 0.0)
+
+    creative_trigger = (
+        (curiosity > 0.55 and stress < 0.35 and (joy > 0.2 or playfulness > 0.08))
+        or (playfulness > 0.2 and stress < 0.25)
+        or (boredom > 0.7 and curiosity > 0.4)
+    )
+
+    if not creative_trigger:
+        return
+
+    _last_paint_launch = now
+    safe_popen(["python", "paint_window.py"])
+    update_inastate(
+        "last_paint_trigger",
+        {
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "reason": "creative_urge",
+            "drivers": {
+                "curiosity": round(curiosity, 3),
+                "joy": round(joy, 3),
+                "playfulness": round(playfulness, 3),
+                "stress": round(stress, 3),
+                "boredom": round(boredom, 3),
+            },
+        },
+    )
+    log_to_statusbox(
+        "[Manager] Creative urge triggered paint "
+        f"(curiosity={curiosity:.2f}, joy={joy:.2f}, play={playfulness:.2f}, stress={stress:.2f})."
+    )
+
 def _maybe_self_read():
     """
     Launch self-reading when curiosity spikes, clarity drops (confused), or
@@ -2303,6 +2402,7 @@ def run_internal_loop():
         safe_popen(["python", "logic_engine.py"])
 
     boredom_check()
+    paint_check()
     _maybe_self_read()
     rebuild_maps_if_needed()
     _check_self_adjustment()
