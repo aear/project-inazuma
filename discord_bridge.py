@@ -34,6 +34,18 @@ try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
     LMStudioAdapter = None  # type: ignore
+try:
+    from PIL import Image
+except Exception:
+    Image = None  # type: ignore
+try:
+    import numpy as np
+except Exception:
+    np = None  # type: ignore
+try:
+    from transformers.fractal_multidimensional_transformers import FractalTransformer
+except Exception:
+    FractalTransformer = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Basic logging setup
@@ -46,6 +58,17 @@ logging.basicConfig(
 logger = logging.getLogger("discord_bridge")
 CONFIG_PATH = Path("config.json")
 _CHAT_ADAPTER = None
+IMAGE_ATTACHMENT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+IMAGE_ATTACHMENT_MIME_MAP = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
+DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT = 4
 
 
 def _load_discord_sinks():
@@ -224,6 +247,130 @@ def _extract_tokens(text: str):
     return [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text or "")]
 
 
+def _clean_content_type(content_type):
+    if not content_type:
+        return None
+    return content_type.split(";", 1)[0].strip().lower() or None
+
+
+def _resolve_image_extension(filename, content_type):
+    ext = Path(filename or "").suffix.lower()
+    if ext in IMAGE_ATTACHMENT_EXTENSIONS:
+        return ext
+    cleaned = _clean_content_type(content_type)
+    if cleaned in IMAGE_ATTACHMENT_MIME_MAP:
+        return IMAGE_ATTACHMENT_MIME_MAP[cleaned]
+    if cleaned and cleaned.startswith("image/") and ext:
+        return ext
+    return None
+
+
+def _sanitize_attachment_basename(filename):
+    base = Path(filename or "").stem.strip()
+    if not base:
+        base = "image"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    safe = safe.strip("._-")
+    return (safe or "image")[:64]
+
+
+def _resolve_attachment_dir(child, cfg):
+    raw = cfg.get("image_attachment_dir") or cfg.get("attachment_dir") or cfg.get("attachments_dir")
+    if raw:
+        return Path(raw)
+    return Path("AI_Children") / child / "memory" / "discord_attachments"
+
+
+def _resolve_attachment_limit(cfg):
+    raw = (
+        cfg.get("image_attachment_max_mb")
+        or cfg.get("attachment_max_mb")
+        or cfg.get("attachment_max_size_mb")
+    )
+    if raw is None:
+        return DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
+    try:
+        limit = int(float(raw) * 1024 * 1024)
+        return limit if limit > 0 else DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
+    except Exception:
+        logger.warning("Invalid discord image attachment max size; using default.")
+        return DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
+
+
+def _resolve_attachment_count(cfg):
+    raw = cfg.get("max_image_attachments")
+    if raw is None:
+        return DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT
+    try:
+        return max(0, int(raw))
+    except Exception:
+        logger.warning("Invalid discord max_image_attachments value; using default.")
+        return DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT
+
+
+def _format_image_attachment_note(attachments):
+    if not attachments:
+        return ""
+    names = []
+    for entry in attachments:
+        name = entry.get("original_filename") or entry.get("filename")
+        if name:
+            names.append(str(name))
+    if not names:
+        return f"[Image attachment(s): {len(attachments)}]"
+    if len(names) > 4:
+        shown = ", ".join(names[:4])
+        return f"[Image attachment(s): {shown}, +{len(names) - 4} more]"
+    return f"[Image attachment(s): {', '.join(names)}]"
+
+
+def _save_fragment(child, fragment):
+    frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{fragment['id']}.json"
+    frag_path.parent.mkdir(parents=True, exist_ok=True)
+    with frag_path.open("w", encoding="utf-8") as fh:
+        json.dump(fragment, fh, indent=4)
+
+
+def _build_discord_image_fragment(
+    *,
+    path: Path,
+    child: str,
+    fragment_id: str,
+    tags: list[str],
+    summary: str,
+    source_context: dict,
+    rel_path: Optional[str],
+):
+    if Image is None or np is None or FractalTransformer is None:
+        logger.warning("Image processing unavailable; check pillow/numpy imports and transformer availability.")
+        return None
+    try:
+        with Image.open(path) as img:
+            array = np.array(img.convert("L")).flatten().tolist()
+    except Exception:
+        logger.exception("Failed to open image attachment at %s", path)
+        return None
+    if not array:
+        return None
+    fragment = {
+        "id": fragment_id,
+        "summary": summary,
+        "tags": list(dict.fromkeys(tags)),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "discord_attachment",
+        "modality": "image",
+        "image_features": array[:1024],
+        "image_path": rel_path or str(path),
+        "emotions": {"curiosity": 0.3, "focus": 0.3},
+        "source_context": source_context,
+    }
+    transformer = FractalTransformer()
+    vec = transformer.encode_image_fragment(fragment)
+    fragment["importance"] = vec.get("importance")
+    _save_fragment(child, fragment)
+    return fragment
+
+
 def _log_raw_outbound(msg):
     """
     Raw fallback: log outbound text when Discord send is unavailable.
@@ -346,6 +493,14 @@ def process_inbound_message(msg) -> CommsResponse:
         )
 
     child = get_current_child()
+    user_text = msg.text or ""
+    attachments = []
+    if msg.metadata:
+        attachments = msg.metadata.get("image_attachments") or []
+    attachment_note = _format_image_attachment_note(attachments)
+    prompt_text = user_text
+    if attachment_note:
+        prompt_text = f"{user_text}\n\n{attachment_note}" if user_text.strip() else attachment_note
 
     # Give Ina the option to stay silent based on her urge to type/communicate.
     root_cfg: dict = {}
@@ -380,9 +535,9 @@ def process_inbound_message(msg) -> CommsResponse:
     adapter = get_chat_adapter()
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
 
-    tokens = _extract_tokens(msg.text)
+    tokens = _extract_tokens(user_text)
     symbolic = generate_symbolic_reply_from_text(
-        msg.text,
+        user_text,
         child=child,
         base_path=Path("AI_Children"),
         max_symbols=4,
@@ -397,7 +552,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 "unknown_words": symbolic.get("unknown"),
             }
         )
-        if not symbolic_unknown:
+        if not symbolic_unknown and not attachments:
             return CommsResponse(text=symbolic_text, metadata=metadata)
 
     if adapter:
@@ -434,7 +589,7 @@ def process_inbound_message(msg) -> CommsResponse:
                     metadata["symbolic_hint"] = symbolic_text
             else:
                 reply_text = adapter.handle_prompt(
-                    msg.text,
+                    prompt_text,
                     speaker=msg.sender.display_name or msg.sender.internal_id,
                     tags=["discord", "text"],
                     entity_links=entity_links,
@@ -444,8 +599,16 @@ def process_inbound_message(msg) -> CommsResponse:
         except Exception:
             logger.exception("LMStudioAdapter failed; falling back to echo.")
 
+    if attachments:
+        metadata["image_attachment_count"] = len(attachments)
+        metadata["image_attachment_names"] = [
+            name
+            for name in (entry.get("original_filename") or entry.get("filename") for entry in attachments)
+            if name
+        ]
+
     if not reply_text:
-        reply_text = f"{INA_INSTANCE_NAME}: {msg.text}"
+        reply_text = f"{INA_INSTANCE_NAME}: {prompt_text}"
 
     return CommsResponse(
         text=reply_text,
@@ -557,7 +720,14 @@ class InaDiscordClient(discord.Client):
             if lower in VOICE_JOIN_COMMANDS:
                 await self._handle_voice_join(message)
                 return
-            self._route_to_comms(message, is_dm=True, owner_friend=owner_friend, high_trust=high_trust)
+            image_attachments = await self._ingest_image_attachments(message)
+            self._route_to_comms(
+                message,
+                is_dm=True,
+                owner_friend=owner_friend,
+                high_trust=high_trust,
+                image_attachments=image_attachments,
+            )
             return
 
         # Guild messages: only handle those in the configured text channel
@@ -579,7 +749,8 @@ class InaDiscordClient(discord.Client):
             return
 
         logger.info("Inbound guild message in text channel %s: %s", message.channel.id, content)
-        self._route_to_comms(message, is_dm=False)
+        image_attachments = await self._ingest_image_attachments(message)
+        self._route_to_comms(message, is_dm=False, image_attachments=image_attachments)
 
     async def _handle_voice_join(self, message: discord.Message) -> None:
         target_channel = self.voice_channel
@@ -636,6 +807,127 @@ class InaDiscordClient(discord.Client):
             await asyncio.sleep(1.0)
             await _attempt_join("after reset")
 
+    async def _ingest_image_attachments(self, message: discord.Message) -> list[dict]:
+        cfg = get_discord_config()
+        if isinstance(cfg, dict):
+            allow_images = cfg.get("allow_image_attachments")
+            if allow_images is None:
+                allow_images = cfg.get("allow_attachments")
+            if allow_images is False:
+                return []
+
+        attachments = list(message.attachments or [])
+        if not attachments:
+            return []
+
+        child = get_current_child()
+        attachment_dir = _resolve_attachment_dir(child, cfg)
+        max_images = _resolve_attachment_count(cfg)
+        max_bytes = _resolve_attachment_limit(cfg)
+        if max_images == 0:
+            return []
+
+        can_process = Image is not None and np is not None and FractalTransformer is not None
+        saved: list[dict] = []
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        for idx, attachment in enumerate(attachments):
+            if max_images and len(saved) >= max_images:
+                break
+
+            content_type = _clean_content_type(getattr(attachment, "content_type", None))
+            ext = _resolve_image_extension(getattr(attachment, "filename", ""), content_type)
+            if not ext:
+                continue
+
+            if attachment.size and max_bytes and attachment.size > max_bytes:
+                logger.info(
+                    "Skipping image attachment %s (%s bytes > %s limit).",
+                    attachment.filename,
+                    attachment.size,
+                    max_bytes,
+                )
+                continue
+
+            safe_base = _sanitize_attachment_basename(getattr(attachment, "filename", ""))
+            safe_name = f"{message.id}_{idx}_{safe_base}{ext}"
+            dest_path = attachment_dir / safe_name
+            try:
+                data = await attachment.read()
+            except Exception:
+                logger.exception("Failed to read Discord attachment %s", attachment.filename)
+                continue
+
+            if max_bytes and len(data) > max_bytes:
+                logger.info(
+                    "Skipping image attachment %s (%s bytes > %s limit).",
+                    attachment.filename,
+                    len(data),
+                    max_bytes,
+                )
+                continue
+
+            try:
+                dest_path.write_bytes(data)
+            except Exception:
+                logger.exception("Failed to save Discord attachment to %s", dest_path)
+                continue
+
+            memory_root = Path("AI_Children") / child / "memory"
+            try:
+                rel_path = str(dest_path.relative_to(memory_root))
+            except ValueError:
+                rel_path = str(dest_path)
+
+            source_context = {
+                "discord_message_id": str(message.id),
+                "discord_author_id": str(message.author.id),
+                "discord_channel_id": str(message.channel.id),
+                "discord_guild_id": str(message.guild.id) if message.guild else None,
+                "attachment": {
+                    "original_filename": attachment.filename,
+                    "content_type": content_type,
+                    "size_bytes": len(data),
+                },
+            }
+            tags = ["discord", "image", "attachment", "inbound"]
+            tags.append("dm" if message.guild is None else "guild")
+            author_name = (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "global_name", None)
+                or getattr(message.author, "name", None)
+                or str(message.author)
+            )
+            summary_name = attachment.filename or dest_path.name
+            summary = f"Discord image attachment from {author_name}: {summary_name}"
+            fragment_id = f"frag_discord_image_{message.id}_{idx}"
+            fragment = None
+            if can_process:
+                fragment = await asyncio.to_thread(
+                    _build_discord_image_fragment,
+                    path=dest_path,
+                    child=child,
+                    fragment_id=fragment_id,
+                    tags=tags,
+                    summary=summary,
+                    source_context=source_context,
+                    rel_path=rel_path,
+                )
+            if fragment:
+                logger.info("Discord image stored as fragment %s (%s).", fragment.get("id"), dest_path.name)
+            saved.append(
+                {
+                    "filename": dest_path.name,
+                    "original_filename": attachment.filename,
+                    "content_type": content_type,
+                    "size_bytes": len(data),
+                    "saved_path": str(dest_path),
+                    "relative_path": rel_path,
+                    "fragment_id": fragment.get("id") if fragment else None,
+                }
+            )
+
+        return saved
+
     def _route_to_comms(
         self,
         message: discord.Message,
@@ -643,6 +935,7 @@ class InaDiscordClient(discord.Client):
         is_dm: bool,
         owner_friend: bool = False,
         high_trust: bool = False,
+        image_attachments: Optional[list[dict]] = None,
     ) -> None:
         sender = make_sender_info_from_discord(message, backend_name=BACKEND_NAME)
         channel = make_channel_info_from_discord(message, backend_name=BACKEND_NAME)
@@ -653,6 +946,9 @@ class InaDiscordClient(discord.Client):
             "is_owner_friend": owner_friend,
             "is_high_trust": high_trust,
         }
+        if image_attachments:
+            metadata["image_attachments"] = image_attachments
+            metadata["image_attachment_count"] = len(image_attachments)
         if message.guild:
             metadata["discord_guild_id"] = str(message.guild.id)
 

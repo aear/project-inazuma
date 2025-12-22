@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import math
 
 # Basic vector aliases
@@ -131,6 +131,7 @@ class ExteriorModel:
     garden_color: Color
     garden_normal: Vec3
     fences: List["FenceSegment"]
+    spawn_point: Optional[Vec3] = None
 
 
 @dataclass
@@ -226,6 +227,13 @@ def load_house_from_plan(path: str = "ina_house_plan.json") -> Tuple[House, Exte
             color=tuple(fence.get("color", (1.0, 1.0, 1.0, 1.0))),
         ))
 
+    # Spawn point
+    spawn_point = None
+    spawn = storey.get("spawn", {})
+    position = spawn.get("position")
+    if position and len(position) >= 3:
+        spawn_point = (float(position[0]), float(position[1]), float(position[2]))
+
     exterior = ExteriorModel(
         footprint=footprint,
         walls=walls,
@@ -238,6 +246,7 @@ def load_house_from_plan(path: str = "ina_house_plan.json") -> Tuple[House, Exte
         garden_color=garden_color,
         garden_normal=garden_normal,
         fences=fences,
+        spawn_point=spawn_point,
     )
 
     # Interior rooms

@@ -15,6 +15,8 @@ import bz2
 import lzma
 import uuid
 import fnmatch
+import random
+import xml.etree.ElementTree as ET
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,9 +41,17 @@ except Exception as e:  # pragma: no cover - import guard
     generate_fragment = None
     _AUDIO_DIGEST_IMPORT_ERROR = e
 
+_PDF_IMPORT_ERROR = None
+try:
+    import fitz  # type: ignore
+except Exception as e:  # pragma: no cover - optional dependency
+    fitz = None
+    _PDF_IMPORT_ERROR = e
+
 
 FRAG_LIMIT = 1000
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
+DOCUMENT_EXTENSIONS = {".pdf", ".odt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".webm"}
@@ -49,6 +59,7 @@ SIMPLE_COMPRESSED_EXTENSIONS = {".gz", ".bz2", ".xz"}
 
 FILE_SIZE_LIMITS = {
     "text": 5 * 1024 * 1024,        # 5 MB
+    "document": 50 * 1024 * 1024,   # 50 MB
     "image": 25 * 1024 * 1024,      # 25 MB
     "audio": 75 * 1024 * 1024,      # 75 MB
     "video": 800 * 1024 * 1024,     # 800 MB
@@ -60,6 +71,7 @@ ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
 SELF_READ_PREF_FILENAME = "self_read_preferences.json"
 SELF_READ_SKIP_REQUESTS = "self_read_skip_requests.json"
 VALID_SOURCE_KEYS = {"code", "music", "books", "venv"}
+SELF_READ_SOURCE_ENV = "SELF_READ_SOURCE"
 
 DEFAULT_SELF_READ_PREFS = {
     "source_choices": {
@@ -104,6 +116,17 @@ def _default_self_read_prefs():
         "source_choices": dict(DEFAULT_SELF_READ_PREFS["source_choices"]),
         "skip_files": list(DEFAULT_SELF_READ_PREFS["skip_files"]),
     }
+
+
+def _load_self_read_source_override():
+    value = os.getenv(SELF_READ_SOURCE_ENV)
+    if not value:
+        return None
+    source = value.strip().lower()
+    if source in VALID_SOURCE_KEYS:
+        return source
+    log_to_statusbox(f"[SelfRead] Ignoring invalid {SELF_READ_SOURCE_ENV} '{value}'.")
+    return None
 
 
 def _self_read_pref_path(child):
@@ -390,6 +413,8 @@ def classify_suffixes(suffixes):
     ext = suffixes[-1].lower()
     if ext in TEXT_EXTENSIONS:
         return "text"
+    if ext in DOCUMENT_EXTENSIONS:
+        return "document"
     if ext in IMAGE_EXTENSIONS:
         return "image"
     if ext in AUDIO_EXTENSIONS:
@@ -456,6 +481,201 @@ def log_reflection(child, fragment):
 
     with open(path, "w") as f:
         json.dump(reflection, f, indent=4)
+
+def _normalize_document_text(text):
+    if not text:
+        return ""
+    cleaned = text.replace("\x00", " ")
+    return " ".join(cleaned.split())
+
+
+def _document_chunk_starts(length, chunk_size, max_chunks, seed):
+    if length <= chunk_size:
+        return [0]
+    if length <= chunk_size * max_chunks:
+        return list(range(0, length, chunk_size))[:max_chunks]
+
+    rng = random.Random(seed)
+    starts = {
+        0,
+        max(0, (length // 2) - (chunk_size // 2)),
+        max(0, length - chunk_size),
+    }
+    while len(starts) < max_chunks:
+        starts.add(rng.randint(0, length - chunk_size))
+    return sorted(starts)[:max_chunks]
+
+
+def _document_chunks(text, source, chunk_size=400, max_chunks=5):
+    cleaned = _normalize_document_text(text)
+    if not cleaned:
+        return []
+    seed = hash(source) & 0xFFFFFFFF
+    starts = _document_chunk_starts(len(cleaned), chunk_size, max_chunks, seed)
+    return [cleaned[start:start + chunk_size] for start in starts]
+
+
+def _limit_text(text, limit):
+    if not text:
+        return ""
+    if limit and len(text) > limit:
+        return text[:limit]
+    return text
+
+
+def _extract_pdf_text(path, *, max_pages=10, max_chars=12000):
+    if fitz is None:
+        log_to_statusbox(f"[RawFileManager] PDF support unavailable: {_PDF_IMPORT_ERROR}")
+        return ""
+    try:
+        total = 0
+        parts = []
+        with fitz.open(path) as doc:
+            for index, page in enumerate(doc):
+                if index >= max_pages:
+                    break
+                text = page.get_text("text") or ""
+                if not text:
+                    continue
+                parts.append(text)
+                total += len(text)
+                if total >= max_chars:
+                    break
+        return _limit_text("".join(parts), max_chars)
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to read PDF {path}: {e}")
+        return ""
+
+
+def _extract_pdf_text_bytes(data, source_label, *, max_pages=10, max_chars=12000):
+    if fitz is None:
+        log_to_statusbox(f"[RawFileManager] PDF support unavailable: {_PDF_IMPORT_ERROR}")
+        return ""
+    try:
+        total = 0
+        parts = []
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            for index, page in enumerate(doc):
+                if index >= max_pages:
+                    break
+                text = page.get_text("text") or ""
+                if not text:
+                    continue
+                parts.append(text)
+                total += len(text)
+                if total >= max_chars:
+                    break
+        return _limit_text("".join(parts), max_chars)
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to read PDF {source_label}: {e}")
+        return ""
+
+
+def _extract_odt_text_bytes(data, source_label, *, max_chars=12000):
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if "content.xml" not in archive.namelist():
+                log_to_statusbox(f"[RawFileManager] ODT missing content.xml: {source_label}")
+                return ""
+            raw = archive.read("content.xml")
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to read ODT {source_label}: {e}")
+        return ""
+
+    try:
+        root = ET.fromstring(raw)
+        text = " ".join(root.itertext())
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to parse ODT {source_label}: {e}")
+        return ""
+
+    return _limit_text(text, max_chars)
+
+
+def _extract_odt_text(path, *, max_chars=12000):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        log_to_statusbox(f"[RawFileManager] Failed to read ODT {path}: {e}")
+        return ""
+    return _extract_odt_text_bytes(data, str(path), max_chars=max_chars)
+
+
+def fragment_document_text(text, source, transformer, doc_type=None):
+    chunks = _document_chunks(text, source)
+    if not chunks:
+        return []
+
+    fragments = []
+    for chunk in chunks:
+        frag_id = f"frag_text_{uuid.uuid4().hex[:10]}"
+        tags = ["text", "self_read", "document"]
+        if doc_type:
+            tags.append(doc_type)
+        tags = list(dict.fromkeys(tags))
+
+        summary = f"Excerpt from {Path(source).name}: {chunk}"
+        frag = {
+            "id": frag_id,
+            "modality": "text",
+            "summary": summary,
+            "text": chunk,
+            "length": len(chunk),
+            "tags": tags,
+            "source": source,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "emotions": {"curiosity": 0.55, "focus": 0.35}
+        }
+        vec = transformer.encode(frag)
+        frag["importance"] = vec["importance"]
+        try:
+            update_text_vocab(
+                chunk,
+                child=child,
+                tags=frag["tags"],
+                emotions=frag.get("emotions"),
+                source="raw_file_manager",
+            )
+        except Exception:
+            pass
+        fragments.append(frag)
+    return fragments
+
+
+def fragment_document(path, transformer):
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        text = _extract_pdf_text(path)
+        doc_type = "pdf"
+    elif ext == ".odt":
+        text = _extract_odt_text(path)
+        doc_type = "odt"
+    else:
+        return []
+
+    if not text:
+        log_to_statusbox(f"[RawFileManager] No text extracted from {path}.")
+        return []
+    return fragment_document_text(text, path.name, transformer, doc_type=doc_type)
+
+
+def fragment_document_bytes(data, source_label, transformer, suffix):
+    ext = suffix.lower()
+    if ext == ".pdf":
+        text = _extract_pdf_text_bytes(data, source_label)
+        doc_type = "pdf"
+    elif ext == ".odt":
+        text = _extract_odt_text_bytes(data, source_label)
+        doc_type = "odt"
+    else:
+        return []
+
+    if not text:
+        log_to_statusbox(f"[RawFileManager] No text extracted from {source_label}.")
+        return []
+    return fragment_document_text(text, source_label, transformer, doc_type=doc_type)
+
 
 def fragment_text(text, source, transformer):
     chunks = [text[i:i+400] for i in range(0, len(text), 400)]
@@ -734,6 +954,9 @@ def _fragments_from_data_buffer(data, inner_path, container_path, category, tran
             text = data.decode("latin-1", errors="ignore")
         return fragment_text(text, source_label, transformer)
 
+    if category == "document":
+        return fragment_document_bytes(data, source_label, transformer, inner_path.suffix)
+
     if category == "image":
         return fragment_image(io.BytesIO(data), transformer, source_label=source_label)
 
@@ -831,62 +1054,80 @@ def self_read_and_train():
     prefs = _apply_skip_requests(child, prefs)
     source_choices = prefs.get("source_choices", DEFAULT_SELF_READ_PREFS["source_choices"])
     skip_patterns = prefs.get("skip_files", [])
+    source_override = _load_self_read_source_override()
+    if source_override and not source_choices.get(source_override, False):
+        log_to_statusbox(f"[SelfRead] Source override '{source_override}' ignored by preference.")
+        source_override = None
 
     raw_history = load_history(child)
     history = {entry for entry in raw_history if "/" in entry}
     legacy_history = {entry for entry in raw_history if "/" not in entry}
     new_fragments = []
 
-    roots = []
-    seen_roots = set()
+    def collect_roots(override):
+        roots = []
+        seen_roots = set()
 
-    def add_root(path, audio_only=False, source_key="code"):
-        if path is None:
-            return
-        try:
-            resolved = path.resolve()
-        except FileNotFoundError:
-            return
-        if resolved in seen_roots:
-            return
-        seen_roots.add(resolved)
-        roots.append((path, audio_only, source_key))
+        def add_root(path, audio_only=False, source_key="code"):
+            if override and source_key != override:
+                return
+            if path is None:
+                return
+            try:
+                resolved = path.resolve()
+            except FileNotFoundError:
+                return
+            if resolved in seen_roots:
+                return
+            seen_roots.add(resolved)
+            roots.append((path, audio_only, source_key))
 
-    if source_choices.get("code", True):
-        if default_root.exists():
-            add_root(default_root, audio_only=False, source_key="code")
+        if source_choices.get("code", True):
+            if default_root.exists():
+                add_root(default_root, audio_only=False, source_key="code")
+            else:
+                log_to_statusbox(f"[SelfRead] Project root not found: {default_root}")
         else:
-            log_to_statusbox(f"[SelfRead] Project root not found: {default_root}")
-    else:
-        log_to_statusbox("[SelfRead] Preference: project code scan disabled.")
+            log_to_statusbox("[SelfRead] Preference: project code scan disabled.")
 
-    if source_choices.get("books", True):
-        if book_folder_path and book_folder_path.exists():
-            add_root(book_folder_path, audio_only=False, source_key="books")
+        if source_choices.get("books", True):
+            if book_folder_path and book_folder_path.exists():
+                add_root(book_folder_path, audio_only=False, source_key="books")
+            elif book_folder_path:
+                log_to_statusbox(f"[SelfRead] Book folder not found: {book_folder_path}")
         elif book_folder_path:
-            log_to_statusbox(f"[SelfRead] Book folder not found: {book_folder_path}")
-    elif book_folder_path:
-        log_to_statusbox("[SelfRead] Preference: book folder skipped by choice.")
+            log_to_statusbox("[SelfRead] Preference: book folder skipped by choice.")
 
-    if source_choices.get("music", True):
-        if music_folder_path and music_folder_path.exists():
-            add_root(music_folder_path, audio_only=True, source_key="music")
+        if source_choices.get("music", True):
+            if music_folder_path and music_folder_path.exists():
+                add_root(music_folder_path, audio_only=True, source_key="music")
+            elif music_folder_path:
+                log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
         elif music_folder_path:
-            log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
-    elif music_folder_path:
-        log_to_statusbox("[SelfRead] Preference: music folder skipped by choice.")
+            log_to_statusbox("[SelfRead] Preference: music folder skipped by choice.")
 
-    if source_choices.get("code", True):
-        if ina_work_path and ina_work_path.exists():
-            add_root(ina_work_path, audio_only=False, source_key="code")
-        elif ina_work_path:
-            log_to_statusbox(f"[SelfRead] Ina work folder not found: {ina_work_path}")
+        if source_choices.get("code", True):
+            if ina_work_path and ina_work_path.exists():
+                add_root(ina_work_path, audio_only=False, source_key="code")
+            elif ina_work_path:
+                log_to_statusbox(f"[SelfRead] Ina work folder not found: {ina_work_path}")
 
-    if source_choices.get("venv", False):
-        if venv_path and venv_path.exists():
-            add_root(venv_path, audio_only=False, source_key="venv")
-        elif venv_path:
-            log_to_statusbox(f"[SelfRead] Virtual environment not found: {venv_path}")
+        if source_choices.get("venv", False):
+            if venv_path and venv_path.exists():
+                add_root(venv_path, audio_only=False, source_key="venv")
+            elif venv_path:
+                log_to_statusbox(f"[SelfRead] Virtual environment not found: {venv_path}")
+
+        return roots
+
+    roots = collect_roots(source_override)
+    if source_override:
+        log_to_statusbox(f"[SelfRead] Source override: {source_override}")
+        if not roots:
+            log_to_statusbox(
+                f"[SelfRead] No roots available for '{source_override}'; falling back to all sources."
+            )
+            roots = collect_roots(None)
 
     log_to_statusbox(f"[SelfRead] Child set to: {child}")
     if roots:
@@ -961,6 +1202,9 @@ def self_read_and_train():
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
                     result = fragment_text(text, path.name, transformer)
+
+                elif category == "document":
+                    result = fragment_document(path, transformer)
 
                 elif category == "image":
                     result = fragment_image(path, transformer)

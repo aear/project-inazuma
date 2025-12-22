@@ -350,6 +350,7 @@ def fragment_audio_digest(
 def fragment_device_log(
     label: str,
     *,
+    child: Optional[str] = None,
     importance: float = 0.05,
     emotions: Optional[Dict[str, float]] = None,
     symbols: Optional[List[str]] = None,
@@ -369,7 +370,8 @@ def fragment_device_log(
 
     We do *not* load the audio; we just build a summary + metadata.
     """
-    child = _current_child()
+    if child is None:
+        child = _current_child()
     log_dir = Path("AI_Children") / child / "memory" / "audio_session"
     log_file = log_dir / f"{label}_log.json"
 

@@ -1670,6 +1670,55 @@ def paint_check():
         f"(curiosity={curiosity:.2f}, joy={joy:.2f}, play={playfulness:.2f}, stress={stress:.2f})."
     )
 
+
+def _get_last_self_read_source() -> Optional[str]:
+    last = get_inastate("last_self_read_source")
+    if isinstance(last, dict):
+        return last.get("source")
+    if isinstance(last, str):
+        return last
+    return None
+
+
+def _pick_self_read_source() -> Optional[str]:
+    state = get_inastate("self_read_exploration_options") or {}
+    options = state.get("options") if isinstance(state, dict) else None
+    if not isinstance(options, list) or not options:
+        return None
+
+    source_choices = _load_self_read_source_choices()
+    last_source = _get_last_self_read_source()
+    candidates = []
+    total_weight = 0.0
+
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        source = option.get("source")
+        if not source or not source_choices.get(source, False):
+            continue
+        try:
+            weight = float(option.get("invitation", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if weight <= 0.0:
+            continue
+        if last_source and source == last_source:
+            weight *= 0.45
+        candidates.append((source, weight))
+        total_weight += weight
+
+    if not candidates or total_weight <= 0.0:
+        return None
+
+    roll = random.random() * total_weight
+    for source, weight in candidates:
+        roll -= weight
+        if roll <= 0:
+            return source
+    return candidates[-1][0]
+
+
 def _maybe_self_read():
     """
     Launch self-reading when curiosity spikes, clarity drops (confused), or
@@ -1716,9 +1765,25 @@ def _maybe_self_read():
             "familiarity": round(familiarity, 3),
         },
     }
+    source_pick = _pick_self_read_source()
+    popen_kwargs = {}
+    if source_pick:
+        trigger["source_pick"] = source_pick
+        update_inastate(
+            "last_self_read_source",
+            {
+                "source": source_pick,
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "reason": reason,
+            },
+        )
+        env = dict(os.environ)
+        env["SELF_READ_SOURCE"] = source_pick
+        popen_kwargs["env"] = env
+        log_to_statusbox(f"[Manager] Self-read source pick: {source_pick}.")
     update_inastate("last_self_read_trigger", trigger)
     log_to_statusbox(f"[Manager] Self-read triggered ({reason}).")
-    safe_popen(["python", "raw_file_manager.py"])
+    safe_popen(["python", "raw_file_manager.py"], **popen_kwargs)
 
 def _update_contact_urges():
     """

@@ -123,7 +123,12 @@ class FractalTransformer:
 
     def encode_image_fragment(self, fragment):
         fragment["modality"] = "image"
-        return self.encode(fragment)
+        vec = self._numeric_embedding(fragment.get("image_features", []))
+        return {
+            "vector": vec,
+            "importance": round(np.mean(np.abs(vec)), 4),
+            "source": "FractalTransformer"
+        }
 
     def encode_video_fragment(self, fragment):
         fragment["modality"] = "video"

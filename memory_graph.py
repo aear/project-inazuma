@@ -16,6 +16,12 @@ from body_schema import get_region_anchors
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
+try:
+    from cold_storage import compact_fragment_file, policy_from_config as cold_policy_from_config
+except Exception:  # pragma: no cover
+    compact_fragment_file = None
+    cold_policy_from_config = None
+
 MEMORY_TIERS = ["short", "working", "long", "cold"]
 
 NEURAL_MAP_BURST_DEFAULT = 60
@@ -135,6 +141,16 @@ def _memory_policy():
                 tier_defaults["target_count"] = target_override
         policy[tier] = tier_defaults
     return policy
+
+
+def _cold_storage_policy() -> Dict[str, Any]:
+    cfg = _load_config()
+    if cold_policy_from_config is None:
+        return {"enabled": False, "auto_compact": False}
+    try:
+        return cold_policy_from_config(cfg)
+    except Exception:
+        return {"enabled": False, "auto_compact": False}
 
 
 EMOTION_SLIDERS: Tuple[str, ...] = (
@@ -420,6 +436,30 @@ def _load_fragment_from_path(path: Path) -> Optional[Dict[str, Any]]:
         if parent_tier in MEMORY_TIERS:
             data["tier"] = parent_tier
     return data
+
+
+def _neighbor_ids(fragment: Dict[str, Any]) -> List[str]:
+    neighbors: List[str] = []
+    for key in ("prev_id", "next_id", "prev", "next"):
+        value = fragment.get(key)
+        if isinstance(value, str) and value:
+            neighbors.append(value)
+        elif isinstance(value, list):
+            neighbors.extend(str(item) for item in value if item)
+    context = fragment.get("context")
+    if isinstance(context, dict):
+        ctx_neighbors = context.get("neighbors") or context.get("neighbor_ids")
+        if isinstance(ctx_neighbors, list):
+            neighbors.extend(str(item) for item in ctx_neighbors if item)
+    return list(dict.fromkeys(neighbors))
+
+
+def _is_compacted_fragment(fragment: Dict[str, Any]) -> bool:
+    if isinstance(fragment.get("cold_core"), dict):
+        return True
+    if fragment.get("cold_compacted_at"):
+        return True
+    return False
 
 
 def _candidate_pool_from_index(
@@ -1547,6 +1587,7 @@ class MemoryManager:
         self.index_path = Path("AI_Children") / child / "memory" / "memory_map.json"
         self.memory_map = {}
         self.policy = tier_policy or _memory_policy()
+        self.cold_storage_policy = _cold_storage_policy()
         self.load_map()
 
     def ensure_tier_directories(self):
@@ -1605,6 +1646,42 @@ class MemoryManager:
             if path.exists():
                 return path
         return None
+
+    def _compact_cold_fragment(
+        self,
+        frag_id: str,
+        meta: Dict[str, Any],
+        path: Path,
+        cold_policy: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            import cold_storage  # type: ignore
+        except Exception:
+            return None
+
+        if not cold_policy.get("enabled", True):
+            return None
+
+        if cold_policy.get("require_index_entry", True):
+            if frag_id not in self.memory_map:
+                return {"fragment_id": frag_id, "status": "skipped", "reason": "index_missing"}
+            resolved = self._resolve_fragment_path(frag_id, meta)
+            if resolved is None or resolved != path:
+                return {"fragment_id": frag_id, "status": "skipped", "reason": "index_unqueryable"}
+
+        fragment = _load_fragment_from_path(path)
+        if not fragment:
+            return {"fragment_id": frag_id, "status": "skipped", "reason": "unreadable"}
+        if _is_compacted_fragment(fragment):
+            return {"fragment_id": frag_id, "status": "skipped", "reason": "already_compacted"}
+
+        if cold_policy.get("require_neighbor_links", True):
+            neighbors = _neighbor_ids(fragment)
+            missing = [nid for nid in neighbors if nid not in self.memory_map]
+            if missing:
+                return {"fragment_id": frag_id, "status": "skipped", "reason": "missing_neighbors"}
+
+        return cold_storage.compact_fragment_file(path, child=self.child, policy=cold_policy)
 
     @staticmethod
     def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -1785,6 +1862,17 @@ class MemoryManager:
 
         self.ensure_tier_directories()
         now = now or datetime.now(timezone.utc)
+        cold_policy = None
+        auto_compact = False
+        purge_pending = False
+        try:
+            import cold_storage  # type: ignore
+
+            cold_policy = cold_storage.policy_from_config(_load_config())
+            auto_compact = bool(cold_policy.get("enabled")) and bool(cold_policy.get("auto_compact"))
+            purge_pending = auto_compact and bool(cold_policy.get("purge_pending_delete", False))
+        except Exception:
+            cold_policy = None
         buckets = {tier: [] for tier in MEMORY_TIERS}
         transitions: Dict[str, int] = {}
         missing = 0
@@ -1818,6 +1906,8 @@ class MemoryManager:
                 buckets[next_tier].extend(overflow)
 
         moved = 0
+        compacted = 0
+        compaction_skipped = 0
         for target_tier, records in buckets.items():
             for record in records:
                 frag_id = record["id"]
@@ -1851,8 +1941,43 @@ class MemoryManager:
                     meta["last_seen"] = record["last_seen"]
                 self.memory_map[frag_id] = meta
 
+                if auto_compact and target_tier == "cold" and cold_policy:
+                    result = self._compact_cold_fragment(frag_id, meta, dest_path, cold_policy)
+                    if isinstance(result, dict):
+                        status = result.get("status")
+                        if status in {"failed", "compacted", "retained"}:
+                            log_to_statusbox(
+                                f"[ColdStorage] {status} fragment {frag_id}."
+                            )
+
+                if (
+                    target_tier == "cold"
+                    and compact_fragment_file
+                    and self.cold_storage_policy.get("auto_compact", False)
+                    and self.cold_storage_policy.get("enabled", True)
+                ):
+                    try:
+                        if compact_fragment_file(dest_path, child=self.child, policy=self.cold_storage_policy):
+                            compacted += 1
+                    except Exception:
+                        compaction_skipped += 1
+
         if moved or missing:
             self.save_map()
+
+        if purge_pending and cold_policy:
+            try:
+                import cold_storage  # type: ignore
+
+                purge_stats = cold_storage.purge_pending_delete(self.child, cold_policy)
+                deleted = purge_stats.get("deleted", 0)
+                kept = purge_stats.get("kept", 0)
+                if deleted or kept:
+                    log_to_statusbox(
+                        f"[ColdStorage] Pending-delete purge: deleted {deleted}, kept {kept}."
+                    )
+            except Exception:
+                pass
 
         transition_summary = ", ".join(f"{k}:{v}" for k, v in sorted(transitions.items()))
         if not transition_summary:
@@ -1862,6 +1987,10 @@ class MemoryManager:
         )
         if missing:
             log_to_statusbox(f"[Memory] Rebalance skipped {missing} missing fragment files.")
+        if compacted:
+            log_to_statusbox(f"[Memory] Cold compaction updated {compacted} fragment(s).")
+        if compaction_skipped:
+            log_to_statusbox(f"[Memory] Cold compaction skipped {compaction_skipped} fragment(s).")
 
         counts = self.stats()
         return {"moved": moved, "missing": missing, "transitions": transitions, "counts": counts}
