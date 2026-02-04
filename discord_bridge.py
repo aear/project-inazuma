@@ -46,6 +46,14 @@ try:
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 except Exception:
     FractalTransformer = None  # type: ignore
+try:
+    from fragment_limits import get_memory_guard_level, should_accept_fragment  # type: ignore
+except Exception:
+    def get_memory_guard_level():  # type: ignore[redefinition]
+        return "unknown"
+
+    def should_accept_fragment(*args, **kwargs):  # type: ignore[redefinition]
+        return True, "limits_unavailable"
 
 # ---------------------------------------------------------------------------
 # Basic logging setup
@@ -364,6 +372,10 @@ def _build_discord_image_fragment(
         "emotions": {"curiosity": 0.3, "focus": 0.3},
         "source_context": source_context,
     }
+    allowed, reason = should_accept_fragment(fragment=fragment)
+    if not allowed:
+        logger.info("Skipping discord image fragment %s (%s).", fragment_id, reason)
+        return None
     transformer = FractalTransformer()
     vec = transformer.encode_image_fragment(fragment)
     fragment["importance"] = vec.get("importance")
@@ -808,6 +820,10 @@ class InaDiscordClient(discord.Client):
             await _attempt_join("after reset")
 
     async def _ingest_image_attachments(self, message: discord.Message) -> list[dict]:
+        level = get_memory_guard_level()
+        if level in {"soft", "hard"}:
+            logger.info("Skipping Discord image attachments due to memory guard (%s).", level)
+            return []
         cfg = get_discord_config()
         if isinstance(cfg, dict):
             allow_images = cfg.get("allow_image_attachments")
@@ -1260,6 +1276,10 @@ class InaDiscordClient(discord.Client):
         """
         Backfill recent Discord text + owner DMs into Ina's experience log for language training.
         """
+        level = get_memory_guard_level()
+        if level in {"soft", "hard"}:
+            logger.info("Skipping Discord history ingest due to memory guard (%s).", level)
+            return
         targets = []
         if self.text_channel:
             targets.append(("guild_text", self.text_channel))

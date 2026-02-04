@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
-from model_manager import load_config
+from model_manager import load_config, get_inastate
 from gui_hook import log_to_statusbox
 from optic_nerve import DesktopOpticNerve
 from obs_bridge import OBSWebSocketBridge
@@ -39,6 +39,10 @@ def capture_webcam_frame(device_index=0):
     return frame if ret else None
 
 def capture_display_frame():
+    frame = _capture_world_override()
+    if frame is not None:
+        return frame
+
     if obs_bridge:
         frame = obs_bridge.capture_frame()
         if frame is not None:
@@ -57,6 +61,31 @@ def capture_display_frame():
         return frame
     except Exception:
         return None
+
+
+def _capture_world_override():
+    try:
+        mode = get_inastate("vision_mode")
+        world_connected = bool(get_inastate("world_connected", False))
+    except Exception:
+        return None
+
+    if not world_connected or mode != "world":
+        return None
+
+    try:
+        path = get_inastate("vision_frame_path")
+    except Exception:
+        path = None
+
+    if not path:
+        return None
+
+    try:
+        frame = cv2.imread(path)
+    except Exception:
+        return None
+    return frame
 
 def compute_delta(prev, current):
     delta = cv2.absdiff(prev, current)

@@ -10,13 +10,23 @@ import math
 
 DEFAULT_ANCHORS = {
     "head": {"center": [0.0, 0.0, 9.5], "radius": 1.4},
+    "hair": {"center": [0.0, 0.0, 10.9], "radius": 1.05},
+    "left_eye": {"center": [-0.719, 0.899, 10.013], "radius": 0.252},
+    "right_eye": {"center": [0.719, 0.899, 10.013], "radius": 0.252},
+    "left_ear": {"center": [-1.361, 0.0, 9.674], "radius": 0.308},
+    "right_ear": {"center": [1.361, 0.0, 9.674], "radius": 0.308},
+    "mouth": {"center": [0.0, 0.958, 8.794], "radius": 0.35},
     "throat": {"center": [0.0, 0.0, 7.8], "radius": 0.9},
     "chest": {"center": [0.0, 0.0, 6.2], "radius": 1.6},
     "core": {"center": [0.0, 0.0, 4.4], "radius": 1.4},
     "left_arm": {"center": [-2.4, 0.0, 5.8], "radius": 1.2},
     "right_arm": {"center": [2.4, 0.0, 5.8], "radius": 1.2},
+    "left_hand": {"center": [-3.48, 0.0, 4.72], "radius": 0.72},
+    "right_hand": {"center": [3.48, 0.0, 4.72], "radius": 0.72},
     "left_leg": {"center": [-1.0, 0.0, 1.6], "radius": 1.3},
     "right_leg": {"center": [1.0, 0.0, 1.6], "radius": 1.3},
+    "left_foot": {"center": [-1.325, 0.0, 0.17], "radius": 0.845},
+    "right_foot": {"center": [1.325, 0.0, 0.17], "radius": 0.845},
 }
 
 

@@ -2,7 +2,11 @@ import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from model_manager import seed_self_question, get_inastate
+try:
+    from model_manager import seed_self_question, get_inastate, update_inastate
+except Exception:  # pragma: no cover - optional during standalone runs
+    from model_manager import seed_self_question, get_inastate
+    update_inastate = None
 from gui_hook import log_to_statusbox
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
@@ -286,6 +290,56 @@ class InstinctEngine:
             "enjoyment": round(enjoyment, 4)
         }
 
+    def _update_move_urge(self, emotions):
+        if update_inastate is None:
+            return
+
+        snapshot = emotions if isinstance(emotions, dict) else {}
+        values = snapshot.get("values") if isinstance(snapshot, dict) else None
+        if isinstance(values, dict) and values:
+            snapshot = values
+
+        boredom = max(get_inastate("emotion_boredom") or snapshot.get("boredom", 0.0) or 0.0, 0.0)
+        curiosity = max(snapshot.get("curiosity", 0.0), 0.0)
+        novelty = max(snapshot.get("novelty", 0.0), 0.0)
+        intensity = max(snapshot.get("intensity", 0.0), 0.0)
+        attention = max(snapshot.get("attention", 0.0), 0.0)
+        stress = max(snapshot.get("stress", 0.0), 0.0)
+        threat = max(snapshot.get("threat", 0.0), 0.0)
+        sleep_pressure = max(get_inastate("sleep_pressure") or 0.0, 0.0)
+
+        energy = get_inastate("current_energy")
+        try:
+            energy = max(0.0, min(1.0, float(energy))) if energy is not None else 0.5
+        except Exception:
+            energy = 0.5
+        fatigue = 1.0 - energy
+
+        drive = (0.35 * curiosity) + (0.2 * novelty) + (0.2 * intensity) + (0.15 * attention) + (0.1 * boredom)
+        inhibition = min(0.75, (0.35 * stress) + (0.3 * threat) + (0.25 * sleep_pressure) + (0.2 * fatigue))
+        urge = max(0.0, min(1.0, drive * (1.0 - inhibition)))
+
+        update_inastate(
+            "urge_to_move",
+            {
+                "level": round(urge, 3),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "drivers": {
+                    "curiosity": round(curiosity, 3),
+                    "novelty": round(novelty, 3),
+                    "intensity": round(intensity, 3),
+                    "attention": round(attention, 3),
+                    "boredom": round(boredom, 3),
+                    "stress": round(stress, 3),
+                    "threat": round(threat, 3),
+                    "sleep_pressure": round(sleep_pressure, 3),
+                    "fatigue": round(fatigue, 3),
+                    "base_drive": round(drive, 3),
+                    "inhibition": round(inhibition, 3),
+                },
+            },
+        )
+
     def should_express(self):
         expr_log = self.memory_path / "expressions.json"
         if not expr_log.exists(): return True
@@ -330,6 +384,8 @@ class InstinctEngine:
         combined_emotions = dict(current_emotions)
         combined_emotions.update(emotion_snapshot)
         last_snapshot = self.preferences.get("last_emotion_snapshot", {})
+
+        self._update_move_urge(combined_emotions)
 
         if self.should_express():
             actions.append({

@@ -165,6 +165,55 @@ Tune behaviour through the `neural_map_policy` block in `config.json`:
 This keeps neuron/synapse maps adaptive and slow-drifting so Ina refines structure
 over time instead of tearing it down every cycle.
 
+## Development principles
+
+### Prefer reuse over reimplementation
+- Before writing new code, **search for an existing implementation** that already solves it (even if prototype-quality).
+- If an existing implementation works, **extract + reuse** it rather than rewriting.
+- If reuse would introduce coupling, **factor the shared logic into a module** (e.g., `movement/`, `net/`, `world/`) and import it.
+
+### Canonical reference files
+Some files are considered *reference implementations* and should be reused unless there is a reason not to:
+- `house_viewer.py` = canonical reference for first-person movement, camera controls, and basic world navigation patterns.
+If unsure whether to reuse: **default to reuse**, then note the tradeoff in the PR/commit message.
+
+### DRY is the default
+- If you find yourself re-typing a subsystem that already exists elsewhere in the repo, stop and refactor into a shared module.
+- Avoid “nearly identical” copies; prefer one shared implementation + thin wrappers.
+
+## Memory handling (IMPORTANT)
+
+### Avoid memory tree scans
+- Do not run recursive searches (rg/find/ls -R) under `AI_Children/` unless explicitly required.
+- If a memory file is needed, open only the specific file and keep reads minimal.
+
+### Do not load large memory files wholesale
+Ina's memory data can be very large (multi-GB JSON/JSONL). Avoid:
+- reading `memory_graph.json`, `typed_neural_graph.json`, or large fragment stores fully into RAM
+- printing entire JSON structures into logs/console
+- iterating the entire fragment set unless explicitly required
+
+### Preferred access patterns
+- Use **indexes / summaries / metadata** first (counts, keys, timestamps).
+- Use **streaming** and **incremental parsing** for large JSON/JSONL:
+  - JSONL: line-by-line iteration
+  - JSON: incremental parse or chunked tooling; avoid `json.load()` on huge files
+- Prefer working through existing “fragment” APIs / helper scripts (e.g. `raw_file_manager`, `memory_graph` query helpers) instead of direct memory reads.
+
+### Sampling rules
+When debugging, prefer:
+- top-N newest fragments
+- time-window slices
+- random sampling with a fixed seed
+- filtering by tag/type before loading payloads
+
+### Persistence rules
+- Write append-only logs (`.jsonl`) for events.
+- Snapshot state periodically rather than rewriting massive structures.
+
+### Reason
+This protects stability (RAM), performance, and avoids accidental “over-reading” of Ina’s internal history.
+
 
 ## Final Note
 

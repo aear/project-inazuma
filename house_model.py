@@ -18,6 +18,7 @@ class Opening:
     height: float
     sill_height: float
     offset_along_wall: float  # distance from wall start along segment
+    id: Optional[str] = None
 
 
 # ---------- INTERIOR MODEL ----------
@@ -176,12 +177,16 @@ def load_house_from_plan(path: str = "ina_house_plan.json") -> Tuple[House, Exte
     for seg in wall_defaults.get("segments", []):
         openings: List[Opening] = []
         for op in seg.get("openings", []):
+            opening_id = op.get("id")
+            if opening_id is not None:
+                opening_id = str(opening_id)
             openings.append(Opening(
                 type=op["type"],
                 width=op["width"],
                 height=op["height"],
                 sill_height=op.get("sill_height", 0.0),
                 offset_along_wall=op.get("offset_along_wall", 0.0),
+                id=opening_id,
             ))
 
         wall_color = tuple(seg.get("color", default_color))

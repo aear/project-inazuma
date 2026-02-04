@@ -68,6 +68,9 @@ class DesktopOpticNerve:
 
         self._capture = None
         self._episode_started = False
+        self._window_capture_bounds: Optional[Dict[str, int]] = None
+        self._window_capture_meta: Optional[Dict[str, Any]] = None
+        self._config_mtime: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Episode management
@@ -105,17 +108,22 @@ class DesktopOpticNerve:
     # ------------------------------------------------------------------
     def capture_frame(self) -> Optional[np.ndarray]:
         """Grab the current Desktop 1 frame."""
+        self._refresh_window_capture()
+        window_bounds = self._window_capture_bounds
         if mss:
             if self._capture is None:
                 self._capture = mss.mss()
             try:
-                monitor = (
-                    self._capture.monitors[self.monitor_index]
-                    if self.monitor_index in range(1, len(self._capture.monitors))
-                    else self._capture.monitors[1]
-                )
+                if window_bounds:
+                    monitor = window_bounds
+                else:
+                    monitor = (
+                        self._capture.monitors[self.monitor_index]
+                        if self.monitor_index in range(1, len(self._capture.monitors))
+                        else self._capture.monitors[1]
+                    )
             except Exception:
-                monitor = self._capture.monitors[1]
+                monitor = window_bounds or self._capture.monitors[1]
             try:
                 raw = self._capture.grab(monitor)
             except Exception:
@@ -128,7 +136,17 @@ class DesktopOpticNerve:
 
         if pyautogui:
             try:
-                image = pyautogui.screenshot()
+                if window_bounds:
+                    image = pyautogui.screenshot(
+                        region=(
+                            window_bounds["left"],
+                            window_bounds["top"],
+                            window_bounds["width"],
+                            window_bounds["height"],
+                        )
+                    )
+                else:
+                    image = pyautogui.screenshot()
                 frame = np.array(image)
                 if frame.ndim == 3 and frame.shape[2] == 3:
                     frame = frame[:, :, ::-1]
@@ -156,12 +174,72 @@ class DesktopOpticNerve:
             "workspace": "Desktop 1",
             "monitor_index": self.monitor_index,
         }
+        if self._window_capture_meta:
+            metadata.update(self._window_capture_meta)
         event_id = self.bridge.log_screen_snapshot(
             frame, tags=self.tags, narrative=self.narrative, metadata=metadata
         )
         if self.write_fragments:
             self._write_fragment(frame, ts, event_id, metadata)
         return event_id
+
+    # ------------------------------------------------------------------
+    # Config-driven window capture
+    # ------------------------------------------------------------------
+    def _refresh_window_capture(self) -> None:
+        path = Path("config.json")
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            self._config_mtime = None
+            return
+        if self._config_mtime is not None and stat.st_mtime == self._config_mtime:
+            return
+        self._config_mtime = stat.st_mtime
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception:
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            return
+        window = cfg.get("vision_window")
+        if not isinstance(window, dict):
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            return
+        bounds = window.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            return
+        try:
+            left = int(bounds[0])
+            top = int(bounds[1])
+            width = int(bounds[2])
+            height = int(bounds[3])
+        except (TypeError, ValueError):
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            return
+        if width <= 1 or height <= 1:
+            self._window_capture_bounds = None
+            self._window_capture_meta = None
+            return
+        self._window_capture_bounds = {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        }
+        self._window_capture_meta = {
+            "window_title": window.get("title"),
+            "window_id": window.get("window_id"),
+            "window_channel": window.get("channel"),
+            "window_source": window.get("source"),
+        }
 
     # ------------------------------------------------------------------
     # Helpers

@@ -28,6 +28,13 @@ This repo shares the **runtime, transformers, and GUI**, not the private dataset
 - `audio_labels` in `config.json` controls which devices are sampled; trim this list to avoid conflicts.
 - Use `audio_device_overrides` to point a label at a specific PipeWire/ALSA device (e.g., an OBS monitor mix), and `stereo_audio_labels` to force stereo on non-output labels.
 
+## World server + clients (local + OBS streaming)
+- Start the world server (unix socket + TCP + HTTP stream): `python world_server.py` (TCP default `7777`)
+- Ina client (unix socket): `python ina_client.py --interactive`
+- Player client (TCP + local unix relay): `python player_client.py --interactive`
+- OBS browser sources can point to `http://localhost:6969/channel/world` (or `/channel/ina`, `/channel/player`, `/channel/tv`).
+- Optional OBS scene switching: `python world_server.py --obs-enabled --obs-scene tv=TVScene`
+
 
 # Inazuma Quasi-License (Non-Binding Philosophical Rider)
 

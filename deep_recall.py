@@ -141,6 +141,10 @@ class DeepRecallConfig:
 
     # Max RAM usage percentage before we pause (if psutil is available).
     max_memory_percent: float = 85.0
+    # Max swap usage percentage before we pause (if psutil is available).
+    max_swap_percent: float = 15.0
+    # Minimum available RAM (GB) before we pause (if psutil is available).
+    min_available_gb: float = 4.0
 
     # Emotional thresholds (if emotion_engine is wired).
     max_stress: float = 0.75      # above this, we pause
@@ -524,12 +528,31 @@ class DeepRecallManager:
 
         try:
             vm = psutil.virtual_memory()
-            if vm.percent > self.config.max_memory_percent:
+            max_mem = float(self.config.max_memory_percent or 0.0)
+            if max_mem > 0 and vm.percent > max_mem:
                 self.log(
                     f"[DeepRecall] Memory usage too high ({vm.percent:.1f}% > "
                     f"{self.config.max_memory_percent}%), pausing."
                 )
                 return False
+            max_swap = float(getattr(self.config, "max_swap_percent", 0.0) or 0.0)
+            if max_swap > 0:
+                swap = psutil.swap_memory()
+                if swap.percent > max_swap:
+                    self.log(
+                        f"[DeepRecall] Swap usage too high ({swap.percent:.1f}% > "
+                        f"{max_swap:.1f}%), pausing."
+                    )
+                    return False
+            min_available_gb = float(getattr(self.config, "min_available_gb", 0.0) or 0.0)
+            if min_available_gb > 0:
+                available_gb = vm.available / (1024.0 ** 3)
+                if available_gb < min_available_gb:
+                    self.log(
+                        f"[DeepRecall] Available RAM too low ({available_gb:.2f}GB < "
+                        f"{min_available_gb:.2f}GB), pausing."
+                    )
+                    return False
         except Exception as e:
             self.log(f"[DeepRecall] Memory check failed ({e}), ignoring.")
 

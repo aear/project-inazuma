@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,16 @@ try:
     import memory_gatekeeper  # type: ignore
 except Exception:  # noqa: BLE001
     memory_gatekeeper = None  # type: ignore
+
+try:
+    from fragment_limits import should_accept_fragment  # type: ignore
+except Exception:  # noqa: BLE001
+    def should_accept_fragment(*args, **kwargs):  # type: ignore[redefinition]
+        return True, "limits_unavailable"
+
+
+_FRAGMENT_DROP_LOG_COOLDOWN = 30.0
+_last_fragment_drop_log = 0.0
 
 
 # === Helpers =================================================================
@@ -202,7 +213,23 @@ def store_fragment(fragment: Dict[str, Any], reason: str = "") -> Optional[Path]
     if "id" not in fragment:
         fragment["id"] = _make_fragment_id(f"frag_{fragment['type']}")
 
+    allowed, limit_reason = should_accept_fragment(fragment=fragment)
+    if not allowed:
+        _log_fragment_drop(fragment, limit_reason)
+        return None
+
     return _submit_to_gatekeeper(fragment, reason=reason)
+
+
+def _log_fragment_drop(fragment: Dict[str, Any], reason: str) -> None:
+    global _last_fragment_drop_log
+    now = time.time()
+    if _last_fragment_drop_log and (now - _last_fragment_drop_log) < _FRAGMENT_DROP_LOG_COOLDOWN:
+        return
+    frag_id = fragment.get("id") or "<unknown>"
+    frag_type = fragment.get("type", "unknown")
+    _last_fragment_drop_log = now
+    log_to_statusbox(f"[Fragments] Dropped {frag_type} fragment {frag_id} ({reason}).")
 
 
 # === Generic fragment builders ===============================================

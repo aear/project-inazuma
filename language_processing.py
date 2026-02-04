@@ -3,6 +3,7 @@ import re
 import json
 import hashlib
 import tempfile
+import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,114 @@ NEUTRAL_SOUND_FINGERPRINT = {
     "volume_db": -22,
     "silence_ratio": 0.1,
 }
+
+
+def _hz_to_mel(hz: float) -> float:
+    return 2595.0 * math.log10(1.0 + hz / 700.0)
+
+
+def _mel_to_hz(mel: float) -> float:
+    return 700.0 * (10 ** (mel / 2595.0) - 1.0)
+
+
+def _mel_bin_frequencies(n_mels: int, sr: int) -> List[float]:
+    if n_mels <= 0:
+        return []
+    mel_min = _hz_to_mel(0.0)
+    mel_max = _hz_to_mel(sr / 2.0)
+    mel_points = [
+        mel_min + (mel_max - mel_min) * i / (n_mels + 1)
+        for i in range(n_mels + 2)
+    ]
+    return [_mel_to_hz(mel) for mel in mel_points[1:-1]]
+
+
+def _infer_sound_features_from_centroid(
+    centroid,
+    *,
+    sample_rate: int = 44100,
+    texture: Optional[Dict[str, Any]] = None,
+    uses: Optional[int] = None,
+):
+    if not isinstance(centroid, (list, tuple)) or len(centroid) < 4:
+        return None, None
+
+    values: List[Optional[float]] = []
+    for val in centroid:
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            num = None
+        if num is not None and not math.isfinite(num):
+            num = None
+        values.append(num)
+
+    if not any(v is not None for v in values):
+        return None, None
+
+    freqs = _mel_bin_frequencies(len(values), sample_rate)
+    if len(freqs) != len(values):
+        freqs = freqs[: len(values)]
+
+    weights = [
+        pow(10.0, v / 10.0) if v is not None else 0.0
+        for v in values[: len(freqs)]
+    ]
+    total = sum(weights)
+    if total <= 0:
+        return None, None
+
+    pitch_mean = sum(f * w for f, w in zip(freqs, weights)) / total
+    dominant_idx = max(range(len(weights)), key=lambda i: weights[i])
+    dominant_freq = freqs[dominant_idx]
+
+    top_idx = sorted(range(len(weights)), key=lambda i: weights[i], reverse=True)[:4]
+    max_w = weights[top_idx[0]] or 1.0
+    partials = [
+        {"freq": round(float(freqs[i]), 2), "gain": round(float(weights[i] / max_w), 3)}
+        for i in top_idx
+        if weights[i] > 0
+    ]
+
+    volume_db = None
+    silence_ratio = 0.12
+    if isinstance(texture, dict):
+        rms = texture.get("rms")
+        try:
+            rms = float(rms)
+        except (TypeError, ValueError):
+            rms = None
+        if rms is not None:
+            volume_db = 20 * math.log10(max(1e-4, rms))
+            volume_db = max(-60.0, min(-6.0, volume_db))
+            silence_ratio = max(0.05, min(0.5, 0.45 - rms * 1.8))
+
+    if volume_db is None:
+        numeric_vals = [v for v in values if v is not None]
+        avg_db = sum(numeric_vals) / max(1, len(numeric_vals))
+        volume_db = max(-60.0, min(-6.0, avg_db))
+        if avg_db < -40.0:
+            silence_ratio = 0.35
+
+    confidence = None
+    if uses is not None:
+        try:
+            uses_val = max(0, int(uses))
+            confidence = 0.28 + min(0.45, math.log1p(uses_val) / 7.0)
+            confidence = min(0.8, confidence)
+        except (TypeError, ValueError):
+            confidence = None
+
+    fingerprint = {
+        "pitch_mean": round(float(pitch_mean), 2),
+        "dominant_freq": round(float(dominant_freq), 2),
+        "volume_db": round(float(volume_db), 2),
+        "silence_ratio": round(float(silence_ratio), 3),
+    }
+    if partials:
+        fingerprint["partials"] = partials
+
+    return fingerprint, confidence
 
 
 def _load_json(path: Path):
@@ -562,6 +671,24 @@ def speak_symbolically(
             if fingerprint:
                 log_to_statusbox(f"[Voice] Reconstructed sound features from summary for {sid}.")
         if not fingerprint:
+            sample_rate = entry.get("sample_rate") or 44100
+            try:
+                sample_rate = int(sample_rate)
+            except (TypeError, ValueError):
+                sample_rate = 44100
+            inferred, inferred_conf = _infer_sound_features_from_centroid(
+                entry.get("centroid"),
+                sample_rate=sample_rate,
+                texture=entry.get("texture"),
+                uses=entry.get("uses"),
+            )
+            if inferred:
+                fingerprint = inferred
+                feature_source = "centroid_infer"
+                if inferred_conf is not None:
+                    feature_confidence = inferred_conf
+                log_to_statusbox(f"[Voice] Derived sound features from centroid for {sid}.")
+        if not fingerprint:
             # Seed a simple tone from the symbol id so it's never silent
             seed = int(hashlib.sha256(sid.encode("utf-8")).hexdigest()[:8], 16)
             base_freq = 300 + (seed % 600)  # 300–900 Hz
@@ -935,9 +1062,9 @@ def summarize_known_words(child):
 
 def respond_to_word(child, word, *, base_path: Optional[Path] = None):
     vocab_path = _memory_root(child, base_path) / "symbol_to_token.json"
-    symbol_map_path = _memory_root(child, base_path) / "sound_symbol_map.json"
+    symbol_map = load_sound_symbol_map(child, base_path)
 
-    if not os.path.exists(vocab_path) or not os.path.exists(symbol_map_path):
+    if not os.path.exists(vocab_path) or not symbol_map:
         print("[LangLearn] No vocab or symbol map found.")
         return
 
@@ -947,20 +1074,21 @@ def respond_to_word(child, word, *, base_path: Optional[Path] = None):
 
     with open(vocab_path, "r") as f:
         vocab = json.load(f)
-    with open(symbol_map_path, "r") as f:
-        symbol_map = json.load(f)
-
     for sym, entry in vocab.items():
-        if entry["word"].lower() == word.lower():
+        if entry.get("word", "").lower() == word.lower():
             clip = symbol_map.get(sym, {}).get("clip")
             if clip:
                 clip_path = _memory_root(child, base_path) / "audio_session" / clip
                 if clip_path.exists():
                     print(f"[LangLearn] Responding with: {word} → {clip_path.name}")
-                    from pydub import AudioSegment
-                    from pydub.playback import play
-                    audio = AudioSegment.from_mp3(clip_path)
-                    play(audio)
+                    try:
+                        from pydub import AudioSegment
+                        from pydub.playback import play
+
+                        audio = AudioSegment.from_file(clip_path)
+                        play(audio)
+                    except Exception as exc:
+                        print(f"[LangLearn] Failed to play {clip_path.name}: {exc}")
             describe_word_grounding(child, word, base_path=base_path, verbose=True)
             return
     print(f"[LangLearn] No audio response found for: '{word}'")

@@ -533,6 +533,17 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
         symbol_sequence, symbol_map = assign_sound_symbols(
             features, symbol_map, diversity_boost=diversity_boost, texture_hint=texture
         )
+        symbol_store = symbol_map.get("symbols") if isinstance(symbol_map, dict) else None
+        if isinstance(symbol_store, dict) and symbol_sequence:
+            clip_name = Path(clip_path).name
+            clip_stamp = datetime.now(timezone.utc).isoformat()
+            for sym_id in set(symbol_sequence):
+                entry = symbol_store.get(sym_id)
+                if not isinstance(entry, dict):
+                    entry = {"centroid": None, "uses": 0, "last_seen": clip_stamp}
+                entry["clip"] = clip_name
+                entry["clip_updated"] = clip_stamp
+                symbol_store[sym_id] = entry
 
         symbol_words, symbol_words_path = load_symbol_words(child)
         proto_word_candidates, symbol_words = derive_proto_words(symbol_sequence, symbol_words)

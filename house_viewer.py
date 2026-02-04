@@ -2,19 +2,29 @@
 
 import copy
 import json
+from datetime import date, datetime, timedelta, timezone
 import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
+import urllib.error
+import urllib.request
 
-from geometry_utils import get_unit_cube_meshdata
+from geometry_utils import (
+    get_unit_cube_meshdata,
+    get_unit_cylinder_meshdata,
+    get_unit_sphere_meshdata,
+)
 from house_model import (
     create_prototype_house,
     create_prototype_exterior,
@@ -27,6 +37,14 @@ from house_model import (
     WallSegment,
 )
 
+try:
+    from model_manager import get_inastate
+except Exception:  # pragma: no cover - optional dependency
+    get_inastate = None
+try:
+    from safe_popen import safe_popen
+except Exception:  # pragma: no cover - optional dependency
+    safe_popen = None
 
 Vec2 = Tuple[float, float]
 Vec3 = Tuple[float, float, float]
@@ -51,6 +69,7 @@ class ArchitectState:
     ceiling_lights: List["ArchitectCeilingLight"] = field(default_factory=list)
     light_switches: List["ArchitectLightSwitch"] = field(default_factory=list)
     spawn_point: Optional[Vec3] = None
+    ina_spawn_point: Optional[Vec3] = None
 
 
 @dataclass
@@ -111,6 +130,9 @@ class DoorInstance:
     height: float
     base_angle: float
     open_angle: float
+    wall_ref: Optional[WallSegment] = None
+    offset_along_wall: float = 0.0
+    door_id: Optional[str] = None
     current_angle: float = 0.0
     target_angle: float = 0.0
 
@@ -121,6 +143,8 @@ class FurniturePartDef:
     offset: Vec3
     color: Tuple[float, float, float, float]
     gl_options: Optional[str] = None
+    shape: str = "box"
+    emissive: float = 0.0
 
 
 @dataclass
@@ -128,6 +152,9 @@ class FurniturePrototype:
     key: str
     label: str
     parts: List[FurniturePartDef]
+    seat_offset: Optional[Vec3] = None
+    interact_radius: float = 0.0
+    tags: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -135,6 +162,8 @@ class FurniturePart:
     mesh: gl.GLMeshItem
     size: Vec3
     offset: Vec3
+    base_size: Vec3
+    base_offset: Vec3
 
 
 @dataclass
@@ -145,6 +174,13 @@ class FurnitureInstance:
     position: np.ndarray
     rotation: float
     parts: List[FurniturePart]
+    collision_radius: float
+    seat_offset: Optional[Vec3] = None
+    interact_radius: float = 0.0
+    tags: List[str] = field(default_factory=list)
+    pose_offset: Vec3 = (0.0, 0.0, 0.0)
+    tilt_deg: float = 0.0
+    knocked: bool = False
 
 
 class ArchitectCanvas(QtWidgets.QGraphicsView):
@@ -270,27 +306,17 @@ class ArchitectCanvas(QtWidgets.QGraphicsView):
             self._scene.addItem(item)
 
         if state.spawn_point is not None:
-            spawn_x = state.spawn_point[0]
-            spawn_y = state.spawn_point[2]
-            radius = max(0.15, self.viewer.architect_settings.grid_size * 0.4)
-            pen = QtGui.QPen(QtGui.QColor(255, 180, 60, 220))
-            pen.setWidthF(0.05)
-            circle = QtWidgets.QGraphicsEllipseItem(
-                spawn_x - radius,
-                spawn_y - radius,
-                radius * 2.0,
-                radius * 2.0,
+            self._draw_spawn_marker(
+                state.spawn_point,
+                QtGui.QColor(255, 180, 60, 220),
+                QtGui.QColor(255, 180, 60, 60),
             )
-            circle.setPen(pen)
-            circle.setBrush(QtGui.QBrush(QtGui.QColor(255, 180, 60, 60)))
-            self._scene.addItem(circle)
-            self._scene.addLine(
-                QtCore.QLineF(spawn_x - radius * 1.5, spawn_y, spawn_x + radius * 1.5, spawn_y),
-                pen,
-            )
-            self._scene.addLine(
-                QtCore.QLineF(spawn_x, spawn_y - radius * 1.5, spawn_x, spawn_y + radius * 1.5),
-                pen,
+
+        if state.ina_spawn_point is not None:
+            self._draw_spawn_marker(
+                state.ina_spawn_point,
+                QtGui.QColor(120, 200, 255, 220),
+                QtGui.QColor(120, 200, 255, 60),
             )
 
         if not self._scene.items():
@@ -304,6 +330,30 @@ class ArchitectCanvas(QtWidgets.QGraphicsView):
         if alpha_override is not None:
             alpha = alpha_override
         return QtGui.QColor(int(r * 255), int(g * 255), int(b * 255), alpha)
+
+    def _draw_spawn_marker(self, spawn: Vec3, pen_color: QtGui.QColor, fill_color: QtGui.QColor):
+        spawn_x = spawn[0]
+        spawn_y = spawn[2]
+        radius = max(0.15, self.viewer.architect_settings.grid_size * 0.4)
+        pen = QtGui.QPen(pen_color)
+        pen.setWidthF(0.05)
+        circle = QtWidgets.QGraphicsEllipseItem(
+            spawn_x - radius,
+            spawn_y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        )
+        circle.setPen(pen)
+        circle.setBrush(QtGui.QBrush(fill_color))
+        self._scene.addItem(circle)
+        self._scene.addLine(
+            QtCore.QLineF(spawn_x - radius * 1.5, spawn_y, spawn_x + radius * 1.5, spawn_y),
+            pen,
+        )
+        self._scene.addLine(
+            QtCore.QLineF(spawn_x, spawn_y - radius * 1.5, spawn_x, spawn_y + radius * 1.5),
+            pen,
+        )
 
     def _make_thick_segment(self, start, end, thickness, color):
         poly = self._segment_polygon(start, end, thickness)
@@ -546,6 +596,10 @@ class ArchitectCanvas(QtWidgets.QGraphicsView):
             self.viewer.architect_set_spawn((pos.x(), pos.y()))
             return
 
+        if tool == "ina_spawn":
+            self.viewer.architect_set_ina_spawn((pos.x(), pos.y()))
+            return
+
         if tool == "ceiling_light":
             self.viewer.architect_add_ceiling_light((pos.x(), pos.y()))
             return
@@ -671,6 +725,86 @@ class ArchitectCanvas(QtWidgets.QGraphicsView):
             y += grid
 
 
+class RadialMenu(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent, QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setWindowOpacity(0.98)
+        self._buttons = []
+        self._radius = 90
+        self._button_size = QtCore.QSize(120, 30)
+
+    def show_menu(self, global_center: QtCore.QPoint, actions: List[Tuple[str, callable]]):
+        self._clear_buttons()
+        if not actions:
+            return
+        count = len(actions)
+        angle_step = (2.0 * math.pi) / max(count, 1)
+        diameter = (self._radius * 2) + self._button_size.width()
+        self.setFixedSize(diameter, diameter)
+        center = QtCore.QPoint(diameter // 2, diameter // 2)
+
+        for idx, (label, callback) in enumerate(actions):
+            angle = angle_step * idx - (math.pi / 2.0)
+            dx = math.cos(angle) * self._radius
+            dy = math.sin(angle) * self._radius
+            btn = QtWidgets.QToolButton(self)
+            btn.setText(label)
+            btn.setFixedSize(self._button_size)
+            btn.move(
+                int(center.x() + dx - self._button_size.width() / 2),
+                int(center.y() + dy - self._button_size.height() / 2),
+            )
+            btn.clicked.connect(self._wrap_callback(callback))
+            self._buttons.append(btn)
+
+        self.move(global_center.x() - diameter // 2, global_center.y() - diameter // 2)
+        self.show()
+
+    def _wrap_callback(self, callback):
+        def _handler():
+            self.close()
+            if callback is not None:
+                callback()
+        return _handler
+
+    def _clear_buttons(self):
+        for btn in self._buttons:
+            btn.deleteLater()
+        self._buttons = []
+
+    def keyPressEvent(self, event):
+        if event.key() in (QtCore.Qt.Key_Escape, QtCore.Qt.Key_Backspace):
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+
+class CrosshairWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self._size = 12
+        self._gap = 4
+        self._thickness = 2
+        self._color = QtGui.QColor(235, 235, 235, 190)
+        diameter = (self._size * 2) + (self._thickness * 2)
+        self.setFixedSize(diameter, diameter)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        pen = QtGui.QPen(self._color)
+        pen.setWidth(self._thickness)
+        painter.setPen(pen)
+        center = self.rect().center()
+        painter.drawLine(center.x() - self._size, center.y(), center.x() - self._gap, center.y())
+        painter.drawLine(center.x() + self._gap, center.y(), center.x() + self._size, center.y())
+        painter.drawLine(center.x(), center.y() - self._size, center.x(), center.y() - self._gap)
+        painter.drawLine(center.x(), center.y() + self._gap, center.x(), center.y() + self._size)
+
+
 class HouseViewer(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -679,16 +813,21 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor((10, 10, 20))
         self.view.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.crosshair = CrosshairWidget(self.view)
+        self.crosshair.hide()
         self.architect_state = ArchitectState()
         self.architect_settings = ArchitectSettings()
         self.architect_dirty = False
         self.architect_loaded = False
         self.architect_plan_cache = None
         self.architect_room_counter = 1
+        self._runtime_rooms = []
         self.doors: List[DoorInstance] = []
         self.door_items: List[gl.GLGraphicsItem] = []
         self.door_open_speed = 120.0
         self.door_interact_distance = 2.0
+        self._door_state_callback = None
+        self._door_state_cache = {}
         self.architect_canvas = ArchitectCanvas(self)
         self.central_stack = QtWidgets.QStackedWidget()
         self.central_stack.addWidget(self.view)
@@ -715,6 +854,10 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.player_height = 1.7
         self.player_width = 0.4
         self.player_depth = 0.4
+        self.player_eye_height_stand = self.player_eye_height
+        self.player_crouch_factor = 0.55
+        self.player_crouch_speed_multiplier = 0.55
+        self.player_crouched = False
         self.player_pos = None  # GL coords: x, y, z
         self.player_yaw = 0.0
         self.player_pitch = 0.0
@@ -724,11 +867,67 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.player_look_distance = 0.6
         self.mouse_sensitivity = 0.15
         self.ground_snap_enabled = True
+        self.player_vertical_velocity = 0.0
+        self.player_jump_speed = 4.8
+        self.player_gravity = 9.8
+        self.player_respawn_depth = 6.0
+        self._jump_consumed = False
+        self.door_block_angle = 8.0
+        self.max_light_intensity = 2.0
+        self.max_light_value = 1.5
+        self._climb_surface_instance = None
+        self._climb_surface_z = None
+        self._climb_surface_radius = 0.0
+        self._climb_surface_margin = 0.05
         self.player_items: List[gl.GLGraphicsItem] = []
         self.player_item = None
-        self.player_avatar_enabled = False
+        self.player_avatar_enabled = True
         self.player_avatar_parts: List[FurniturePart] = []
+        self.ina_items: List[gl.GLGraphicsItem] = []
+        self.ina_avatar_parts: List[FurniturePart] = []
+        self.ina_pos = None
+        self.ina_velocity = np.zeros(3, dtype=float)
+        self.ina_anim_use_inastate = True
+        self.ina_schema_path = "body_schema.json"
+        self._schema_cache = {}
+        self.seated = False
+        self.seated_return_pos = None
+        self.seated_return_yaw = 0.0
+        self.seated_eye_height_factor = 0.72
+        self._desk_in_use = False
+        self._desk_use_callback = None
+        self.room_light_state = {}
         self.player_schema_path = "player_schema.json"
+        self.exterior_model = None
+        self._interaction_highlight = None
+        self._interaction_target = None
+        self._player_anim_phase = 0.0
+        self._player_anim_last_pos = None
+        self._player_anim_last_ts = time.perf_counter()
+        self._ina_anim_phase = 0.0
+        self._ina_anim_last_pos = None
+        self._ina_anim_last_ts = time.perf_counter()
+        self._hifi_player_cache = None
+        self._hifi_player_cache_ts = 0.0
+        self.tv_channel = self._load_tv_channel()
+        self._tv_stream_last_update = 0.0
+        self._tv_stream_interval = 1.0
+        self._tv_stream_bounds = None
+        self._tv_stream_config_mtime = None
+        self._tv_stream_items = {}
+        self._tv_stream_size = (320, 180)
+        self.radial_menu = RadialMenu(self)
+        self._radial_menu_active = False
+        self._radial_menu_target = None
+        self.radial_menu.finished.connect(self._on_radial_menu_closed)
+        self._light_dimmer_dialog = None
+        self.interact_hold_threshold = 0.35
+        self._interact_hold_timer = QtCore.QTimer(self)
+        self._interact_hold_timer.setSingleShot(True)
+        self._interact_hold_timer.timeout.connect(self._on_interact_hold_timeout)
+        self._interact_press_active = False
+        self._interact_press_target = None
+        self._interact_hold_opened = False
         self._load_player_schema()
         self.keys_down = set()
         self._orbit_camera_state = None
@@ -744,7 +943,6 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._tick_timer = QtCore.QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(16)
-        self.exterior_model = None
         self._player_control_keys = {
             QtCore.Qt.Key_W,
             QtCore.Qt.Key_A,
@@ -753,6 +951,7 @@ class HouseViewer(QtWidgets.QMainWindow):
             QtCore.Qt.Key_Space,
             QtCore.Qt.Key_C,
             QtCore.Qt.Key_Shift,
+            QtCore.Qt.Key_Control,
             QtCore.Qt.Key_Left,
             QtCore.Qt.Key_Right,
             QtCore.Qt.Key_Up,
@@ -763,9 +962,9 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.view.installEventFilter(self)
 
         # Reference grid
-        grid = gl.GLGridItem()
-        grid.scale(2, 2, 1)
-        self.view.addItem(grid)
+        self.grid_item = gl.GLGridItem()
+        self.grid_item.scale(2, 2, 1)
+        self.view.addItem(self.grid_item)
 
         # Toolbar
         toolbar = self.addToolBar("Main")
@@ -783,8 +982,9 @@ class HouseViewer(QtWidgets.QMainWindow):
         toolbar.addAction(fps_act)
         self.first_person_action = fps_act
 
-        avatar_act = QtWidgets.QAction("Ina Avatar", self)
+        avatar_act = QtWidgets.QAction("Player Avatar", self)
         avatar_act.setCheckable(True)
+        avatar_act.setChecked(self.player_avatar_enabled)
         avatar_act.toggled.connect(self.set_player_avatar_enabled)
         toolbar.addAction(avatar_act)
         self.player_avatar_action = avatar_act
@@ -806,6 +1006,20 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.interior_items: List[gl.GLGraphicsItem] = []
         self.furniture_items: List[gl.GLGraphicsItem] = []
         self.light_items: List[gl.GLGraphicsItem] = []
+        self.sky_items: List[gl.GLGraphicsItem] = []
+        self.sky_radius = 90.0
+        self._sky_last_update = 0.0
+        self.sun_location_name = "SE14"
+        self.sun_location = (51.48, -0.03)
+        self._sun_times_cache = {
+            "date": None,
+            "sunrise": None,
+            "sunset": None,
+            "fetched_at": 0.0,
+            "source": None,
+        }
+        self._lit_items = []
+        self._lighting_last_update = 0.0
 
         # For now: allow toggling interior debug rendering if you want it
         self.show_interior = True
@@ -856,6 +1070,214 @@ class HouseViewer(QtWidgets.QMainWindow):
         nx, ny, nz = normal
         return (nx, nz, ny)
 
+    @staticmethod
+    def _normalize_tags(tags, fallback: Optional[List[str]] = None) -> List[str]:
+        if isinstance(tags, str):
+            tags = [tags]
+        if isinstance(tags, (list, tuple)):
+            cleaned = []
+            for tag in tags:
+                if not isinstance(tag, str):
+                    continue
+                text = tag.strip()
+                if text:
+                    cleaned.append(text)
+            if cleaned:
+                return cleaned
+        if fallback:
+            return list(fallback)
+        return []
+
+    def _is_sofa_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key in ("sofa", "couch"):
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "sofa" in tags or "couch" in tags
+
+    def _is_desk_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "desk":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "desk" in tags or "computer" in tags
+
+    def _is_counter_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "counter":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "counter" in tags
+
+    def _is_hifi_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "hifi":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "hifi" in tags or "hi-fi" in tags
+
+    def _is_tv_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "tv":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "tv" in tags or "screen" in tags
+
+    def _is_bookshelf_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "bookshelf":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "bookshelf" in tags or "books" in tags or "reading" in tags
+
+    def _is_living_room_unit_instance(self, instance: FurnitureInstance) -> bool:
+        if instance.key == "living_room_unit":
+            return True
+        tags = self._normalize_tags(instance.tags)
+        return "living_room_unit" in tags or ("living_room" in tags and "cabinet" in tags)
+
+    def _kitchen_appliance_kind(self, instance: FurnitureInstance) -> Optional[str]:
+        if instance.key == "fridge":
+            return "fridge"
+        if instance.key == "microwave":
+            return "microwave"
+        if instance.key in ("cooker", "stove", "oven"):
+            return "cooker"
+        tags = self._normalize_tags(instance.tags)
+        if "fridge" in tags:
+            return "fridge"
+        if "microwave" in tags:
+            return "microwave"
+        if "cooker" in tags or "stove" in tags or "oven" in tags:
+            return "cooker"
+        return None
+
+    def _local_bounds_from_defs(self, defs: List[FurniturePartDef]):
+        min_x = min_y = min_z = None
+        max_x = max_y = max_z = None
+        for part_def in defs:
+            size = part_def.size
+            offset = part_def.offset
+            half_x = float(size[0]) * 0.5
+            half_y = float(size[1]) * 0.5
+            half_z = float(size[2]) * 0.5
+            x0 = float(offset[0]) - half_x
+            x1 = float(offset[0]) + half_x
+            y0 = float(offset[1]) - half_y
+            y1 = float(offset[1]) + half_y
+            z0 = float(offset[2]) - half_z
+            z1 = float(offset[2]) + half_z
+            min_x = x0 if min_x is None else min(min_x, x0)
+            max_x = x1 if max_x is None else max(max_x, x1)
+            min_y = y0 if min_y is None else min(min_y, y0)
+            max_y = y1 if max_y is None else max(max_y, y1)
+            min_z = z0 if min_z is None else min(min_z, z0)
+            max_z = z1 if max_z is None else max(max_z, z1)
+        return min_x, max_x, min_y, max_y, min_z, max_z
+
+    def _local_bounds_from_parts(self, parts: List[FurniturePart], use_base: bool = True):
+        min_x = min_y = min_z = None
+        max_x = max_y = max_z = None
+        for part in parts:
+            size = part.base_size if use_base else part.size
+            offset = part.base_offset if use_base else part.offset
+            half_x = float(size[0]) * 0.5
+            half_y = float(size[1]) * 0.5
+            half_z = float(size[2]) * 0.5
+            x0 = float(offset[0]) - half_x
+            x1 = float(offset[0]) + half_x
+            y0 = float(offset[1]) - half_y
+            y1 = float(offset[1]) + half_y
+            z0 = float(offset[2]) - half_z
+            z1 = float(offset[2]) + half_z
+            min_x = x0 if min_x is None else min(min_x, x0)
+            max_x = x1 if max_x is None else max(max_x, x1)
+            min_y = y0 if min_y is None else min(min_y, y0)
+            max_y = y1 if max_y is None else max(max_y, y1)
+            min_z = z0 if min_z is None else min(min_z, z0)
+            max_z = z1 if max_z is None else max(max_z, z1)
+        return min_x, max_x, min_y, max_y, min_z, max_z
+
+    def _clear_climb_surface(self) -> None:
+        self._climb_surface_instance = None
+        self._climb_surface_z = None
+        self._climb_surface_radius = 0.0
+
+    def _furniture_vertical_bounds(self, instance: FurnitureInstance, *, use_base: bool = True):
+        bounds = self._local_bounds_from_parts(instance.parts, use_base=use_base)
+        min_z = bounds[4]
+        max_z = bounds[5]
+        if min_z is None or max_z is None:
+            return None
+        base_z = float(instance.position[2])
+        return base_z + float(min_z), base_z + float(max_z)
+
+    def _furniture_surface_z(self, instance: FurnitureInstance) -> Optional[float]:
+        if instance.seat_offset:
+            try:
+                return float(instance.position[2]) + float(instance.seat_offset[2])
+            except Exception:
+                pass
+        bounds = self._furniture_vertical_bounds(instance, use_base=False)
+        if bounds is None:
+            return None
+        return bounds[1]
+
+    def _furniture_surface_position(self, instance: FurnitureInstance) -> np.ndarray:
+        pos = np.array(instance.position, dtype=float)
+        surface_z = self._furniture_surface_z(instance)
+        if surface_z is not None:
+            pos[2] = surface_z
+        return pos
+
+    def _is_climbable_instance(self, instance: FurnitureInstance) -> bool:
+        tag_set = set(self._normalize_tags(instance.tags))
+        blocked = {"tv", "screen", "hifi", "lamp", "microwave", "fridge", "cooker", "stove", "appliance"}
+        if any(tag in tag_set for tag in blocked):
+            return False
+        climb_tags = {"surface", "seat", "bed", "sofa", "desk", "counter", "cabinet", "bookshelf"}
+        return bool(tag_set.intersection(climb_tags))
+
+    def _nearest_climbable_surface(self, used_ids: set[int]):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if instance.instance_id in used_ids:
+                continue
+            if not self._is_climbable_instance(instance):
+                continue
+            radius = max(instance.interact_radius, instance.collision_radius + 0.4)
+            surface_pos = self._furniture_surface_position(instance)
+            surface_xy = np.array(surface_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - surface_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, surface_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, surface_pos = best
+        radius = max(instance.interact_radius, instance.collision_radius + 0.4)
+        if best_dist > radius:
+            return None
+        return instance, surface_pos, best_dist
+
+    def _update_climb_surface(self) -> Optional[float]:
+        if self._climb_surface_instance is None or self.player_pos is None:
+            return None
+        instance = self._climb_surface_instance
+        if instance not in self.furniture_instances:
+            self._clear_climb_surface()
+            return None
+        surface_z = self._furniture_surface_z(instance)
+        if surface_z is None:
+            self._clear_climb_surface()
+            return None
+        dx = float(self.player_pos[0]) - float(instance.position[0])
+        dy = float(self.player_pos[1]) - float(instance.position[1])
+        radius = self._climb_surface_radius or max(instance.collision_radius, 0.5)
+        if (dx * dx + dy * dy) > (radius * radius):
+            self._clear_climb_surface()
+            return None
+        self._climb_surface_z = surface_z
+        return surface_z
+
     # ---- Camera helpers ----
 
     def reset_camera(self):
@@ -870,6 +1292,8 @@ class HouseViewer(QtWidgets.QMainWindow):
     def clear_items(self, items: List[gl.GLGraphicsItem]):
         for item in items:
             self.view.removeItem(item)
+            if item in self._lit_items:
+                self._lit_items.remove(item)
         items.clear()
 
     def reload_scene(self):
@@ -879,11 +1303,17 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.clear_items(self.door_items)
         self.clear_items(self.furniture_items)
         self.clear_items(getattr(self, "light_items", []))
+        self.clear_items(getattr(self, "sky_items", []))
+        self.clear_items(self.ina_items)
         self._clear_furnish_preview()
+        self._lit_items = []
         self.doors.clear()
         self.player_item = None
         self.player_avatar_parts = []
         self.player_pos = None
+        self.ina_avatar_parts = []
+        self.ina_pos = None
+        self.room_light_state = {}
         self.furniture_instances.clear()
         self.furniture_instances_by_id.clear()
         self._furniture_instance_counter = 1
@@ -899,7 +1329,10 @@ class HouseViewer(QtWidgets.QMainWindow):
             house = create_prototype_house()
             exterior = create_prototype_exterior()
         self.exterior_model = exterior
+        self._runtime_rooms = [room for room in house.rooms if room.name != "garden"]
         self._build_exterior(exterior)
+
+        self._build_sky()
 
         # Interior boxes (optional debug)
         if self.show_interior:
@@ -911,6 +1344,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._load_player_schema()
         self._ensure_player()
         self._update_player_visibility()
+        self._ensure_ina_avatar()
         if self.first_person_enabled:
             self._sync_first_person_camera()
         if self.furnish_mode_enabled:
@@ -955,7 +1389,8 @@ class HouseViewer(QtWidgets.QMainWindow):
             ("room", "Room"),
             ("door", "Door"),
             ("window", "Window"),
-            ("spawn", "Spawn"),
+            ("spawn", "Player Spawn"),
+            ("ina_spawn", "Ina Spawn"),
             ("fence", "Fence"),
             ("ceiling_light", "Ceiling Light"),
             ("switch", "Switch"),
@@ -1173,7 +1608,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         plan_box = QtWidgets.QGroupBox("Plan Actions")
         plan_layout = QtWidgets.QGridLayout(plan_box)
         save_btn = QtWidgets.QPushButton("Save Furniture")
-        spawn_btn = QtWidgets.QPushButton("Spawn At Bed")
+        spawn_btn = QtWidgets.QPushButton("Ina Spawn At Bed")
         plan_layout.addWidget(save_btn, 0, 0)
         plan_layout.addWidget(spawn_btn, 0, 1)
         layout.addWidget(plan_box)
@@ -1260,6 +1695,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                     frame_height + mattress_height + pillow_height / 2.0,
                 ),
                 color=(0.95, 0.95, 0.96, 1.0),
+                shape="sphere",
             ),
             FurniturePartDef(
                 size=(pillow_width, pillow_depth, pillow_height),
@@ -1269,9 +1705,18 @@ class HouseViewer(QtWidgets.QMainWindow):
                     frame_height + mattress_height + pillow_height / 2.0,
                 ),
                 color=(0.95, 0.95, 0.96, 1.0),
+                shape="sphere",
             ),
         ]
-        catalog["bed"] = FurniturePrototype(key="bed", label="Bed", parts=bed_parts)
+        bed_seat_height = frame_height + mattress_height * 0.85
+        catalog["bed"] = FurniturePrototype(
+            key="bed",
+            label="Bed",
+            parts=bed_parts,
+            seat_offset=(0.0, 0.0, bed_seat_height),
+            interact_radius=1.8,
+            tags=["bed", "sleep", "rest", "furniture"],
+        )
 
         table_width = 1.2
         table_depth = 0.8
@@ -1298,9 +1743,15 @@ class HouseViewer(QtWidgets.QMainWindow):
                             leg_height / 2.0,
                         ),
                         color=(0.5, 0.35, 0.2, 1.0),
+                        shape="cylinder",
                     )
                 )
-        catalog["table"] = FurniturePrototype(key="table", label="Table", parts=table_parts)
+        catalog["table"] = FurniturePrototype(
+            key="table",
+            label="Table",
+            parts=table_parts,
+            tags=["table", "surface", "furniture"],
+        )
 
         chair_width = 0.5
         chair_depth = 0.5
@@ -1334,9 +1785,475 @@ class HouseViewer(QtWidgets.QMainWindow):
                             chair_leg_height / 2.0,
                         ),
                         color=(0.4, 0.26, 0.16, 1.0),
+                        shape="cylinder",
                     )
                 )
-        catalog["chair"] = FurniturePrototype(key="chair", label="Chair", parts=chair_parts)
+        catalog["chair"] = FurniturePrototype(
+            key="chair",
+            label="Chair",
+            parts=chair_parts,
+            seat_offset=(0.0, 0.0, seat_height),
+            interact_radius=0.9,
+            tags=["chair", "seat", "furniture"],
+        )
+
+        sofa_width = 2.0
+        sofa_depth = 0.9
+        sofa_base_height = 0.22
+        sofa_cushion_height = 0.18
+        sofa_back_height = 0.7
+        sofa_back_thickness = 0.12
+        sofa_arm_width = 0.15
+        sofa_arm_height = 0.55
+        sofa_seat_height = sofa_base_height + sofa_cushion_height
+
+        sofa_parts = [
+            FurniturePartDef(
+                size=(sofa_width, sofa_depth, sofa_base_height),
+                offset=(0.0, 0.0, sofa_base_height / 2.0),
+                color=(0.28, 0.24, 0.22, 1.0),
+            ),
+            FurniturePartDef(
+                size=(sofa_width - 0.12, sofa_depth - 0.1, sofa_cushion_height),
+                offset=(
+                    0.0,
+                    0.0,
+                    sofa_base_height + sofa_cushion_height / 2.0,
+                ),
+                color=(0.55, 0.5, 0.46, 1.0),
+                shape="sphere",
+            ),
+            FurniturePartDef(
+                size=(sofa_width, sofa_back_thickness, sofa_back_height),
+                offset=(
+                    0.0,
+                    sofa_depth / 2.0 - sofa_back_thickness / 2.0,
+                    sofa_base_height + sofa_cushion_height + sofa_back_height / 2.0,
+                ),
+                color=(0.32, 0.28, 0.26, 1.0),
+            ),
+            FurniturePartDef(
+                size=(sofa_arm_width, sofa_depth, sofa_arm_height),
+                offset=(
+                    -(sofa_width / 2.0 - sofa_arm_width / 2.0),
+                    0.0,
+                    sofa_arm_height / 2.0,
+                ),
+                color=(0.3, 0.26, 0.24, 1.0),
+            ),
+            FurniturePartDef(
+                size=(sofa_arm_width, sofa_depth, sofa_arm_height),
+                offset=(
+                    sofa_width / 2.0 - sofa_arm_width / 2.0,
+                    0.0,
+                    sofa_arm_height / 2.0,
+                ),
+                color=(0.3, 0.26, 0.24, 1.0),
+            ),
+        ]
+        catalog["sofa"] = FurniturePrototype(
+            key="sofa",
+            label="Sofa",
+            parts=sofa_parts,
+            seat_offset=(0.0, 0.0, sofa_seat_height),
+            interact_radius=1.8,
+            tags=["sofa", "couch", "seat", "sleep", "lounge", "furniture"],
+        )
+
+        unit_width = 1.6
+        unit_depth = 0.45
+        unit_height = 0.65
+        unit_top_thickness = 0.04
+        unit_body_height = unit_height - unit_top_thickness
+        unit_door_height = 0.45
+        unit_door_thickness = 0.02
+        unit_door_width = (unit_width - 0.12) / 2.0
+        unit_door_offset_y = unit_depth / 2.0 - unit_door_thickness / 2.0
+        unit_door_offset_z = unit_door_height / 2.0 + 0.08
+
+        unit_parts = [
+            FurniturePartDef(
+                size=(unit_width, unit_depth, unit_body_height),
+                offset=(0.0, 0.0, unit_body_height / 2.0),
+                color=(0.52, 0.4, 0.28, 1.0),
+            ),
+            FurniturePartDef(
+                size=(unit_width, unit_depth, unit_top_thickness),
+                offset=(0.0, 0.0, unit_body_height + unit_top_thickness / 2.0),
+                color=(0.62, 0.5, 0.36, 1.0),
+            ),
+        ]
+        for x_sign in (-1.0, 1.0):
+            unit_parts.append(
+                FurniturePartDef(
+                    size=(unit_door_width, unit_door_thickness, unit_door_height),
+                    offset=(
+                        x_sign * (unit_door_width / 2.0 + 0.03),
+                        unit_door_offset_y,
+                        unit_door_offset_z,
+                    ),
+                    color=(0.46, 0.34, 0.24, 1.0),
+                )
+            )
+        catalog["living_room_unit"] = FurniturePrototype(
+            key="living_room_unit",
+            label="Living Room Unit",
+            parts=unit_parts,
+            tags=["living_room", "cabinet", "surface", "furniture"],
+        )
+
+        hifi_width = 0.55
+        hifi_depth = 0.3
+        hifi_height = 0.2
+        hifi_panel_height = 0.12
+        hifi_panel_depth = 0.02
+
+        hifi_parts = [
+            FurniturePartDef(
+                size=(hifi_width, hifi_depth, hifi_height),
+                offset=(0.0, 0.0, hifi_height / 2.0),
+                color=(0.16, 0.17, 0.2, 1.0),
+            ),
+            FurniturePartDef(
+                size=(hifi_width - 0.06, hifi_panel_depth, hifi_panel_height),
+                offset=(
+                    0.0,
+                    hifi_depth / 2.0 - hifi_panel_depth / 2.0,
+                    hifi_panel_height / 2.0 + 0.03,
+                ),
+                color=(0.05, 0.05, 0.07, 1.0),
+            ),
+        ]
+        catalog["hifi"] = FurniturePrototype(
+            key="hifi",
+            label="Hi-Fi Stack",
+            parts=hifi_parts,
+            interact_radius=1.15,
+            tags=["hifi", "audio", "music", "electronics", "furniture"],
+        )
+
+        tv_width = 2.2
+        tv_height = 1.2
+        tv_depth = 0.08
+        tv_base_width = 0.9
+        tv_base_depth = 0.35
+        tv_base_height = 0.04
+        tv_neck_width = 0.12
+        tv_neck_depth = 0.1
+        tv_neck_height = 0.28
+
+        tv_parts = [
+            FurniturePartDef(
+                size=(tv_base_width, tv_base_depth, tv_base_height),
+                offset=(0.0, 0.0, tv_base_height / 2.0),
+                color=(0.18, 0.18, 0.2, 1.0),
+            ),
+            FurniturePartDef(
+                size=(tv_neck_width, tv_neck_depth, tv_neck_height),
+                offset=(0.0, 0.0, tv_base_height + tv_neck_height / 2.0),
+                color=(0.2, 0.2, 0.22, 1.0),
+            ),
+            FurniturePartDef(
+                size=(tv_width, tv_depth, tv_height),
+                offset=(
+                    0.0,
+                    0.0,
+                    tv_base_height + tv_neck_height + tv_height / 2.0,
+                ),
+                color=(0.08, 0.1, 0.16, 1.0),
+                emissive=0.35,
+            ),
+        ]
+        catalog["tv"] = FurniturePrototype(
+            key="tv",
+            label="Big TV",
+            parts=tv_parts,
+            interact_radius=1.6,
+            tags=["tv", "screen", "media", "furniture"],
+        )
+
+        desk_width = 1.4
+        desk_depth = 0.7
+        desk_height = 0.75
+        desk_top_thickness = 0.05
+        desk_leg_thickness = 0.08
+        desk_leg_height = desk_height - desk_top_thickness
+        desk_seat_height = 0.46
+        desk_monitor_height = 0.35
+        desk_monitor_width = 0.5
+        desk_monitor_depth = 0.08
+
+        desk_parts = [
+            FurniturePartDef(
+                size=(desk_width, desk_depth, desk_top_thickness),
+                offset=(0.0, 0.0, desk_height - desk_top_thickness / 2.0),
+                color=(0.5, 0.36, 0.22, 1.0),
+            ),
+            FurniturePartDef(
+                size=(desk_monitor_width, desk_monitor_depth, desk_monitor_height),
+                offset=(
+                    0.0,
+                    desk_depth / 2.0 - desk_monitor_depth / 2.0 - 0.05,
+                    desk_height + desk_monitor_height / 2.0,
+                ),
+                color=(0.15, 0.16, 0.18, 1.0),
+            ),
+        ]
+        for x_sign in (-1.0, 1.0):
+            for y_sign in (-1.0, 1.0):
+                desk_parts.append(
+                    FurniturePartDef(
+                        size=(desk_leg_thickness, desk_leg_thickness, desk_leg_height),
+                        offset=(
+                            x_sign * (desk_width / 2.0 - desk_leg_thickness / 2.0),
+                            y_sign * (desk_depth / 2.0 - desk_leg_thickness / 2.0),
+                            desk_leg_height / 2.0,
+                        ),
+                        color=(0.45, 0.32, 0.2, 1.0),
+                        shape="cylinder",
+                    )
+                )
+        catalog["desk"] = FurniturePrototype(
+            key="desk",
+            label="Computer Desk",
+            parts=desk_parts,
+            seat_offset=(0.0, -(desk_depth / 2.0 + 0.35), desk_seat_height),
+            interact_radius=1.3,
+            tags=["desk", "computer", "work", "discord", "furniture"],
+        )
+
+        shelf_width = 1.4
+        shelf_depth = 0.35
+        shelf_height = 1.8
+        shelf_thickness = 0.04
+        shelf_side_thickness = 0.06
+        shelf_back_thickness = 0.03
+        shelf_color = (0.5, 0.36, 0.22, 1.0)
+        shelf_accent = (0.42, 0.3, 0.2, 1.0)
+
+        shelf_parts = [
+            FurniturePartDef(
+                size=(shelf_width, shelf_depth, shelf_thickness),
+                offset=(0.0, 0.0, shelf_thickness / 2.0),
+                color=shelf_color,
+            ),
+            FurniturePartDef(
+                size=(shelf_width, shelf_depth, shelf_thickness),
+                offset=(0.0, 0.0, shelf_height - shelf_thickness / 2.0),
+                color=shelf_color,
+            ),
+            FurniturePartDef(
+                size=(shelf_width, shelf_back_thickness, shelf_height),
+                offset=(0.0, -shelf_depth / 2.0 + shelf_back_thickness / 2.0, shelf_height / 2.0),
+                color=shelf_accent,
+            ),
+            FurniturePartDef(
+                size=(shelf_side_thickness, shelf_depth, shelf_height),
+                offset=(
+                    -(shelf_width / 2.0 - shelf_side_thickness / 2.0),
+                    0.0,
+                    shelf_height / 2.0,
+                ),
+                color=shelf_accent,
+            ),
+            FurniturePartDef(
+                size=(shelf_side_thickness, shelf_depth, shelf_height),
+                offset=(
+                    shelf_width / 2.0 - shelf_side_thickness / 2.0,
+                    0.0,
+                    shelf_height / 2.0,
+                ),
+                color=shelf_accent,
+            ),
+        ]
+        for shelf_idx in range(1, 4):
+            z = shelf_height * (shelf_idx / 4.0)
+            shelf_parts.append(
+                FurniturePartDef(
+                    size=(shelf_width - shelf_side_thickness * 2.0, shelf_depth - shelf_back_thickness, shelf_thickness),
+                    offset=(0.0, shelf_back_thickness / 2.0, z),
+                    color=shelf_color,
+                )
+            )
+        catalog["bookshelf"] = FurniturePrototype(
+            key="bookshelf",
+            label="Bookshelf",
+            parts=shelf_parts,
+            interact_radius=1.4,
+            tags=["bookshelf", "books", "reading", "furniture", "surface"],
+        )
+
+        fridge_width = 0.9
+        fridge_depth = 0.8
+        fridge_height = 1.9
+        fridge_door_thickness = 0.05
+        fridge_handle_width = 0.06
+        fridge_handle_depth = 0.04
+        fridge_handle_height = 0.6
+
+        fridge_parts = [
+            FurniturePartDef(
+                size=(fridge_width, fridge_depth, fridge_height),
+                offset=(0.0, 0.0, fridge_height / 2.0),
+                color=(0.92, 0.93, 0.95, 1.0),
+            ),
+            FurniturePartDef(
+                size=(fridge_width - 0.04, fridge_door_thickness, fridge_height - 0.04),
+                offset=(
+                    0.0,
+                    fridge_depth / 2.0 - fridge_door_thickness / 2.0,
+                    fridge_height / 2.0,
+                ),
+                color=(0.88, 0.9, 0.92, 1.0),
+            ),
+            FurniturePartDef(
+                size=(fridge_handle_width, fridge_handle_depth, fridge_handle_height),
+                offset=(
+                    fridge_width / 2.0 - fridge_handle_width / 2.0 - 0.05,
+                    fridge_depth / 2.0 + fridge_handle_depth / 2.0 - 0.01,
+                    fridge_height * 0.55,
+                ),
+                color=(0.72, 0.74, 0.76, 1.0),
+                shape="cylinder",
+            ),
+        ]
+        catalog["fridge"] = FurniturePrototype(
+            key="fridge",
+            label="Fridge",
+            parts=fridge_parts,
+            interact_radius=1.4,
+            tags=["kitchen", "appliance", "fridge", "food", "snack", "furniture"],
+        )
+
+        microwave_width = 0.6
+        microwave_depth = 0.45
+        microwave_height = 0.35
+        microwave_door_thickness = 0.03
+        microwave_window_height = 0.18
+        microwave_panel_width = 0.12
+
+        microwave_parts = [
+            FurniturePartDef(
+                size=(microwave_width, microwave_depth, microwave_height),
+                offset=(0.0, 0.0, microwave_height / 2.0),
+                color=(0.28, 0.29, 0.32, 1.0),
+            ),
+            FurniturePartDef(
+                size=(microwave_width - 0.08, microwave_door_thickness, microwave_window_height),
+                offset=(
+                    -microwave_panel_width * 0.45,
+                    microwave_depth / 2.0 - microwave_door_thickness / 2.0,
+                    microwave_height * 0.55,
+                ),
+                color=(0.08, 0.09, 0.11, 0.6),
+                gl_options="translucent",
+                emissive=0.18,
+            ),
+            FurniturePartDef(
+                size=(microwave_panel_width, microwave_door_thickness, microwave_height * 0.6),
+                offset=(
+                    microwave_width / 2.0 - microwave_panel_width / 2.0 - 0.04,
+                    microwave_depth / 2.0 - microwave_door_thickness / 2.0,
+                    microwave_height * 0.5,
+                ),
+                color=(0.2, 0.21, 0.24, 1.0),
+            ),
+        ]
+        catalog["microwave"] = FurniturePrototype(
+            key="microwave",
+            label="Microwave",
+            parts=microwave_parts,
+            interact_radius=1.1,
+            tags=["kitchen", "appliance", "microwave", "food", "furniture"],
+        )
+
+        cooker_width = 0.8
+        cooker_depth = 0.6
+        cooker_height = 0.9
+        cooker_top_height = 0.06
+        cooker_body_height = cooker_height - cooker_top_height
+        cooker_door_thickness = 0.04
+        cooker_door_height = 0.38
+
+        cooker_parts = [
+            FurniturePartDef(
+                size=(cooker_width, cooker_depth, cooker_body_height),
+                offset=(0.0, 0.0, cooker_body_height / 2.0),
+                color=(0.25, 0.26, 0.28, 1.0),
+            ),
+            FurniturePartDef(
+                size=(cooker_width, cooker_depth, cooker_top_height),
+                offset=(0.0, 0.0, cooker_body_height + cooker_top_height / 2.0),
+                color=(0.15, 0.16, 0.18, 1.0),
+            ),
+            FurniturePartDef(
+                size=(cooker_width - 0.1, cooker_door_thickness, cooker_door_height),
+                offset=(
+                    0.0,
+                    cooker_depth / 2.0 - cooker_door_thickness / 2.0,
+                    cooker_door_height / 2.0 + 0.08,
+                ),
+                color=(0.1, 0.1, 0.12, 0.7),
+                gl_options="translucent",
+            ),
+            FurniturePartDef(
+                size=(cooker_width - 0.2, 0.03, 0.03),
+                offset=(
+                    0.0,
+                    cooker_depth / 2.0 + 0.02,
+                    cooker_door_height + 0.14,
+                ),
+                color=(0.6, 0.6, 0.62, 1.0),
+            ),
+        ]
+        burner_size = 0.14
+        burner_height = 0.02
+        for x_sign in (-1.0, 1.0):
+            for y_sign in (-1.0, 1.0):
+                cooker_parts.append(
+                    FurniturePartDef(
+                        size=(burner_size, burner_size, burner_height),
+                        offset=(
+                            x_sign * cooker_width * 0.22,
+                            y_sign * cooker_depth * 0.2,
+                            cooker_body_height + cooker_top_height + burner_height / 2.0,
+                        ),
+                        color=(0.08, 0.08, 0.1, 1.0),
+                        shape="cylinder",
+                    )
+                )
+        catalog["cooker"] = FurniturePrototype(
+            key="cooker",
+            label="Cooker",
+            parts=cooker_parts,
+            interact_radius=1.25,
+            tags=["kitchen", "appliance", "cooker", "stove", "food", "furniture"],
+        )
+
+        counter_width = 1.6
+        counter_depth = 0.6
+        counter_height = 0.9
+        counter_top_thickness = 0.05
+        counter_body_height = counter_height - counter_top_thickness
+
+        counter_parts = [
+            FurniturePartDef(
+                size=(counter_width, counter_depth, counter_body_height),
+                offset=(0.0, 0.0, counter_body_height / 2.0),
+                color=(0.62, 0.46, 0.32, 1.0),
+            ),
+            FurniturePartDef(
+                size=(counter_width, counter_depth, counter_top_thickness),
+                offset=(0.0, 0.0, counter_body_height + counter_top_thickness / 2.0),
+                color=(0.82, 0.78, 0.72, 1.0),
+            ),
+        ]
+        catalog["counter"] = FurniturePrototype(
+            key="counter",
+            label="Kitchen Counter",
+            parts=counter_parts,
+            tags=["kitchen", "counter", "surface", "furniture"],
+        )
 
         lamp_base = 0.3
         lamp_base_height = 0.05
@@ -1351,11 +2268,13 @@ class HouseViewer(QtWidgets.QMainWindow):
                 size=(lamp_base, lamp_base, lamp_base_height),
                 offset=(0.0, 0.0, lamp_base_height / 2.0),
                 color=(0.2, 0.2, 0.22, 1.0),
+                shape="cylinder",
             ),
             FurniturePartDef(
                 size=(lamp_stem_width, lamp_stem_width, lamp_stem_height),
                 offset=(0.0, 0.0, lamp_base_height + lamp_stem_height / 2.0),
                 color=(0.35, 0.35, 0.38, 1.0),
+                shape="cylinder",
             ),
             FurniturePartDef(
                 size=(lamp_shade_width, lamp_shade_depth, lamp_shade_height),
@@ -1366,9 +2285,16 @@ class HouseViewer(QtWidgets.QMainWindow):
                 ),
                 color=(1.0, 0.95, 0.7, 0.8),
                 gl_options="translucent",
+                shape="cylinder",
+                emissive=0.25,
             ),
         ]
-        catalog["lamp"] = FurniturePrototype(key="lamp", label="Floor Lamp", parts=lamp_parts)
+        catalog["lamp"] = FurniturePrototype(
+            key="lamp",
+            label="Floor Lamp",
+            parts=lamp_parts,
+            tags=["lamp", "light", "furniture"],
+        )
 
         return catalog
 
@@ -1440,6 +2366,10 @@ class HouseViewer(QtWidgets.QMainWindow):
             x, _, z = self.architect_state.spawn_point
             self.architect_state.spawn_point = (x, float(value), z)
             self.architect_canvas.refresh_scene()
+        if key == "spawn_height" and self.architect_state.ina_spawn_point is not None:
+            x, _, z = self.architect_state.ina_spawn_point
+            self.architect_state.ina_spawn_point = (x, float(value), z)
+            self.architect_canvas.refresh_scene()
 
     def _set_architect_tool(self, tool: str):
         self.architect_settings.tool = tool
@@ -1454,7 +2384,9 @@ class HouseViewer(QtWidgets.QMainWindow):
         elif tool == "window":
             message = "Window: click a wall to place a window opening."
         elif tool == "spawn":
-            message = "Spawn: click to set the player spawn point."
+            message = "Player Spawn: click to set the player spawn point."
+        elif tool == "ina_spawn":
+            message = "Ina Spawn: click to set Ina's spawn point."
         elif tool == "fence":
             message = "Fence: click-drag to draw fence segments."
         elif tool == "ceiling_light":
@@ -1488,6 +2420,8 @@ class HouseViewer(QtWidgets.QMainWindow):
             self.central_stack.setCurrentWidget(self.view)
             self.view.setFocus()
             self._set_architect_status("")
+            if self.architect_loaded:
+                self._refresh_light_items_from_state()
 
     def set_furnish_mode(self, enabled: bool):
         if enabled:
@@ -1570,6 +2504,7 @@ class HouseViewer(QtWidgets.QMainWindow):
             self.furniture_rotation,
             preview=True,
             instance_id=0,
+            tags=None,
         )
         if self._furnish_last_mouse_pos is not None:
             gl_pos = self._screen_pos_to_ground(self._furnish_last_mouse_pos)
@@ -1590,6 +2525,9 @@ class HouseViewer(QtWidgets.QMainWindow):
     def _update_furnish_preview_position(self, gl_pos: np.ndarray):
         if self.furniture_preview is None:
             return
+        proto = self.furniture_catalog.get(self.furniture_active_key)
+        if proto is not None:
+            gl_pos = self._snap_furniture_to_counter(proto, gl_pos)
         self.furniture_preview.position = np.array(gl_pos, dtype=float)
         self._update_furniture_instance_transform(self.furniture_preview)
 
@@ -1599,6 +2537,79 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.furniture_preview.rotation = self.furniture_rotation
         self._update_furniture_instance_transform(self.furniture_preview)
 
+    def _point_over_counter(self, gl_pos: np.ndarray, counter: FurnitureInstance) -> bool:
+        bounds = self._local_bounds_from_parts(counter.parts, use_base=True)
+        if bounds[0] is None:
+            return False
+        margin = 0.08
+        dx = float(gl_pos[0]) - float(counter.position[0])
+        dy = float(gl_pos[1]) - float(counter.position[1])
+        angle = -np.radians(counter.rotation)
+        cos_a = float(np.cos(angle))
+        sin_a = float(np.sin(angle))
+        local_x = cos_a * dx - sin_a * dy
+        local_y = sin_a * dx + cos_a * dy
+        min_x, max_x, min_y, max_y, _, _ = bounds
+        if min_x is None or max_x is None or min_y is None or max_y is None:
+            return False
+        return (
+            min_x - margin <= local_x <= max_x + margin
+            and min_y - margin <= local_y <= max_y + margin
+        )
+
+    def _snap_furniture_to_counter(self, proto: FurniturePrototype, gl_pos: np.ndarray) -> np.ndarray:
+        tags = self._normalize_tags(proto.tags)
+        wants_counter = proto.key == "microwave" or "microwave" in tags
+        wants_unit = (
+            proto.key in ("hifi", "tv")
+            or "hifi" in tags
+            or "tv" in tags
+            or "screen" in tags
+        )
+        if not (wants_counter or wants_unit):
+            return gl_pos
+        room = self._room_for_point((float(gl_pos[0]), float(gl_pos[1])))
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if wants_counter and self._is_counter_instance(instance):
+                pass
+            elif wants_unit and self._is_living_room_unit_instance(instance):
+                pass
+            else:
+                continue
+            if room is not None:
+                counter_room = self._room_for_point(
+                    (float(instance.position[0]), float(instance.position[1]))
+                )
+                if counter_room != room:
+                    continue
+            if not self._point_over_counter(gl_pos, instance):
+                continue
+            dist = float(np.linalg.norm(np.array(gl_pos[:2], dtype=float) - instance.position[:2]))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = instance
+        if best is None:
+            return gl_pos
+        counter_bounds = self._local_bounds_from_parts(best.parts, use_base=True)
+        proto_bounds = self._local_bounds_from_defs(proto.parts)
+        if counter_bounds[5] is None:
+            return gl_pos
+        top_z = float(best.position[2]) + float(counter_bounds[5])
+        min_z = float(proto_bounds[4] or 0.0)
+        snapped = np.array(gl_pos, dtype=float)
+        snapped[2] = top_z - min_z
+        return snapped
+
+    def _mesh_for_furniture_part(self, part_def: FurniturePartDef) -> Tuple[gl.MeshData, bool]:
+        shape = (part_def.shape or "box").lower()
+        if shape == "sphere":
+            return get_unit_sphere_meshdata(), True
+        if shape == "cylinder":
+            return get_unit_cylinder_meshdata(), True
+        return get_unit_cube_meshdata(), False
+
     def _create_furniture_instance(
         self,
         proto: FurniturePrototype,
@@ -1606,9 +2617,12 @@ class HouseViewer(QtWidgets.QMainWindow):
         rotation: float,
         preview: bool,
         instance_id: int,
+        tags: Optional[List[str]] = None,
     ) -> FurnitureInstance:
-        md = get_unit_cube_meshdata()
         parts: List[FurniturePart] = []
+        room = None
+        if not preview:
+            room = self._room_for_point((float(position[0]), float(position[1])))
         for part_def in proto.parts:
             color = part_def.color
             if preview:
@@ -1617,9 +2631,10 @@ class HouseViewer(QtWidgets.QMainWindow):
             gl_options = part_def.gl_options
             if gl_options is None and color[3] < 0.99:
                 gl_options = "translucent"
+            meshdata, smooth = self._mesh_for_furniture_part(part_def)
             mesh = gl.GLMeshItem(
-                meshdata=md,
-                smooth=False,
+                meshdata=meshdata,
+                smooth=smooth,
                 color=color,
                 shader="shaded",
                 drawEdges=preview,
@@ -1631,8 +2646,19 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self._furniture_preview_items.append(mesh)
             else:
                 self.furniture_items.append(mesh)
-            parts.append(FurniturePart(mesh=mesh, size=part_def.size, offset=part_def.offset))
+                self._register_lit_item(mesh, part_def.color, room=room, emissive=part_def.emissive)
+            parts.append(
+                FurniturePart(
+                    mesh=mesh,
+                    size=part_def.size,
+                    offset=part_def.offset,
+                    base_size=part_def.size,
+                    base_offset=part_def.offset,
+                )
+            )
 
+        collision_radius = self._compute_furniture_collision_radius(proto)
+        instance_tags = list(tags) if tags is not None else list(proto.tags)
         instance = FurnitureInstance(
             instance_id=instance_id,
             key=proto.key,
@@ -1640,6 +2666,10 @@ class HouseViewer(QtWidgets.QMainWindow):
             position=np.array(position, dtype=float),
             rotation=rotation,
             parts=parts,
+            collision_radius=collision_radius,
+            seat_offset=proto.seat_offset,
+            interact_radius=proto.interact_radius,
+            tags=instance_tags,
         )
         self._update_furniture_instance_transform(instance)
         return instance
@@ -1648,6 +2678,8 @@ class HouseViewer(QtWidgets.QMainWindow):
         angle = np.radians(instance.rotation)
         cos_a = float(np.cos(angle))
         sin_a = float(np.sin(angle))
+        pose_offset = np.array(getattr(instance, "pose_offset", (0.0, 0.0, 0.0)), dtype=float)
+        tilt_deg = float(getattr(instance, "tilt_deg", 0.0))
         rot = np.array(
             [
                 [cos_a, -sin_a, 0.0],
@@ -1659,17 +2691,29 @@ class HouseViewer(QtWidgets.QMainWindow):
         for part in instance.parts:
             offset = np.array(part.offset, dtype=float)
             rotated_offset = rot @ offset
-            center = instance.position + rotated_offset
+            center = instance.position + rotated_offset + pose_offset
             part.mesh.resetTransform()
             part.mesh.scale(part.size[0], part.size[1], part.size[2])
             if abs(instance.rotation) > 1e-3:
                 part.mesh.rotate(instance.rotation, 0, 0, 1)
+            if abs(tilt_deg) > 1e-3:
+                part.mesh.rotate(tilt_deg, 1, 0, 0)
             part.mesh.translate(center[0], center[1], center[2])
+
+    def _compute_furniture_collision_radius(self, proto: FurniturePrototype) -> float:
+        max_radius = 0.0
+        for part in proto.parts:
+            half_x = float(part.size[0]) * 0.5
+            half_y = float(part.size[1]) * 0.5
+            radius = math.hypot(half_x, half_y)
+            max_radius = max(max_radius, radius)
+        return max(max_radius, 0.2)
 
     def _place_furniture_at(self, gl_pos: np.ndarray):
         proto = self.furniture_catalog.get(self.furniture_active_key)
         if proto is None:
             return
+        gl_pos = self._snap_furniture_to_counter(proto, gl_pos)
         instance_id = self._furniture_instance_counter
         self._furniture_instance_counter += 1
         instance = self._create_furniture_instance(
@@ -1678,6 +2722,7 @@ class HouseViewer(QtWidgets.QMainWindow):
             self.furniture_rotation,
             preview=False,
             instance_id=instance_id,
+            tags=None,
         )
         self.furniture_instances.append(instance)
         self.furniture_instances_by_id[instance_id] = instance
@@ -1735,6 +2780,10 @@ class HouseViewer(QtWidgets.QMainWindow):
                 rotation,
                 preview=False,
                 instance_id=instance_id,
+                tags=self._normalize_tags(
+                    entry.get("tags"),
+                    fallback=self.furniture_catalog[key].tags,
+                ),
             )
             self.furniture_instances.append(instance)
             self.furniture_instances_by_id[instance_id] = instance
@@ -1762,6 +2811,9 @@ class HouseViewer(QtWidgets.QMainWindow):
         lighting = storey.get("lighting", {})
         wall_height = float(storey.get("height", self.architect_settings.wall_height))
         ceiling_y = wall_height - 0.05
+        self.architect_settings.wall_height = wall_height
+        self.architect_state.ceiling_lights = []
+        self.architect_state.light_switches = []
 
         radius = max(0.08, float(self.architect_settings.ceiling_light_radius))
         ceiling_size = (radius * 2.0, 0.05, radius * 2.0)
@@ -1773,13 +2825,30 @@ class HouseViewer(QtWidgets.QMainWindow):
                 light.get("color", self.architect_settings.ceiling_light_color),
                 self.architect_settings.ceiling_light_color,
             )
+            room = light.get("room")
+            if not room:
+                room = self._room_for_point((float(pos[0]), float(pos[1])))
+            self.architect_state.ceiling_lights.append(
+                ArchitectCeilingLight(
+                    position=(float(pos[0]), float(pos[1])),
+                    color=color,
+                    room=room,
+                )
+            )
+            color = self._light_color_for_room(color, room)
             center = (float(pos[0]), ceiling_y, float(pos[1]))
-            mesh = self._make_box(center=center, size=ceiling_size, color=color, draw_edges=True)
+            mesh = self._make_box(
+                center=center,
+                size=ceiling_size,
+                color=color,
+                draw_edges=True,
+                room=room,
+            )
             mesh.setGLOptions("translucent")
             self.view.addItem(mesh)
             self.light_items.append(mesh)
 
-        switch_size = (0.12, 0.18, 0.05)
+        switch_size = (0.16, 0.22, 0.05)
         for switch in lighting.get("switches", []):
             pos = switch.get("position", [0.0, 0.0])
             if not isinstance(pos, (list, tuple)) or len(pos) < 2:
@@ -1789,15 +2858,125 @@ class HouseViewer(QtWidgets.QMainWindow):
                 switch.get("color", self.architect_settings.switch_color),
                 self.architect_settings.switch_color,
             )
-            center = (float(pos[0]), height, float(pos[1]))
+            room = switch.get("room")
+            if not room:
+                room = self._room_for_point((float(pos[0]), float(pos[1])))
+            self.architect_state.light_switches.append(
+                ArchitectLightSwitch(
+                    position=(float(pos[0]), float(pos[1])),
+                    height=height,
+                    room=room,
+                )
+            )
+            center = self._switch_world_center((float(pos[0]), float(pos[1])), height, room)
             mesh = self._make_box(
                 center=center,
                 size=switch_size,
                 color=color,
                 draw_edges=True,
+                room=room,
             )
             self.view.addItem(mesh)
             self.light_items.append(mesh)
+
+    def _refresh_light_items_from_state(self):
+        self.clear_items(self.light_items)
+        wall_height = float(self.architect_settings.wall_height)
+        ceiling_y = wall_height - 0.05
+
+        radius = max(0.08, float(self.architect_settings.ceiling_light_radius))
+        ceiling_size = (radius * 2.0, 0.05, radius * 2.0)
+        for light in self.architect_state.ceiling_lights:
+            center = (float(light.position[0]), ceiling_y, float(light.position[1]))
+            color = self._light_color_for_room(light.color, light.room)
+            mesh = self._make_box(
+                center=center,
+                size=ceiling_size,
+                color=color,
+                draw_edges=True,
+                room=light.room,
+            )
+            if color[3] < 0.99:
+                mesh.setGLOptions("translucent")
+            self.view.addItem(mesh)
+            self.light_items.append(mesh)
+
+        switch_size = (0.16, 0.22, 0.05)
+        for switch in self.architect_state.light_switches:
+            center = self._switch_world_center(
+                (float(switch.position[0]), float(switch.position[1])),
+                float(switch.height),
+                switch.room,
+            )
+            mesh = self._make_box(
+                center=center,
+                size=switch_size,
+                color=self.architect_settings.switch_color,
+                draw_edges=True,
+                room=switch.room,
+            )
+            self.view.addItem(mesh)
+            self.light_items.append(mesh)
+
+        self._update_lighting(force=True)
+
+    def _light_color_for_room(self, color, room: Optional[str]):
+        key = room or "global"
+        state = self._get_room_light_state(key)
+        if not state["enabled"]:
+            return (color[0] * 0.25, color[1] * 0.25, color[2] * 0.25, color[3] * 0.6)
+        intensity = max(0.05, min(self.max_light_intensity, float(state["intensity"])))
+        tint = state["color"]
+        return (
+            min(self.max_light_value, color[0] * intensity * tint[0]),
+            min(self.max_light_value, color[1] * intensity * tint[1]),
+            min(self.max_light_value, color[2] * intensity * tint[2]),
+            color[3],
+        )
+
+    def _switch_world_center(self, pos: Vec2, height: float, room_name: Optional[str]) -> Vec3:
+        offset = self._switch_offset_from_wall(pos, room_name)
+        return (float(pos[0] + offset[0]), float(height), float(pos[1] + offset[1]))
+
+    def _switch_offset_from_wall(self, pos: Vec2, room_name: Optional[str]) -> Vec2:
+        if self.exterior_model is None or not self.exterior_model.walls:
+            return (0.0, 0.0)
+        best_wall = None
+        best_dist = None
+        best_mid = None
+        for wall in self.exterior_model.walls:
+            dist, _ = self._distance_to_segment(pos, wall.start, wall.end)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_wall = wall
+        if best_wall is None:
+            return (0.0, 0.0)
+
+        x1, z1 = best_wall.start
+        x2, z2 = best_wall.end
+        dx = x2 - x1
+        dz = z2 - z1
+        length = math.hypot(dx, dz)
+        if length < 1e-6:
+            return (0.0, 0.0)
+        nx, nz = -dz / length, dx / length
+        mid_x = (x1 + x2) / 2.0
+        mid_z = (z1 + z2) / 2.0
+
+        target_vec = None
+        if room_name:
+            for room in self.architect_state.rooms:
+                if room.name == room_name:
+                    target_vec = (room.center[0] - mid_x, room.center[2] - mid_z)
+                    break
+        if target_vec is None:
+            target_vec = (pos[0] - mid_x, pos[1] - mid_z)
+
+        if (nx * target_vec[0] + nz * target_vec[1]) < 0.0:
+            nx, nz = -nx, -nz
+
+        offset_dist = (best_wall.thickness * 0.5) + 0.04
+        return (nx * offset_dist, nz * offset_dist)
 
     def _save_furniture_plan(self):
         plan_path = "ina_house_plan.json"
@@ -1830,24 +3009,27 @@ class HouseViewer(QtWidgets.QMainWindow):
         plan_path = "ina_house_plan.json"
         data = self._load_plan_data(plan_path)
         storey = self._ensure_plan_storey(data)
-        storey["spawn"] = {"position": [float(v) for v in spawn]}
+        spawns = storey.setdefault("spawns", {})
+        spawns["ina"] = [float(v) for v in spawn]
         if self._save_plan_data(data, plan_path, status_callback=self._set_furnish_status):
-            self._set_furnish_status("Spawn set to bed.")
+            self._set_furnish_status("Ina spawn set to bed.")
 
-        if self.exterior_model is not None:
-            self.exterior_model.spawn_point = spawn
-        self.architect_state.spawn_point = spawn
-        self.architect_settings.spawn_height = spawn[1]
-        self.player_pos = None
-        self._ensure_player()
-        if self.first_person_enabled:
-            self._sync_first_person_camera()
+        self.architect_state.ina_spawn_point = spawn
+        if self.architect_loaded:
+            self.architect_canvas.refresh_scene()
+        self.ina_pos = np.array(self._to_gl_pos(spawn), dtype=float)
+        self._ensure_ina_avatar()
 
     def _remove_furniture_instance(self, instance: FurnitureInstance):
         for part in instance.parts:
             self.view.removeItem(part.mesh)
             if part.mesh in self.furniture_items:
                 self.furniture_items.remove(part.mesh)
+            if part.mesh in self._lit_items:
+                self._lit_items.remove(part.mesh)
+        entry = self._tv_stream_items.pop(instance.instance_id, None)
+        if entry and entry.get("item") is not None:
+            self.view.removeItem(entry["item"])
         if instance in self.furniture_instances:
             self.furniture_instances.remove(instance)
         self.furniture_instances_by_id.pop(instance.instance_id, None)
@@ -2047,6 +3229,9 @@ class HouseViewer(QtWidgets.QMainWindow):
         if best_dist is not None and best_dist > threshold:
             self._set_architect_status("Openings must be placed near a wall.")
             return
+        wall_idx = self.architect_state.walls.index(best_wall) + 1
+        op_idx = len(best_wall.openings) + 1
+        opening_id = f"{opening_type}_{wall_idx}_{op_idx}"
         if opening_type == "door":
             opening = Opening(
                 type="door",
@@ -2054,6 +3239,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 height=self.architect_settings.door_height,
                 sill_height=self.architect_settings.door_sill,
                 offset_along_wall=best_offset,
+                id=opening_id,
             )
         else:
             opening = Opening(
@@ -2062,6 +3248,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 height=self.architect_settings.window_height,
                 sill_height=self.architect_settings.window_sill,
                 offset_along_wall=best_offset,
+                id=opening_id,
             )
         best_wall.openings.append(opening)
         self._set_architect_dirty()
@@ -2069,7 +3256,8 @@ class HouseViewer(QtWidgets.QMainWindow):
 
     def _room_for_point(self, pos: Vec2) -> Optional[str]:
         x, z = float(pos[0]), float(pos[1])
-        for room in self.architect_state.rooms:
+        rooms = self.architect_state.rooms if self.architect_state.rooms else self._runtime_rooms
+        for room in rooms:
             center_x, _, center_z = room.center
             width, _, depth = room.size
             if abs(x - center_x) <= width / 2.0 and abs(z - center_z) <= depth / 2.0:
@@ -2079,8 +3267,18 @@ class HouseViewer(QtWidgets.QMainWindow):
     def architect_set_spawn(self, pos: Vec2):
         spawn = (float(pos[0]), float(self.architect_settings.spawn_height), float(pos[1]))
         self.architect_state.spawn_point = spawn
+        if self.exterior_model is not None:
+            self.exterior_model.spawn_point = spawn
         self._set_architect_dirty()
         self.architect_canvas.refresh_scene()
+
+    def architect_set_ina_spawn(self, pos: Vec2):
+        spawn = (float(pos[0]), float(self.architect_settings.spawn_height), float(pos[1]))
+        self.architect_state.ina_spawn_point = spawn
+        self._set_architect_dirty()
+        self.architect_canvas.refresh_scene()
+        self.ina_pos = np.array(self._to_gl_pos(spawn), dtype=float)
+        self._ensure_ina_avatar()
 
     def architect_add_ceiling_light(self, pos: Vec2):
         light = ArchitectCeilingLight(
@@ -2091,6 +3289,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.architect_state.ceiling_lights.append(light)
         self._set_architect_dirty()
         self.architect_canvas.refresh_scene()
+        self._refresh_light_items_from_state()
 
     def architect_add_light_switch(self, pos: Vec2):
         switch = ArchitectLightSwitch(
@@ -2101,12 +3300,14 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.architect_state.light_switches.append(switch)
         self._set_architect_dirty()
         self.architect_canvas.refresh_scene()
+        self._refresh_light_items_from_state()
 
     def architect_clear(self):
         self.architect_state = ArchitectState()
         self.architect_room_counter = 1
         self._set_architect_dirty()
         self.architect_canvas.refresh_scene()
+        self._refresh_light_items_from_state()
 
     def architect_delete_at(self, pos: Vec2):
         px, py = pos
@@ -2145,9 +3346,23 @@ class HouseViewer(QtWidgets.QMainWindow):
             sx, _, sz = self.architect_state.spawn_point
             if math.hypot(px - sx, py - sz) <= threshold:
                 self.architect_state.spawn_point = None
+                if self.exterior_model is not None:
+                    self.exterior_model.spawn_point = None
                 self._set_architect_dirty()
                 self.architect_canvas.refresh_scene()
                 self._set_architect_status("Spawn point deleted.")
+                return
+
+        if self.architect_state.ina_spawn_point is not None:
+            sx, _, sz = self.architect_state.ina_spawn_point
+            if math.hypot(px - sx, py - sz) <= threshold:
+                self.architect_state.ina_spawn_point = None
+                self.clear_items(self.ina_items)
+                self.ina_avatar_parts = []
+                self.ina_pos = None
+                self._set_architect_dirty()
+                self.architect_canvas.refresh_scene()
+                self._set_architect_status("Ina spawn deleted.")
                 return
 
         if self.architect_state.ceiling_lights:
@@ -2163,6 +3378,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self._set_architect_dirty()
                 self.architect_canvas.refresh_scene()
                 self._set_architect_status("Ceiling light deleted.")
+                self._refresh_light_items_from_state()
                 return
 
         if self.architect_state.light_switches:
@@ -2178,6 +3394,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self._set_architect_dirty()
                 self.architect_canvas.refresh_scene()
                 self._set_architect_status("Light switch deleted.")
+                self._refresh_light_items_from_state()
                 return
 
         if self.architect_state.footprint_points:
@@ -2255,6 +3472,8 @@ class HouseViewer(QtWidgets.QMainWindow):
         except Exception:
             data = None
 
+        player_spawn_override = None
+        ina_spawn_point = None
         if data is not None:
             self.architect_plan_cache = data
             site = data.get("site", {})
@@ -2307,6 +3526,22 @@ class HouseViewer(QtWidgets.QMainWindow):
             self.architect_settings.ceiling_light_radius = float(
                 lighting.get("default_ceiling_radius", self.architect_settings.ceiling_light_radius)
             )
+
+            spawns = storey.get("spawns", {})
+            player_spawn = spawns.get("player")
+            if isinstance(player_spawn, (list, tuple)) and len(player_spawn) >= 3:
+                player_spawn_override = (
+                    float(player_spawn[0]),
+                    float(player_spawn[1]),
+                    float(player_spawn[2]),
+                )
+            ina_spawn = spawns.get("ina") or storey.get("ina_spawn")
+            if isinstance(ina_spawn, (list, tuple)) and len(ina_spawn) >= 3:
+                ina_spawn_point = (
+                    float(ina_spawn[0]),
+                    float(ina_spawn[1]),
+                    float(ina_spawn[2]),
+                )
 
         try:
             house, exterior = load_house_from_plan(plan_path)
@@ -2363,6 +3598,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                             height=op.height,
                             sill_height=op.sill_height,
                             offset_along_wall=op.offset_along_wall,
+                            id=op.id,
                         )
                         for op in wall.openings
                     ],
@@ -2382,15 +3618,17 @@ class HouseViewer(QtWidgets.QMainWindow):
             ],
             ceiling_lights=ceiling_lights,
             light_switches=light_switches,
-            spawn_point=exterior.spawn_point,
+            spawn_point=player_spawn_override if player_spawn_override is not None else exterior.spawn_point,
+            ina_spawn_point=ina_spawn_point,
         )
         self.architect_room_counter = len(self.architect_state.rooms) + 1
         self.architect_dirty = False
         self.architect_loaded = True
-        if exterior.spawn_point is not None:
-            self.architect_settings.spawn_height = float(exterior.spawn_point[1])
+        if self.architect_state.spawn_point is not None:
+            self.architect_settings.spawn_height = float(self.architect_state.spawn_point[1])
         self._sync_architect_controls()
         self.architect_canvas.refresh_scene()
+        self._refresh_light_items_from_state()
         self._set_architect_status("Plan loaded into architect mode.")
 
     def save_architect_plan(self, reload_after: bool = False):
@@ -2484,10 +3722,12 @@ class HouseViewer(QtWidgets.QMainWindow):
         for idx, wall in enumerate(self.architect_state.walls, start=1):
             openings = []
             for op_idx, op in enumerate(wall.openings, start=1):
+                opening_id = op.id or f"{op.type}_{idx}_{op_idx}"
+                op.id = opening_id
                 openings.append(
                     {
                         "type": op.type,
-                        "id": f"{op.type}_{idx}_{op_idx}",
+                        "id": opening_id,
                         "offset_along_wall": float(op.offset_along_wall),
                         "width": float(op.width),
                         "height": float(op.height),
@@ -2542,10 +3782,20 @@ class HouseViewer(QtWidgets.QMainWindow):
             )
         storey["fences"] = fences
 
+        spawns = storey.setdefault("spawns", {})
         if self.architect_state.spawn_point is not None:
-            storey["spawn"] = {"position": [float(v) for v in self.architect_state.spawn_point]}
+            spawn_pos = [float(v) for v in self.architect_state.spawn_point]
+            storey["spawn"] = {"position": list(spawn_pos)}
+            spawns["player"] = list(spawn_pos)
         else:
             storey.pop("spawn", None)
+            spawns.pop("player", None)
+        if self.architect_state.ina_spawn_point is not None:
+            spawns["ina"] = [float(v) for v in self.architect_state.ina_spawn_point]
+        else:
+            spawns.pop("ina", None)
+        if not spawns:
+            storey.pop("spawns", None)
 
         self._update_plan_with_lighting(storey)
         self._update_plan_with_furniture(storey)
@@ -2574,6 +3824,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 "id": f"switch_{idx}",
                 "position": [float(switch.position[0]), float(switch.position[1])],
                 "height": float(switch.height),
+                "color": list(self.architect_settings.switch_color),
             }
             if switch.room:
                 payload["room"] = switch.room
@@ -2584,14 +3835,16 @@ class HouseViewer(QtWidgets.QMainWindow):
         furniture_entries = []
         for instance in self.furniture_instances:
             model_pos = self._to_model_pos(instance.position)
-            furniture_entries.append(
-                {
-                    "id": f"furniture_{instance.instance_id}",
-                    "key": instance.key,
-                    "position": [float(model_pos[0]), float(model_pos[1]), float(model_pos[2])],
-                    "rotation": float(instance.rotation),
-                }
-            )
+            payload = {
+                "id": f"furniture_{instance.instance_id}",
+                "key": instance.key,
+                "position": [float(model_pos[0]), float(model_pos[1]), float(model_pos[2])],
+                "rotation": float(instance.rotation),
+            }
+            tags = self._normalize_tags(instance.tags)
+            if tags:
+                payload["tags"] = tags
+            furniture_entries.append(payload)
         storey["furniture"] = furniture_entries
 
     def _sync_architect_controls(self):
@@ -2861,6 +4114,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         angle = np.degrees(np.arctan2(dy, dx))
         mesh.rotate(-angle, 0, 0, 1)
         mesh.translate(mx, my, height / 2.0)
+        self._register_lit_item(mesh, wall.color, room=None)
 
         return mesh
 
@@ -2887,6 +4141,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         angle = np.degrees(np.arctan2(dy, dx))
         mesh.rotate(-angle, 0, 0, 1)
         mesh.translate(mx, my, height / 2.0)
+        self._register_lit_item(mesh, fence.color, room=None)
         return mesh
 
     def _build_fence_with_posts(self, fence) -> List[gl.GLMeshItem]:
@@ -2956,40 +4211,76 @@ class HouseViewer(QtWidgets.QMainWindow):
     ) -> Optional[gl.GLMeshItem]:
         if len(outline) < 3:
             return None
-
-        points = self._expand_polygon_radial(outline, roof_overhang)
-        triangles = self._triangulate_polygon(points)
-        if not triangles:
+        cx = sum(p[0] for p in outline) / len(outline)
+        cz = sum(p[1] for p in outline) / len(outline)
+        min_dist = min(math.hypot(p[0] - cx, p[1] - cz) for p in outline)
+        if min_dist < 1e-3:
             return None
 
-        top_y = roof_height
+        inner_points = list(outline)
+        outer_points = (
+            self._expand_polygon_radial(outline, roof_overhang)
+            if roof_overhang > 1e-4
+            else list(outline)
+        )
+        core_shrink = max(roof_overhang * 0.6, roof_thickness * 0.5, 0.15)
+        core_shrink = min(core_shrink, min_dist * 0.45)
+        core_points = (
+            self._expand_polygon_radial(outline, -core_shrink)
+            if core_shrink > 0.05
+            else list(outline)
+        )
+
+        core_triangles = self._triangulate_polygon(core_points)
+        outer_triangles = self._triangulate_polygon(outer_points)
+        if not core_triangles or not outer_triangles:
+            return None
+
+        inner_y = roof_height
+        core_y = roof_height + max(0.22, roof_thickness * 0.8)
+        upturn = max(0.06, roof_overhang * 0.2) if roof_overhang > 1e-4 else 0.0
+        outer_y = roof_height + upturn
         bottom_y = roof_height - roof_thickness
 
         verts = []
-        for x, z in points:
-            verts.append(self._to_gl_pos((x, top_y, z)))
-        for x, z in points:
+        for x, z in core_points:
+            verts.append(self._to_gl_pos((x, core_y, z)))
+        core_start = 0
+        for x, z in inner_points:
+            verts.append(self._to_gl_pos((x, inner_y, z)))
+        inner_start = len(core_points)
+        for x, z in outer_points:
+            verts.append(self._to_gl_pos((x, outer_y, z)))
+        outer_start = inner_start + len(inner_points)
+        for x, z in outer_points:
             verts.append(self._to_gl_pos((x, bottom_y, z)))
+        bottom_start = outer_start + len(outer_points)
 
-        n = len(points)
         faces = []
-        for a, b, c in triangles:
-            faces.append([a, b, c])
-            faces.append([a + n, c + n, b + n])
+        for a, b, c in core_triangles:
+            faces.append([core_start + a, core_start + b, core_start + c])
+        for a, b, c in outer_triangles:
+            faces.append([bottom_start + a, bottom_start + c, bottom_start + b])
 
+        n = len(inner_points)
         for i in range(n):
             j = (i + 1) % n
-            faces.append([i, j, j + n])
-            faces.append([i, j + n, i + n])
+            faces.append([core_start + i, core_start + j, inner_start + j])
+            faces.append([core_start + i, inner_start + j, inner_start + i])
+            faces.append([inner_start + i, inner_start + j, outer_start + j])
+            faces.append([inner_start + i, outer_start + j, outer_start + i])
+            faces.append([outer_start + i, outer_start + j, bottom_start + j])
+            faces.append([outer_start + i, bottom_start + j, bottom_start + i])
 
         mesh_data = gl.MeshData(vertexes=np.array(verts, dtype=float), faces=np.array(faces, dtype=int))
         mesh = gl.GLMeshItem(
             meshdata=mesh_data,
-            smooth=False,
+            smooth=True,
             color=color,
             shader="shaded",
             drawEdges=False,
         )
+        self._register_lit_item(mesh, color, room=None)
         return mesh
 
     def _expand_polygon_radial(self, points: List[Vec2], offset: float) -> List[Vec2]:
@@ -3107,6 +4398,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         angle = np.degrees(np.arctan2(dy, dx))
         mesh.rotate(-angle, 0, 0, 1)
         mesh.translate(mx, my, z_center)
+        self._register_lit_item(mesh, color, room=None)
         return mesh
 
     def _build_wall_with_openings(self, wall: WallSegment) -> List[gl.GLGraphicsItem]:
@@ -3306,6 +4598,7 @@ class HouseViewer(QtWidgets.QMainWindow):
 
         angle = np.degrees(np.arctan2(direction[1], direction[0]))
         open_angle = 90.0
+        door_id = opening.id if getattr(opening, "id", None) else None
 
         door = DoorInstance(
             item=mesh,
@@ -3315,8 +4608,13 @@ class HouseViewer(QtWidgets.QMainWindow):
             height=opening.height,
             base_angle=angle,
             open_angle=open_angle,
+            wall_ref=wall,
+            offset_along_wall=opening.offset_along_wall,
+            door_id=door_id,
         )
         self._update_door_transform(door)
+        if door.door_id and door.door_id in self._door_state_cache:
+            self._set_door_state(door, self._door_state_cache[door.door_id], snap=True)
         self.doors.append(door)
     def _make_wall_windows(self, wall: WallSegment):
         """
@@ -3484,7 +4782,236 @@ class HouseViewer(QtWidgets.QMainWindow):
             color=room.color,
             draw_edges=True,
             normal=(0, 1, 0),
+            room=room.name,
         )
+
+    # ---- Sky ----
+
+    def _build_sky(self):
+        self.clear_items(self.sky_items)
+        self._sky_bodies = [
+            {"name": "sun", "color": (1.0, 0.95, 0.7, 1.0), "size": 3.0},
+            {"name": "moon", "color": (0.75, 0.8, 0.95, 1.0), "size": 2.2},
+        ]
+        for body in self._sky_bodies:
+            mesh = self._make_sky_body(body["color"], body["size"])
+            body["mesh"] = mesh
+        self._update_sky_positions(force=True)
+
+    def _make_sky_body(self, color, size: float) -> gl.GLMeshItem:
+        md = get_unit_cube_meshdata()
+        mesh = gl.GLMeshItem(
+            meshdata=md,
+            smooth=False,
+            color=color,
+            shader="shaded",
+            drawEdges=False,
+        )
+        mesh.scale(size, size, size)
+        self.view.addItem(mesh)
+        self.sky_items.append(mesh)
+        return mesh
+
+    def _update_sky_positions(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._sky_last_update < 1.0:
+            return
+        self._sky_last_update = now
+
+        sun_dir = self._sun_direction()
+
+        center = self._vector_to_np(self.view.opts.get("center", self.cam_center))
+        sun_pos = center + sun_dir * self.sky_radius
+        moon_pos = center - sun_dir * self.sky_radius
+
+        sun_intensity = max(0.0, min(1.0, (sun_dir[2] + 0.2) / 1.2))
+        night_color = np.array([10.0, 10.0, 20.0], dtype=float)
+        day_color = np.array([120.0, 170.0, 230.0], dtype=float)
+        bg = night_color + (day_color - night_color) * sun_intensity
+        self.view.setBackgroundColor(tuple(int(c) for c in bg))
+        self._update_lighting()
+
+        for body in getattr(self, "_sky_bodies", []):
+            mesh = body.get("mesh")
+            if mesh is None:
+                continue
+            if body.get("name") == "sun":
+                pos = sun_pos
+            else:
+                pos = moon_pos
+            mesh.resetTransform()
+            size = float(body.get("size", 2.0))
+            mesh.scale(size, size, size)
+            mesh.translate(pos[0], pos[1], pos[2])
+
+    def _sun_direction(self) -> np.ndarray:
+        sun_times = self._get_sunrise_sunset()
+        if sun_times is None:
+            return self._fallback_sun_direction()
+        sunrise, sunset = sun_times
+        now = datetime.now().astimezone()
+        if sunrise <= now <= sunset:
+            total = (sunset - sunrise).total_seconds()
+            progress = (now - sunrise).total_seconds() / max(total, 1.0)
+            angle = progress * math.pi
+        else:
+            if now < sunrise:
+                night_start = sunset - timedelta(days=1)
+                night_end = sunrise
+            else:
+                night_start = sunset
+                night_end = sunrise + timedelta(days=1)
+            total = (night_end - night_start).total_seconds()
+            progress = (now - night_start).total_seconds() / max(total, 1.0)
+            angle = math.pi + progress * math.pi
+        return np.array([math.cos(angle), 0.0, math.sin(angle)], dtype=float)
+
+    def _fallback_sun_direction(self) -> np.ndarray:
+        local = time.localtime()
+        day_fraction = (local.tm_hour + local.tm_min / 60.0 + local.tm_sec / 3600.0) / 24.0
+        angle = (day_fraction - 0.25) * (2.0 * math.pi)
+        return np.array([math.cos(angle), 0.0, math.sin(angle)], dtype=float)
+
+    def _get_sunrise_sunset(self) -> Optional[Tuple[datetime, datetime]]:
+        today = date.today()
+        cache = self._sun_times_cache
+        if (
+            cache.get("date") == today
+            and cache.get("sunrise")
+            and cache.get("sunset")
+            and cache.get("source") == "api"
+        ):
+            return cache["sunrise"], cache["sunset"]
+        if time.time() - cache.get("fetched_at", 0.0) < 3600.0:
+            if cache.get("sunrise") and cache.get("sunset"):
+                return cache.get("sunrise"), cache.get("sunset")
+            return None
+
+        lat, lon = self.sun_location
+        url = (
+            "https://api.sunrise-sunset.org/json"
+            f"?lat={lat}&lng={lon}&formatted=0"
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=4.0) as resp:
+                data = json.load(resp)
+        except (urllib.error.URLError, ValueError, OSError):
+            cache["fetched_at"] = time.time()
+            return self._sunrise_sunset_fallback(today)
+
+        if data.get("status") != "OK":
+            cache["fetched_at"] = time.time()
+            return self._sunrise_sunset_fallback(today)
+
+        results = data.get("results", {})
+        sunrise_str = results.get("sunrise")
+        sunset_str = results.get("sunset")
+        if not sunrise_str or not sunset_str:
+            cache["fetched_at"] = time.time()
+            return self._sunrise_sunset_fallback(today)
+
+        sunrise = self._parse_iso_datetime(sunrise_str)
+        sunset = self._parse_iso_datetime(sunset_str)
+        if sunrise is None or sunset is None:
+            cache["fetched_at"] = time.time()
+            return self._sunrise_sunset_fallback(today)
+
+        sunrise = sunrise.astimezone()
+        sunset = sunset.astimezone()
+        cache["date"] = today
+        cache["sunrise"] = sunrise
+        cache["sunset"] = sunset
+        cache["fetched_at"] = time.time()
+        cache["source"] = "api"
+        return sunrise, sunset
+
+    def _sunrise_sunset_fallback(self, for_date: date) -> Optional[Tuple[datetime, datetime]]:
+        fallback = self._calculate_sunrise_sunset(for_date)
+        cache = self._sun_times_cache
+        cache["fetched_at"] = time.time()
+        cache["source"] = "fallback"
+        if fallback is None:
+            cache["sunrise"] = None
+            cache["sunset"] = None
+            return None
+        sunrise, sunset = fallback
+        cache["date"] = for_date
+        cache["sunrise"] = sunrise
+        cache["sunset"] = sunset
+        return sunrise, sunset
+
+    def _calculate_sunrise_sunset(self, for_date: date) -> Optional[Tuple[datetime, datetime]]:
+        """Approximate sunrise/sunset using a NOAA-style fallback calculation."""
+        lat, lon = self.sun_location
+        day_of_year = for_date.timetuple().tm_yday
+        zenith = 90.833
+
+        def _calc(is_sunrise: bool) -> Optional[datetime]:
+            lng_hour = lon / 15.0
+            if is_sunrise:
+                t = day_of_year + ((6.0 - lng_hour) / 24.0)
+            else:
+                t = day_of_year + ((18.0 - lng_hour) / 24.0)
+
+            mean_anomaly = (0.9856 * t) - 3.289
+            true_long = (
+                mean_anomaly
+                + (1.916 * math.sin(math.radians(mean_anomaly)))
+                + (0.020 * math.sin(math.radians(2 * mean_anomaly)))
+                + 282.634
+            ) % 360.0
+
+            right_ascension = math.degrees(
+                math.atan(0.91764 * math.tan(math.radians(true_long)))
+            )
+            right_ascension %= 360.0
+            l_quadrant = math.floor(true_long / 90.0) * 90.0
+            ra_quadrant = math.floor(right_ascension / 90.0) * 90.0
+            right_ascension = (right_ascension + (l_quadrant - ra_quadrant)) / 15.0
+
+            sin_dec = 0.39782 * math.sin(math.radians(true_long))
+            cos_dec = math.cos(math.asin(sin_dec))
+            cos_lat = math.cos(math.radians(lat))
+            if abs(cos_lat) < 1e-6:
+                return None
+            cos_h = (
+                math.cos(math.radians(zenith))
+                - (sin_dec * math.sin(math.radians(lat)))
+            ) / (cos_dec * cos_lat)
+
+            if cos_h > 1 or cos_h < -1:
+                return None
+
+            if is_sunrise:
+                hour_angle = 360.0 - math.degrees(math.acos(cos_h))
+            else:
+                hour_angle = math.degrees(math.acos(cos_h))
+            hour_angle /= 15.0
+
+            local_mean_time = hour_angle + right_ascension - (0.06571 * t) - 6.622
+            utc_time = (local_mean_time - lng_hour) % 24.0
+            utc_dt = datetime(
+                for_date.year, for_date.month, for_date.day, tzinfo=timezone.utc
+            ) + timedelta(hours=utc_time)
+            return utc_dt.astimezone()
+
+        sunrise = _calc(True)
+        sunset = _calc(False)
+        if sunrise is None or sunset is None:
+            return None
+        return sunrise, sunset
+
+    def _parse_iso_datetime(self, value: str) -> Optional[datetime]:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     # ---- Player / first-person ----
 
@@ -3516,6 +5043,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 )
         else:
             self.keys_down.clear()
+            self._reset_interaction_hold()
             self._set_mouse_capture(False)
             if self._orbit_camera_state is not None:
                 state = self._orbit_camera_state
@@ -3531,6 +5059,31 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self.cam_elevation = state["elevation"]
 
         self._update_player_visibility()
+        self._update_crosshair_visibility()
+        self._update_grid_visibility()
+        self._update_interaction_target()
+
+    def _update_crosshair_position(self):
+        if not hasattr(self, "crosshair"):
+            return
+        rect = self.view.rect()
+        size = self.crosshair.size()
+        x = max(0, (rect.width() - size.width()) // 2)
+        y = max(0, (rect.height() - size.height()) // 2)
+        self.crosshair.move(int(x), int(y))
+
+    def _update_crosshair_visibility(self):
+        if not hasattr(self, "crosshair"):
+            return
+        visible = self.first_person_enabled and not self._radial_menu_active
+        self.crosshair.setVisible(visible)
+        if visible:
+            self._update_crosshair_position()
+
+    def _update_grid_visibility(self):
+        if not hasattr(self, "grid_item"):
+            return
+        self.grid_item.setVisible(not self.first_person_enabled)
 
     def set_player_avatar_enabled(self, enabled: bool):
         if enabled == self.player_avatar_enabled:
@@ -3573,78 +5126,195 @@ class HouseViewer(QtWidgets.QMainWindow):
 
     def _create_player_avatar_parts(self):
         self.player_avatar_parts = []
-        md = get_unit_cube_meshdata()
-        for part_def in self._player_avatar_part_defs():
+        md = get_unit_sphere_meshdata()
+        for part_def in self._schema_part_defs(
+            self.player_schema_path,
+            target_height=self.player_height,
+            color_map={
+                "head": (0.95, 0.84, 0.78, 1.0),
+                "hair": (0.2, 0.16, 0.12, 1.0),
+                "left_eye": (0.96, 0.96, 0.98, 1.0),
+                "right_eye": (0.96, 0.96, 0.98, 1.0),
+                "left_ear": (0.94, 0.85, 0.8, 1.0),
+                "right_ear": (0.94, 0.85, 0.8, 1.0),
+                "mouth": (0.78, 0.48, 0.5, 1.0),
+                "throat": (0.9, 0.78, 0.7, 1.0),
+                "chest": (0.32, 0.34, 0.5, 1.0),
+                "core": (0.28, 0.3, 0.46, 1.0),
+                "left_arm": (0.35, 0.38, 0.55, 1.0),
+                "right_arm": (0.35, 0.38, 0.55, 1.0),
+                "left_leg": (0.16, 0.18, 0.26, 1.0),
+                "right_leg": (0.16, 0.18, 0.26, 1.0),
+            },
+            default_color=(0.4, 0.4, 0.5, 1.0),
+        ):
             mesh = gl.GLMeshItem(
                 meshdata=md,
-                smooth=False,
+                smooth=True,
                 color=part_def.color,
                 shader="shaded",
-                drawEdges=True,
+                drawEdges=False,
             )
             if part_def.gl_options is not None:
                 mesh.setGLOptions(part_def.gl_options)
             self.view.addItem(mesh)
             self.player_items.append(mesh)
             self.player_avatar_parts.append(
-                FurniturePart(mesh=mesh, size=part_def.size, offset=part_def.offset)
+                FurniturePart(
+                    mesh=mesh,
+                    size=part_def.size,
+                    offset=part_def.offset,
+                    base_size=part_def.size,
+                    base_offset=part_def.offset,
+                )
             )
 
-    def _player_avatar_part_defs(self) -> List[FurniturePartDef]:
-        width = max(self.player_width, 0.1)
-        depth = max(self.player_depth, 0.1)
-        height = max(self.player_height, 0.1)
+    def _schema_part_defs_with_keys(
+        self,
+        schema_path: str,
+        target_height: Optional[float] = None,
+        color_map: Optional[dict] = None,
+        default_color: Tuple[float, float, float, float] = (0.6, 0.6, 0.7, 1.0),
+    ) -> List[Tuple[str, FurniturePartDef]]:
+        schema = self._load_body_schema(schema_path)
+        anchors = schema.get("anchors", {})
+        bounds = schema.get("body_bounds", {})
+        extents = bounds.get("extents", [0.3, 0.3, 1.0])
+        center = bounds.get("center", [0.0, 0.0, float(extents[2])])
+        schema_height = max(float(extents[2]) * 2.0, 1e-3)
+        scale = float(target_height) / schema_height if target_height else 1.0
 
-        leg_height = height * 0.45
-        torso_height = height * 0.35
-        head_height = height * 0.2
-        total = leg_height + torso_height + head_height
-        if total > height and total > 1e-6:
-            scale = height / total
-            leg_height *= scale
-            torso_height *= scale
-            head_height *= scale
-
-        def offset_from_bottom(bottom: float, part_height: float) -> float:
-            return bottom + part_height / 2.0 - height / 2.0
-
-        parts: List[FurniturePartDef] = []
-        bottom = 0.0
-        parts.append(
-            FurniturePartDef(
-                size=(width * 0.5, depth * 0.5, leg_height),
-                offset=(0.0, 0.0, offset_from_bottom(bottom, leg_height)),
-                color=(0.18, 0.18, 0.22, 1.0),
+        parts: List[Tuple[str, FurniturePartDef]] = []
+        order = [
+            "left_leg",
+            "right_leg",
+            "left_foot",
+            "right_foot",
+            "core",
+            "chest",
+            "left_arm",
+            "right_arm",
+            "left_hand",
+            "right_hand",
+            "throat",
+            "head",
+            "hair",
+            "left_ear",
+            "right_ear",
+            "left_eye",
+            "right_eye",
+            "mouth",
+        ]
+        for key in order:
+            anchor = anchors.get(key)
+            if not isinstance(anchor, dict):
+                continue
+            anchor_center = anchor.get("center", [0.0, 0.0, 0.0])
+            radius = float(anchor.get("radius", 0.12))
+            if len(anchor_center) < 3:
+                continue
+            offset = (
+                (float(anchor_center[0]) - float(center[0])) * scale,
+                (float(anchor_center[1]) - float(center[1])) * scale,
+                (float(anchor_center[2]) - float(center[2])) * scale,
             )
-        )
-        bottom += leg_height
-        parts.append(
-            FurniturePartDef(
-                size=(width * 0.7, depth * 0.6, torso_height),
-                offset=(0.0, 0.0, offset_from_bottom(bottom, torso_height)),
-                color=(0.35, 0.32, 0.4, 1.0),
-            )
-        )
-        bottom += torso_height
-        parts.append(
-            FurniturePartDef(
-                size=(width * 0.5, depth * 0.55, head_height),
-                offset=(0.0, 0.0, offset_from_bottom(bottom, head_height)),
-                color=(0.95, 0.84, 0.78, 1.0),
-            )
-        )
-        hair_height = head_height * 0.6
-        hair_bottom = bottom + head_height * 0.4
-        parts.append(
-            FurniturePartDef(
-                size=(width * 0.58, depth * 0.6, hair_height),
-                offset=(0.0, 0.0, offset_from_bottom(hair_bottom, hair_height)),
-                color=(0.12, 0.08, 0.16, 1.0),
-            )
-        )
+            size = (radius * 2.0 * scale, radius * 2.0 * scale, radius * 2.0 * scale)
+            color = default_color
+            if color_map and key in color_map:
+                color = color_map[key]
+            parts.append((key, FurniturePartDef(size=size, offset=offset, color=color)))
         return parts
 
+    def _schema_part_defs(
+        self,
+        schema_path: str,
+        target_height: Optional[float] = None,
+        color_map: Optional[dict] = None,
+        default_color: Tuple[float, float, float, float] = (0.6, 0.6, 0.7, 1.0),
+    ) -> List[FurniturePartDef]:
+        return [
+            part_def
+            for _key, part_def in self._schema_part_defs_with_keys(
+                schema_path,
+                target_height=target_height,
+                color_map=color_map,
+                default_color=default_color,
+            )
+        ]
+
+    def _load_body_schema(self, path: str) -> dict:
+        if path in self._schema_cache:
+            return self._schema_cache[path]
+        if not path or not os.path.exists(path):
+            data = {}
+        else:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        self._schema_cache[path] = data
+        return data
+
+    def _ensure_ina_avatar(self):
+        if self.architect_state.ina_spawn_point is None:
+            return
+        self.ina_pos = np.array(self._to_gl_pos(self.architect_state.ina_spawn_point), dtype=float)
+        if not self.ina_avatar_parts:
+            self._create_ina_avatar_parts()
+        self._update_ina_avatar_mesh()
+
+    def _create_ina_avatar_parts(self):
+        self.ina_avatar_parts = []
+        md = get_unit_sphere_meshdata()
+        for part_def in self._schema_part_defs(
+            self.ina_schema_path,
+            target_height=None,
+            color_map={
+                "head": (0.95, 0.86, 0.82, 1.0),
+                "hair": (0.25, 0.18, 0.12, 1.0),
+                "left_eye": (0.96, 0.96, 0.98, 1.0),
+                "right_eye": (0.96, 0.96, 0.98, 1.0),
+                "left_ear": (0.94, 0.85, 0.8, 1.0),
+                "right_ear": (0.94, 0.85, 0.8, 1.0),
+                "mouth": (0.78, 0.48, 0.5, 1.0),
+                "throat": (0.92, 0.82, 0.76, 1.0),
+                "chest": (0.45, 0.36, 0.5, 1.0),
+                "core": (0.4, 0.32, 0.48, 1.0),
+                "left_arm": (0.48, 0.4, 0.55, 1.0),
+                "right_arm": (0.48, 0.4, 0.55, 1.0),
+                "left_hand": (0.52, 0.44, 0.6, 1.0),
+                "right_hand": (0.52, 0.44, 0.6, 1.0),
+                "left_leg": (0.22, 0.18, 0.28, 1.0),
+                "right_leg": (0.22, 0.18, 0.28, 1.0),
+                "left_foot": (0.24, 0.2, 0.3, 1.0),
+                "right_foot": (0.24, 0.2, 0.3, 1.0),
+            },
+            default_color=(0.4, 0.35, 0.5, 1.0),
+        ):
+            mesh = gl.GLMeshItem(
+                meshdata=md,
+                smooth=True,
+                color=part_def.color,
+                shader="shaded",
+                drawEdges=False,
+            )
+            if part_def.gl_options is not None:
+                mesh.setGLOptions(part_def.gl_options)
+            self.view.addItem(mesh)
+            self.ina_items.append(mesh)
+            self.ina_avatar_parts.append(
+                FurniturePart(
+                    mesh=mesh,
+                    size=part_def.size,
+                    offset=part_def.offset,
+                    base_size=part_def.size,
+                    base_offset=part_def.offset,
+                )
+            )
+
     def _reset_player(self):
+        self._clear_climb_surface()
         self.player_pos = self._default_player_position()
         self.player_yaw = 0.0
         self.player_pitch = 0.0
@@ -3705,21 +5375,224 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.player_item.scale(self.player_width, self.player_depth, self.player_height)
         self.player_item.translate(center[0], center[1], center[2])
 
+    def _advance_anim_phase(
+        self,
+        *,
+        phase: float,
+        speed: float,
+        now: float,
+        last_ts: float,
+        idle_speed: float = 0.2,
+        rate: float = 6.0,
+    ) -> Tuple[float, float]:
+        dt = now - last_ts
+        if dt <= 0.0:
+            dt = 0.1
+        dt = max(0.02, min(dt, 0.2))
+        phase_speed = max(speed, idle_speed)
+        phase = (phase + phase_speed * rate * dt) % (2.0 * math.pi)
+        return phase, now
+
+    def _player_animation_state(self) -> Tuple[float, float, float]:
+        if self.player_pos is None:
+            return self._player_anim_phase, 0.0, 0.4
+        now = time.perf_counter()
+        if self._player_anim_last_pos is None:
+            self._player_anim_last_pos = np.array(self.player_pos, dtype=float)
+            self._player_anim_last_ts = now
+            return self._player_anim_phase, 0.0, 0.4
+        dt = now - self._player_anim_last_ts
+        if dt <= 0.0:
+            dt = 0.1
+        delta = np.array(self.player_pos, dtype=float) - self._player_anim_last_pos
+        speed = float(np.linalg.norm(delta[:2]) / max(dt, 1e-3))
+        self._player_anim_last_pos = np.array(self.player_pos, dtype=float)
+        self._player_anim_phase, self._player_anim_last_ts = self._advance_anim_phase(
+            phase=self._player_anim_phase,
+            speed=speed,
+            now=now,
+            last_ts=self._player_anim_last_ts,
+            idle_speed=0.15,
+            rate=6.5,
+        )
+        max_speed = self.player_speed * self.player_sprint_multiplier
+        intensity = min(speed / max(max_speed, 0.1), 1.0)
+        if self.player_crouched:
+            intensity *= 0.8
+        idle = max(0.0, 0.4 - intensity)
+        return self._player_anim_phase, intensity, idle
+
+    def _ina_animation_state(self) -> Tuple[float, float, float]:
+        speed = None
+        intensity = None
+        if self.ina_anim_use_inastate and get_inastate is not None:
+            try:
+                feedback = get_inastate("motor_feedback")
+            except Exception:
+                feedback = None
+            if isinstance(feedback, dict):
+                try:
+                    speed = float(feedback.get("speed", 0.0))
+                except Exception:
+                    speed = 0.0
+                try:
+                    intensity = float(feedback.get("motion_intensity", 0.0))
+                except Exception:
+                    intensity = None
+        if speed is None:
+            speed = float(np.linalg.norm(getattr(self, "ina_velocity", np.zeros(3))[:2]))
+        now = time.perf_counter()
+        if self._ina_anim_last_pos is None:
+            self._ina_anim_last_pos = (
+                np.array(self.ina_pos, dtype=float) if self.ina_pos is not None else None
+            )
+            self._ina_anim_last_ts = now
+        self._ina_anim_phase, self._ina_anim_last_ts = self._advance_anim_phase(
+            phase=self._ina_anim_phase,
+            speed=speed,
+            now=now,
+            last_ts=self._ina_anim_last_ts,
+            idle_speed=0.12,
+            rate=6.0,
+        )
+        if intensity is None:
+            intensity = min(speed / 2.4, 1.0)
+        idle = max(0.0, 0.5 - intensity)
+        return self._ina_anim_phase, intensity, idle
+
+    def _animation_offset(
+        self,
+        key: str,
+        *,
+        phase: float,
+        intensity: float,
+        idle: float,
+        stride_scale: float = 1.0,
+    ) -> Tuple[float, float, float]:
+        stride = 0.12 * intensity * stride_scale
+        lift = 0.07 * intensity * stride_scale
+        sway = 0.04 * intensity * stride_scale
+        bob = 0.02 * (intensity + 0.4 * idle)
+        breath = 0.01 * idle
+
+        def _step(phase_val: float) -> float:
+            return math.sin(phase_val)
+
+        dx = dy = dz = 0.0
+        if key in ("left_leg", "left_foot"):
+            step = _step(phase)
+            dx = step * stride
+            dz = max(0.0, step) * lift * (0.6 if key == "left_leg" else 1.0)
+        elif key in ("right_leg", "right_foot"):
+            step = _step(phase + math.pi)
+            dx = step * stride
+            dz = max(0.0, step) * lift * (0.6 if key == "right_leg" else 1.0)
+        elif key in ("left_arm", "left_hand"):
+            step = _step(phase + math.pi)
+            dx = step * stride * 0.6
+            dz = abs(step) * lift * 0.25
+        elif key in ("right_arm", "right_hand"):
+            step = _step(phase)
+            dx = step * stride * 0.6
+            dz = abs(step) * lift * 0.25
+        elif key in ("core", "chest"):
+            dy = _step(phase) * sway
+            dz = bob
+        elif key in ("head", "hair", "left_ear", "right_ear", "left_eye", "right_eye", "mouth", "throat"):
+            dy = _step(phase) * sway * 0.3
+            dz = bob * 1.5 + breath * _step(phase * 0.5)
+        else:
+            dz = bob * 0.5
+
+        return dx, dy, dz
+
     def _update_player_avatar_mesh(self):
         if not self.player_avatar_parts:
             self._create_player_avatar_parts()
-        part_defs = self._player_avatar_part_defs()
+        part_defs = self._schema_part_defs_with_keys(
+            self.player_schema_path,
+            target_height=self.player_height,
+            color_map=None,
+        )
         if len(part_defs) != len(self.player_avatar_parts):
             self._create_player_avatar_parts()
-            part_defs = self._player_avatar_part_defs()
+            part_defs = self._schema_part_defs_with_keys(
+                self.player_schema_path,
+                target_height=self.player_height,
+                color_map=None,
+            )
 
         center = np.array(self.player_pos, dtype=float)
         body_offset = self.player_eye_height - (self.player_height / 2.0)
         center[2] -= body_offset
 
-        for part, part_def in zip(self.player_avatar_parts, part_defs):
+        phase, intensity, idle = self._player_animation_state()
+        stride_scale = 0.7 if self.player_crouched else 1.0
+        for part, (key, part_def) in zip(self.player_avatar_parts, part_defs):
             part.size = part_def.size
-            part.offset = part_def.offset
+            dx, dy, dz = self._animation_offset(
+                key,
+                phase=phase,
+                intensity=intensity,
+                idle=idle,
+                stride_scale=stride_scale,
+            )
+            part.offset = (
+                part_def.offset[0] + dx,
+                part_def.offset[1] + dy,
+                part_def.offset[2] + dz,
+            )
+            part.mesh.resetTransform()
+            part.mesh.scale(part.size[0], part.size[1], part.size[2])
+            part_center = center + np.array(part.offset, dtype=float)
+            part.mesh.translate(part_center[0], part_center[1], part_center[2])
+
+    def _update_ina_avatar_mesh(self):
+        if self.ina_pos is None:
+            return
+        if not self.ina_avatar_parts:
+            self._create_ina_avatar_parts()
+        part_defs = self._schema_part_defs_with_keys(
+            self.ina_schema_path, target_height=None, color_map=None
+        )
+        if len(part_defs) != len(self.ina_avatar_parts):
+            self._create_ina_avatar_parts()
+            part_defs = self._schema_part_defs_with_keys(
+                self.ina_schema_path, target_height=None, color_map=None
+            )
+
+        center = np.array(self.ina_pos, dtype=float)
+        min_z = None
+        for _key, part_def in part_defs:
+            part_min = part_def.offset[2] - (part_def.size[2] / 2.0)
+            if min_z is None or part_min < min_z:
+                min_z = part_min
+        if min_z is None:
+            min_z = -max(self.player_height / 2.0, 0.1)
+        center[2] -= min_z
+        ground_z = 0.0
+        if hasattr(self, "_ground_z"):
+            try:
+                ground_z = float(self._ground_z())
+            except Exception:
+                ground_z = 0.0
+        if (center[2] + min_z) < ground_z:
+            center[2] += ground_z - (center[2] + min_z)
+        phase, intensity, idle = self._ina_animation_state()
+        for part, (key, part_def) in zip(self.ina_avatar_parts, part_defs):
+            part.size = part_def.size
+            dx, dy, dz = self._animation_offset(
+                key,
+                phase=phase,
+                intensity=intensity,
+                idle=idle,
+                stride_scale=0.95,
+            )
+            part.offset = (
+                part_def.offset[0] + dx,
+                part_def.offset[1] + dy,
+                part_def.offset[2] + dz,
+            )
             part.mesh.resetTransform()
             part.mesh.scale(part.size[0], part.size[1], part.size[2])
             part_center = center + np.array(part.offset, dtype=float)
@@ -3742,7 +5615,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         )
 
     def _ground_z(self) -> float:
-        if self.exterior_model is None:
+        if getattr(self, "exterior_model", None) is None:
             return 0.0
         return float(
             self.exterior_model.garden_center[1]
@@ -3863,10 +5736,15 @@ class HouseViewer(QtWidgets.QMainWindow):
         now = time.perf_counter()
         dt = now - self._last_tick
         self._last_tick = now
+        self._update_sky_positions()
         self._update_door_animations(min(dt, 0.05))
+        self._update_tv_stream()
         if not self.first_person_enabled:
+            self._update_interaction_target()
             return
         self._apply_player_input(min(dt, 0.05))
+        self._maybe_respawn_player()
+        self._update_interaction_target()
 
     def _apply_player_input(self, dt: float):
         if self.player_pos is None:
@@ -3885,6 +5763,11 @@ class HouseViewer(QtWidgets.QMainWindow):
             move -= right
         if QtCore.Qt.Key_A in self.keys_down:
             move += right
+        if self.seated:
+            move[:] = 0.0
+        self._set_crouched(
+            QtCore.Qt.Key_Control in self.keys_down and not self.seated and self.ground_snap_enabled
+        )
         if not self.ground_snap_enabled:
             up = np.array([0.0, 0.0, 1.0], dtype=float)
             if QtCore.Qt.Key_Space in self.keys_down:
@@ -3899,15 +5782,38 @@ class HouseViewer(QtWidgets.QMainWindow):
         speed = self.player_speed
         if QtCore.Qt.Key_Shift in self.keys_down:
             speed *= self.player_sprint_multiplier
+        if self.player_crouched:
+            speed *= self.player_crouch_speed_multiplier
 
         if norm > 1e-6:
-            self.player_pos += move * speed * dt
+            desired = self.player_pos + move * speed * dt
+            self.player_pos = self._resolve_player_collision(self.player_pos, desired)
 
-        if self.ground_snap_enabled:
+        if self.ground_snap_enabled and not self.seated:
+            surface_z = self._update_climb_surface()
             ground_eye_z = self._ground_z() + self.player_eye_height
-            self.player_pos[2] = ground_eye_z
-        elif self.player_pos[2] < self.player_eye_height:
+            if surface_z is not None:
+                ground_eye_z = max(ground_eye_z, surface_z + self.player_eye_height)
+            grounded = self.player_pos[2] <= ground_eye_z + 1e-3
+            if grounded and self.player_vertical_velocity < 0.0:
+                self.player_vertical_velocity = 0.0
+            if grounded:
+                self.player_pos[2] = ground_eye_z
+                if QtCore.Qt.Key_Space in self.keys_down and not self._jump_consumed:
+                    self.player_vertical_velocity = self.player_jump_speed
+                    self._jump_consumed = True
+                    grounded = False
+            if not grounded:
+                self.player_vertical_velocity -= self.player_gravity * dt
+                self.player_pos[2] += self.player_vertical_velocity * dt
+                if self.player_pos[2] <= ground_eye_z:
+                    self.player_pos[2] = ground_eye_z
+                    self.player_vertical_velocity = 0.0
+        elif not self.seated and self.player_pos[2] < self.player_eye_height:
             self.player_pos[2] = self.player_eye_height
+            self.player_vertical_velocity = 0.0
+        elif not self.ground_snap_enabled:
+            self.player_vertical_velocity = 0.0
 
         yaw_delta = 0.0
         pitch_delta = 0.0
@@ -3929,6 +5835,128 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._sync_first_person_camera()
         self._update_player_mesh()
 
+    def _set_crouched(self, crouched: bool) -> None:
+        if crouched == self.player_crouched:
+            return
+        self.player_crouched = crouched
+        self.player_eye_height = (
+            self.player_eye_height_stand * self.player_crouch_factor
+            if crouched
+            else self.player_eye_height_stand
+        )
+        if self.player_pos is not None and self.ground_snap_enabled and not self.seated:
+            ground_eye_z = self._ground_z() + self.player_eye_height
+            self.player_pos[2] = ground_eye_z
+            self.player_vertical_velocity = 0.0
+        self._sync_first_person_camera()
+
+    def _resolve_player_collision(self, current_pos: np.ndarray, desired_pos: np.ndarray) -> np.ndarray:
+        if not self._collides_with_walls(desired_pos):
+            return desired_pos
+        resolved = np.array(current_pos, dtype=float)
+        test = np.array(resolved, dtype=float)
+        test[0] = desired_pos[0]
+        if not self._collides_with_walls(test):
+            resolved[0] = desired_pos[0]
+        test = np.array(resolved, dtype=float)
+        test[1] = desired_pos[1]
+        if not self._collides_with_walls(test):
+            resolved[1] = desired_pos[1]
+        return resolved
+
+    def _maybe_respawn_player(self):
+        if self.player_pos is None:
+            return
+        if not np.isfinite(self.player_pos).all():
+            self._respawn_player("Respawned: invalid position.")
+            return
+        ground_z = self._ground_z()
+        if self.player_pos[2] < ground_z - self.player_respawn_depth:
+            self._respawn_player("Respawned after fall.")
+
+    def _respawn_player(self, message: str):
+        self.seated = False
+        self.seated_return_pos = None
+        self.player_vertical_velocity = 0.0
+        self._jump_consumed = False
+        self._reset_player()
+        self._sync_first_person_camera()
+        self.statusBar().showMessage(message, 1600)
+
+    def _collides_with_walls(self, pos: np.ndarray) -> bool:
+        if self.exterior_model is None:
+            return False
+        radius = max(self.player_width, self.player_depth) * 0.5
+        px, py = float(pos[0]), float(pos[1])
+        for wall in self.exterior_model.walls:
+            dist, offset = self._distance_to_segment((px, py), wall.start, wall.end)
+            if dist <= (wall.thickness * 0.5 + radius):
+                if self._door_gap_allows(wall, offset, radius):
+                    continue
+                return True
+        if self._collides_with_fences(pos, radius):
+            return True
+        if self._collides_with_furniture(px, py, float(pos[2]), radius):
+            return True
+        return False
+
+    def _collides_with_furniture(self, px: float, py: float, pz: float, radius: float) -> bool:
+        if not self.furniture_instances:
+            return False
+        foot_z = float(pz) - float(self.player_eye_height)
+        for instance in self.furniture_instances:
+            bounds = self._furniture_vertical_bounds(instance, use_base=False)
+            if bounds is not None:
+                top_z = bounds[1]
+                if foot_z >= top_z - self._climb_surface_margin:
+                    continue
+            dx = px - float(instance.position[0])
+            dy = py - float(instance.position[1])
+            limit = radius + float(instance.collision_radius)
+            if (dx * dx + dy * dy) <= (limit * limit):
+                return True
+        return False
+
+    def _collides_with_fences(self, pos: np.ndarray, radius: float) -> bool:
+        if self.exterior_model is None:
+            return False
+        fences = []
+        if self.architect_state.fences:
+            fences = self.architect_state.fences
+        elif getattr(self.exterior_model, "fences", None):
+            fences = self.exterior_model.fences
+        if not fences:
+            return False
+        px, py = float(pos[0]), float(pos[1])
+        base_z = float(pos[2]) - float(self.player_eye_height)
+        for fence in fences:
+            if base_z >= float(fence.height) - 0.05:
+                continue
+            dist, _ = self._distance_to_segment((px, py), fence.start, fence.end)
+            if dist <= (float(fence.thickness) * 0.5 + radius):
+                return True
+        return False
+
+    def _door_gap_allows(self, wall: WallSegment, offset: float, radius: float) -> bool:
+        for opening in wall.openings:
+            if opening.type != "door":
+                continue
+            half_width = (opening.width * 0.5) + radius
+            if abs(offset - opening.offset_along_wall) <= half_width:
+                door = self._door_for_opening(wall, opening)
+                if door is not None and abs(door.current_angle) < self.door_block_angle:
+                    return False
+                return True
+        return False
+
+    def _door_for_opening(self, wall: WallSegment, opening: Opening) -> Optional[DoorInstance]:
+        for door in self.doors:
+            if door.wall_ref is not wall:
+                continue
+            if abs(door.offset_along_wall - opening.offset_along_wall) <= 1e-3:
+                return door
+        return None
+
     # ---- Generic mesh helper ----
 
     def _handle_first_person_key_event(self, event, pressed: bool) -> bool:
@@ -3938,7 +5966,7 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self.first_person_action.setChecked(not self.first_person_enabled)
                 return True
             if key == QtCore.Qt.Key_E and self.first_person_enabled:
-                self._toggle_nearest_door()
+                self._begin_context_interaction()
                 return True
             if key == QtCore.Qt.Key_Escape and self.first_person_enabled:
                 self.first_person_action.setChecked(False)
@@ -3950,6 +5978,12 @@ class HouseViewer(QtWidgets.QMainWindow):
         if not self.first_person_enabled:
             return False
 
+        if not pressed and key == QtCore.Qt.Key_E:
+            if event.isAutoRepeat():
+                return True
+            self._finish_context_interaction()
+            return True
+
         if key in self._player_control_keys:
             if event.isAutoRepeat():
                 return True
@@ -3957,13 +5991,392 @@ class HouseViewer(QtWidgets.QMainWindow):
                 self.keys_down.add(key)
             else:
                 self.keys_down.discard(key)
+                if key == QtCore.Qt.Key_Space:
+                    self._jump_consumed = False
             return True
 
         return False
 
-    def _toggle_nearest_door(self):
-        if self.player_pos is None or not self.doors:
+    def _handle_context_interaction(self):
+        if self.player_pos is None:
             return
+        if self._radial_menu_active:
+            return
+        if self.seated:
+            self._stand_from_seat()
+            return
+
+        target = self._pick_interaction_target()
+        if target is None:
+            self.statusBar().showMessage("Nothing to interact with.", 1200)
+            return
+        self._handle_context_interaction_target(target)
+
+    def _begin_context_interaction(self):
+        if self.player_pos is None:
+            return
+        if self._radial_menu_active:
+            return
+        if self.seated:
+            self._stand_from_seat()
+            return
+        target = self._pick_interaction_target()
+        if target is None:
+            self.statusBar().showMessage("Nothing to interact with.", 1200)
+            return
+        self._interact_press_target = target
+        self._interact_press_active = True
+        self._interact_hold_opened = False
+        if self._interact_hold_timer.isActive():
+            self._interact_hold_timer.stop()
+        self._interact_hold_timer.start(max(1, int(self.interact_hold_threshold * 1000)))
+
+    def _finish_context_interaction(self):
+        if not self._interact_press_active:
+            return
+        if self._interact_hold_timer.isActive():
+            self._interact_hold_timer.stop()
+        target = self._interact_press_target
+        menu_opened = self._interact_hold_opened
+        self._interact_press_active = False
+        self._interact_press_target = None
+        self._interact_hold_opened = False
+        if menu_opened:
+            return
+        if target is None:
+            self.statusBar().showMessage("Nothing to interact with.", 1200)
+            return
+        self._handle_context_interaction_target(target)
+
+    def _handle_context_interaction_target(self, target: dict):
+        if self.player_pos is None:
+            return
+        if self._radial_menu_active:
+            return
+        if self.seated:
+            self._stand_from_seat()
+            return
+        kind = target.get("kind")
+        payload = target.get("payload")
+        if kind == "door":
+            self._toggle_door(payload)
+        elif kind == "switch":
+            self._toggle_switch(payload)
+        elif kind == "bed":
+            bed, bed_pos = payload
+            self._lie_in_bed(bed, bed_pos, tuck=False)
+        elif kind == "sofa":
+            sofa, seat_pos = payload
+            self._sit_on_sofa(sofa, seat_pos)
+        elif kind == "desk":
+            desk, seat_pos = payload
+            self._use_desk(desk, seat_pos)
+        elif kind == "chair":
+            chair, seat_pos = payload
+            self._sit_in_chair(chair, seat_pos)
+        elif kind == "fridge":
+            self._use_fridge(payload)
+        elif kind == "microwave":
+            self._use_microwave(payload)
+        elif kind == "cooker":
+            self._use_cooker(payload)
+        elif kind == "hifi":
+            self._use_hifi(payload)
+        elif kind == "tv":
+            self._use_tv(payload)
+        elif kind == "bookshelf":
+            self._use_bookshelf(payload)
+        elif kind == "climb":
+            self._climb_furniture(payload)
+
+    def _open_context_menu(self, target: Optional[dict]) -> bool:
+        if target is None:
+            return False
+        kind = target.get("kind")
+        payload = target.get("payload")
+        if kind == "switch":
+            self._open_switch_menu(payload)
+            return True
+        if kind == "bed":
+            bed, bed_pos = payload
+            self._open_bed_menu(bed, bed_pos)
+            return True
+        if kind == "sofa":
+            sofa, seat_pos = payload
+            self._open_sofa_menu(sofa, seat_pos)
+            return True
+        if kind == "desk":
+            desk, seat_pos = payload
+            self._open_desk_menu(desk, seat_pos)
+            return True
+        if kind == "chair":
+            chair, seat_pos = payload
+            self._open_chair_menu(chair, seat_pos)
+            return True
+        if kind == "fridge":
+            self._open_fridge_menu(payload)
+            return True
+        if kind == "microwave":
+            self._open_microwave_menu(payload)
+            return True
+        if kind == "cooker":
+            self._open_cooker_menu(payload)
+            return True
+        if kind == "hifi":
+            self._open_hifi_menu(payload)
+            return True
+        if kind == "tv":
+            self._open_tv_menu(payload)
+            return True
+        if kind == "bookshelf":
+            self._open_bookshelf_menu(payload)
+            return True
+        return False
+
+    def _on_interact_hold_timeout(self):
+        if not self._interact_press_active or self._interact_hold_opened:
+            return
+        if not self.first_person_enabled or self._radial_menu_active:
+            return
+        if self._open_context_menu(self._interact_press_target):
+            self._interact_hold_opened = True
+
+    def _reset_interaction_hold(self):
+        if self._interact_hold_timer.isActive():
+            self._interact_hold_timer.stop()
+        self._interact_press_active = False
+        self._interact_press_target = None
+        self._interact_hold_opened = False
+
+    def _interaction_candidates(self) -> List[dict]:
+        if self.player_pos is None:
+            return []
+        candidates: List[dict] = []
+        used_instances: set[int] = set()
+        door_info = self._nearest_door()
+        if door_info is not None:
+            door, _ = door_info
+            pos = np.array(door.hinge, dtype=float)
+            pos[2] += float(door.height) * 0.5
+            candidates.append({"kind": "door", "payload": door, "pos": pos})
+
+        switch_info = self._nearest_switch()
+        if switch_info is not None:
+            switch, _ = switch_info
+            center = self._switch_world_center(
+                (float(switch.position[0]), float(switch.position[1])),
+                float(switch.height),
+                switch.room,
+            )
+            pos = np.array(self._to_gl_pos(center), dtype=float)
+            candidates.append({"kind": "switch", "payload": switch, "pos": pos})
+
+        bed_info = self._nearest_bed()
+        if bed_info is not None:
+            bed, bed_pos, _ = bed_info
+            used_instances.add(bed.instance_id)
+            candidates.append({"kind": "bed", "payload": (bed, bed_pos), "pos": bed_pos})
+
+        sofa_info = self._nearest_sofa()
+        if sofa_info is not None:
+            sofa, seat_pos, interact_pos, _ = sofa_info
+            used_instances.add(sofa.instance_id)
+            candidates.append(
+                {"kind": "sofa", "payload": (sofa, seat_pos), "pos": interact_pos}
+            )
+
+        desk_info = self._nearest_desk()
+        if desk_info is not None:
+            desk, seat_pos, _ = desk_info
+            used_instances.add(desk.instance_id)
+            candidates.append({"kind": "desk", "payload": (desk, seat_pos), "pos": seat_pos})
+
+        kitchen_info = self._nearest_kitchen_appliance()
+        if kitchen_info is not None:
+            kind, instance, interact_pos, _ = kitchen_info
+            used_instances.add(instance.instance_id)
+            candidates.append({"kind": kind, "payload": instance, "pos": interact_pos})
+
+        hifi_info = self._nearest_hifi()
+        if hifi_info is not None:
+            hifi, interact_pos, _ = hifi_info
+            used_instances.add(hifi.instance_id)
+            candidates.append({"kind": "hifi", "payload": hifi, "pos": interact_pos})
+
+        tv_info = self._nearest_tv()
+        if tv_info is not None:
+            tv, interact_pos, _ = tv_info
+            used_instances.add(tv.instance_id)
+            candidates.append({"kind": "tv", "payload": tv, "pos": interact_pos})
+
+        bookshelf_info = self._nearest_bookshelf()
+        if bookshelf_info is not None:
+            bookshelf, interact_pos, _ = bookshelf_info
+            used_instances.add(bookshelf.instance_id)
+            candidates.append({"kind": "bookshelf", "payload": bookshelf, "pos": interact_pos})
+
+        chair_info = self._nearest_chair()
+        if chair_info is not None:
+            chair, seat_pos, _ = chair_info
+            used_instances.add(chair.instance_id)
+            candidates.append({"kind": "chair", "payload": (chair, seat_pos), "pos": seat_pos})
+
+        climb_info = self._nearest_climbable_surface(used_instances)
+        if climb_info is not None:
+            instance, surface_pos, _ = climb_info
+            candidates.append({"kind": "climb", "payload": instance, "pos": surface_pos})
+
+        return candidates
+
+    def _pick_interaction_target(self) -> Optional[dict]:
+        candidates = self._interaction_candidates()
+        if not candidates or self.player_pos is None:
+            return None
+
+        forward = self._forward_vector(include_pitch=True)
+        norm = np.linalg.norm(forward)
+        if norm > 1e-6:
+            forward = forward / norm
+
+        aim_bias = 1.5
+        scored = []
+        for cand in candidates:
+            to_target = np.array(cand["pos"], dtype=float) - np.array(self.player_pos, dtype=float)
+            dist = float(np.linalg.norm(to_target))
+            if dist < 1e-6:
+                dist = 1e-6
+            direction = to_target / dist
+            dot = float(np.dot(direction, forward))
+            score = dist * (1.0 + aim_bias * (1.0 - max(dot, 0.0)))
+            cand["dist"] = dist
+            cand["dot"] = dot
+            cand["score"] = score
+            scored.append(cand)
+
+        aim_candidates = [cand for cand in scored if cand["dot"] >= 0.2]
+        if aim_candidates:
+            return min(aim_candidates, key=lambda item: item["score"])
+        return min(scored, key=lambda item: item["dist"])
+
+    def _ensure_interaction_highlight(self):
+        if self._interaction_highlight is not None:
+            return
+        md = get_unit_cube_meshdata()
+        mesh = gl.GLMeshItem(
+            meshdata=md,
+            smooth=False,
+            color=(1.0, 0.9, 0.4, 0.85),
+            shader="shaded",
+            drawEdges=True,
+        )
+        mesh.setGLOptions("translucent")
+        mesh.setDepthValue(2)
+        mesh.setVisible(False)
+        self.view.addItem(mesh)
+        self._interaction_highlight = mesh
+
+    def _set_interaction_highlight(self, pos: np.ndarray, size: float, color: Tuple[float, float, float, float]):
+        self._ensure_interaction_highlight()
+        if self._interaction_highlight is None:
+            return
+        mesh = self._interaction_highlight
+        mesh.resetTransform()
+        mesh.scale(size, size, size)
+        mesh.translate(float(pos[0]), float(pos[1]), float(pos[2]))
+        if hasattr(mesh, "setColor"):
+            mesh.setColor(color)
+        mesh.setVisible(True)
+
+    def _clear_interaction_highlight(self):
+        if self._interaction_highlight is None:
+            return
+        self._interaction_highlight.setVisible(False)
+
+    def _update_interaction_target(self):
+        if not self.first_person_enabled or self.player_pos is None or self._radial_menu_active:
+            self._interaction_target = None
+            self._clear_interaction_highlight()
+            return
+
+        target = self._pick_interaction_target()
+        self._interaction_target = target
+        if target is None:
+            self._clear_interaction_highlight()
+            return
+
+        kind = target["kind"]
+        pos = np.array(target["pos"], dtype=float)
+        if kind == "door":
+            color = (1.0, 0.85, 0.35, 0.85)
+            size = 0.2
+        elif kind == "switch":
+            color = (0.6, 0.95, 1.0, 0.9)
+            size = 0.16
+        elif kind == "bed":
+            color = (0.85, 0.6, 1.0, 0.85)
+            size = 0.28
+            pos[2] += 0.08
+        elif kind == "sofa":
+            color = (0.9, 0.75, 0.55, 0.85)
+            size = 0.26
+            pos[2] += 0.08
+        elif kind == "desk":
+            color = (0.65, 0.85, 1.0, 0.85)
+            size = 0.2
+            pos[2] += 0.05
+        elif kind == "fridge":
+            color = (0.8, 0.9, 1.0, 0.85)
+            size = 0.22
+            pos[2] += 0.12
+        elif kind == "microwave":
+            color = (0.9, 0.85, 0.6, 0.85)
+            size = 0.2
+            pos[2] += 0.1
+        elif kind == "cooker":
+            color = (1.0, 0.7, 0.5, 0.85)
+            size = 0.24
+            pos[2] += 0.12
+        elif kind == "hifi":
+            color = (0.75, 0.9, 1.0, 0.85)
+            size = 0.2
+            pos[2] += 0.1
+        elif kind == "tv":
+            color = (0.65, 0.8, 1.0, 0.85)
+            size = 0.26
+            pos[2] += 0.12
+        elif kind == "bookshelf":
+            color = (0.9, 0.78, 0.5, 0.85)
+            size = 0.24
+            pos[2] += 0.1
+        elif kind == "climb":
+            color = (0.65, 1.0, 0.65, 0.85)
+            size = 0.22
+            pos[2] += 0.08
+        else:
+            color = (0.7, 1.0, 0.7, 0.85)
+            size = 0.22
+            pos[2] += 0.08
+        self._set_interaction_highlight(pos, size, color)
+
+    def _open_radial_menu(self, actions: List[Tuple[str, callable]]):
+        if not actions:
+            return
+        if self.first_person_enabled and self.mouse_capture_supported:
+            self._set_mouse_capture(False)
+        self._radial_menu_active = True
+        self._update_crosshair_visibility()
+        center = self.view.mapToGlobal(self.view.rect().center())
+        self.radial_menu.show_menu(center, actions)
+
+    def _on_radial_menu_closed(self):
+        self._radial_menu_active = False
+        if self.first_person_enabled and self.mouse_capture_supported:
+            self._set_mouse_capture(True)
+        self._update_crosshair_visibility()
+
+    def _nearest_door(self) -> Optional[Tuple[DoorInstance, float]]:
+        if self.player_pos is None or not self.doors:
+            return None
         player_xy = np.array([self.player_pos[0], self.player_pos[1]], dtype=float)
         best = None
         best_dist = None
@@ -3973,12 +6386,1292 @@ class HouseViewer(QtWidgets.QMainWindow):
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best = door
+        if best is None or best_dist is None or best_dist > self.door_interact_distance:
+            return None
+        return best, best_dist
+
+    def _toggle_door(self, door: DoorInstance):
+        if door is None:
+            return
+        open_state = abs(door.target_angle) < 1e-3
+        self._set_door_state(door, open_state, snap=False)
+        if door.door_id:
+            self._door_state_cache[door.door_id] = open_state
+        if self._door_state_callback is not None and door.door_id:
+            try:
+                self._door_state_callback(door.door_id, open_state)
+            except Exception:
+                pass
+
+    def set_door_state_callback(self, callback) -> None:
+        self._door_state_callback = callback
+
+    def apply_door_states(self, door_states: Optional[dict], *, snap: bool = False) -> None:
+        if not isinstance(door_states, dict):
+            return
+        for door_id, raw_state in door_states.items():
+            parsed = self._parse_door_state(raw_state)
+            if parsed is None:
+                continue
+            self._door_state_cache[str(door_id)] = parsed
+        for door in self.doors:
+            if not door.door_id:
+                continue
+            if door.door_id not in self._door_state_cache:
+                continue
+            self._set_door_state(door, self._door_state_cache[door.door_id], snap=snap)
+
+    def _parse_door_state(self, raw_state: object) -> Optional[bool]:
+        state = raw_state
+        if isinstance(state, dict):
+            state = state.get("open")
+        if isinstance(state, bool):
+            return state
+        if isinstance(state, (int, float)):
+            return bool(state)
+        if isinstance(state, str):
+            normalized = state.strip().lower()
+            if normalized in ("open", "opened", "true", "yes", "1"):
+                return True
+            if normalized in ("closed", "close", "false", "no", "0"):
+                return False
+        return None
+
+    def _set_door_state(self, door: DoorInstance, open_state: bool, *, snap: bool = False) -> None:
+        door.target_angle = door.open_angle if open_state else 0.0
+        if snap:
+            door.current_angle = door.target_angle
+            self._update_door_transform(door)
+
+    def _nearest_switch(self) -> Optional[Tuple[ArchitectLightSwitch, float]]:
+        if self.player_pos is None or not self.architect_state.light_switches:
+            return None
+        player_xyz = np.array(self.player_pos, dtype=float)
+        best = None
+        best_dist = None
+        for switch in self.architect_state.light_switches:
+            center = self._switch_world_center(
+                (float(switch.position[0]), float(switch.position[1])),
+                float(switch.height),
+                switch.room,
+            )
+            gl_center = np.array(self._to_gl_pos(center), dtype=float)
+            dist = float(np.linalg.norm(player_xyz - gl_center))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = switch
+        if best is None or best_dist is None or best_dist > 2.0:
+            return None
+        return best, best_dist
+
+    def _toggle_switch(self, switch: ArchitectLightSwitch):
+        room = switch.room or "global"
+        state = self._get_room_light_state(room)
+        state["enabled"] = not state["enabled"]
+        self._refresh_light_items_from_state()
+        self._update_lighting(force=True)
+        state_label = "on" if state["enabled"] else "off"
+        self.statusBar().showMessage(f"Lights {state_label}.", 1200)
+
+    def _open_switch_menu(self, switch: ArchitectLightSwitch):
+        room = switch.room or "global"
+        bright_intensity = self.max_light_intensity
+        actions = [
+            ("On", lambda: self._set_room_light(room, enabled=True)),
+            ("Off", lambda: self._set_room_light(room, enabled=False)),
+            ("Low", lambda: self._set_room_light(room, intensity=0.35, enabled=True)),
+            ("Med", lambda: self._set_room_light(room, intensity=0.65, enabled=True)),
+            ("High", lambda: self._set_room_light(room, intensity=1.0, enabled=True)),
+            ("Bright", lambda: self._set_room_light(room, intensity=bright_intensity, enabled=True)),
+            ("Dimmer...", lambda: self._open_light_dimmer(room)),
+            ("Warm", lambda: self._set_room_light(room, color=(1.0, 0.85, 0.6, 1.0), enabled=True)),
+            ("Neutral", lambda: self._set_room_light(room, color=(1.0, 0.95, 0.8, 1.0), enabled=True)),
+            ("Cool", lambda: self._set_room_light(room, color=(0.75, 0.85, 1.0, 1.0), enabled=True)),
+        ]
+        self._open_radial_menu(actions)
+
+    def _open_light_dimmer(self, room: str):
+        if self._light_dimmer_dialog is not None:
+            self._light_dimmer_dialog.close()
+            self._light_dimmer_dialog = None
+
+        state = self._get_room_light_state(room)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Light Dimmer ({room})")
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        value_label = QtWidgets.QLabel()
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(0, int(self.max_light_intensity * 100))
+        start_value = int(min(state["intensity"], self.max_light_intensity) * 100)
+        slider.setValue(start_value)
+
+        def _update_label(val: int):
+            intensity = val / 100.0
+            value_label.setText(f"Intensity: {intensity:.2f}x")
+
+        def _apply_value(val: int):
+            intensity = val / 100.0
+            self._set_room_light(room, intensity=intensity, enabled=True)
+            _update_label(val)
+
+        slider.valueChanged.connect(_apply_value)
+        _update_label(start_value)
+
+        layout.addWidget(value_label)
+        layout.addWidget(slider)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+
+        self._light_dimmer_dialog = dialog
+        dialog.finished.connect(lambda _: setattr(self, "_light_dimmer_dialog", None))
+        dialog.show()
+
+    def _set_room_light(
+        self,
+        room: str,
+        enabled: Optional[bool] = None,
+        intensity: Optional[float] = None,
+        color: Optional[Tuple[float, float, float, float]] = None,
+    ):
+        state = self._get_room_light_state(room)
+        if enabled is not None:
+            state["enabled"] = bool(enabled)
+        if intensity is not None:
+            clamped = max(0.0, min(self.max_light_intensity, float(intensity)))
+            state["intensity"] = clamped
+        if color is not None:
+            state["color"] = color
+        self._refresh_light_items_from_state()
+        self._update_lighting(force=True)
+
+    def _get_room_light_state(self, room: str) -> dict:
+        state = self.room_light_state.get(room)
+        if state is None:
+            state = {
+                "enabled": True,
+                "intensity": 1.0,
+                "color": (1.0, 1.0, 1.0, 1.0),
+            }
+            self.room_light_state[room] = state
+        return state
+
+    def _nearest_bed(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if instance.key != "bed":
+                continue
+            bed_pos = self._furniture_seat_position(instance)
+            bed_xy = np.array(bed_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - bed_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, bed_pos)
         if best is None or best_dist is None:
+            return None
+        instance, bed_pos = best
+        if best_dist > max(instance.interact_radius, 1.5):
+            return None
+        return instance, bed_pos, best_dist
+
+    def _sofa_interaction_position(
+        self,
+        instance: FurnitureInstance,
+        seat_pos: np.ndarray,
+    ) -> np.ndarray:
+        angle = np.radians(instance.rotation)
+        front_dir = np.array([math.sin(angle), -math.cos(angle), 0.0], dtype=float)
+        front_dist = 0.35
+        return seat_pos + front_dir * front_dist
+
+    def _nearest_sofa(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if not self._is_sofa_instance(instance):
+                continue
+            if not instance.seat_offset or instance.interact_radius <= 0.0:
+                continue
+            seat_pos = self._furniture_seat_position(instance)
+            interact_pos = self._sofa_interaction_position(instance, seat_pos)
+            interact_xy = np.array(interact_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - interact_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, seat_pos, interact_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, seat_pos, interact_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, seat_pos, interact_pos, best_dist
+
+    def _nearest_desk(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if not self._is_desk_instance(instance):
+                continue
+            if not instance.seat_offset or instance.interact_radius <= 0.0:
+                continue
+            seat_pos = self._furniture_seat_position(instance)
+            seat_xy = np.array(seat_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - seat_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, seat_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, seat_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, seat_pos, best_dist
+
+    def _kitchen_interaction_position(self, instance: FurnitureInstance) -> np.ndarray:
+        angle = np.radians(instance.rotation)
+        front_dir = np.array([-math.sin(angle), math.cos(angle), 0.0], dtype=float)
+        front_dist = max(instance.collision_radius * 0.6, 0.4)
+        return instance.position + front_dir * front_dist
+
+    def _hifi_interaction_position(self, instance: FurnitureInstance) -> np.ndarray:
+        angle = np.radians(instance.rotation)
+        front_dir = np.array([-math.sin(angle), math.cos(angle), 0.0], dtype=float)
+        front_dist = max(instance.collision_radius * 0.7, 0.35)
+        return instance.position + front_dir * front_dist
+
+    def _tv_interaction_position(self, instance: FurnitureInstance) -> np.ndarray:
+        angle = np.radians(instance.rotation)
+        front_dir = np.array([-math.sin(angle), math.cos(angle), 0.0], dtype=float)
+        front_dist = max(instance.collision_radius * 0.75, 0.5)
+        return instance.position + front_dir * front_dist
+
+    def _bookshelf_interaction_position(self, instance: FurnitureInstance) -> np.ndarray:
+        pos = np.array(instance.position, dtype=float)
+        bounds = self._furniture_vertical_bounds(instance, use_base=False)
+        if bounds is not None:
+            pos[2] = (bounds[0] + bounds[1]) * 0.5
+        else:
+            pos[2] += 0.8
+        return pos
+
+    def _nearest_hifi(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if not self._is_hifi_instance(instance):
+                continue
+            if instance.interact_radius <= 0.0:
+                continue
+            interact_pos = self._hifi_interaction_position(instance)
+            interact_xy = np.array(interact_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - interact_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, interact_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, interact_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, interact_pos, best_dist
+
+    def _nearest_bookshelf(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if not self._is_bookshelf_instance(instance):
+                continue
+            if instance.interact_radius <= 0.0:
+                continue
+            interact_pos = self._bookshelf_interaction_position(instance)
+            interact_xy = np.array(interact_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - interact_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, interact_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, interact_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, interact_pos, best_dist
+
+    def _nearest_tv(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if not self._is_tv_instance(instance):
+                continue
+            if instance.interact_radius <= 0.0:
+                continue
+            interact_pos = self._tv_interaction_position(instance)
+            interact_xy = np.array(interact_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - interact_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, interact_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, interact_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, interact_pos, best_dist
+
+    def _nearest_kitchen_appliance(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            kind = self._kitchen_appliance_kind(instance)
+            if not kind:
+                continue
+            if instance.interact_radius <= 0.0:
+                continue
+            interact_pos = self._kitchen_interaction_position(instance)
+            interact_xy = np.array(interact_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - interact_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (kind, instance, interact_pos)
+        if best is None or best_dist is None:
+            return None
+        kind, instance, interact_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return kind, instance, interact_pos, best_dist
+
+    def _append_climb_action(self, actions: List[Tuple[str, callable]], instance: FurnitureInstance) -> None:
+        if not self._is_climbable_instance(instance):
             return
-        if best_dist > self.door_interact_distance:
-            self.statusBar().showMessage("No door nearby.", 1500)
+        actions.append(("Climb", lambda: self._climb_furniture(instance)))
+
+    def _open_bed_menu(self, bed: FurnitureInstance, bed_pos: np.ndarray):
+        actions = [
+            ("Get In Bed", lambda: self._lie_in_bed(bed, bed_pos, tuck=False)),
+            ("Tuck In", lambda: self._lie_in_bed(bed, bed_pos, tuck=True)),
+            ("Make Bed", lambda: self._make_bed(bed)),
+        ]
+        self._append_climb_action(actions, bed)
+        self._open_radial_menu(actions)
+
+    def _open_sofa_menu(self, sofa: FurnitureInstance, seat_pos: np.ndarray):
+        actions = [
+            ("Sit", lambda: self._sit_on_sofa(sofa, seat_pos)),
+            ("Lie Down", lambda: self._lie_on_sofa(sofa, seat_pos)),
+        ]
+        self._append_climb_action(actions, sofa)
+        self._open_radial_menu(actions)
+
+    def _open_desk_menu(self, desk: FurnitureInstance, seat_pos: np.ndarray):
+        actions = [
+            ("Use Computer", lambda: self._use_desk(desk, seat_pos)),
+            ("Sit", lambda: self._sit_in_chair(desk, seat_pos)),
+        ]
+        self._append_climb_action(actions, desk)
+        self._open_radial_menu(actions)
+
+    def set_desk_use_callback(self, callback) -> None:
+        self._desk_use_callback = callback
+
+    def is_using_desk(self) -> bool:
+        return bool(self._desk_in_use)
+
+    def _open_chair_menu(self, chair: FurnitureInstance, seat_pos: np.ndarray):
+        actions = [
+            ("Sit", lambda: self._sit_in_chair(chair, seat_pos)),
+        ]
+        self._append_climb_action(actions, chair)
+        self._open_radial_menu(actions)
+
+    def _open_fridge_menu(self, fridge: FurnitureInstance):
+        actions = [
+            ("Grab Snack", lambda: self._request_kitchen_meal("snack", "fridge")),
+        ]
+        if self._kitchen_set_available(fridge):
+            actions.append(("Make Large Meal", lambda: self._request_kitchen_meal("large_meal", "kitchen")))
+        self._open_radial_menu(actions)
+
+    def _open_microwave_menu(self, microwave: FurnitureInstance):
+        actions = [
+            ("Heat Small Meal", lambda: self._request_kitchen_meal("small_meal", "microwave")),
+        ]
+        if self._kitchen_set_available(microwave):
+            actions.append(("Make Large Meal", lambda: self._request_kitchen_meal("large_meal", "kitchen")))
+        self._open_radial_menu(actions)
+
+    def _open_cooker_menu(self, cooker: FurnitureInstance):
+        actions = [
+            ("Cook Meal", lambda: self._request_kitchen_meal("meal", "cooker")),
+        ]
+        if self._kitchen_set_available(cooker):
+            actions.append(("Make Large Meal", lambda: self._request_kitchen_meal("large_meal", "kitchen")))
+        self._open_radial_menu(actions)
+
+    def _open_hifi_menu(self, hifi: FurnitureInstance):
+        actions = [
+            ("Play / Pause", lambda: self._hifi_player_action("play-pause", "Hi-fi: play/pause.")),
+            ("Next Track", lambda: self._hifi_player_action("next", "Hi-fi: next track.")),
+            ("Previous Track", lambda: self._hifi_player_action("previous", "Hi-fi: previous track.")),
+            ("Volume Up", lambda: self._hifi_volume_adjust(0.05, label="Hi-fi")),
+            ("Volume Down", lambda: self._hifi_volume_adjust(-0.05, label="Hi-fi")),
+        ]
+        self._open_radial_menu(actions)
+
+    def _open_tv_menu(self, tv: FurnitureInstance):
+        actions = [
+            ("Play Channel", lambda: self._launch_tv_channel()),
+            ("Channel: Stremio", lambda: self._set_tv_channel("stremio")),
+            ("Channel: YouTube", lambda: self._set_tv_channel("youtube")),
+            ("Channel: Spotify", lambda: self._set_tv_channel("spotify")),
+            ("Set Stremio Window", lambda: self._open_tv_window_picker("stremio")),
+            ("Set YouTube Window", lambda: self._open_tv_window_picker("youtube", prefer_firefox=True)),
+            ("Set Spotify Window", lambda: self._open_tv_window_picker("spotify")),
+            ("Open Firefox", lambda: self._launch_firefox()),
+            ("Open Spotify", lambda: self._launch_spotify()),
+        ]
+        if getattr(tv, "knocked", False):
+            actions.insert(0, ("Right TV", lambda: self._toggle_tv_knock(tv)))
+        else:
+            actions.append(("Knock TV", lambda: self._toggle_tv_knock(tv)))
+        self._open_radial_menu(actions)
+
+    def _open_bookshelf_menu(self, bookshelf: FurnitureInstance):
+        actions = [
+            ("Read Books", lambda: self._use_bookshelf(bookshelf)),
+        ]
+        self._append_climb_action(actions, bookshelf)
+        self._open_radial_menu(actions)
+
+    def _kitchen_set_available(self, instance: FurnitureInstance) -> bool:
+        room = self._room_for_point((float(instance.position[0]), float(instance.position[1])))
+        needed = {"fridge", "microwave", "cooker"}
+        for other in self.furniture_instances:
+            kind = self._kitchen_appliance_kind(other)
+            if not kind:
+                continue
+            if room is not None:
+                other_room = self._room_for_point((float(other.position[0]), float(other.position[1])))
+                if other_room != room:
+                    continue
+            needed.discard(kind)
+            if not needed:
+                return True
+        return False
+
+    def _use_fridge(self, fridge: FurnitureInstance):
+        self._request_kitchen_meal("snack", "fridge")
+
+    def _use_microwave(self, microwave: FurnitureInstance):
+        self._request_kitchen_meal("small_meal", "microwave")
+
+    def _use_cooker(self, cooker: FurnitureInstance):
+        self._request_kitchen_meal("meal", "cooker")
+
+    def _use_hifi(self, hifi: FurnitureInstance):
+        self._hifi_player_action("play-pause", "Hi-fi: play/pause.")
+
+    def _use_tv(self, tv: FurnitureInstance):
+        if getattr(tv, "knocked", False):
+            self.statusBar().showMessage("TV is knocked over.", 1600)
             return
-        best.target_angle = best.open_angle if abs(best.target_angle) < 1e-3 else 0.0
+        self._launch_tv_channel()
+
+    def _use_bookshelf(self, bookshelf: FurnitureInstance):
+        if self._trigger_self_read(source="books"):
+            self.statusBar().showMessage("Bookshelf: reading queued.", 1600)
+        else:
+            self.statusBar().showMessage("Bookshelf: reading unavailable.", 1600)
+
+    def _trigger_self_read(self, source: Optional[str] = None) -> bool:
+        if safe_popen is None:
+            return False
+        if not Path("raw_file_manager.py").exists():
+            return False
+        env = dict(os.environ)
+        if source:
+            env["SELF_READ_SOURCE"] = source
+        return safe_popen(["python", "raw_file_manager.py"], env=env) is not None
+
+    def _toggle_tv_knock(self, tv: FurnitureInstance):
+        tv.knocked = not getattr(tv, "knocked", False)
+        if tv.knocked:
+            bounds = self._furniture_vertical_bounds(tv, use_base=False)
+            height = 0.0
+            if bounds is not None:
+                height = bounds[1] - bounds[0]
+            tv.tilt_deg = 90.0
+            tv.pose_offset = (0.0, 0.0, -height * 0.4)
+            entry = self._tv_stream_items.get(tv.instance_id)
+            if entry and entry.get("item") is not None:
+                entry["item"].setVisible(False)
+            self.statusBar().showMessage("TV knocked over.", 1600)
+        else:
+            tv.tilt_deg = 0.0
+            tv.pose_offset = (0.0, 0.0, 0.0)
+            entry = self._tv_stream_items.get(tv.instance_id)
+            if entry and entry.get("item") is not None:
+                entry["item"].setVisible(True)
+            self.statusBar().showMessage("TV righted.", 1600)
+        self._update_furniture_instance_transform(tv)
+
+    def _request_kitchen_meal(self, meal_name: str, source: str):
+        try:
+            from model_manager import request_meal
+        except Exception:
+            self.statusBar().showMessage("Kitchen connection unavailable.", 1600)
+            return
+        if request_meal(meal_name, reason=f"kitchen:{source}"):
+            label = meal_name.replace("_", " ")
+            self.statusBar().showMessage(f"Kitchen: {label} queued.", 1600)
+        else:
+            self.statusBar().showMessage("Kitchen busy. Try again later.", 1600)
+
+    def _hifi_player_action(self, action: str, message: str):
+        if self._hifi_playerctl([action]):
+            self.statusBar().showMessage(message, 1400)
+
+    def _hifi_volume_adjust(self, delta: float, label: str = "Hi-fi"):
+        step = f"{abs(delta):.2f}{'+' if delta >= 0.0 else '-'}"
+        if self._hifi_playerctl(["volume", step]):
+            direction = "up" if delta >= 0.0 else "down"
+            self.statusBar().showMessage(f"{label}: volume {direction}.", 1400)
+
+    def _launch_firefox(self, url: Optional[str] = None) -> bool:
+        firefox_path = shutil.which("firefox")
+        cmd = None
+        if firefox_path:
+            cmd = [firefox_path]
+            if url:
+                cmd.append(url)
+        elif url:
+            opener = shutil.which("xdg-open")
+            if opener:
+                cmd = [opener, url]
+        if not cmd:
+            self.statusBar().showMessage("TV: Firefox not available.", 2000)
+            return False
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            self.statusBar().showMessage("TV: failed to launch Firefox.", 2000)
+            return False
+        return True
+
+    def _set_tv_channel(self, channel: str):
+        normalized = channel.strip().lower()
+        if normalized not in ("stremio", "youtube", "spotify"):
+            self.statusBar().showMessage("TV: unknown channel.", 1800)
+            return
+        self.tv_channel = normalized
+        has_window = self._apply_tv_channel_window(normalized)
+        label = "Stremio" if normalized == "stremio" else "YouTube"
+        if normalized == "spotify":
+            label = "Spotify"
+        suffix = "" if has_window else " (set a window)"
+        self.statusBar().showMessage(f"TV channel set to {label}{suffix}.", 1600)
+
+    def _launch_tv_channel(self) -> bool:
+        channel = (self.tv_channel or "stremio").strip().lower()
+        self._apply_tv_channel_window(channel)
+        if channel == "youtube":
+            return self._launch_firefox("https://www.youtube.com")
+        if channel == "spotify":
+            return self._launch_spotify()
+        return self._launch_stremio()
+
+    def _load_tv_channel(self) -> str:
+        config = self._load_config_data()
+        channel = (
+            config.get("tv_settings", {})
+            .get("active_channel", "stremio")
+        )
+        if not isinstance(channel, str):
+            return "stremio"
+        channel = channel.strip().lower()
+        return channel if channel in ("stremio", "youtube", "spotify") else "stremio"
+
+    def _apply_tv_channel_window(self, channel: str) -> bool:
+        config = self._load_config_data()
+        tv_settings = config.get("tv_settings", {})
+        channels = tv_settings.get("channels", {})
+        tv_settings["active_channel"] = channel
+        config["tv_settings"] = tv_settings
+        info = channels.get(channel)
+        if not isinstance(info, dict):
+            self._save_config_data(config)
+            return False
+        bounds = info.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
+            self._save_config_data(config)
+            return False
+        self._save_config_data(config)
+        return True
+
+    def _launch_stremio(self) -> bool:
+        stremio_paths = ["stremio", "stremio-desktop"]
+        cmd = None
+        for candidate in stremio_paths:
+            path = shutil.which(candidate)
+            if path:
+                cmd = [path]
+                break
+        if cmd is None:
+            flatpak = shutil.which("flatpak")
+            if flatpak:
+                cmd = [flatpak, "run", "com.stremio.Stremio"]
+        if not cmd:
+            self.statusBar().showMessage("TV: Stremio not available.", 2000)
+            return False
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            self.statusBar().showMessage("TV: failed to launch Stremio.", 2000)
+            return False
+        return True
+
+    def _launch_spotify(self) -> bool:
+        spotify_paths = ["spotify", "spotify-launcher"]
+        cmd = None
+        for candidate in spotify_paths:
+            path = shutil.which(candidate)
+            if path:
+                cmd = [path]
+                break
+        if cmd is None:
+            flatpak = shutil.which("flatpak")
+            if flatpak:
+                cmd = [flatpak, "run", "com.spotify.Client"]
+        if not cmd:
+            self.statusBar().showMessage("TV: Spotify not available.", 2000)
+            return False
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            self.statusBar().showMessage("TV: failed to launch Spotify.", 2000)
+            return False
+        return True
+
+    def _open_tv_window_picker(self, channel: str, prefer_firefox: bool = False):
+        windows, preferred_found = self._list_window_candidates(prefer_firefox=prefer_firefox)
+        if not windows:
+            if self._prompt_tv_window_bounds(channel):
+                self.statusBar().showMessage(
+                    f"TV: {channel.title()} window set (manual bounds).",
+                    2000,
+                )
+                return
+            self.statusBar().showMessage("TV: no windows found (wmctrl missing).", 2200)
+            return
+        items = []
+        for win in windows:
+            class_hint = f" [{win['wm_class']}]" if win.get("wm_class") else ""
+            items.append(
+                f"{win['title']}{class_hint} ({win['width']}x{win['height']}+{win['x']}+{win['y']})"
+            )
+        label = "Firefox Window" if prefer_firefox and preferred_found else "Window"
+        prompt = f"Choose a window for {channel.title()}:"
+        if prefer_firefox and not preferred_found:
+            prompt = f"No Firefox windows found; choose a window for {channel.title()}:"
+        selection, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            f"Select {label}",
+            prompt,
+            items,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        index = items.index(selection)
+        chosen = windows[index]
+        self._store_tv_channel_window(channel, chosen)
+        self.statusBar().showMessage(
+            f"TV: {channel.title()} window set to '{chosen['title']}'.",
+            2000,
+        )
+
+    def _prompt_tv_window_bounds(self, channel: str) -> bool:
+        placeholder = "x,y,width,height"
+        value, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Manual Window Bounds",
+            f"Enter {channel.title()} window bounds ({placeholder}):",
+            text="",
+        )
+        if not ok:
+            return False
+        raw = value.strip()
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) != 4:
+            self.statusBar().showMessage("TV: expected x,y,width,height.", 2000)
+            return False
+        try:
+            x, y, w, h = (int(p) for p in parts)
+        except ValueError:
+            self.statusBar().showMessage("TV: bounds must be integers.", 2000)
+            return False
+        if w <= 1 or h <= 1:
+            self.statusBar().showMessage("TV: width/height must be > 1.", 2000)
+            return False
+        title, _ = QtWidgets.QInputDialog.getText(
+            self,
+            "Window Title (Optional)",
+            f"Label for {channel.title()} window:",
+            text=channel.title(),
+        )
+        window_info = {
+            "window_id": None,
+            "x": x,
+            "y": y,
+            "width": w,
+            "height": h,
+            "title": (title or channel.title()).strip() or channel.title(),
+        }
+        self._store_tv_channel_window(channel, window_info)
+        return True
+
+    def _list_window_candidates(self, prefer_firefox: bool = False) -> Tuple[List[dict], bool]:
+        wmctrl_path = shutil.which("wmctrl")
+        if not wmctrl_path:
+            return [], False
+        try:
+            result = subprocess.run(
+                [wmctrl_path, "-lxG"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception:
+            return [], False
+        windows = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 8)
+            if len(parts) < 9:
+                continue
+            win_id, _desktop, x, y, w, h, _host, wm_class, title = parts
+            try:
+                info = {
+                    "window_id": win_id,
+                    "x": int(x),
+                    "y": int(y),
+                    "width": int(w),
+                    "height": int(h),
+                    "title": title.strip(),
+                    "wm_class": wm_class.strip(),
+                }
+            except ValueError:
+                continue
+            if info["width"] <= 0 or info["height"] <= 0:
+                continue
+            title_lower = info["title"].lower()
+            class_lower = info["wm_class"].lower()
+            info["preferred"] = (
+                "firefox" in title_lower
+                or "mozilla" in title_lower
+                or "firefox" in class_lower
+                or "mozilla" in class_lower
+            )
+            windows.append(info)
+        if prefer_firefox:
+            firefox = [win for win in windows if win.get("preferred")]
+            if firefox:
+                return firefox, True
+            return windows, False
+        return windows, False
+
+    def _store_tv_channel_window(self, channel: str, window_info: dict):
+        config = self._load_config_data()
+        tv_settings = config.get("tv_settings", {})
+        channels = tv_settings.get("channels", {})
+        channels[channel] = {
+            "window_id": window_info.get("window_id"),
+            "title": window_info.get("title"),
+            "wm_class": window_info.get("wm_class"),
+            "bounds": [
+                window_info.get("x"),
+                window_info.get("y"),
+                window_info.get("width"),
+                window_info.get("height"),
+            ],
+        }
+        tv_settings["channels"] = channels
+        tv_settings["active_channel"] = self.tv_channel
+        config["tv_settings"] = tv_settings
+        self._save_config_data(config)
+
+    def _load_config_data(self) -> dict:
+        path = Path("config.json")
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def _save_config_data(self, data: dict) -> bool:
+        path = Path("config.json")
+        try:
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=4)
+        except Exception:
+            self.statusBar().showMessage("TV: failed to save config.json.", 2200)
+            return False
+        return True
+
+    def _refresh_tv_stream_config(self) -> None:
+        path = Path("config.json")
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            self._tv_stream_bounds = None
+            self._tv_stream_config_mtime = None
+            return
+        if self._tv_stream_config_mtime is not None and stat.st_mtime == self._tv_stream_config_mtime:
+            return
+        self._tv_stream_config_mtime = stat.st_mtime
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception:
+            self._tv_stream_bounds = None
+            return
+        tv_settings = cfg.get("tv_settings", {})
+        channel = tv_settings.get("active_channel", self.tv_channel)
+        if not isinstance(channel, str):
+            self._tv_stream_bounds = None
+            return
+        channel = channel.strip().lower()
+        channels = tv_settings.get("channels", {})
+        if not isinstance(channels, dict):
+            self._tv_stream_bounds = None
+            return
+        info = channels.get(channel)
+        if not isinstance(info, dict):
+            self._tv_stream_bounds = None
+            return
+        bounds = info.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
+            self._tv_stream_bounds = None
+            return
+        try:
+            left = int(bounds[0])
+            top = int(bounds[1])
+            width = int(bounds[2])
+            height = int(bounds[3])
+        except (TypeError, ValueError):
+            self._tv_stream_bounds = None
+            return
+        if width <= 1 or height <= 1:
+            self._tv_stream_bounds = None
+            return
+        self._tv_stream_bounds = {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        }
+
+    def _update_tv_stream(self):
+        if not self.furniture_instances:
+            return
+        self._refresh_tv_stream_config()
+        if not self._tv_stream_bounds:
+            return
+        now = time.perf_counter()
+        if (now - self._tv_stream_last_update) < self._tv_stream_interval:
+            return
+        self._tv_stream_last_update = now
+        frame = None
+        try:
+            import mss  # type: ignore
+
+            with mss.mss() as grabber:
+                raw = grabber.grab(self._tv_stream_bounds)
+            if raw is not None:
+                frame = np.array(raw)
+                if frame.shape[-1] == 4:
+                    frame = frame[:, :, [2, 1, 0, 3]]
+        except Exception:
+            frame = None
+        if frame is None:
+            try:
+                import pyautogui  # type: ignore
+
+                bounds = self._tv_stream_bounds
+                image = pyautogui.screenshot(
+                    region=(
+                        bounds["left"],
+                        bounds["top"],
+                        bounds["width"],
+                        bounds["height"],
+                    )
+                )
+                frame = np.array(image)
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    alpha = np.full(frame.shape[:2] + (1,), 255, dtype=frame.dtype)
+                    frame = np.concatenate([frame, alpha], axis=2)
+            except Exception:
+                return
+        if frame is None or frame.ndim < 3 or frame.shape[2] < 3:
+            return
+        target_w, target_h = self._tv_stream_size
+        try:
+            import cv2  # type: ignore
+
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        except Exception:
+            step_y = max(int(frame.shape[0] / target_h), 1)
+            step_x = max(int(frame.shape[1] / target_w), 1)
+            frame = frame[::step_y, ::step_x]
+            frame = frame[:target_h, :target_w]
+        if frame.shape[0] != target_h or frame.shape[1] != target_w:
+            return
+        if frame.shape[2] == 3:
+            alpha = np.full(frame.shape[:2] + (1,), 255, dtype=frame.dtype)
+            frame = np.concatenate([frame, alpha], axis=2)
+        frame = frame.astype(np.uint8, copy=False)
+        data = np.ascontiguousarray(np.transpose(frame, (1, 0, 2)))
+        for instance in self.furniture_instances:
+            if not self._is_tv_instance(instance):
+                continue
+            if getattr(instance, "knocked", False):
+                continue
+            entry = self._ensure_tv_stream_item(instance, target_w, target_h)
+            if entry is None:
+                continue
+            item = entry["item"]
+            item.setData(data)
+            self._update_tv_stream_item_transform(instance, item, target_w, target_h)
+
+    def _ensure_tv_stream_item(self, instance: FurnitureInstance, width_px: int, height_px: int):
+        entry = self._tv_stream_items.get(instance.instance_id)
+        if entry and entry.get("size") == (width_px, height_px):
+            return entry
+        if entry and entry.get("item") is not None:
+            self.view.removeItem(entry["item"])
+        blank = np.zeros((width_px, height_px, 4), dtype=np.ubyte)
+        item = gl.GLImageItem(blank, smooth=True, glOptions="opaque")
+        self.view.addItem(item)
+        entry = {"item": item, "size": (width_px, height_px)}
+        self._tv_stream_items[instance.instance_id] = entry
+        return entry
+
+    def _update_tv_stream_item_transform(
+        self,
+        instance: FurnitureInstance,
+        item: gl.GLImageItem,
+        width_px: int,
+        height_px: int,
+    ):
+        if not instance.parts:
+            return
+        screen_part = max(
+            instance.parts,
+            key=lambda part: float(part.size[0]) * float(part.size[2]),
+        )
+        angle = np.radians(instance.rotation)
+        cos_a = float(np.cos(angle))
+        sin_a = float(np.sin(angle))
+        rot = np.array(
+            [
+                [cos_a, -sin_a, 0.0],
+                [sin_a, cos_a, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        rotated_offset = rot @ np.array(screen_part.offset, dtype=float)
+        center = instance.position + rotated_offset
+        width = float(screen_part.size[0])
+        height = float(screen_part.size[2])
+        depth = float(screen_part.size[1])
+        right_dir = np.array([cos_a, sin_a, 0.0], dtype=float)
+        up_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+        front_dir = np.array([-sin_a, cos_a, 0.0], dtype=float)
+        front_offset = depth * 0.5 + 0.01
+        origin = (
+            center
+            + front_dir * front_offset
+            - right_dir * (width / 2.0)
+            - up_dir * (height / 2.0)
+        )
+        if width_px <= 0 or height_px <= 0:
+            return
+        scale_x = width / float(width_px)
+        scale_y = height / float(height_px)
+        m = np.eye(4, dtype=float)
+        m[0:3, 0] = right_dir * scale_x
+        m[0:3, 1] = up_dir * scale_y
+        m[0:3, 2] = front_dir
+        m[0:3, 3] = origin
+        item.setTransform(pg.Transform3D(m))
+
+    def _hifi_playerctl(self, args: List[str]) -> bool:
+        if sys.platform != "linux":
+            self.statusBar().showMessage("Media control requires Linux MPRIS.", 2000)
+            return False
+        playerctl_path = shutil.which("playerctl")
+        if not playerctl_path:
+            self.statusBar().showMessage("Media: install playerctl to control Spotify.", 2200)
+            return False
+        cmd = [playerctl_path]
+        player = self._resolve_hifi_player()
+        if player:
+            cmd.extend(["-p", player])
+        cmd.extend(args)
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            self.statusBar().showMessage("Media: playerctl missing.", 2000)
+            return False
+        except subprocess.CalledProcessError as exc:
+            msg = (exc.stderr or exc.stdout or "").strip()
+            if "No players found" in msg or "Player is not running" in msg:
+                self._hifi_player_cache = None
+                self._hifi_player_cache_ts = 0.0
+                self.statusBar().showMessage("Media: open Spotify and try again.", 2000)
+            elif msg:
+                self.statusBar().showMessage(f"Media: {msg}", 2000)
+            else:
+                self.statusBar().showMessage("Media: command failed.", 2000)
+            return False
+        return True
+
+    def _resolve_hifi_player(self) -> Optional[str]:
+        now = time.time()
+        if (
+            self._hifi_player_cache
+            and (now - self._hifi_player_cache_ts) < 4.0
+        ):
+            return self._hifi_player_cache
+        env_override = os.environ.get("INAZUMA_HIFI_PLAYER")
+        if env_override:
+            self._hifi_player_cache = env_override
+            self._hifi_player_cache_ts = now
+            return env_override
+        playerctl_path = shutil.which("playerctl")
+        if not playerctl_path:
+            return None
+        result = subprocess.run(
+            [playerctl_path, "-l"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        players = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not players:
+            return None
+        selected = None
+        for name in players:
+            if "spotify" in name.lower():
+                selected = name
+                break
+        if selected is None:
+            selected = players[0]
+        self._hifi_player_cache = selected
+        self._hifi_player_cache_ts = now
+        return selected
+
+    def _sit_on_sofa(self, sofa: FurnitureInstance, seat_pos: np.ndarray):
+        self._clear_climb_surface()
+        self._sit_in_chair(sofa, seat_pos)
+
+    def _lie_on_sofa(self, sofa: FurnitureInstance, seat_pos: np.ndarray):
+        self._clear_climb_surface()
+        self.seated = True
+        self.seated_return_pos = np.array(self.player_pos, dtype=float)
+        self.seated_return_yaw = self.player_yaw
+        eye_height = self.player_eye_height * 0.38
+        self.player_pos = np.array(
+            [seat_pos[0], seat_pos[1], seat_pos[2] + eye_height],
+            dtype=float,
+        )
+        self._sync_first_person_camera()
+
+    def _use_desk(self, desk: FurnitureInstance, seat_pos: np.ndarray):
+        self._clear_climb_surface()
+        self._sit_in_chair(desk, seat_pos)
+        self._desk_in_use = True
+        if self._desk_use_callback is not None:
+            try:
+                self._desk_use_callback(desk)
+            except Exception:
+                pass
+        self.statusBar().showMessage("Using desk.", 1200)
+
+    def _climb_furniture(self, instance: FurnitureInstance):
+        if self.player_pos is None:
+            return
+        surface_z = self._furniture_surface_z(instance)
+        if surface_z is None:
+            return
+        self.seated = False
+        self.seated_return_pos = None
+        self._clear_climb_surface()
+        self._climb_surface_instance = instance
+        self._climb_surface_radius = max(instance.collision_radius * 1.05, 0.6)
+        center_xy = np.array(instance.position[:2], dtype=float)
+        target_xy = np.array(self.player_pos[:2], dtype=float)
+        offset = target_xy - center_xy
+        dist = float(np.linalg.norm(offset))
+        if dist > self._climb_surface_radius:
+            if dist > 1e-6:
+                target_xy = center_xy + offset / dist * (self._climb_surface_radius * 0.8)
+            else:
+                target_xy = center_xy
+        self.player_vertical_velocity = 0.0
+        self._jump_consumed = False
+        self.player_pos = np.array(
+            [target_xy[0], target_xy[1], surface_z + self.player_eye_height],
+            dtype=float,
+        )
+        self._sync_first_person_camera()
+        self.statusBar().showMessage("Climbed up.", 1200)
+
+    def _lie_in_bed(self, bed: FurnitureInstance, bed_pos: np.ndarray, tuck: bool):
+        self._clear_climb_surface()
+        self.seated = True
+        self.seated_return_pos = np.array(self.player_pos, dtype=float)
+        self.seated_return_yaw = self.player_yaw
+        factor = 0.32 if tuck else 0.4
+        eye_height = self.player_eye_height * factor
+        self.player_pos = np.array(
+            [bed_pos[0], bed_pos[1], bed_pos[2] + eye_height],
+            dtype=float,
+        )
+        self._sync_first_person_camera()
+
+    def _make_bed(self, bed: FurnitureInstance):
+        if bed.key != "bed":
+            return
+        if getattr(bed, "_made", False):
+            for part in bed.parts:
+                part.size = part.base_size
+                part.offset = part.base_offset
+            bed._made = False
+            self._update_furniture_instance_transform(bed)
+            self.statusBar().showMessage("Bed unmade.", 1200)
+            return
+
+        for idx, part in enumerate(bed.parts):
+            if idx >= len(bed.parts) - 2:
+                part.size = (
+                    part.base_size[0],
+                    part.base_size[1],
+                    part.base_size[2] * 0.45,
+                )
+                part.offset = (
+                    part.base_offset[0],
+                    part.base_offset[1],
+                    part.base_offset[2] - (part.base_size[2] * 0.25),
+                )
+        bed._made = True
+        self._update_furniture_instance_transform(bed)
+        self.statusBar().showMessage("Bed made.", 1200)
+
+    def _nearest_chair(self):
+        if self.player_pos is None:
+            return None
+        player_xy = np.array(self.player_pos[:2], dtype=float)
+        best = None
+        best_dist = None
+        for instance in self.furniture_instances:
+            if instance.key == "bed" or self._is_sofa_instance(instance):
+                continue
+            if self._is_desk_instance(instance):
+                continue
+            if not instance.seat_offset or instance.interact_radius <= 0.0:
+                continue
+            seat_pos = self._furniture_seat_position(instance)
+            seat_xy = np.array(seat_pos[:2], dtype=float)
+            dist = float(np.linalg.norm(player_xy - seat_xy))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = (instance, seat_pos)
+        if best is None or best_dist is None:
+            return None
+        instance, seat_pos = best
+        if best_dist > instance.interact_radius:
+            return None
+        return instance, seat_pos, best_dist
+
+    def _furniture_seat_position(self, instance: FurnitureInstance) -> np.ndarray:
+        seat_offset = instance.seat_offset or (0.0, 0.0, 0.0)
+        angle = np.radians(instance.rotation)
+        cos_a = float(np.cos(angle))
+        sin_a = float(np.sin(angle))
+        rot = np.array(
+            [
+                [cos_a, -sin_a, 0.0],
+                [sin_a, cos_a, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        offset = rot @ np.array(seat_offset, dtype=float)
+        return instance.position + offset
+
+    def _sit_in_chair(self, chair: FurnitureInstance, seat_pos: np.ndarray):
+        self._clear_climb_surface()
+        self.seated = True
+        self.seated_return_pos = np.array(self.player_pos, dtype=float)
+        self.seated_return_yaw = self.player_yaw
+        self._desk_in_use = False
+        eye_height = self.player_eye_height * self.seated_eye_height_factor
+        self.player_pos = np.array(
+            [seat_pos[0], seat_pos[1], seat_pos[2] + eye_height],
+            dtype=float,
+        )
+        self._sync_first_person_camera()
+
+    def _stand_from_seat(self):
+        self._clear_climb_surface()
+        if self.seated_return_pos is not None:
+            self.player_pos = np.array(self.seated_return_pos, dtype=float)
+            self.player_yaw = self.seated_return_yaw
+        self.seated = False
+        self.seated_return_pos = None
+        self._desk_in_use = False
+        self._sync_first_person_camera()
 
     def _update_door_animations(self, dt: float):
         if not self.doors:
@@ -4143,6 +7836,8 @@ class HouseViewer(QtWidgets.QMainWindow):
             if event.type() == QtCore.QEvent.FocusIn:
                 if self.first_person_enabled and self.mouse_capture_supported:
                     self._set_mouse_capture(True)
+            if event.type() == QtCore.QEvent.Resize:
+                self._update_crosshair_position()
             if self._handle_mouse_look(event):
                 return True
         return super().eventFilter(obj, event)
@@ -4204,6 +7899,8 @@ class HouseViewer(QtWidgets.QMainWindow):
         color,
         draw_edges: bool = False,
         normal=None,
+        room: Optional[str] = None,
+        lit: bool = True,
     ) -> gl.GLMeshItem:
         w, h, d = self._to_gl_size(size)
         cx, cy, cz = self._to_gl_pos(center)
@@ -4235,7 +7932,87 @@ class HouseViewer(QtWidgets.QMainWindow):
                         axis /= axis_len
                     mesh.rotate(angle, *axis)
         mesh.translate(cx, cy, cz)
+        if lit:
+            self._register_lit_item(mesh, color, room=room)
         return mesh
+
+    def _register_lit_item(
+        self,
+        mesh: gl.GLMeshItem,
+        color,
+        room: Optional[str] = None,
+        emissive: float = 0.0,
+    ):
+        base = (
+            float(color[0]),
+            float(color[1]),
+            float(color[2]),
+            float(color[3]) if len(color) > 3 else 1.0,
+        )
+        mesh._base_color = base
+        mesh._room_key = room
+        mesh._emissive = max(0.0, min(1.0, float(emissive)))
+        self._lit_items.append(mesh)
+        self._apply_lighting_to_item(mesh)
+
+    def _apply_lighting_to_item(self, mesh: gl.GLMeshItem):
+        base = getattr(mesh, "_base_color", None)
+        if base is None:
+            return
+        room = getattr(mesh, "_room_key", None)
+        ambient = self._current_ambient_intensity()
+        ambient_color = self._current_ambient_color()
+        room_state = self._get_room_light_state(room or "global")
+        room_intensity = room_state["intensity"] if room_state["enabled"] else 0.0
+        room_color = room_state["color"]
+        room_boost = 0.85 * room_intensity
+        emissive = getattr(mesh, "_emissive", 0.0)
+
+        r = base[0] * (ambient * ambient_color[0]) + base[0] * room_boost * room_color[0]
+        g = base[1] * (ambient * ambient_color[1]) + base[1] * room_boost * room_color[1]
+        b = base[2] * (ambient * ambient_color[2]) + base[2] * room_boost * room_color[2]
+        if emissive > 0.0:
+            r += base[0] * emissive
+            g += base[1] * emissive
+            b += base[2] * emissive
+        max_value = self.max_light_value
+        r = max(0.0, min(max_value, r))
+        g = max(0.0, min(max_value, g))
+        b = max(0.0, min(max_value, b))
+        if hasattr(mesh, "setColor"):
+            mesh.setColor((r, g, b, base[3]))
+
+    def _update_lighting(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._lighting_last_update < 0.5:
+            return
+        self._lighting_last_update = now
+        for mesh in list(self._lit_items):
+            self._apply_lighting_to_item(mesh)
+
+    def _current_ambient_intensity(self) -> float:
+        sun_dir = self._sun_direction()
+        sun_intensity = max(0.0, min(1.0, (sun_dir[2] + 0.15) / 1.15))
+        moon_dir = -sun_dir
+        moon_intensity = max(0.0, min(1.0, (moon_dir[2] + 0.05) / 1.05))
+        ambient = 0.2 + (0.7 * sun_intensity) + (0.15 * moon_intensity)
+        return max(0.05, min(1.0, ambient))
+
+    def _current_ambient_color(self) -> Tuple[float, float, float]:
+        sun_dir = self._sun_direction()
+        sun_intensity = max(0.0, min(1.0, (sun_dir[2] + 0.2) / 1.2))
+        moon_dir = -sun_dir
+        moon_intensity = max(0.0, min(1.0, (moon_dir[2] + 0.05) / 1.05))
+        day = np.array([1.0, 0.96, 0.9], dtype=float)
+        night = np.array([0.35, 0.42, 0.55], dtype=float)
+        moon = np.array([0.6, 0.68, 0.8], dtype=float)
+        color = night + (day - night) * sun_intensity
+        color = color + (moon - color) * (moon_intensity * 0.25)
+        return (
+            float(np.clip(color[0], 0.0, 1.0)),
+            float(np.clip(color[1], 0.0, 1.0)),
+            float(np.clip(color[2], 0.0, 1.0)),
+        )
 
 
 def main():

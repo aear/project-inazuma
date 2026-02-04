@@ -23,6 +23,11 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
+try:
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
+
 def load_config():
     path = Path("config.json")
     if not path.exists():
@@ -49,6 +54,497 @@ _DEFAULT_SELF_READ_SOURCE_CHOICES = {
     "venv": False,
 }
 
+_MEMORY_GUARD_DEFAULTS = {
+    "enabled": True,
+    "ram_soft_percent": 35.0,
+    "ram_hard_percent": 45.0,
+    "swap_soft_percent": 5.0,
+    "swap_hard_percent": 10.0,
+    "min_available_gb": 8.0,
+    "log_cooldown_sec": 120.0,
+}
+_MEMORY_GUARD_CHECK_INTERVAL = 5.0
+_last_memory_guard_check = 0.0
+_last_memory_guard_log = 0.0
+_last_memory_guard_key: Optional[tuple] = None
+_memory_guard_state: Dict[str, Any] = {"level": "unknown"}
+_BUNDLE_POLICY_DEFAULTS = {
+    "enabled": False,
+    "allow_apply": False,
+    "cooldown_seconds": 3600.0,
+    "max_files_per_bundle": 10_000,
+    "max_bundle_bytes": 512 * 1024 * 1024,
+    "max_file_bytes": 256 * 1024,
+    "bundle_dir": "bundles",
+    "write_manifest": True,
+    "follow_symlinks": False,
+    "default_include": [],
+    "default_exclude": [],
+    "allowed_roots": [],
+    "exclude_dirs": [],
+}
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_percent(value: Any, default: float) -> float:
+    coerced = _coerce_float(value, default)
+    return max(0.0, min(100.0, coerced))
+
+
+def _clamp_positive(value: Any, default: float) -> float:
+    coerced = _coerce_float(value, default)
+    return coerced if coerced >= 0.0 else default
+
+
+def _coerce_str_list(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _memory_guard_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    guard_raw = cfg.get("memory_guard") if isinstance(cfg, dict) else None
+    guard = guard_raw if isinstance(guard_raw, dict) else {}
+
+    limits = _MEMORY_GUARD_DEFAULTS.copy()
+    limits["enabled"] = _coerce_bool(guard.get("enabled", limits["enabled"]), limits["enabled"])
+
+    for key in ("ram_soft_percent", "ram_hard_percent", "swap_soft_percent", "swap_hard_percent"):
+        if key in guard:
+            limits[key] = _clamp_percent(guard.get(key), limits[key])
+
+    if "min_available_gb" in guard:
+        limits["min_available_gb"] = _clamp_positive(guard.get("min_available_gb"), limits["min_available_gb"])
+    if "log_cooldown_sec" in guard:
+        limits["log_cooldown_sec"] = _clamp_positive(guard.get("log_cooldown_sec"), limits["log_cooldown_sec"])
+
+    if "ram_hard_percent" not in guard:
+        try:
+            fraction = float(cfg.get("max_ram_fraction"))
+        except (TypeError, ValueError):
+            fraction = None
+        if fraction is not None and fraction > 0:
+            hard = max(0.0, min(100.0, fraction * 100.0))
+            limits["ram_hard_percent"] = hard
+            limits["ram_soft_percent"] = min(limits["ram_soft_percent"], hard * 0.85)
+
+    limits["ram_soft_percent"] = min(limits["ram_soft_percent"], limits["ram_hard_percent"])
+    limits["swap_soft_percent"] = min(limits["swap_soft_percent"], limits["swap_hard_percent"])
+    return limits
+
+
+def _publish_memory_guard_state(state: Dict[str, Any]) -> None:
+    global _last_memory_guard_key
+    key = (
+        state.get("level"),
+        state.get("ram_percent"),
+        state.get("swap_percent"),
+        state.get("ram_available_gb"),
+    )
+    if key == _last_memory_guard_key:
+        return
+    update_inastate("memory_guard", state)
+    _last_memory_guard_key = key
+
+
+def _maybe_log_memory_guard_state(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    global _last_memory_guard_log
+    level = state.get("level")
+    if level not in {"soft", "hard"}:
+        return
+    now = time.time()
+    cooldown = float(limits.get("log_cooldown_sec", _MEMORY_GUARD_DEFAULTS["log_cooldown_sec"]))
+    if _last_memory_guard_log and (now - _last_memory_guard_log) < cooldown:
+        return
+    _last_memory_guard_log = now
+    log_to_statusbox(
+        "[Manager] Memory pressure "
+        f"{level}: RAM {state.get('ram_percent')}% "
+        f"(avail {state.get('ram_available_gb')}GB), "
+        f"swap {state.get('swap_percent')}%. Deferring non-critical work."
+    )
+
+
+def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
+    global _memory_guard_state, _last_memory_guard_check
+    now = time.time()
+    if not force and _memory_guard_state and (now - _last_memory_guard_check) < _MEMORY_GUARD_CHECK_INTERVAL:
+        return _memory_guard_state
+
+    _last_memory_guard_check = now
+    timestamp = datetime.now(timezone.utc).isoformat()
+    limits = _memory_guard_limits()
+
+    if psutil is None:
+        state = {"timestamp": timestamp, "level": "unknown", "reason": "psutil_unavailable"}
+    elif not limits.get("enabled", True):
+        state = {"timestamp": timestamp, "level": "disabled", "limits": limits}
+    else:
+        vm = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        available_gb = vm.available / (1024.0 ** 3)
+        triggers = []
+        level = "ok"
+
+        hard = False
+        if limits["min_available_gb"] > 0 and available_gb <= limits["min_available_gb"]:
+            triggers.append("available_low")
+            hard = True
+        if limits["ram_hard_percent"] > 0 and vm.percent >= limits["ram_hard_percent"]:
+            triggers.append("ram_hard")
+            hard = True
+        if limits["swap_hard_percent"] > 0 and swap.percent >= limits["swap_hard_percent"]:
+            triggers.append("swap_hard")
+            hard = True
+
+        if hard:
+            level = "hard"
+        else:
+            soft = False
+            if limits["ram_soft_percent"] > 0 and vm.percent >= limits["ram_soft_percent"]:
+                triggers.append("ram_soft")
+                soft = True
+            if limits["swap_soft_percent"] > 0 and swap.percent >= limits["swap_soft_percent"]:
+                triggers.append("swap_soft")
+                soft = True
+            if soft:
+                level = "soft"
+
+        state = {
+            "timestamp": timestamp,
+            "level": level,
+            "ram_percent": round(vm.percent, 1),
+            "ram_used_gb": round(vm.used / (1024.0 ** 3), 2),
+            "ram_available_gb": round(available_gb, 2),
+            "swap_percent": round(swap.percent, 1),
+            "swap_used_gb": round(swap.used / (1024.0 ** 3), 2),
+            "limits": {
+                "ram_soft_percent": limits["ram_soft_percent"],
+                "ram_hard_percent": limits["ram_hard_percent"],
+                "swap_soft_percent": limits["swap_soft_percent"],
+                "swap_hard_percent": limits["swap_hard_percent"],
+                "min_available_gb": limits["min_available_gb"],
+            },
+            "triggers": triggers,
+        }
+
+    _memory_guard_state = state
+    if isinstance(state, dict) and state.get("level") in {"soft", "hard"}:
+        _maybe_log_memory_guard_state(state, limits)
+    _publish_memory_guard_state(state)
+    return state
+
+
+def _bundle_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    raw = cfg.get("bundle_policy") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    policy = _BUNDLE_POLICY_DEFAULTS.copy()
+    policy["enabled"] = _coerce_bool(raw.get("enabled", policy["enabled"]), policy["enabled"])
+    policy["allow_apply"] = _coerce_bool(raw.get("allow_apply", policy["allow_apply"]), policy["allow_apply"])
+    policy["write_manifest"] = _coerce_bool(raw.get("write_manifest", policy["write_manifest"]), policy["write_manifest"])
+    policy["follow_symlinks"] = _coerce_bool(raw.get("follow_symlinks", policy["follow_symlinks"]), policy["follow_symlinks"])
+    policy["cooldown_seconds"] = _clamp_positive(raw.get("cooldown_seconds", policy["cooldown_seconds"]), policy["cooldown_seconds"])
+
+    policy["max_files_per_bundle"] = max(
+        1, _coerce_int(raw.get("max_files_per_bundle", policy["max_files_per_bundle"]), policy["max_files_per_bundle"])
+    )
+    policy["max_bundle_bytes"] = max(
+        1, _coerce_int(raw.get("max_bundle_bytes", policy["max_bundle_bytes"]), policy["max_bundle_bytes"])
+    )
+    policy["max_file_bytes"] = max(
+        1, _coerce_int(raw.get("max_file_bytes", policy["max_file_bytes"]), policy["max_file_bytes"])
+    )
+
+    policy["bundle_dir"] = str(raw.get("bundle_dir", policy["bundle_dir"]) or policy["bundle_dir"])
+    policy["default_include"] = _coerce_str_list(raw.get("default_include"))
+    policy["default_exclude"] = _coerce_str_list(raw.get("default_exclude"))
+    policy["allowed_roots"] = _coerce_str_list(raw.get("allowed_roots"))
+    policy["exclude_dirs"] = _coerce_str_list(raw.get("exclude_dirs"))
+    return policy
+
+
+def _resolve_bundle_roots(policy: Dict[str, Any], child: str) -> List[Path]:
+    roots: List[Path] = []
+    for entry in policy.get("allowed_roots", []) or []:
+        if not entry:
+            continue
+        try:
+            formatted = entry.format(child=child)
+        except Exception:
+            formatted = entry
+        roots.append(Path(formatted).expanduser())
+    if not roots:
+        roots = [Path("AI_Children") / child / "memory"]
+    return [root.resolve() for root in roots]
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    if value is None:
+        return default
+    coerced = _coerce_int(value, default)
+    return max(minimum, min(coerced, maximum))
+
+
+def _maybe_bundle_memory(defer_optional: bool) -> None:
+    global _last_bundle_launch, _bundle_thread
+    if defer_optional:
+        return
+    if get_inastate("dreaming") or get_inastate("meditating"):
+        return
+
+    policy = _bundle_policy()
+    if not policy.get("enabled", False):
+        return
+    if _bundle_thread and _bundle_thread.is_alive():
+        return
+
+    request = get_inastate("bundle_request")
+    if not request:
+        return
+    if not isinstance(request, dict):
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "error",
+                "reason": "bundle_request_not_dict",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+
+    now = time.time()
+    cooldown = float(policy.get("cooldown_seconds", _BUNDLE_POLICY_DEFAULTS["cooldown_seconds"]))
+    if _last_bundle_launch and (now - _last_bundle_launch) < cooldown:
+        return
+
+    child = load_config().get("current_child", CHILD)
+    allowed_roots = _resolve_bundle_roots(policy, child)
+    root_value = request.get("root") or None
+    if root_value:
+        root = Path(str(root_value)).expanduser()
+    else:
+        root = allowed_roots[0]
+    root = root.resolve()
+    if not any(_is_relative_to(root, allowed) for allowed in allowed_roots):
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "blocked",
+                "reason": "root_not_allowed",
+                "root": str(root),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+    if not root.exists():
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "error",
+                "reason": "root_missing",
+                "root": str(root),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+    if not root.is_dir():
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "error",
+                "reason": "root_not_dir",
+                "root": str(root),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+
+    bundle_dir_value = request.get("bundle_dir") or policy.get("bundle_dir")
+    if bundle_dir_value:
+        bundle_dir = Path(str(bundle_dir_value)).expanduser()
+        if not bundle_dir.is_absolute():
+            bundle_dir = root / bundle_dir
+    else:
+        bundle_dir = root / "bundles"
+    bundle_dir_resolved = bundle_dir.resolve() if bundle_dir.exists() else bundle_dir
+    if not _is_relative_to(bundle_dir_resolved, root):
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "blocked",
+                "reason": "bundle_dir_not_under_root",
+                "bundle_dir": str(bundle_dir),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+
+    include_globs = _coerce_str_list(request.get("include")) or policy.get("default_include", [])
+    exclude_globs = list(policy.get("default_exclude", []))
+    for entry in _coerce_str_list(request.get("exclude")):
+        if entry not in exclude_globs:
+            exclude_globs.append(entry)
+
+    max_files_per_bundle = _bounded_int(
+        request.get("max_files_per_bundle"),
+        policy["max_files_per_bundle"],
+        1,
+        policy["max_files_per_bundle"],
+    )
+    max_bundle_bytes = _bounded_int(
+        request.get("max_bundle_bytes"),
+        policy["max_bundle_bytes"],
+        1,
+        policy["max_bundle_bytes"],
+    )
+    max_file_bytes = _bounded_int(
+        request.get("max_file_bytes"),
+        policy["max_file_bytes"],
+        1,
+        policy["max_file_bytes"],
+    )
+    max_file_bytes = min(max_file_bytes, max_bundle_bytes)
+
+    apply_requested = _coerce_bool(request.get("apply", False), False)
+    apply_allowed = apply_requested and policy.get("allow_apply", False)
+    apply_note = "apply_not_allowed" if apply_requested and not apply_allowed else None
+    follow_symlinks = _coerce_bool(request.get("follow_symlinks", policy["follow_symlinks"]), policy["follow_symlinks"])
+    write_manifest = _coerce_bool(request.get("write_manifest", policy["write_manifest"]), policy["write_manifest"])
+
+    action_desc = f"memory bundle {'apply' if apply_allowed else 'plan'}"
+    feedback = check_action({"description": action_desc})
+    if not feedback.get("overall", {}).get("pass", False):
+        update_inastate("bundle_request", None)
+        update_inastate(
+            "bundle_status",
+            {
+                "status": "blocked",
+                "reason": feedback.get("overall", {}).get("rationale"),
+                "action": action_desc,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+
+    update_inastate("bundle_request", None)
+    _last_bundle_launch = now
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    def _worker():
+        global _bundle_thread
+        try:
+            from memory_bundler import apply_bundle, plan_bundle
+
+            if apply_allowed:
+                report = apply_bundle(
+                    root=root,
+                    bundle_dir=bundle_dir,
+                    include_globs=include_globs,
+                    exclude_globs=exclude_globs,
+                    follow_symlinks=follow_symlinks,
+                    max_file_bytes=max_file_bytes,
+                    max_bundle_bytes=max_bundle_bytes,
+                    max_files_per_bundle=max_files_per_bundle,
+                    exclude_dirs=policy.get("exclude_dirs"),
+                    write_manifest=write_manifest,
+                )
+                status = "applied"
+            else:
+                report = plan_bundle(
+                    root=root,
+                    bundle_dir=bundle_dir,
+                    include_globs=include_globs,
+                    exclude_globs=exclude_globs,
+                    follow_symlinks=follow_symlinks,
+                    max_file_bytes=max_file_bytes,
+                    max_bundle_bytes=max_bundle_bytes,
+                    max_files_per_bundle=max_files_per_bundle,
+                    exclude_dirs=policy.get("exclude_dirs"),
+                    write_manifest=write_manifest,
+                )
+                status = "planned"
+
+            payload = report.to_dict()
+            payload.update(
+                {
+                    "status": status,
+                    "apply_requested": apply_requested,
+                    "apply_allowed": apply_allowed,
+                    "apply_note": apply_note,
+                    "root": str(root),
+                    "bundle_dir": str(bundle_dir),
+                    "include": include_globs,
+                    "exclude": exclude_globs,
+                    "max_files_per_bundle": max_files_per_bundle,
+                    "max_bundle_bytes": max_bundle_bytes,
+                    "max_file_bytes": max_file_bytes,
+                    "started_at": started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            update_inastate("bundle_status", payload)
+            log_to_statusbox(
+                f"[Manager] Memory bundle {status}: {report.total_files} -> {report.new_file_count}"
+            )
+        except Exception as exc:
+            update_inastate(
+                "bundle_status",
+                {
+                    "status": "failed",
+                    "reason": str(exc),
+                    "root": str(root),
+                    "bundle_dir": str(bundle_dir),
+                    "started_at": started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            log_to_statusbox(f"[Manager] Memory bundling failed: {exc}")
+        finally:
+            _bundle_thread = None
+
+    _bundle_thread = threading.Thread(target=_worker, name="memory_bundle", daemon=True)
+    _bundle_thread.start()
+
 reflection_core = SelfReflectionCore(ina_reference="model_manager")
 adjustment_scheduler = SelfAdjustmentScheduler()
 memory_manager = MemoryManager(CHILD)
@@ -66,6 +562,9 @@ _last_typing_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
 _last_stable_urge_log = 0.0
 _STABLE_URGE_LOG_COOLDOWN = 180  # seconds
+_last_motor_intent_ts = 0.0
+_MOTOR_INTENT_COOLDOWN = 12.0
+_MOTOR_URGE_THRESHOLD = 0.6
 _last_continuity_run = 0.0
 _CONTINUITY_COOLDOWN = 3600.0  # seconds between heavy continuity sweeps
 _last_intuition_run = 0.0
@@ -75,12 +574,17 @@ _META_ALERT_COOLDOWN = 900.0
 _last_fragment_health_scan = 0.0
 _FRAGMENT_HEALTH_COOLDOWN = 1800.0
 _fragment_health_thread: Optional[threading.Thread] = None
+_last_bundle_launch = 0.0
+_bundle_thread: Optional[threading.Thread] = None
+_last_world_sense_mode: Optional[str] = None
 _last_exploration_invite_log = 0.0
 _EXPLORATION_INVITE_COOLDOWN = 240.0
 _last_humor_bridge_log = 0.0
 _HUMOR_BRIDGE_LOG_COOLDOWN = 240.0
 _last_trauma_run = 0.0
 _TRAUMA_COOLDOWN = 900.0
+_last_ina_client_check = 0.0
+_INA_CLIENT_CHECK_COOLDOWN = 300.0
 _NUTRITION_TARGET = 0.64
 _NUTRITION_DECAY_PER_SEC = 0.000045
 _NUTRITION_MIN = 0.05
@@ -246,6 +750,67 @@ def safe_run(cmd, description=None):
         subprocess.run(cmd, check=False)
     except Exception as e:
         log_to_statusbox(f"[Manager] Failed to run {' '.join(map(str, cmd))}: {e}")
+
+
+def _is_process_running(pattern: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _apply_world_sense_override() -> None:
+    global _last_world_sense_mode
+    world_connected = bool(get_inastate("world_connected", False))
+    target_mode = "world" if world_connected else "default"
+    if target_mode == _last_world_sense_mode:
+        return
+    _last_world_sense_mode = target_mode
+
+    update_inastate("sensory_mode", target_mode)
+    update_inastate("vision_mode", target_mode)
+    update_inastate("audio_mode", target_mode)
+
+    if world_connected:
+        safe_call(["pkill", "-f", "audio_listener.py"])
+        if not _is_process_running("vision_window.py"):
+            safe_popen(["python", "vision_window.py"])
+        try:
+            auto_launch = bool(load_config().get("auto_launch_ina_viewer", False))
+        except Exception:
+            auto_launch = False
+        if auto_launch and not _is_process_running("ina_arch_viewer.py"):
+            safe_popen(["python", "ina_arch_viewer.py"])
+        log_to_statusbox("[Manager] World connected: overriding senses with 3D mode.")
+    else:
+        if not _is_process_running("audio_listener.py"):
+            safe_popen(["python", "audio_listener.py"])
+        if not _is_process_running("vision_window.py"):
+            safe_popen(["python", "vision_window.py"])
+        log_to_statusbox("[Manager] World disconnected: restoring default senses.")
+
+
+def _maybe_ensure_ina_client() -> None:
+    global _last_ina_client_check
+    now = time.time()
+    try:
+        interval = float(load_config().get("ina_client_check_interval", _INA_CLIENT_CHECK_COOLDOWN))
+    except Exception:
+        interval = _INA_CLIENT_CHECK_COOLDOWN
+    if interval <= 0:
+        return
+    if _last_ina_client_check and (now - _last_ina_client_check) < interval:
+        return
+    _last_ina_client_check = now
+    if not _is_process_running("ina_client.py"):
+        safe_popen(["python", "ina_client.py", "--daemon"])
+        log_to_statusbox("[Manager] Restarted ina_client (was not running).")
 
 def get_sweet_spots():
     path = MEMORY_PATH / "sweet_spots.json"
@@ -690,6 +1255,14 @@ def _publish_deep_recall_state():
 def _build_deep_recall_manager() -> Optional[DeepRecallManager]:
     try:
         memory_backend = _FragmentMemoryBackend(CHILD)
+        guard = _memory_guard_limits()
+        max_memory_percent = guard.get("ram_hard_percent", 50.0)
+        max_swap_percent = guard.get("swap_hard_percent", 0.0)
+        min_available_gb = guard.get("min_available_gb", 0.0)
+        if not guard.get("enabled", True):
+            max_memory_percent = 50.0
+            max_swap_percent = 0.0
+            min_available_gb = 0.0
         config = DeepRecallConfig(
             chunk_size=4,
             burst_chunk_size=1,
@@ -697,7 +1270,9 @@ def _build_deep_recall_manager() -> Optional[DeepRecallManager]:
             burst_collect_garbage=True,
             state_path=str(_DEEP_RECALL_STATE_PATH),
             min_energy=0.35,
-            max_memory_percent=50.0,
+            max_memory_percent=max_memory_percent,
+            max_swap_percent=max_swap_percent,
+            min_available_gb=min_available_gb,
         )
         return DeepRecallManager(
             memory_backend=memory_backend,
@@ -1141,8 +1716,12 @@ def _check_self_adjustment():
     _last_opportunities = set(opportunities.keys())
 
 def launch_background_loops():
-    safe_popen(["python", "audio_listener.py"])
-    safe_popen(["python", "vision_window.py"])
+    if not _is_process_running("ina_client.py"):
+        safe_popen(["python", "ina_client.py", "--daemon"])
+    if not _is_process_running("audio_listener.py"):
+        safe_popen(["python", "audio_listener.py"])
+    if not _is_process_running("vision_window.py"):
+        safe_popen(["python", "vision_window.py"])
     log_to_statusbox("[Manager] Background loops launched.")
 
 def monitor_energy():
@@ -1896,6 +2475,90 @@ def _update_contact_urges():
         _last_typing_urge_log = now
 
 
+def _maybe_emit_motor_intent() -> None:
+    global _last_motor_intent_ts
+    world_connected = bool(get_inastate("world_connected", False))
+    if not world_connected or get_inastate("dreaming", False):
+        return
+
+    move_urge = get_inastate("urge_to_move") or {}
+    urge_level = _clamp01(move_urge.get("level") or 0.0, default=0.0)
+
+    config = load_config()
+    try:
+        threshold = float(config.get("motor_urge_threshold", _MOTOR_URGE_THRESHOLD))
+    except Exception:
+        threshold = _MOTOR_URGE_THRESHOLD
+    if urge_level < threshold:
+        return
+
+    try:
+        cooldown = float(config.get("motor_intent_cooldown", _MOTOR_INTENT_COOLDOWN))
+    except Exception:
+        cooldown = _MOTOR_INTENT_COOLDOWN
+    cooldown = max(0.0, cooldown)
+
+    now = time.time()
+    if cooldown > 0 and _last_motor_intent_ts and (now - _last_motor_intent_ts) < cooldown:
+        return
+
+    def _age_seconds(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            raw = raw.get("timestamp")
+        if isinstance(raw, (int, float)):
+            try:
+                return max(0.0, now - float(raw))
+            except Exception:
+                return None
+        if isinstance(raw, str):
+            try:
+                ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+                return max(0.0, now - ts)
+            except Exception:
+                return None
+        return None
+
+    heartbeat_age = _age_seconds(get_inastate("last_world_heartbeat"))
+    if heartbeat_age is not None and heartbeat_age > 30.0:
+        return
+
+    last_intent_age = _age_seconds(get_inastate("last_motor_intent"))
+    if last_intent_age is not None and last_intent_age < max(2.0, cooldown * 0.5):
+        return
+
+    last_feedback_age = _age_seconds(get_inastate("last_motor_update"))
+    if last_feedback_age is not None and last_feedback_age < 2.5:
+        return
+
+    scale = max(0.2, min(1.0, urge_level))
+    forward = min(1.0, 0.35 + (0.45 * scale))
+    strafe = random.uniform(-0.4, 0.4) * scale
+    turn = random.uniform(-0.6, 0.6) * scale
+    duration = min(1.8, 0.6 + (0.9 * scale))
+    run = scale > 0.75
+
+    update_inastate(
+        "motor_intent",
+        {
+            "forward": round(forward, 3),
+            "strafe": round(strafe, 3),
+            "turn": round(turn, 3),
+            "up": 0.0,
+            "run": run,
+            "duration": round(duration, 2),
+            "seq": int(now * 1000),
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "source": "model_manager",
+            "reason": "urge_to_move",
+            "urge_level": round(urge_level, 3),
+        },
+    )
+    _last_motor_intent_ts = now
+    log_to_statusbox(f"[Manager] Motor intent issued (urge {urge_level:.2f}).")
+
+
 def _update_stable_pattern_urge():
     """
     Surface an urge to seek stable patterns (text fragments, structured audio)
@@ -2170,6 +2833,8 @@ def _maybe_run_trauma_processor():
     energy/stress gating; this function just rate-limits launches.
     """
     global _last_trauma_run
+    if _memory_guard_state.get("level") in {"soft", "hard"}:
+        return
     now = time.time()
     if (now - _last_trauma_run) < _TRAUMA_COOLDOWN:
         return
@@ -2422,6 +3087,12 @@ def rebuild_maps_if_needed():
 
 def run_internal_loop():
     _ensure_continuity_thread()
+    _apply_world_sense_override()
+    _maybe_ensure_ina_client()
+    memory_guard = _refresh_memory_guard_state()
+    memory_level = memory_guard.get("level")
+    defer_optional = memory_level in {"soft", "hard"}
+    defer_spawns = memory_level == "hard"
     monitor_hunger()
     monitor_energy()
     _maybe_run_intuition_probe()
@@ -2451,36 +3122,48 @@ def run_internal_loop():
 
 
 
-    if get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
+    world_connected = bool(get_inastate("world_connected", False))
+
+    if not defer_optional and get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
         safe_popen(["python", "meditation_state.py"])
 
-    if get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
-        safe_popen(["python", "dreamstate.py"])
+    if not defer_optional:
+        if not world_connected and get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
+            safe_popen(["python", "dreamstate.py"])
+        elif not world_connected and not get_inastate("dreaming", False):
+            safe_popen(["python", "dreamstate.py"])
 
-    safe_run(["python", "emotion_engine.py"])
-    safe_run(["python", "instinct_engine.py"])
+    if not defer_spawns:
+        safe_run(["python", "emotion_engine.py"])
+        safe_run(["python", "instinct_engine.py"])
 
-    safe_popen(["python", "early_comm.py"])
+    if not defer_optional:
+        safe_popen(["python", "early_comm.py"])
 
-    if not feedback_inhibition():
+    if not defer_optional and not feedback_inhibition():
         safe_popen(["python", "predictive_layer.py"])
         safe_popen(["python", "logic_engine.py"])
 
-    boredom_check()
-    paint_check()
-    _maybe_self_read()
-    rebuild_maps_if_needed()
+    if not defer_optional:
+        boredom_check()
+        paint_check()
+        _maybe_self_read()
+        rebuild_maps_if_needed()
     _check_self_adjustment()
     _update_contact_urges()
+    _maybe_emit_motor_intent()
     _update_stable_pattern_urge()
     _update_self_read_exploration_opportunities()
     _update_humor_bridge()
     _maybe_run_trauma_processor()
     _run_passive_reflection()
-    _step_deep_recall()
+    if not defer_optional:
+        _step_deep_recall()
     _update_machine_semantics()
-    _scan_fragment_health()
-    _run_prediction_meta_analysis()
+    if not defer_optional:
+        _scan_fragment_health()
+        _run_prediction_meta_analysis()
+        _maybe_bundle_memory(defer_optional)
     # Periodically evaluate alignment metrics and surface warnings if needed
     evaluate_alignment()
 

@@ -126,6 +126,19 @@ class OBSWebSocketBridge:
             self._log_once(f"OBS record directory request failed: {exc}")
             return False
 
+    def set_program_scene(self, scene_name: str) -> bool:
+        """Switch OBS to a named program scene."""
+        if not self.is_available or not scene_name:
+            return False
+        try:
+            ok = bool(self._run_async(self._set_program_scene(scene_name)))
+            if ok:
+                self._log(f"Program scene set to: {scene_name}")
+            return ok
+        except Exception as exc:  # pragma: no cover - runtime guard
+            self._log_once(f"OBS program scene request failed: {exc}")
+            return False
+
     # ------------------------------------------------------------------ #
     # Internal helpers                                                   #
     # ------------------------------------------------------------------ #
@@ -209,6 +222,21 @@ class OBSWebSocketBridge:
                     "SetRecordDirectory", {"recordDirectory": directory}
                 )
             )
+            return True
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    async def _set_program_scene(self, scene_name: str) -> bool:
+        client = self._make_client()
+        if client is None:
+            return False
+        try:
+            await client.connect()
+            await client.wait_until_identified()
+            await client.call(simpleobsws.Request("SetCurrentProgramScene", {"sceneName": scene_name}))
             return True
         finally:
             try:
