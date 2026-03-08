@@ -7,6 +7,9 @@ import uuid
 import threading
 import os
 import random
+import gc
+import traceback
+import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +24,7 @@ from self_adjustment_scheduler import SelfAdjustmentScheduler
 from continuity_manager import ContinuityManager
 from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
+from fragment_repair import process_corrupt_queue
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 try:
@@ -32,8 +36,12 @@ def load_config():
     path = Path("config.json")
     if not path.exists():
         return {}
-    with open(path, "r") as f:
-        return json.load(f)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")
@@ -43,6 +51,7 @@ _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.js
 RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
 TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
+_DECISION_PANIC_LOG_PATH = MEMORY_PATH / "decision_panic_log.jsonl"
 _SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"
 _FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
 _INASTATE_LOCK_PATH = MEMORY_PATH / "inastate.lock"
@@ -61,13 +70,77 @@ _MEMORY_GUARD_DEFAULTS = {
     "swap_soft_percent": 5.0,
     "swap_hard_percent": 10.0,
     "min_available_gb": 8.0,
+    "ina_soft_gb": 0.0,
+    "ina_hard_gb": 0.0,
+    "shed_on_soft": False,
+    "shed_on_hard": True,
+    "shed_cooldown_sec": 45.0,
+    "shed_process_patterns": [],
+    "queue_enabled": False,
+    "queue_ram_used_gb": 0.0,
+    "queue_swap_used_gb": 0.0,
+    "queue_max_items": 64,
+    "queue_event_cooldown_sec": 20.0,
+    "queue_auto_shed": True,
+    "queue_process_cooldown_sec": 30.0,
     "log_cooldown_sec": 120.0,
+}
+_META_ARBITRATION_DEFAULTS = {
+    "enabled": True,
+    "activation_threshold": 0.35,
+    "conflict_margin": 0.12,
+    "conflict_min_level": 0.3,
+    "indecision_horizon_sec": 180.0,
+    "resolution_decay": 0.55,
+    "narrowing_gain": 0.35,
+    "narrowing_band_high": 0.24,
+    "narrowing_band_low": 0.08,
+    "boost_gain": 0.22,
+    "suppression_gain": 0.18,
+    "stall_action_window_sec": 30.0,
+    "log_discomfort_threshold": 0.65,
+    "log_cooldown_sec": 90.0,
+    "panic_enabled": True,
+    "panic_discomfort_threshold": 0.82,
+    "panic_conflict_threshold": 0.55,
+    "panic_indecision_sec": 240.0,
+    "panic_repeat_sec": 90.0,
+    "panic_popup_enabled": True,
+    "panic_popup_cooldown_sec": 300.0,
+    "need_aliases_enabled": True,
+    "auto_generate_need_aliases": True,
+    "alias_prefix": "sym_need_",
+}
+_NEED_CANONICAL_VARIABLES = {
+    "reversibility_estimate": {
+        "description": "Estimated reversibility of candidate actions before committing.",
+        "default_probe": "simulate action on shadow state",
+        "default_provider_modules": ["logic_engine.py", "predictive_layer.py"],
+        "default_output": "scalar [-1..1] where +1 is reversible",
+    },
+    "urgency_signal": {
+        "description": "Relative urgency gradient to break ties across active urges.",
+        "default_probe": "compare delayed-cost delta across candidate actions",
+        "default_provider_modules": ["predictive_layer.py", "emotion_engine.py"],
+        "default_output": "scalar [0..1] where higher means immediate action cost of delay",
+    },
+    "context_scope": {
+        "description": "How complete and bounded the current decision context is.",
+        "default_probe": "measure coverage of relevant world/self context channels",
+        "default_provider_modules": ["memory_graph.py", "logic_engine.py"],
+        "default_output": "scalar [0..1] where higher means sufficient context coverage",
+    },
 }
 _MEMORY_GUARD_CHECK_INTERVAL = 5.0
 _last_memory_guard_check = 0.0
 _last_memory_guard_log = 0.0
 _last_memory_guard_key: Optional[tuple] = None
 _memory_guard_state: Dict[str, Any] = {"level": "unknown"}
+_last_memory_shed_ts = 0.0
+_last_memory_queue_event_ts = 0.0
+_last_memory_queue_process_ts = 0.0
+_RUNTIME_HEARTBEAT_INTERVAL = 30.0
+_last_runtime_heartbeat = 0.0
 _BUNDLE_POLICY_DEFAULTS = {
     "enabled": False,
     "allow_apply": False,
@@ -82,6 +155,17 @@ _BUNDLE_POLICY_DEFAULTS = {
     "default_exclude": [],
     "allowed_roots": [],
     "exclude_dirs": [],
+}
+_FRAGMENT_REPAIR_DEFAULTS = {
+    "enabled": False,
+    "mode": "quarantine",  # quarantine | delete | repair | inspect
+    "require_intent": True,
+    "consume_intent": True,
+    "cooldown_seconds": 900.0,
+    "max_actions_per_pass": 3,
+    "max_repair_bytes": 256 * 1024,
+    "quarantine_dir": "fragments/corrupt",
+    "pending_delete_dir": "fragments/pending_delete",
 }
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -134,6 +218,45 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return False
 
 
+def _ina_process_tree_rss_gb() -> float:
+    if psutil is None:
+        return 0.0
+    try:
+        root = psutil.Process(os.getpid())
+    except Exception:
+        return 0.0
+    procs = [root]
+    try:
+        procs.extend(root.children(recursive=True))
+    except Exception:
+        pass
+
+    rss_bytes = 0
+    for proc in procs:
+        try:
+            rss_bytes += int(proc.memory_info().rss)
+        except Exception:
+            continue
+    return rss_bytes / (1024.0 ** 3)
+
+
+def _trim_allocator_memory() -> bool:
+    """
+    Best-effort trim for glibc allocators on Linux to return free arenas.
+    Safe no-op when unavailable.
+    """
+    try:
+        import ctypes  # local import to avoid hard dependency
+
+        libc = ctypes.CDLL("libc.so.6")
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _memory_guard_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = cfg or load_config()
     guard_raw = cfg.get("memory_guard") if isinstance(cfg, dict) else None
@@ -148,6 +271,36 @@ def _memory_guard_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
     if "min_available_gb" in guard:
         limits["min_available_gb"] = _clamp_positive(guard.get("min_available_gb"), limits["min_available_gb"])
+    if "ina_soft_gb" in guard:
+        limits["ina_soft_gb"] = _clamp_positive(guard.get("ina_soft_gb"), limits["ina_soft_gb"])
+    if "ina_hard_gb" in guard:
+        limits["ina_hard_gb"] = _clamp_positive(guard.get("ina_hard_gb"), limits["ina_hard_gb"])
+    if "shed_on_soft" in guard:
+        limits["shed_on_soft"] = _coerce_bool(guard.get("shed_on_soft"), limits["shed_on_soft"])
+    if "shed_on_hard" in guard:
+        limits["shed_on_hard"] = _coerce_bool(guard.get("shed_on_hard"), limits["shed_on_hard"])
+    if "shed_cooldown_sec" in guard:
+        limits["shed_cooldown_sec"] = _clamp_positive(guard.get("shed_cooldown_sec"), limits["shed_cooldown_sec"])
+    if "shed_process_patterns" in guard:
+        limits["shed_process_patterns"] = _coerce_str_list(guard.get("shed_process_patterns"))
+    if "queue_enabled" in guard:
+        limits["queue_enabled"] = _coerce_bool(guard.get("queue_enabled"), limits["queue_enabled"])
+    if "queue_ram_used_gb" in guard:
+        limits["queue_ram_used_gb"] = _clamp_positive(guard.get("queue_ram_used_gb"), limits["queue_ram_used_gb"])
+    if "queue_swap_used_gb" in guard:
+        limits["queue_swap_used_gb"] = _clamp_positive(guard.get("queue_swap_used_gb"), limits["queue_swap_used_gb"])
+    if "queue_max_items" in guard:
+        limits["queue_max_items"] = max(1, _coerce_int(guard.get("queue_max_items"), int(limits["queue_max_items"])))
+    if "queue_event_cooldown_sec" in guard:
+        limits["queue_event_cooldown_sec"] = _clamp_positive(
+            guard.get("queue_event_cooldown_sec"), limits["queue_event_cooldown_sec"]
+        )
+    if "queue_auto_shed" in guard:
+        limits["queue_auto_shed"] = _coerce_bool(guard.get("queue_auto_shed"), limits["queue_auto_shed"])
+    if "queue_process_cooldown_sec" in guard:
+        limits["queue_process_cooldown_sec"] = _clamp_positive(
+            guard.get("queue_process_cooldown_sec"), limits["queue_process_cooldown_sec"]
+        )
     if "log_cooldown_sec" in guard:
         limits["log_cooldown_sec"] = _clamp_positive(guard.get("log_cooldown_sec"), limits["log_cooldown_sec"])
 
@@ -163,6 +316,82 @@ def _memory_guard_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
     limits["ram_soft_percent"] = min(limits["ram_soft_percent"], limits["ram_hard_percent"])
     limits["swap_soft_percent"] = min(limits["swap_soft_percent"], limits["swap_hard_percent"])
+    if limits["ina_hard_gb"] > 0:
+        if limits["ina_soft_gb"] <= 0:
+            limits["ina_soft_gb"] = max(0.0, limits["ina_hard_gb"] * 0.8)
+        else:
+            limits["ina_soft_gb"] = min(limits["ina_soft_gb"], limits["ina_hard_gb"])
+    return limits
+
+
+def _meta_arbitration_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    raw = cfg.get("meta_arbitration") if isinstance(cfg, dict) else None
+    section = raw if isinstance(raw, dict) else {}
+
+    limits = _META_ARBITRATION_DEFAULTS.copy()
+    limits["enabled"] = _coerce_bool(section.get("enabled", limits["enabled"]), limits["enabled"])
+    limits["panic_enabled"] = _coerce_bool(section.get("panic_enabled", limits["panic_enabled"]), limits["panic_enabled"])
+    limits["panic_popup_enabled"] = _coerce_bool(
+        section.get("panic_popup_enabled", limits["panic_popup_enabled"]),
+        limits["panic_popup_enabled"],
+    )
+    limits["need_aliases_enabled"] = _coerce_bool(
+        section.get("need_aliases_enabled", limits["need_aliases_enabled"]),
+        limits["need_aliases_enabled"],
+    )
+    limits["auto_generate_need_aliases"] = _coerce_bool(
+        section.get("auto_generate_need_aliases", limits["auto_generate_need_aliases"]),
+        limits["auto_generate_need_aliases"],
+    )
+
+    for key in (
+        "activation_threshold",
+        "conflict_margin",
+        "conflict_min_level",
+        "resolution_decay",
+        "narrowing_gain",
+        "narrowing_band_high",
+        "narrowing_band_low",
+        "boost_gain",
+        "suppression_gain",
+        "log_discomfort_threshold",
+        "panic_discomfort_threshold",
+        "panic_conflict_threshold",
+    ):
+        if key in section:
+            limits[key] = _clamp01(section.get(key), default=limits[key])
+
+    for key in (
+        "indecision_horizon_sec",
+        "stall_action_window_sec",
+        "log_cooldown_sec",
+        "panic_indecision_sec",
+        "panic_repeat_sec",
+        "panic_popup_cooldown_sec",
+    ):
+        if key in section:
+            limits[key] = _clamp_positive(section.get(key), limits[key])
+
+    limits["conflict_margin"] = max(0.01, limits["conflict_margin"])
+    limits["indecision_horizon_sec"] = max(5.0, limits["indecision_horizon_sec"])
+    limits["stall_action_window_sec"] = max(1.0, limits["stall_action_window_sec"])
+    limits["panic_indecision_sec"] = max(10.0, limits["panic_indecision_sec"])
+    limits["panic_repeat_sec"] = max(10.0, limits["panic_repeat_sec"])
+    limits["panic_popup_cooldown_sec"] = max(30.0, limits["panic_popup_cooldown_sec"])
+    limits["resolution_decay"] = min(1.0, max(0.0, limits["resolution_decay"]))
+    alias_prefix = section.get("alias_prefix")
+    if isinstance(alias_prefix, str) and alias_prefix.strip():
+        limits["alias_prefix"] = alias_prefix.strip().lower()
+    if not str(limits.get("alias_prefix", "")).startswith("sym_need_"):
+        limits["alias_prefix"] = "sym_need_"
+    limits["narrowing_band_high"] = max(0.01, limits["narrowing_band_high"])
+    limits["narrowing_band_low"] = max(0.0, limits["narrowing_band_low"])
+    if limits["narrowing_band_low"] > limits["narrowing_band_high"]:
+        limits["narrowing_band_low"], limits["narrowing_band_high"] = (
+            limits["narrowing_band_high"],
+            limits["narrowing_band_low"],
+        )
     return limits
 
 
@@ -173,6 +402,7 @@ def _publish_memory_guard_state(state: Dict[str, Any]) -> None:
         state.get("ram_percent"),
         state.get("swap_percent"),
         state.get("ram_available_gb"),
+        state.get("ina_rss_gb"),
     )
     if key == _last_memory_guard_key:
         return
@@ -190,11 +420,13 @@ def _maybe_log_memory_guard_state(state: Dict[str, Any], limits: Dict[str, Any])
     if _last_memory_guard_log and (now - _last_memory_guard_log) < cooldown:
         return
     _last_memory_guard_log = now
+    ina_rss = state.get("ina_rss_gb")
+    ina_text = f", Ina RSS {ina_rss}GB" if isinstance(ina_rss, (int, float)) else ""
     log_to_statusbox(
         "[Manager] Memory pressure "
         f"{level}: RAM {state.get('ram_percent')}% "
         f"(avail {state.get('ram_available_gb')}GB), "
-        f"swap {state.get('swap_percent')}%. Deferring non-critical work."
+        f"swap {state.get('swap_percent')}%{ina_text}. Deferring non-critical work."
     )
 
 
@@ -216,6 +448,7 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
         vm = psutil.virtual_memory()
         swap = psutil.swap_memory()
         available_gb = vm.available / (1024.0 ** 3)
+        ina_rss_gb = _ina_process_tree_rss_gb()
         triggers = []
         level = "ok"
 
@@ -229,6 +462,9 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
         if limits["swap_hard_percent"] > 0 and swap.percent >= limits["swap_hard_percent"]:
             triggers.append("swap_hard")
             hard = True
+        if limits["ina_hard_gb"] > 0 and ina_rss_gb >= limits["ina_hard_gb"]:
+            triggers.append("ina_hard")
+            hard = True
 
         if hard:
             level = "hard"
@@ -239,6 +475,9 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
                 soft = True
             if limits["swap_soft_percent"] > 0 and swap.percent >= limits["swap_soft_percent"]:
                 triggers.append("swap_soft")
+                soft = True
+            if limits["ina_soft_gb"] > 0 and ina_rss_gb >= limits["ina_soft_gb"]:
+                triggers.append("ina_soft")
                 soft = True
             if soft:
                 level = "soft"
@@ -251,12 +490,18 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
             "ram_available_gb": round(available_gb, 2),
             "swap_percent": round(swap.percent, 1),
             "swap_used_gb": round(swap.used / (1024.0 ** 3), 2),
+            "ina_rss_gb": round(ina_rss_gb, 2),
             "limits": {
                 "ram_soft_percent": limits["ram_soft_percent"],
                 "ram_hard_percent": limits["ram_hard_percent"],
                 "swap_soft_percent": limits["swap_soft_percent"],
                 "swap_hard_percent": limits["swap_hard_percent"],
                 "min_available_gb": limits["min_available_gb"],
+                "ina_soft_gb": limits["ina_soft_gb"],
+                "ina_hard_gb": limits["ina_hard_gb"],
+                "queue_enabled": limits["queue_enabled"],
+                "queue_ram_used_gb": limits["queue_ram_used_gb"],
+                "queue_swap_used_gb": limits["queue_swap_used_gb"],
             },
             "triggers": triggers,
         }
@@ -266,6 +511,192 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
         _maybe_log_memory_guard_state(state, limits)
     _publish_memory_guard_state(state)
     return state
+
+
+def _default_shed_patterns() -> List[str]:
+    return [
+        "dreamstate.py",
+        "meditation_state.py",
+        "early_comm.py",
+        "predictive_layer.py",
+        "logic_engine.py",
+        "paint_window.py",
+        "boredom_state.py",
+        "trauma_processor.py",
+    ]
+
+
+def _shed_memory_now(
+    *,
+    level: str,
+    limits: Dict[str, Any],
+    reason: str,
+    respect_cooldown: bool = True,
+) -> bool:
+    global _last_memory_shed_ts
+    now = time.time()
+    cooldown = float(limits.get("shed_cooldown_sec", _MEMORY_GUARD_DEFAULTS["shed_cooldown_sec"]))
+    if respect_cooldown and _last_memory_shed_ts and (now - _last_memory_shed_ts) < cooldown:
+        return False
+
+    gc.collect()
+    trimmed = _trim_allocator_memory()
+
+    patterns = limits.get("shed_process_patterns") or _default_shed_patterns()
+    stopped: List[str] = []
+    for pattern in patterns:
+        if not pattern:
+            continue
+        if _is_process_running(pattern):
+            safe_call(["pkill", "-f", pattern], description=f"memory_shed_stop:{pattern}")
+            stopped.append(pattern)
+
+    _last_memory_shed_ts = now
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "reason": reason,
+        "trimmed_allocator": bool(trimmed),
+        "stopped_processes": stopped,
+    }
+    update_inastate("memory_shed_last", payload)
+    log_to_statusbox(
+        f"[Manager] Memory shed ({level}/{reason}): gc run, allocator_trim={bool(trimmed)}, stopped={len(stopped)}."
+    )
+    return True
+
+
+def _maybe_shed_memory_pressure(level: str, limits: Dict[str, Any]) -> None:
+    if level not in {"soft", "hard"}:
+        return
+    if level == "soft" and not limits.get("shed_on_soft", False):
+        return
+    if level == "hard" and not limits.get("shed_on_hard", True):
+        return
+    _shed_memory_now(level=level, limits=limits, reason="memory_guard", respect_cooldown=True)
+
+
+def _push_memory_pressure_queue_event(event: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    queue = get_inastate("memory_pressure_queue") or []
+    if not isinstance(queue, list):
+        queue = []
+    queue.append(event)
+    max_items = max(1, int(limits.get("queue_max_items", _MEMORY_GUARD_DEFAULTS["queue_max_items"])))
+    queue = queue[-max_items:]
+    update_inastate("memory_pressure_queue", queue)
+    update_inastate(
+        "memory_pressure_queue_state",
+        {
+            "pending": len(queue),
+            "last_event": event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _maybe_enqueue_memory_pressure_event(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    global _last_memory_queue_event_ts
+    if not limits.get("queue_enabled", False):
+        return
+    if not isinstance(state, dict):
+        return
+
+    ram_used = _coerce_float(state.get("ram_used_gb"), 0.0)
+    swap_used = _coerce_float(state.get("swap_used_gb"), 0.0)
+    ram_limit = _coerce_float(limits.get("queue_ram_used_gb"), 0.0)
+    swap_limit = _coerce_float(limits.get("queue_swap_used_gb"), 0.0)
+
+    reasons = []
+    if ram_limit > 0 and ram_used >= ram_limit:
+        reasons.append("ram_used")
+    if swap_limit > 0 and swap_used >= swap_limit:
+        reasons.append("swap_used")
+    if not reasons:
+        return
+
+    now = time.time()
+    event_cooldown = float(
+        limits.get("queue_event_cooldown_sec", _MEMORY_GUARD_DEFAULTS["queue_event_cooldown_sec"])
+    )
+    if _last_memory_queue_event_ts and (now - _last_memory_queue_event_ts) < event_cooldown:
+        return
+
+    event = {
+        "id": uuid.uuid4().hex[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "memory_guard",
+        "reasons": reasons,
+        "ram_used_gb": ram_used,
+        "swap_used_gb": swap_used,
+        "ina_rss_gb": _coerce_float(state.get("ina_rss_gb"), 0.0),
+        "limits": {
+            "queue_ram_used_gb": ram_limit,
+            "queue_swap_used_gb": swap_limit,
+        },
+    }
+    _push_memory_pressure_queue_event(event, limits)
+    _last_memory_queue_event_ts = now
+    log_to_statusbox(
+        f"[Manager] Memory event queued: ram={ram_used:.2f}GB swap={swap_used:.2f}GB reasons={','.join(reasons)}."
+    )
+
+
+def _process_memory_pressure_queue(limits: Dict[str, Any]) -> None:
+    global _last_memory_queue_process_ts
+    queue = get_inastate("memory_pressure_queue") or []
+    if not isinstance(queue, list) or not queue:
+        return
+    if not limits.get("queue_auto_shed", True):
+        return
+
+    now = time.time()
+    process_cooldown = float(
+        limits.get("queue_process_cooldown_sec", _MEMORY_GUARD_DEFAULTS["queue_process_cooldown_sec"])
+    )
+    if _last_memory_queue_process_ts and (now - _last_memory_queue_process_ts) < process_cooldown:
+        return
+
+    event = queue[0]
+    did_shed = _shed_memory_now(level="queue", limits=limits, reason="queued_event", respect_cooldown=True)
+    if not did_shed:
+        return
+
+    queue.pop(0)
+    update_inastate("memory_pressure_queue", queue)
+    update_inastate(
+        "memory_pressure_queue_state",
+        {
+            "pending": len(queue),
+            "last_processed": event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _last_memory_queue_process_ts = now
+
+
+def _consume_operator_memory_signal(limits: Dict[str, Any]) -> None:
+    signal = get_inastate("operator_memory_signal")
+    if not isinstance(signal, dict):
+        return
+    action = str(signal.get("action") or "").strip().lower()
+    if action not in {"too_much_memory", "memory_too_high", "shed_memory_now"}:
+        return
+
+    update_inastate("operator_memory_signal", None)
+    state = _refresh_memory_guard_state(force=True)
+    event = {
+        "id": uuid.uuid4().hex[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": str(signal.get("source") or "operator"),
+        "action": action,
+        "note": signal.get("note"),
+        "ram_used_gb": _coerce_float(state.get("ram_used_gb"), 0.0),
+        "swap_used_gb": _coerce_float(state.get("swap_used_gb"), 0.0),
+        "ina_rss_gb": _coerce_float(state.get("ina_rss_gb"), 0.0),
+        "reasons": ["operator_signal"],
+    }
+    _push_memory_pressure_queue_event(event, limits)
+    _shed_memory_now(level="operator", limits=limits, reason="operator_signal", respect_cooldown=False)
 
 
 def _bundle_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -295,6 +726,33 @@ def _bundle_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     policy["default_exclude"] = _coerce_str_list(raw.get("default_exclude"))
     policy["allowed_roots"] = _coerce_str_list(raw.get("allowed_roots"))
     policy["exclude_dirs"] = _coerce_str_list(raw.get("exclude_dirs"))
+    return policy
+
+
+def _fragment_repair_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    raw = cfg.get("fragment_repair_policy") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    policy = _FRAGMENT_REPAIR_DEFAULTS.copy()
+    policy["enabled"] = _coerce_bool(raw.get("enabled", policy["enabled"]), policy["enabled"])
+    policy["require_intent"] = _coerce_bool(raw.get("require_intent", policy["require_intent"]), policy["require_intent"])
+    policy["consume_intent"] = _coerce_bool(raw.get("consume_intent", policy["consume_intent"]), policy["consume_intent"])
+    policy["cooldown_seconds"] = _clamp_positive(raw.get("cooldown_seconds", policy["cooldown_seconds"]), policy["cooldown_seconds"])
+
+    mode = str(raw.get("mode", policy["mode"]) or policy["mode"]).lower()
+    if mode not in {"quarantine", "delete", "repair", "inspect"}:
+        mode = policy["mode"]
+    policy["mode"] = mode
+
+    policy["max_actions_per_pass"] = max(
+        1, _coerce_int(raw.get("max_actions_per_pass", policy["max_actions_per_pass"]), policy["max_actions_per_pass"])
+    )
+    policy["max_repair_bytes"] = max(
+        0, _coerce_int(raw.get("max_repair_bytes", policy["max_repair_bytes"]), policy["max_repair_bytes"])
+    )
+    policy["quarantine_dir"] = str(raw.get("quarantine_dir", policy["quarantine_dir"]) or policy["quarantine_dir"])
+    policy["pending_delete_dir"] = str(raw.get("pending_delete_dir", policy["pending_delete_dir"]) or policy["pending_delete_dir"])
     return policy
 
 
@@ -523,6 +981,16 @@ def _maybe_bundle_memory(defer_optional: bool) -> None:
                 }
             )
             update_inastate("bundle_status", payload)
+            update_inastate(
+                "bundle_prune_ready",
+                {
+                    "ready": status == "applied",
+                    "status": status,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "root": str(root),
+                    "bundle_dir": str(bundle_dir),
+                },
+            )
             log_to_statusbox(
                 f"[Manager] Memory bundle {status}: {report.total_files} -> {report.new_file_count}"
             )
@@ -536,6 +1004,16 @@ def _maybe_bundle_memory(defer_optional: bool) -> None:
                     "bundle_dir": str(bundle_dir),
                     "started_at": started_at,
                     "finished_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            update_inastate(
+                "bundle_prune_ready",
+                {
+                    "ready": False,
+                    "status": "failed",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "root": str(root),
+                    "bundle_dir": str(bundle_dir),
                 },
             )
             log_to_statusbox(f"[Manager] Memory bundling failed: {exc}")
@@ -557,6 +1035,8 @@ _last_paint_launch = 0.0
 _PAINT_COOLDOWN = 600  # seconds
 _last_self_read_launch = 0.0
 _SELF_READ_COOLDOWN = 300  # seconds
+_last_self_read_hold_log = 0.0
+_SELF_READ_HOLD_LOG_COOLDOWN = 120.0
 _last_voice_urge_log = 0.0
 _last_typing_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
@@ -565,15 +1045,26 @@ _STABLE_URGE_LOG_COOLDOWN = 180  # seconds
 _last_motor_intent_ts = 0.0
 _MOTOR_INTENT_COOLDOWN = 12.0
 _MOTOR_URGE_THRESHOLD = 0.6
+_last_walk_to_marker_ts = 0.0
+_walk_to_marker_attempt: Optional[Dict[str, Any]] = None
+_ground_fault_streak = 0
+_ground_fault_clear_streak = 0
+_ground_fault_active = False
+_ground_fault_window_id: Optional[str] = None
+_ground_fault_window_started_at: Optional[str] = None
+_last_ground_fault_log = 0.0
+_GROUND_FAULT_LOG_COOLDOWN = 60.0
 _last_continuity_run = 0.0
 _CONTINUITY_COOLDOWN = 3600.0  # seconds between heavy continuity sweeps
 _last_intuition_run = 0.0
 _INTUITION_COOLDOWN = 600.0
 _last_meta_alert = 0.0
 _META_ALERT_COOLDOWN = 900.0
+_last_meta_arbitration_log = 0.0
 _last_fragment_health_scan = 0.0
 _FRAGMENT_HEALTH_COOLDOWN = 1800.0
 _fragment_health_thread: Optional[threading.Thread] = None
+_last_fragment_repair_run = 0.0
 _last_bundle_launch = 0.0
 _bundle_thread: Optional[threading.Thread] = None
 _last_world_sense_mode: Optional[str] = None
@@ -696,7 +1187,8 @@ def _load_inastate_state() -> Dict[str, Any]:
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -830,6 +1322,8 @@ def get_sweet_spots():
 
 def get_inastate(key, default=None):
     state = _load_inastate_state()
+    if not isinstance(state, dict):
+        return default
     return state.get(key, default)
 
 
@@ -838,6 +1332,15 @@ def update_inastate(key, value):
         state = _load_inastate_state()
         state[key] = value
         _atomic_write_inastate(state)
+
+
+def _maybe_update_runtime_heartbeat() -> None:
+    global _last_runtime_heartbeat
+    now = time.time()
+    if _last_runtime_heartbeat and (now - _last_runtime_heartbeat) < _RUNTIME_HEARTBEAT_INTERVAL:
+        return
+    update_inastate("runtime_heartbeat", datetime.now(timezone.utc).isoformat())
+    _last_runtime_heartbeat = now
 
 
 def increment_inastate_metric(metric: str, amount: int = 1):
@@ -894,6 +1397,117 @@ def append_typed_outbox_entry(
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")
         return None
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        return True
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to append JSONL at {path}: {exc}")
+        return False
+
+
+def _sanitize_need_alias(value: Any, *, prefix: str = "sym_need_") -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    cleaned = "".join(ch for ch in raw if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "_")
+    if not cleaned:
+        cleaned = f"{prefix}unnamed"
+    if not cleaned.startswith(prefix):
+        cleaned = f"{prefix}{cleaned}"
+    cleaned = cleaned[:64]
+    return cleaned if len(cleaned) > len(prefix) else f"{prefix}{uuid.uuid4().hex[:6]}"
+
+
+def _resolve_need_symbol_aliases(
+    canonical_variables: List[str],
+    *,
+    limits: Dict[str, Any],
+    now_iso: str,
+) -> Dict[str, str]:
+    if not limits.get("need_aliases_enabled", True):
+        return {}
+
+    prefix = str(limits.get("alias_prefix") or "sym_need_")
+    registry_raw = get_inastate("need_symbol_aliases")
+    registry = registry_raw if isinstance(registry_raw, dict) else {}
+    changed = False
+
+    # Optional alias override channel so Ina/operator can rename tags over time.
+    pending_raw = get_inastate("need_alias_requests")
+    pending = pending_raw if isinstance(pending_raw, dict) else {}
+    if pending:
+        used_aliases = {
+            str(entry.get("alias"))
+            for entry in registry.values()
+            if isinstance(entry, dict) and entry.get("alias")
+        }
+        for canonical, requested in pending.items():
+            canonical_name = str(canonical or "").strip()
+            if not canonical_name:
+                continue
+            alias = _sanitize_need_alias(requested, prefix=prefix)
+            if alias in used_aliases:
+                alias = _sanitize_need_alias(f"{alias}_{uuid.uuid4().hex[:4]}", prefix=prefix)
+            used_aliases.add(alias)
+            entry = registry.get(canonical_name) if isinstance(registry.get(canonical_name), dict) else {}
+            entry["alias"] = alias
+            entry["canonical_variable"] = canonical_name
+            entry["last_updated"] = now_iso
+            entry.setdefault("created_at", now_iso)
+            entry["source"] = "request"
+            registry[canonical_name] = entry
+            changed = True
+        update_inastate("need_alias_requests", None)
+
+    used_aliases = {
+        str(entry.get("alias"))
+        for entry in registry.values()
+        if isinstance(entry, dict) and entry.get("alias")
+    }
+
+    for canonical in canonical_variables:
+        canonical_name = str(canonical or "").strip()
+        if not canonical_name:
+            continue
+        entry = registry.get(canonical_name) if isinstance(registry.get(canonical_name), dict) else {}
+        alias = entry.get("alias")
+        if not alias and limits.get("auto_generate_need_aliases", True):
+            seed = canonical_name.replace("_", "")[:10] or "need"
+            alias = _sanitize_need_alias(f"{prefix}{seed}_{uuid.uuid4().hex[:4]}", prefix=prefix)
+            while alias in used_aliases:
+                alias = _sanitize_need_alias(f"{prefix}{seed}_{uuid.uuid4().hex[:4]}", prefix=prefix)
+            used_aliases.add(alias)
+            entry["alias"] = alias
+            entry["canonical_variable"] = canonical_name
+            entry["created_at"] = now_iso
+            entry["last_updated"] = now_iso
+            entry["source"] = "auto_generated"
+            changed = True
+        elif alias:
+            normalized_alias = _sanitize_need_alias(alias, prefix=prefix)
+            if normalized_alias != alias:
+                alias = normalized_alias
+                entry["alias"] = alias
+                entry["last_updated"] = now_iso
+                changed = True
+            entry.setdefault("canonical_variable", canonical_name)
+            entry.setdefault("created_at", now_iso)
+            registry[canonical_name] = entry
+        if entry and canonical_name not in registry:
+            registry[canonical_name] = entry
+
+    if changed:
+        update_inastate("need_symbol_aliases", registry)
+
+    resolved: Dict[str, str] = {}
+    for canonical in canonical_variables:
+        entry = registry.get(canonical)
+        if isinstance(entry, dict) and isinstance(entry.get("alias"), str):
+            resolved[canonical] = entry["alias"]
+    return resolved
 
 
 _semantic_scaffold_cache: Dict[str, Any] = {}
@@ -2259,11 +2873,24 @@ def _get_last_self_read_source() -> Optional[str]:
     return None
 
 
-def _pick_self_read_source() -> Optional[str]:
+def _pick_self_read_source(meta_arbitration: Optional[Dict[str, Any]] = None) -> Optional[str]:
     state = get_inastate("self_read_exploration_options") or {}
     options = state.get("options") if isinstance(state, dict) else None
     if not isinstance(options, list) or not options:
         return None
+
+    arbitration = meta_arbitration if isinstance(meta_arbitration, dict) else (get_inastate("meta_arbitration") or {})
+    allowed_signals: List[str] = []
+    if isinstance(arbitration, dict):
+        raw_allowed = arbitration.get("allowed_signals")
+        if isinstance(raw_allowed, list):
+            allowed_signals = [str(item) for item in raw_allowed if item]
+    if allowed_signals and "self_read" not in set(allowed_signals):
+        return None
+
+    top_signal = str(arbitration.get("top_signal") or "") if isinstance(arbitration, dict) else ""
+    discomfort = _clamp01(arbitration.get("discomfort"), default=0.0) if isinstance(arbitration, dict) else 0.0
+    allowed_set = set(allowed_signals)
 
     source_choices = _load_self_read_source_choices()
     last_source = _get_last_self_read_source()
@@ -2282,6 +2909,31 @@ def _pick_self_read_source() -> Optional[str]:
             continue
         if weight <= 0.0:
             continue
+
+        # Arbitration-informed source shaping: do not force an outcome,
+        # but gently bias source choice toward the current narrowed lane.
+        if top_signal == "rest":
+            if source == "music":
+                weight *= 1.25
+            elif source == "books":
+                weight *= 1.1
+            elif source == "code":
+                weight *= 0.8
+            elif source == "venv":
+                weight *= 0.75
+        elif top_signal in {"stability", "self_read"}:
+            if source in {"code", "books"}:
+                weight *= 1.2
+            elif source == "venv":
+                weight *= 1.08
+
+        if discomfort >= 0.7 and source in {"code", "books", "venv"}:
+            weight *= 1.0 + (0.16 * discomfort)
+        if "stability" in allowed_set and source in {"code", "books"}:
+            weight *= 1.08
+        if "rest" in allowed_set and source == "music":
+            weight *= 1.12
+
         if last_source and source == last_source:
             weight *= 0.45
         candidates.append((source, weight))
@@ -2303,7 +2955,7 @@ def _maybe_self_read():
     Launch self-reading when curiosity spikes, clarity drops (confused), or
     familiarity is high enough to want to revisit known files.
     """
-    global _last_self_read_launch
+    global _last_self_read_launch, _last_self_read_hold_log
     snapshot = get_inastate("emotion_snapshot") or {}
     emo = snapshot.get("values") or snapshot
 
@@ -2332,6 +2984,28 @@ def _maybe_self_read():
     if not reason:
         return
 
+    arbitration = get_inastate("meta_arbitration") or {}
+    allowed_signals = arbitration.get("allowed_signals") if isinstance(arbitration, dict) else []
+    if isinstance(allowed_signals, list) and allowed_signals and "self_read" not in {str(item) for item in allowed_signals if item}:
+        if (now - _last_self_read_hold_log) >= _SELF_READ_HOLD_LOG_COOLDOWN:
+            top_signal = arbitration.get("top_signal") if isinstance(arbitration, dict) else None
+            log_to_statusbox(
+                f"[Manager] Self-read urge noted but held by arbitration"
+                f" (top signal: {top_signal or 'unknown'})."
+            )
+            _last_self_read_hold_log = now
+        update_inastate(
+            "last_self_read_deferral",
+            {
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "reason": reason,
+                "deferred_by": "meta_arbitration",
+                "top_signal": arbitration.get("top_signal") if isinstance(arbitration, dict) else None,
+                "allowed_signals": allowed_signals if isinstance(allowed_signals, list) else [],
+            },
+        )
+        return
+
     _last_self_read_launch = now
     trigger = {
         "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
@@ -2344,10 +3018,22 @@ def _maybe_self_read():
             "familiarity": round(familiarity, 3),
         },
     }
-    source_pick = _pick_self_read_source()
+    source_pick = _pick_self_read_source(meta_arbitration=arbitration if isinstance(arbitration, dict) else None)
     popen_kwargs = {}
     if source_pick:
         trigger["source_pick"] = source_pick
+    if isinstance(arbitration, dict):
+        trigger["arbitration"] = {
+            "status": arbitration.get("status"),
+            "top_signal": arbitration.get("top_signal"),
+            "allowed_signals": arbitration.get("allowed_signals") if isinstance(arbitration.get("allowed_signals"), list) else [],
+            "discomfort": arbitration.get("discomfort"),
+        }
+    if not source_pick and isinstance(arbitration, dict):
+        trigger["source_pick_blocked_by_arbitration"] = bool(
+            isinstance(allowed_signals, list) and allowed_signals and "self_read" not in {str(item) for item in allowed_signals if item}
+        )
+    if source_pick:
         update_inastate(
             "last_self_read_source",
             {
@@ -2475,22 +3161,1468 @@ def _update_contact_urges():
         _last_typing_urge_log = now
 
 
-def _maybe_emit_motor_intent() -> None:
-    global _last_motor_intent_ts
+def _age_seconds(raw: Any, *, now: Optional[float] = None) -> Optional[float]:
+    if now is None:
+        now = time.time()
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("timestamp")
+    if isinstance(raw, (int, float)):
+        try:
+            return max(0.0, now - float(raw))
+        except Exception:
+            return None
+    if isinstance(raw, str):
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            return max(0.0, now - ts)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_level_from_signal_payload(payload: Any, *, key: str = "level", default: float = 0.0) -> float:
+    if isinstance(payload, dict):
+        return _clamp01(payload.get(key), default=default)
+    return _clamp01(payload, default=default)
+
+
+def _resolve_meta_adjusted_level(payload: Any, default: float = 0.0) -> float:
+    if not isinstance(payload, dict):
+        return _clamp01(payload, default=default)
+    base = _extract_level_from_signal_payload(payload, default=default)
+    adjusted = payload.get("adjusted_level")
+    if adjusted is None:
+        return base
+    return _clamp01(adjusted, default=base)
+
+
+def _best_self_read_invitation(payload: Any) -> Dict[str, Any]:
+    best_level = 0.0
+    best_source: Optional[str] = None
+    if isinstance(payload, dict):
+        options = payload.get("options")
+        if isinstance(options, list):
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                level = _clamp01(option.get("invitation"), default=0.0)
+                if level <= best_level:
+                    continue
+                best_level = level
+                source = option.get("source")
+                if source is not None:
+                    best_source = str(source)
+    return {"level": best_level, "source": best_source}
+
+
+def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Build a meta-signal over cross-system urges so unresolved conflict can
+    escalate organically instead of forcing a fixed winner policy.
+    """
+    global _last_meta_arbitration_log
+
+    now = time.time()
+    now_iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    limits = _meta_arbitration_limits()
+
+    if not limits.get("enabled", True):
+        disabled_state = {
+            "updated_at": now_iso,
+            "enabled": False,
+            "status": "disabled",
+            "signals": [],
+            "drivers": {},
+            "allowed_signals": [],
+            "adjusted_levels": {},
+            "indecision_seconds": 0.0,
+            "indecision_cost": 0.0,
+            "discomfort": 0.0,
+        }
+        update_inastate("meta_arbitration", disabled_state)
+        return disabled_state
+
+    voice_state = get_inastate("urge_to_voice") or {}
+    type_state = get_inastate("urge_to_type") or {}
+    move_state = get_inastate("urge_to_move") or {}
+    stability_state = get_inastate("urge_to_seek_stability") or {}
+    self_read_state = get_inastate("self_read_exploration_options") or {}
+    self_read_best = _best_self_read_invitation(self_read_state)
+
+    snapshot = get_inastate("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else {}
+    if isinstance(values, dict) and values:
+        snapshot = values
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
+    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    clarity = _clamp01(snapshot.get("clarity"), default=0.5)
+    fuzziness = _clamp01(snapshot.get("fuzziness", snapshot.get("fuzz_level", 0.0)), default=0.5)
+    alignment = _clamp01(snapshot.get("alignment"), default=0.5)
+    drift = _clamp01(snapshot.get("symbolic_drift") or get_inastate("symbolic_drift") or 0.0, default=0.0)
+
+    guard_state = memory_guard if isinstance(memory_guard, dict) else (get_inastate("memory_guard") or {})
+    guard_level = ""
+    if isinstance(guard_state, dict):
+        guard_level = str(guard_state.get("level") or "").strip().lower()
+    memory_pressure = 0.0
+    if guard_level == "soft":
+        memory_pressure = 0.65
+    elif guard_level == "hard":
+        memory_pressure = 1.0
+    elif guard_level in {"unknown", "disabled"}:
+        memory_pressure = 0.2
+    if isinstance(guard_state, dict):
+        ram_percent = _clamp01(_coerce_float(guard_state.get("ram_percent"), 0.0) / 100.0, default=0.0)
+        memory_pressure = max(memory_pressure, ram_percent)
+
+    coherence_risk = _clamp01(
+        (0.45 * (1.0 - clarity)) + (0.3 * fuzziness) + (0.15 * drift) + (0.1 * (1.0 - alignment)),
+        default=0.0,
+    )
+    energy_instability = _clamp01((0.6 * (1.0 - energy)) + (0.4 * sleep_pressure), default=0.0)
+    global_load = _clamp01(
+        (0.4 * memory_pressure) + (0.35 * coherence_risk) + (0.25 * energy_instability),
+        default=0.0,
+    )
+
+    rest_drive = _clamp01((0.7 * sleep_pressure) + (0.3 * (1.0 - energy)), default=0.0)
+    candidates = [
+        {"id": "move", "source": "urge_to_move", "level": _extract_level_from_signal_payload(move_state)},
+        {"id": "voice", "source": "urge_to_voice", "level": _extract_level_from_signal_payload(voice_state)},
+        {"id": "type", "source": "urge_to_type", "level": _extract_level_from_signal_payload(type_state)},
+        {"id": "stability", "source": "urge_to_seek_stability", "level": _extract_level_from_signal_payload(stability_state)},
+        {"id": "self_read", "source": "self_read_exploration_options", "level": self_read_best["level"]},
+        {"id": "rest", "source": "derived:energy_stability", "level": rest_drive},
+    ]
+    candidates.sort(key=lambda item: item["level"], reverse=True)
+
+    activation_threshold = limits["activation_threshold"]
+    active = [item for item in candidates if item["level"] >= activation_threshold]
+    active_ids = {item["id"] for item in active}
+    active_count = len(active)
+    active_mean = (
+        _clamp01(sum(item["level"] for item in active) / active_count, default=0.0)
+        if active_count
+        else 0.0
+    )
+
+    top = candidates[0] if candidates else None
+    runner = candidates[1] if len(candidates) > 1 else None
+    top_level = top["level"] if top else 0.0
+    runner_level = runner["level"] if runner else 0.0
+    winner_margin = max(0.0, top_level - runner_level)
+
+    tie_pressure = 0.0
+    if (
+        active_count >= 2
+        and top_level >= limits["conflict_min_level"]
+        and winner_margin < limits["conflict_margin"]
+    ):
+        tie_pressure = _clamp01(
+            1.0 - (winner_margin / max(limits["conflict_margin"], 1e-6)),
+            default=0.0,
+        )
+    breadth_pressure = _clamp01((active_count - 1) / max(len(candidates) - 1, 1), default=0.0)
+    conflict_score = _clamp01(
+        (0.5 * tie_pressure * max(top_level, runner_level))
+        + (0.2 * active_mean)
+        + (0.15 * breadth_pressure)
+        + (0.15 * global_load),
+        default=0.0,
+    )
+
+    action_ages = [
+        _age_seconds(get_inastate("last_expression_time"), now=now),
+        _age_seconds(get_inastate("last_motor_intent"), now=now),
+        _age_seconds(get_inastate("last_self_read_trigger"), now=now),
+    ]
+    valid_action_ages = [age for age in action_ages if age is not None]
+    recent_action_age = min(valid_action_ages) if valid_action_ages else None
+    stall_window = max(1.0, limits["stall_action_window_sec"])
+    stall_pressure = (
+        1.0 if recent_action_age is None else _clamp01(recent_action_age / stall_window, default=0.0)
+    )
+
+    previous = get_inastate("meta_arbitration") or {}
+    if not isinstance(previous, dict):
+        previous = {}
+    prev_indecision = _clamp_positive(previous.get("indecision_seconds"), 0.0)
+    age_since_last_meta = _age_seconds(previous.get("updated_at"), now=now)
+    dt = max(1.0, min(30.0, age_since_last_meta if age_since_last_meta is not None else 10.0))
+
+    unresolved_conflict = (
+        active_count >= 2
+        and top_level >= limits["conflict_min_level"]
+        and winner_margin < limits["conflict_margin"]
+    )
+    if unresolved_conflict:
+        indecision_seconds = min(limits["indecision_horizon_sec"] * 4.0, prev_indecision + dt)
+    else:
+        decay = dt * (0.35 + (0.35 if winner_margin >= limits["conflict_margin"] else 0.0))
+        indecision_seconds = max(0.0, prev_indecision * limits["resolution_decay"] - decay)
+        if conflict_score >= 0.45 and stall_pressure >= 0.85:
+            indecision_seconds = min(limits["indecision_horizon_sec"] * 4.0, indecision_seconds + (0.4 * dt))
+
+    indecision_ratio = _clamp01(indecision_seconds / max(5.0, limits["indecision_horizon_sec"]), default=0.0)
+    indecision_cost = _clamp01((0.55 * indecision_ratio) + (0.45 * conflict_score), default=0.0)
+    discomfort = _clamp01(
+        (0.5 * indecision_cost) + (0.3 * global_load) + (0.2 * stall_pressure),
+        default=0.0,
+    )
+
+    band_high = limits["narrowing_band_high"]
+    band_low = limits["narrowing_band_low"]
+    narrowing_band = band_high - discomfort * (band_high - band_low)
+    narrowing_band = max(band_low, min(band_high, narrowing_band))
+    dynamic_floor = _clamp01(
+        activation_threshold + (limits["narrowing_gain"] * discomfort),
+        default=activation_threshold,
+    )
+    gate = max(dynamic_floor, top_level - narrowing_band) if top else dynamic_floor
+    allowed = [item for item in candidates if item["level"] >= gate]
+    if not allowed and top:
+        allowed = [top]
+    allowed_ids = {item["id"] for item in allowed}
+
+    adjusted_levels: Dict[str, float] = {}
+    for item in candidates:
+        level = item["level"]
+        proximity = _clamp01(level / max(top_level, 1e-6), default=0.0) if top_level > 0 else 0.0
+        if item["id"] in allowed_ids:
+            adjusted = _clamp01(level + (limits["boost_gain"] * discomfort * proximity), default=level)
+        else:
+            adjusted = _clamp01(level - (limits["suppression_gain"] * discomfort), default=level)
+        adjusted_levels[item["id"]] = round(adjusted, 3)
+
+    signal_rows: List[Dict[str, Any]] = []
+    for item in candidates:
+        signal_rows.append(
+            {
+                "id": item["id"],
+                "source": item["source"],
+                "level": round(item["level"], 3),
+                "adjusted_level": adjusted_levels.get(item["id"], round(item["level"], 3)),
+                "active": item["id"] in active_ids,
+                "allowed": item["id"] in allowed_ids,
+            }
+        )
+
+    prev_discomfort = _clamp01(previous.get("discomfort"), default=0.0)
+    if unresolved_conflict and discomfort > (prev_discomfort + 0.02):
+        status = "escalating"
+    elif unresolved_conflict:
+        status = "conflicted"
+    elif discomfort < max(0.0, prev_discomfort - 0.03):
+        status = "cooling"
+    else:
+        status = "resolved"
+
     world_connected = bool(get_inastate("world_connected", False))
-    if not world_connected or get_inastate("dreaming", False):
+    prediction_state = get_inastate("current_prediction") or {}
+    if not isinstance(prediction_state, dict):
+        prediction_state = {}
+    prediction_vec = prediction_state.get("predicted_vector") or {}
+    if not isinstance(prediction_vec, dict):
+        prediction_vec = {}
+    prediction_confidence = _clamp01(prediction_vec.get("confidence") or 0.0, default=0.0)
+
+    machine_semantics = get_inastate("machine_semantics") or {}
+    axes = machine_semantics.get("axes") if isinstance(machine_semantics, dict) else {}
+    if not isinstance(axes, dict):
+        axes = {}
+
+    def axis_value(axis_id: str, default: float = 0.5) -> float:
+        axis = axes.get(axis_id)
+        if isinstance(axis, dict):
+            return _clamp01(axis.get("value"), default=default)
+        return default
+
+    predictive_reliability = axis_value("predictive_reliability", default=0.5)
+    controllability = axis_value("controllability", default=0.5)
+    signal_integrity = axis_value("signal_integrity", default=0.5)
+
+    checks: List[Dict[str, Any]] = [
+        {
+            "id": "signal_conflict",
+            "value": round(conflict_score, 3),
+            "status": "high" if conflict_score >= 0.65 else ("medium" if conflict_score >= 0.45 else "low"),
+            "note": "Competition between action channels.",
+        },
+        {
+            "id": "context_clarity",
+            "value": round(1.0 - coherence_risk, 3),
+            "status": "low" if coherence_risk >= 0.6 else ("medium" if coherence_risk >= 0.45 else "high"),
+            "note": "How understandable the current context seems.",
+        },
+        {
+            "id": "prediction_fit",
+            "value": round(predictive_reliability, 3),
+            "status": "low" if predictive_reliability < 0.45 else ("medium" if predictive_reliability < 0.6 else "high"),
+            "note": "Whether prediction context supports a choice.",
+        },
+        {
+            "id": "resource_budget",
+            "value": round(1.0 - memory_pressure, 3),
+            "status": "low" if memory_pressure >= 0.8 else ("medium" if memory_pressure >= 0.6 else "high"),
+            "note": "Memory/compute room for optional actions.",
+        },
+        {
+            "id": "feedback_loop",
+            "value": round(1.0 - stall_pressure, 3),
+            "status": "low" if stall_pressure >= 0.85 else ("medium" if stall_pressure >= 0.6 else "high"),
+            "note": "Recent action feedback available to break indecision.",
+        },
+        {
+            "id": "controllability",
+            "value": round(controllability, 3),
+            "status": "low" if controllability < 0.45 else ("medium" if controllability < 0.6 else "high"),
+            "note": "Sense of agency in the current situation.",
+        },
+        {
+            "id": "signal_integrity",
+            "value": round(signal_integrity, 3),
+            "status": "low" if signal_integrity < 0.45 else ("medium" if signal_integrity < 0.6 else "high"),
+            "note": "Clarity vs. noise in incoming signals.",
+        },
+    ]
+
+    missing_inputs: List[Dict[str, Any]] = []
+
+    def add_missing(
+        missing_id: str,
+        severity: str,
+        reason: str,
+        *,
+        canonical_variable: str,
+        suggested_probe: str,
+        where_to_obtain: str,
+        provider_modules: List[str],
+        expected_output: str,
+    ) -> None:
+        for item in missing_inputs:
+            if item.get("id") == missing_id:
+                return
+        canonical_meta = _NEED_CANONICAL_VARIABLES.get(canonical_variable, {})
+        providers = [str(name) for name in provider_modules if isinstance(name, str) and name]
+        providers = list(dict.fromkeys(providers))
+        missing_inputs.append(
+            {
+                "id": missing_id,
+                "severity": severity,
+                "canonical_variable": canonical_variable,
+                "canonical_description": canonical_meta.get("description"),
+                "reason": reason,
+                "suggested_probe": suggested_probe,
+                "where_to_obtain": where_to_obtain,
+                "provider_modules": providers,
+                "source_location": where_to_obtain,
+                "expected_output": expected_output,
+                # Backward-compatible field so existing consumers still render a probe line.
+                "probe": suggested_probe,
+            }
+        )
+
+    if unresolved_conflict and winner_margin <= (limits["conflict_margin"] * 0.5):
+        add_missing(
+            "tie_break_signal",
+            "high" if conflict_score >= 0.7 else "medium",
+            "Top options are too close together to resolve naturally.",
+            canonical_variable="urgency_signal",
+            suggested_probe="compare delayed-cost delta across candidate actions",
+            where_to_obtain="prediction rollouts + machine_semantics.attention_value",
+            provider_modules=["predictive_layer.py", "logic_engine.py"],
+            expected_output="scalar [0..1] where higher means delay is costly",
+        )
+    if coherence_risk >= 0.58:
+        add_missing(
+            "context_clarity",
+            "high" if coherence_risk >= 0.72 else "medium",
+            "Context model is noisy (clarity/fuzziness mismatch).",
+            canonical_variable="context_scope",
+            suggested_probe="measure context coverage across world, memory, and active goal channels",
+            where_to_obtain="world_heartbeat + machine_semantics + memory_graph context links",
+            provider_modules=["logic_engine.py", "memory_graph.py", "predictive_layer.py"],
+            expected_output="scalar [0..1] where higher means context is sufficiently bounded",
+        )
+    if predictive_reliability < 0.45 or prediction_confidence < 0.35:
+        add_missing(
+            "reversibility_estimate",
+            "medium",
+            "Outcome reversibility is under-modeled for this decision frame.",
+            canonical_variable="reversibility_estimate",
+            suggested_probe="simulate action on shadow state",
+            where_to_obtain="counterfactual rollout in predictive + logic shadow simulation",
+            provider_modules=["logic_engine.py", "predictive_layer.py"],
+            expected_output="scalar [-1..1] where +1 is reversible",
+        )
+    if not world_connected and (top_level >= activation_threshold or unresolved_conflict):
+        add_missing(
+            "world_feedback",
+            "medium",
+            "World channel is disconnected during active arbitration.",
+            canonical_variable="context_scope",
+            suggested_probe="reacquire world heartbeat and verify sensor freshness",
+            where_to_obtain="world_server heartbeat + touch/motor feedback timestamps",
+            provider_modules=["ina_client.py", "motor_controls.py", "model_manager.py"],
+            expected_output="bool freshness + scalar [0..1] context confidence",
+        )
+    if memory_pressure >= 0.8:
+        add_missing(
+            "resource_budget",
+            "high" if memory_pressure >= 0.9 else "medium",
+            "Memory pressure is constraining option execution.",
+            canonical_variable="context_scope",
+            suggested_probe="estimate executable option budget under current guard limits",
+            where_to_obtain="memory_guard + module pressure queue state",
+            provider_modules=["model_manager.py", "fragment_limits.py"],
+            expected_output="scalar [0..1] where higher means enough budget to branch",
+        )
+    if stall_pressure >= 0.85:
+        add_missing(
+            "action_feedback",
+            "medium",
+            "No recent action feedback to resolve competing urges.",
+            canonical_variable="reversibility_estimate",
+            suggested_probe="run low-risk probe action and score reversibility from feedback",
+            where_to_obtain="motor intent feedback + expression outcomes over short horizon",
+            provider_modules=["model_manager.py", "predictive_layer.py", "early_comm.py"],
+            expected_output="scalar [-1..1] where +1 confirms safe reversible exploration",
+        )
+    if active_count == 0 or (top_level < activation_threshold and discomfort >= 0.55):
+        add_missing(
+            "salience_signal",
+            "medium",
+            "No signal is confidently above activation while pressure remains elevated.",
+            canonical_variable="urgency_signal",
+            suggested_probe="derive urgency from unresolved-cost slope over recent loops",
+            where_to_obtain="meta_arbitration indecision trajectory + conflict trend",
+            provider_modules=["model_manager.py", "emotion_engine.py"],
+            expected_output="scalar [0..1] where higher indicates decisive urgency",
+        )
+    if "self_read" not in allowed_ids and coherence_risk >= 0.58 and active_count >= 2:
+        add_missing(
+            "inquiry_channel",
+            "medium",
+            "Conflict may require context gathering but self-read is currently suppressed.",
+            canonical_variable="context_scope",
+            suggested_probe="open a constrained self-read lane and test context reduction",
+            where_to_obtain="self_read_exploration_options + post-read coherence delta",
+            provider_modules=["model_manager.py", "raw_file_manager.py"],
+            expected_output="scalar [0..1] context gain after inquiry",
+        )
+
+    canonical_missing = sorted(
+        {
+            str(item.get("canonical_variable"))
+            for item in missing_inputs
+            if isinstance(item, dict) and item.get("canonical_variable")
+        }
+    )
+    alias_map = _resolve_need_symbol_aliases(canonical_missing, limits=limits, now_iso=now_iso)
+    for item in missing_inputs:
+        canonical = str(item.get("canonical_variable") or "")
+        alias = alias_map.get(canonical)
+        if alias:
+            item["symbolic_tag"] = alias
+            item["symbolic_phrase"] = f"{alias}::{canonical}"
+
+    self_diagnosis_lines: List[str] = []
+    if missing_inputs:
+        for item in missing_inputs[:6]:
+            symbol = item.get("symbolic_tag")
+            canonical = item.get("canonical_variable")
+            prefix = f"{symbol} ({canonical})" if symbol else str(canonical or item.get("id"))
+            self_diagnosis_lines.append(
+                f"{prefix}: {item.get('reason')} Probe: {item.get('suggested_probe')}"
+            )
+    else:
+        self_diagnosis_lines.append(
+            "No explicit missing-input class detected; conflict currently appears intensity-driven."
+        )
+
+    recommended_actions: List[Dict[str, Any]] = []
+    for item in missing_inputs:
+        recommended_actions.append(
+            {
+                "symbolic_tag": item.get("symbolic_tag"),
+                "canonical_variable": item.get("canonical_variable"),
+                "suggested_probe": item.get("suggested_probe"),
+                "where_to_obtain": item.get("where_to_obtain"),
+                "provider_modules": item.get("provider_modules"),
+                "expected_output": item.get("expected_output"),
+            }
+        )
+
+    recommended_tools = []
+    for action in recommended_actions:
+        probe = action.get("suggested_probe")
+        providers = action.get("provider_modules") if isinstance(action.get("provider_modules"), list) else []
+        provider_text = ", ".join(str(name) for name in providers if name)
+        if probe and provider_text:
+            recommended_tools.append(f"{probe} via {provider_text}")
+        elif probe:
+            recommended_tools.append(str(probe))
+    recommended_tools = list(dict.fromkeys(recommended_tools))
+
+    symbolic_needs = [item.get("symbolic_tag") for item in missing_inputs if item.get("symbolic_tag")]
+
+    diagnostics_payload = {
+        "missing_inputs": missing_inputs,
+        "checks": checks,
+        "self_diagnosis": self_diagnosis_lines,
+        "recommended_tools": recommended_tools,
+        "recommended_actions": recommended_actions,
+        "canonical_seed_variables": list(_NEED_CANONICAL_VARIABLES.keys()),
+        "symbolic_needs": symbolic_needs,
+        "canonical_to_symbolic_map": alias_map,
+    }
+
+    advocacy_payload = {
+        "updated_at": now_iso,
+        "mode": "symbolic_need_report",
+        "canonical_variables": canonical_missing,
+        "symbolic_tags": symbolic_needs,
+        "canonical_to_symbolic_map": alias_map,
+        "entries": recommended_actions,
+        "self_diagnosis": self_diagnosis_lines,
+        "language_bridge": "symbolic -> canonical -> human",
+        "alias_update_channel": "need_alias_requests",
+    }
+    update_inastate("decision_need_advocacy", advocacy_payload)
+
+    payload = {
+        "updated_at": now_iso,
+        "enabled": True,
+        "status": status,
+        "top_signal": top["id"] if top else None,
+        "runner_up_signal": runner["id"] if runner else None,
+        "winner_margin": round(winner_margin, 3),
+        "active_count": active_count,
+        "conflict_score": round(conflict_score, 3),
+        "indecision_seconds": round(indecision_seconds, 2),
+        "indecision_cost": round(indecision_cost, 3),
+        "discomfort": round(discomfort, 3),
+        "dynamic_floor": round(gate, 3),
+        "narrowing_band": round(narrowing_band, 3),
+        "allowed_signals": [item["id"] for item in allowed],
+        "adjusted_levels": adjusted_levels,
+        "signals": signal_rows,
+        "drivers": {
+            "memory_pressure": round(memory_pressure, 3),
+            "coherence_risk": round(coherence_risk, 3),
+            "energy_instability": round(energy_instability, 3),
+            "global_load": round(global_load, 3),
+            "stall_pressure": round(stall_pressure, 3),
+            "recent_action_age_sec": round(recent_action_age, 2) if recent_action_age is not None else None,
+            "best_self_read_source": self_read_best.get("source"),
+            "world_connected": world_connected,
+            "prediction_confidence": round(prediction_confidence, 3),
+            "predictive_reliability": round(predictive_reliability, 3),
+        },
+        "diagnostics": diagnostics_payload,
+    }
+
+    panic_prev = get_inastate("decision_panic") or {}
+    if not isinstance(panic_prev, dict):
+        panic_prev = {}
+    prev_panic_active = bool(panic_prev.get("active"))
+    prev_panic_arbitration = panic_prev.get("arbitration") if isinstance(panic_prev.get("arbitration"), dict) else {}
+    prev_panic_discomfort = _clamp01(prev_panic_arbitration.get("discomfort"), default=0.0)
+    prev_panic_indecision = _clamp_positive(prev_panic_arbitration.get("indecision_seconds"), 0.0)
+    last_panic_log_age = _age_seconds(panic_prev.get("last_logged_at"), now=now)
+    panic_active = bool(
+        limits.get("panic_enabled", True)
+        and unresolved_conflict
+        and discomfort >= limits["panic_discomfort_threshold"]
+        and conflict_score >= limits["panic_conflict_threshold"]
+        and indecision_seconds >= limits["panic_indecision_sec"]
+        and (stall_pressure >= 0.65 or bool(missing_inputs))
+    )
+    panic_event: Optional[str] = None
+    should_log_panic = False
+    if panic_active and not prev_panic_active:
+        panic_event = "panic_entered"
+        should_log_panic = True
+    elif panic_active:
+        escalating = discomfort >= (prev_panic_discomfort + 0.015) or indecision_seconds >= (prev_panic_indecision + 15.0)
+        if (last_panic_log_age is None or last_panic_log_age >= limits["panic_repeat_sec"]) and escalating:
+            panic_event = "panic_escalating"
+            should_log_panic = True
+    elif prev_panic_active:
+        panic_event = "panic_resolved"
+        should_log_panic = True
+
+    if panic_active or prev_panic_active:
+        prior_episode_id = panic_prev.get("episode_id")
+        if panic_active and prev_panic_active and prior_episode_id:
+            episode_id = str(prior_episode_id)
+        elif panic_active:
+            episode_id = f"panic_{uuid.uuid4().hex[:10]}"
+        else:
+            episode_id = str(prior_episode_id or f"panic_{uuid.uuid4().hex[:10]}")
+
+        started_at = panic_prev.get("started_at") if prev_panic_active else now_iso
+        panic_payload = {
+            "active": panic_active,
+            "episode_id": episode_id,
+            "status": "active" if panic_active else "resolved",
+            "updated_at": now_iso,
+            "started_at": started_at,
+            "resolved_at": (None if panic_active else now_iso),
+            "event": panic_event,
+            "arbitration": {
+                "status": status,
+                "top_signal": top["id"] if top else None,
+                "runner_up_signal": runner["id"] if runner else None,
+                "winner_margin": round(winner_margin, 3),
+                "conflict_score": round(conflict_score, 3),
+                "indecision_seconds": round(indecision_seconds, 2),
+                "indecision_cost": round(indecision_cost, 3),
+                "discomfort": round(discomfort, 3),
+                "allowed_signals": [item["id"] for item in allowed],
+            },
+            "missing_inputs": missing_inputs,
+            "diagnostic_checks": checks,
+            "self_diagnosis": self_diagnosis_lines,
+            "recommended_tools": recommended_tools,
+            "last_logged_at": now_iso if should_log_panic else panic_prev.get("last_logged_at"),
+            "last_popup_at": panic_prev.get("last_popup_at"),
+        }
+
+        popup_triggered = False
+        if panic_active and should_log_panic and limits.get("panic_popup_enabled", True):
+            last_popup_age = _age_seconds(panic_prev.get("last_popup_at"), now=now)
+            if last_popup_age is None or last_popup_age >= limits["panic_popup_cooldown_sec"]:
+                popup_triggered = True
+                panic_payload["last_popup_at"] = now_iso
+        panic_payload["popup_triggered"] = popup_triggered
+        update_inastate("decision_panic", panic_payload)
+
+        if should_log_panic:
+            log_entry = {
+                "timestamp": now_iso,
+                "event": panic_event,
+                "episode_id": episode_id,
+                "arbitration": panic_payload["arbitration"],
+                "missing_inputs": missing_inputs,
+                "self_diagnosis": self_diagnosis_lines,
+            }
+            _append_jsonl(_DECISION_PANIC_LOG_PATH, log_entry)
+            if panic_event == "panic_resolved":
+                log_to_statusbox("[Manager] Decision panic resolved; arbitration pressure cooled.")
+            else:
+                missing_ids = ", ".join(item.get("id", "") for item in missing_inputs[:4]) or "unknown"
+                log_to_statusbox(
+                    f"[Manager] Decision panic detected ({panic_event}); likely missing: {missing_ids}."
+                )
+        if popup_triggered:
+            safe_popen(["python", "decision_panic_window.py"])
+
+    update_inastate("meta_arbitration", payload)
+
+    for key, signal_id in (
+        ("urge_to_voice", "voice"),
+        ("urge_to_type", "type"),
+        ("urge_to_move", "move"),
+        ("urge_to_seek_stability", "stability"),
+    ):
+        signal_payload = get_inastate(key)
+        if not isinstance(signal_payload, dict):
+            continue
+        patched = dict(signal_payload)
+        patched["adjusted_level"] = adjusted_levels.get(signal_id, round(_extract_level_from_signal_payload(signal_payload), 3))
+        patched["arbitration"] = {
+            "updated_at": now_iso,
+            "status": status,
+            "discomfort": round(discomfort, 3),
+            "indecision_cost": round(indecision_cost, 3),
+            "allowed": signal_id in allowed_ids,
+            "top_signal": top["id"] if top else None,
+        }
+        update_inastate(key, patched)
+
+    if discomfort >= limits["log_discomfort_threshold"]:
+        cooldown = limits["log_cooldown_sec"]
+        if _last_meta_arbitration_log == 0.0 or (now - _last_meta_arbitration_log) >= cooldown:
+            allow_text = ", ".join(item["id"] for item in allowed[:3]) if allowed else "none"
+            log_to_statusbox(
+                f"[Manager] Arbitration pressure {discomfort:.2f} "
+                f"(cost {indecision_cost:.2f}) - narrowing options to {allow_text}."
+            )
+            _last_meta_arbitration_log = now
+
+    return payload
+
+
+def _motor_ground_sense_snapshot() -> Dict[str, Any]:
+    touch_feedback = get_inastate("touch_feedback") or {}
+    touch_world = get_inastate("touch_world") or {}
+    motor_feedback = get_inastate("motor_feedback") or {}
+
+    grounded_signals: List[bool] = []
+    support_scores: List[float] = []
+    sources: List[str] = []
+    stance: Optional[str] = None
+    contact_count = 0
+
+    if isinstance(touch_feedback, dict) and touch_feedback:
+        sources.append("touch_feedback")
+        grounded_signals.append(bool(touch_feedback.get("grounded")))
+        support_scores.append(_clamp01(touch_feedback.get("surface_solidity"), default=0.0))
+        support_scores.append(_clamp01(touch_feedback.get("foot_pressure"), default=0.0))
+        stance_raw = touch_feedback.get("stance")
+        if isinstance(stance_raw, str) and stance_raw.strip():
+            stance = stance_raw.strip()
+        contacts = touch_feedback.get("contacts")
+        if isinstance(contacts, list):
+            contact_count = max(contact_count, len(contacts))
+
+    if isinstance(touch_world, dict) and touch_world:
+        sources.append("touch_world")
+        grounded_signals.append(bool(touch_world.get("grounded")))
+        surface = touch_world.get("ground_surface")
+        if isinstance(surface, dict):
+            support_scores.append(_clamp01(surface.get("solidity"), default=0.0))
+        contacts = touch_world.get("contacts")
+        if isinstance(contacts, list):
+            contact_count = max(contact_count, len(contacts))
+
+    if isinstance(motor_feedback, dict) and motor_feedback:
+        sources.append("motor_feedback")
+        grounded_signals.append(bool(motor_feedback.get("grounded")))
+        gravity_load = _clamp01(motor_feedback.get("gravity_load"), default=0.0)
+        support_scores.append(gravity_load)
+
+    grounded = any(grounded_signals)
+    support_confidence = max(support_scores) if support_scores else (1.0 if grounded else 0.0)
+
+    return {
+        "grounded": grounded,
+        "surface": "solid" if grounded else "unknown",
+        "support_confidence": round(_clamp01(support_confidence, default=0.0), 3),
+        "stance": stance,
+        "contact_count": int(contact_count),
+        "sources": sources,
+    }
+
+
+def _update_motor_control_status(
+    *,
+    now: float,
+    decision: str,
+    reason: str,
+    world_connected: bool,
+    dreaming: bool,
+    urge_level: float,
+    threshold: float,
+    cooldown: float,
+    heartbeat_age: Optional[float],
+    last_intent_age: Optional[float],
+    last_feedback_age: Optional[float],
+    intent_issued: bool = False,
+) -> None:
+    heartbeat_fresh = heartbeat_age is None or heartbeat_age <= 30.0
+    standing_by_choice = decision == "stand_still_by_choice"
+    payload = {
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "source": "model_manager",
+        "movement_logic_ready": True,
+        "world_connected": bool(world_connected),
+        "dreaming": bool(dreaming),
+        "intent_pipeline_ready": bool(world_connected and not dreaming and heartbeat_fresh),
+        "decision": decision,
+        "reason": reason,
+        "standing_by_choice": standing_by_choice,
+        "intent_issued": bool(intent_issued),
+        "urge_to_move": {
+            "level": round(_clamp01(urge_level, default=0.0), 3),
+            "threshold": round(max(0.0, float(threshold)), 3),
+        },
+        "cooldown_seconds": round(max(0.0, float(cooldown)), 3),
+        "ages_seconds": {
+            "world_heartbeat": round(heartbeat_age, 3) if heartbeat_age is not None else None,
+            "last_motor_intent": round(last_intent_age, 3) if last_intent_age is not None else None,
+            "last_motor_feedback": round(last_feedback_age, 3) if last_feedback_age is not None else None,
+        },
+        "ground_sense": _motor_ground_sense_snapshot(),
+    }
+    update_inastate("motor_control_status", payload)
+
+
+def _walk_to_marker_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "enabled": False,
+        "marker_name": "marker_1m",
+        "marker": {},
+        "distance_m": 1.0,
+        "arrival_radius": 0.2,
+        "max_distance": 4.0,
+        "step_duration": 0.9,
+        "step_strength": 0.5,
+        "run": False,
+        "min_urge_level": 0.45,
+        "cooldown_seconds": 45.0,
+        "min_feedback_age": 0.6,
+        "evaluation_grace_seconds": 1.2,
+        "min_movement": 0.12,
+        "min_progress": 0.05,
+    }
+    if cfg is None:
+        cfg = load_config()
+    raw = cfg.get("walk_to_marker_experiment", {}) if isinstance(cfg, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    policy = defaults.copy()
+    policy["enabled"] = _coerce_bool(raw.get("enabled", policy["enabled"]), policy["enabled"])
+    policy["marker_name"] = str(raw.get("marker_name") or policy["marker_name"])
+    marker = raw.get("marker")
+    policy["marker"] = marker if isinstance(marker, dict) else {}
+    policy["distance_m"] = max(0.25, min(_coerce_float(raw.get("distance_m", policy["distance_m"]), policy["distance_m"]), 3.0))
+    policy["arrival_radius"] = max(0.05, _coerce_float(raw.get("arrival_radius", policy["arrival_radius"]), policy["arrival_radius"]))
+    policy["max_distance"] = max(policy["arrival_radius"] + 0.05, _coerce_float(raw.get("max_distance", policy["max_distance"]), policy["max_distance"]))
+    policy["step_duration"] = max(0.2, _coerce_float(raw.get("step_duration", policy["step_duration"]), policy["step_duration"]))
+    policy["step_strength"] = max(0.1, min(_coerce_float(raw.get("step_strength", policy["step_strength"]), policy["step_strength"]), 1.0))
+    policy["run"] = _coerce_bool(raw.get("run", policy["run"]), policy["run"])
+    policy["min_urge_level"] = max(0.0, min(_coerce_float(raw.get("min_urge_level", policy["min_urge_level"]), policy["min_urge_level"]), 1.0))
+    policy["cooldown_seconds"] = max(0.0, _coerce_float(raw.get("cooldown_seconds", policy["cooldown_seconds"]), policy["cooldown_seconds"]))
+    policy["min_feedback_age"] = max(0.0, _coerce_float(raw.get("min_feedback_age", policy["min_feedback_age"]), policy["min_feedback_age"]))
+    policy["evaluation_grace_seconds"] = max(
+        0.2, _coerce_float(raw.get("evaluation_grace_seconds", policy["evaluation_grace_seconds"]), policy["evaluation_grace_seconds"])
+    )
+    policy["min_movement"] = max(0.02, _coerce_float(raw.get("min_movement", policy["min_movement"]), policy["min_movement"]))
+    policy["min_progress"] = max(0.01, _coerce_float(raw.get("min_progress", policy["min_progress"]), policy["min_progress"]))
+    return policy
+
+
+def _world_pose_snapshot() -> Optional[Dict[str, float]]:
+    pose = get_inastate("world_pose")
+    if not isinstance(pose, dict):
+        return None
+    pos = pose.get("position")
+    if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+        return None
+    try:
+        x = float(pos[0])
+        y = float(pos[1])
+        z = float(pos[2])
+    except Exception:
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return None
+    try:
+        yaw_deg = float(pose.get("yaw_deg")) if pose.get("yaw_deg") is not None else 0.0
+    except Exception:
+        yaw_deg = 0.0
+    return {"x": x, "y": y, "z": z, "yaw_deg": yaw_deg}
+
+
+def _distance_xy(ax: float, ay: float, bx: float, by: float) -> float:
+    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+
+
+def _resolve_marker_position(policy: Dict[str, Any], pose: Dict[str, float]) -> Tuple[float, float, float]:
+    marker = policy.get("marker")
+    if isinstance(marker, dict) and marker:
+        try:
+            mx = float(marker.get("x"))
+            my = float(marker.get("y"))
+            mz = float(marker.get("z", pose["z"]))
+            if math.isfinite(mx) and math.isfinite(my) and math.isfinite(mz):
+                return mx, my, mz
+        except Exception:
+            pass
+    yaw_rad = math.radians(float(pose.get("yaw_deg", 0.0)))
+    distance_m = float(policy.get("distance_m", 1.0))
+    # world-space forward for yaw in this simulation coordinate system
+    fwd_x = -math.sin(yaw_rad)
+    fwd_y = math.cos(yaw_rad)
+    return (
+        float(pose["x"] + (fwd_x * distance_m)),
+        float(pose["y"] + (fwd_y * distance_m)),
+        float(pose["z"]),
+    )
+
+
+def _set_walk_to_marker_status(status: str, **extra: Any) -> None:
+    payload = {
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "model_manager",
+    }
+    payload.update(extra)
+    update_inastate("walk_to_marker_status", payload)
+
+
+def _finalize_walk_to_marker_attempt(now: float) -> None:
+    global _walk_to_marker_attempt, _last_walk_to_marker_ts
+    attempt = _walk_to_marker_attempt
+    if not isinstance(attempt, dict):
+        _walk_to_marker_attempt = None
+        return
+    _walk_to_marker_attempt = None
+    _last_walk_to_marker_ts = now
+
+    pose = _world_pose_snapshot()
+    if not pose:
+        _set_walk_to_marker_status(
+            "step_failed",
+            experiment_id=attempt.get("id"),
+            success=False,
+            failure_bucket="command_integration_or_execution",
+            reason="no_world_pose_feedback",
+            marker=attempt.get("marker"),
+        )
         return
 
+    start_pos = attempt.get("start_position") or [pose["x"], pose["y"], pose["z"]]
+    marker = attempt.get("marker") or {}
+    marker_x = _coerce_float(marker.get("x"), pose["x"])
+    marker_y = _coerce_float(marker.get("y"), pose["y"])
+    start_x = _coerce_float(start_pos[0], pose["x"]) if isinstance(start_pos, (list, tuple)) and len(start_pos) >= 1 else pose["x"]
+    start_y = _coerce_float(start_pos[1], pose["y"]) if isinstance(start_pos, (list, tuple)) and len(start_pos) >= 2 else pose["y"]
+
+    movement_m = _distance_xy(start_x, start_y, pose["x"], pose["y"])
+    start_distance = _distance_xy(start_x, start_y, marker_x, marker_y)
+    end_distance = _distance_xy(pose["x"], pose["y"], marker_x, marker_y)
+    progress_m = max(0.0, start_distance - end_distance)
+
+    min_movement = max(0.02, _coerce_float(attempt.get("min_movement"), 0.12))
+    min_progress = max(0.01, _coerce_float(attempt.get("min_progress"), 0.05))
+    success = movement_m >= min_movement and progress_m >= min_progress and end_distance <= start_distance
+    result = "stepped_toward_marker" if success else "step_failed"
+    failure_bucket = None
+
+    diagnostics = {
+        "movement_m": round(movement_m, 4),
+        "progress_m": round(progress_m, 4),
+        "start_distance_m": round(start_distance, 4),
+        "end_distance_m": round(end_distance, 4),
+        "motor_status": get_inastate("motor_control_status") or {},
+        "touch_world": get_inastate("touch_world") or {},
+        "ground_fault": get_inastate("ground_sense_fault") or {},
+    }
+
+    if not success:
+        touch_world = diagnostics["touch_world"] if isinstance(diagnostics["touch_world"], dict) else {}
+        contacts = touch_world.get("contacts") if isinstance(touch_world.get("contacts"), list) else []
+        bounded = any(
+            isinstance(entry, dict)
+            and str(entry.get("surface", "")).startswith("bounds_")
+            and _coerce_float(entry.get("pressure"), 0.0) >= 0.35
+            for entry in contacts
+        )
+        ground_fault = diagnostics["ground_fault"] if isinstance(diagnostics["ground_fault"], dict) else {}
+        motor_status = diagnostics["motor_status"] if isinstance(diagnostics["motor_status"], dict) else {}
+        motor_decision = str(motor_status.get("decision") or "")
+
+        if movement_m < min_movement:
+            if _coerce_bool(ground_fault.get("active", False), False):
+                failure_bucket = "grounding_fault"
+            elif bounded:
+                failure_bucket = "collision_or_bounds"
+            elif motor_decision in {"stand_still_by_choice", "walk_to_marker_waiting", "walk_to_marker_cooldown"}:
+                failure_bucket = "policy_or_instinct_hold"
+            else:
+                failure_bucket = "command_integration_or_execution"
+        else:
+            failure_bucket = "path_or_heading_mismatch"
+
+    _set_walk_to_marker_status(
+        result,
+        experiment_id=attempt.get("id"),
+        success=success,
+        marker=attempt.get("marker"),
+        start_position=[round(start_x, 4), round(start_y, 4), _coerce_float(start_pos[2], pose["z"]) if isinstance(start_pos, (list, tuple)) and len(start_pos) >= 3 else round(pose["z"], 4)],
+        end_position=[round(pose["x"], 4), round(pose["y"], 4), round(pose["z"], 4)],
+        diagnostics=diagnostics,
+        failure_bucket=failure_bucket,
+    )
+    if success:
+        log_to_statusbox("[Manager] Walk-to-marker experiment: step completed toward marker.")
+    else:
+        log_to_statusbox(f"[Manager] Walk-to-marker experiment: step failed ({failure_bucket or 'unknown'}).")
+
+
+def _maybe_run_walk_to_marker_experiment(
+    *,
+    now: float,
+    world_connected: bool,
+    dreaming: bool,
+    urge_level: float,
+    threshold: float,
+    cooldown: float,
+    heartbeat_age: Optional[float],
+    last_intent_age: Optional[float],
+    last_feedback_age: Optional[float],
+) -> bool:
+    global _walk_to_marker_attempt, _last_walk_to_marker_ts, _last_motor_intent_ts
+    policy = _walk_to_marker_policy(load_config())
+    if not policy.get("enabled", False):
+        return False
+
+    if isinstance(_walk_to_marker_attempt, dict):
+        evaluate_after = _coerce_float(_walk_to_marker_attempt.get("evaluate_after"), now)
+        if now >= evaluate_after:
+            _finalize_walk_to_marker_attempt(now)
+        else:
+            _set_walk_to_marker_status(
+                "step_in_progress",
+                experiment_id=_walk_to_marker_attempt.get("id"),
+                evaluate_after=datetime.fromtimestamp(evaluate_after, timezone.utc).isoformat(),
+            )
+            _update_motor_control_status(
+                now=now,
+                decision="walk_to_marker_waiting",
+                reason="awaiting_step_feedback",
+                world_connected=world_connected,
+                dreaming=dreaming,
+                urge_level=urge_level,
+                threshold=threshold,
+                cooldown=cooldown,
+                heartbeat_age=heartbeat_age,
+                last_intent_age=last_intent_age,
+                last_feedback_age=last_feedback_age,
+            )
+        return True
+
+    experiment_cooldown = _coerce_float(policy.get("cooldown_seconds"), 0.0)
+    if experiment_cooldown > 0 and _last_walk_to_marker_ts and (now - _last_walk_to_marker_ts) < experiment_cooldown:
+        remaining = max(0.0, experiment_cooldown - (now - _last_walk_to_marker_ts))
+        _set_walk_to_marker_status("cooldown", cooldown_remaining_seconds=round(remaining, 2))
+        _update_motor_control_status(
+            now=now,
+            decision="walk_to_marker_cooldown",
+            reason="experiment_cooldown",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    if not world_connected:
+        _set_walk_to_marker_status("blocked", reason="world_not_connected")
+        _update_motor_control_status(
+            now=now,
+            decision="hold_world_disconnected",
+            reason="walk_to_marker_world_not_connected",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    if dreaming:
+        _set_walk_to_marker_status("blocked", reason="dreaming_active")
+        _update_motor_control_status(
+            now=now,
+            decision="hold_dreaming",
+            reason="walk_to_marker_dreaming",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    if heartbeat_age is not None and heartbeat_age > 30.0:
+        _set_walk_to_marker_status("blocked", reason="world_heartbeat_stale")
+        _update_motor_control_status(
+            now=now,
+            decision="hold_world_sync",
+            reason="walk_to_marker_world_heartbeat_stale",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    pose = _world_pose_snapshot()
+    if pose is None:
+        _set_walk_to_marker_status("blocked", reason="no_world_pose")
+        _update_motor_control_status(
+            now=now,
+            decision="walk_to_marker_waiting",
+            reason="missing_world_pose",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    marker_x, marker_y, marker_z = _resolve_marker_position(policy, pose)
+    marker_name = str(policy.get("marker_name") or "marker")
+    marker_payload = {"name": marker_name, "x": round(marker_x, 4), "y": round(marker_y, 4), "z": round(marker_z, 4)}
+    distance_to_marker = _distance_xy(pose["x"], pose["y"], marker_x, marker_y)
+    arrival_radius = _coerce_float(policy.get("arrival_radius"), 0.2)
+    max_distance = _coerce_float(policy.get("max_distance"), 4.0)
+
+    if distance_to_marker <= arrival_radius:
+        _last_walk_to_marker_ts = now
+        _set_walk_to_marker_status("already_at_marker", marker=marker_payload, distance_m=round(distance_to_marker, 4), success=True)
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="walk_to_marker_already_reached",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    if distance_to_marker > max_distance:
+        _last_walk_to_marker_ts = now
+        _set_walk_to_marker_status("blocked", reason="marker_out_of_range", marker=marker_payload, distance_m=round(distance_to_marker, 4))
+        _update_motor_control_status(
+            now=now,
+            decision="walk_to_marker_waiting",
+            reason="marker_out_of_range",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    min_urge = _coerce_float(policy.get("min_urge_level"), 0.45)
+    if urge_level < min_urge:
+        _last_walk_to_marker_ts = now
+        _set_walk_to_marker_status(
+            "refused_volitional",
+            reason="urge_below_marker_threshold",
+            marker=marker_payload,
+            distance_m=round(distance_to_marker, 4),
+            urge_level=round(urge_level, 3),
+            min_urge_level=round(min_urge, 3),
+        )
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="walk_to_marker_low_urge",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    min_feedback_age = _coerce_float(policy.get("min_feedback_age"), 0.6)
+    if last_feedback_age is not None and last_feedback_age < min_feedback_age:
+        _set_walk_to_marker_status("waiting", reason="recent_motor_feedback_settling")
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="walk_to_marker_wait_feedback_settle",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return True
+
+    dx = marker_x - pose["x"]
+    dy = marker_y - pose["y"]
+    distance = max(distance_to_marker, 1e-6)
+    ux = dx / distance
+    uy = dy / distance
+    yaw_rad = math.radians(pose.get("yaw_deg", 0.0))
+    cos_y = math.cos(yaw_rad)
+    sin_y = math.sin(yaw_rad)
+    strafe = (ux * cos_y) + (uy * sin_y)
+    forward = (-ux * sin_y) + (uy * cos_y)
+    norm = math.sqrt((forward * forward) + (strafe * strafe))
+    if norm > 1.0:
+        forward /= norm
+        strafe /= norm
+    step_strength = _coerce_float(policy.get("step_strength"), 0.5)
+    forward *= step_strength
+    strafe *= step_strength
+
+    duration = _coerce_float(policy.get("step_duration"), 0.9)
+    run = _coerce_bool(policy.get("run"), False)
+    experiment_id = f"walk_marker_{int(now * 1000)}"
+    marker_intent = {
+        "id": experiment_id,
+        "name": "walk_to_marker",
+        "marker": marker_payload,
+        "start_distance_m": round(distance_to_marker, 4),
+        "step_only_if_wanted": True,
+    }
+    update_inastate(
+        "motor_intent",
+        {
+            "forward": round(forward, 3),
+            "strafe": round(strafe, 3),
+            "turn": 0.0,
+            "up": 0.0,
+            "run": run,
+            "duration": round(duration, 2),
+            "seq": int(now * 1000),
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "source": "model_manager",
+            "reason": "walk_to_marker_experiment",
+            "urge_level": round(urge_level, 3),
+            "experiment": marker_intent,
+        },
+    )
+    _last_motor_intent_ts = now
+    _last_walk_to_marker_ts = now
+    eval_after = now + max(0.5, duration) + _coerce_float(policy.get("evaluation_grace_seconds"), 1.2)
+    _walk_to_marker_attempt = {
+        "id": experiment_id,
+        "issued_at": now,
+        "evaluate_after": eval_after,
+        "start_position": [pose["x"], pose["y"], pose["z"]],
+        "marker": marker_payload,
+        "min_movement": _coerce_float(policy.get("min_movement"), 0.12),
+        "min_progress": _coerce_float(policy.get("min_progress"), 0.05),
+    }
+    _set_walk_to_marker_status(
+        "step_issued",
+        experiment_id=experiment_id,
+        marker=marker_payload,
+        start_position=[round(pose["x"], 4), round(pose["y"], 4), round(pose["z"], 4)],
+        start_distance_m=round(distance_to_marker, 4),
+        intent={"forward": round(forward, 3), "strafe": round(strafe, 3), "duration": round(duration, 2), "run": run},
+        evaluate_after=datetime.fromtimestamp(eval_after, timezone.utc).isoformat(),
+    )
+    _update_motor_control_status(
+        now=now,
+        decision="move_intent_issued",
+        reason="walk_to_marker_experiment",
+        world_connected=world_connected,
+        dreaming=dreaming,
+        urge_level=urge_level,
+        threshold=threshold,
+        cooldown=cooldown,
+        heartbeat_age=heartbeat_age,
+        last_intent_age=0.0,
+        last_feedback_age=last_feedback_age,
+        intent_issued=True,
+    )
+    log_to_statusbox(
+        "[Manager] Walk-to-marker experiment issued one voluntary step "
+        f"(dist={distance_to_marker:.2f}m, urge={urge_level:.2f})."
+    )
+    return True
+
+
+def _ground_fault_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "activate_after": 2,
+        "clear_after": 3,
+        "fall_speed_threshold": -0.35,
+        "ground_distance_threshold": 0.1,
+        "pressure_min_threshold": 0.06,
+        "speed_tolerance": 0.2,
+    }
+    if cfg is None:
+        cfg = load_config()
+    raw = cfg.get("ground_sense_fault_guard", {}) if isinstance(cfg, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    policy = defaults.copy()
+    policy["enabled"] = _coerce_bool(raw.get("enabled", policy["enabled"]), policy["enabled"])
+    policy["activate_after"] = max(1, _coerce_int(raw.get("activate_after", policy["activate_after"]), int(policy["activate_after"])))
+    policy["clear_after"] = max(1, _coerce_int(raw.get("clear_after", policy["clear_after"]), int(policy["clear_after"])))
+    policy["fall_speed_threshold"] = _coerce_float(raw.get("fall_speed_threshold", policy["fall_speed_threshold"]), policy["fall_speed_threshold"])
+    policy["ground_distance_threshold"] = max(
+        0.01, _coerce_float(raw.get("ground_distance_threshold", policy["ground_distance_threshold"]), policy["ground_distance_threshold"])
+    )
+    policy["pressure_min_threshold"] = max(
+        0.0, _coerce_float(raw.get("pressure_min_threshold", policy["pressure_min_threshold"]), policy["pressure_min_threshold"])
+    )
+    policy["speed_tolerance"] = max(0.01, _coerce_float(raw.get("speed_tolerance", policy["speed_tolerance"]), policy["speed_tolerance"]))
+    return policy
+
+
+def _update_ground_sense_fault_state() -> bool:
+    global _ground_fault_streak, _ground_fault_clear_streak, _ground_fault_active
+    global _ground_fault_window_id, _ground_fault_window_started_at, _last_ground_fault_log
+
+    policy = _ground_fault_policy(load_config())
+    now = time.time()
+    now_iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+
+    touch_feedback = get_inastate("touch_feedback") or {}
+    touch_world = get_inastate("touch_world") or {}
+    motor_feedback = get_inastate("motor_feedback") or {}
+
+    tf_grounded = bool(touch_feedback.get("grounded")) if isinstance(touch_feedback, dict) else False
+    tw_grounded = bool(touch_world.get("grounded")) if isinstance(touch_world, dict) else False
+    mf_grounded = bool(motor_feedback.get("grounded")) if isinstance(motor_feedback, dict) else False
+
+    vertical_speed = _coerce_float(motor_feedback.get("vertical_speed"), 0.0) if isinstance(motor_feedback, dict) else 0.0
+    foot_pressure = _coerce_float(touch_feedback.get("foot_pressure"), 0.0) if isinstance(touch_feedback, dict) else 0.0
+    ground_distance = _coerce_float(touch_world.get("ground_distance"), 0.0) if isinstance(touch_world, dict) else 0.0
+    speed_tolerance = _coerce_float(policy.get("speed_tolerance"), 0.2)
+
+    contradictions: List[str] = []
+    if tf_grounded and vertical_speed <= _coerce_float(policy.get("fall_speed_threshold"), -0.35):
+        contradictions.append("grounded_but_falling")
+    if tf_grounded and ground_distance > _coerce_float(policy.get("ground_distance_threshold"), 0.1):
+        contradictions.append("grounded_but_above_ground_plane")
+    if abs(vertical_speed) <= speed_tolerance and (mf_grounded != tw_grounded):
+        contradictions.append("motor_touch_ground_disagree")
+    if tw_grounded and abs(vertical_speed) <= speed_tolerance and foot_pressure < _coerce_float(policy.get("pressure_min_threshold"), 0.06):
+        contradictions.append("grounded_without_foot_pressure")
+
+    if not _coerce_bool(policy.get("enabled"), True):
+        _ground_fault_streak = 0
+        _ground_fault_clear_streak = 0
+        _ground_fault_active = False
+        _ground_fault_window_id = None
+        _ground_fault_window_started_at = None
+        update_inastate(
+            "ground_sense_fault",
+            {
+                "active": False,
+                "enabled": False,
+                "timestamp": now_iso,
+                "contradictions": [],
+                "streak": 0,
+            },
+        )
+        update_inastate(
+            "map_training_guard",
+            {
+                "timestamp": now_iso,
+                "aggressive_training_allowed": True,
+                "reason": "ground_fault_guard_disabled",
+            },
+        )
+        return False
+
+    previous_active = _ground_fault_active
+    if contradictions:
+        _ground_fault_streak += 1
+        _ground_fault_clear_streak = 0
+    else:
+        _ground_fault_streak = 0
+        if _ground_fault_active:
+            _ground_fault_clear_streak += 1
+        else:
+            _ground_fault_clear_streak = 0
+
+    activate_after = max(1, _coerce_int(policy.get("activate_after"), 2))
+    clear_after = max(1, _coerce_int(policy.get("clear_after"), 3))
+    if contradictions and _ground_fault_streak >= activate_after:
+        _ground_fault_active = True
+        if _ground_fault_window_id is None:
+            _ground_fault_window_id = f"gsf_{uuid.uuid4().hex[:10]}"
+        if _ground_fault_window_started_at is None:
+            _ground_fault_window_started_at = now_iso
+    elif _ground_fault_active and not contradictions and _ground_fault_clear_streak >= clear_after:
+        _ground_fault_active = False
+        _ground_fault_window_id = None
+        _ground_fault_window_started_at = None
+
+    payload = {
+        "active": bool(_ground_fault_active),
+        "enabled": True,
+        "timestamp": now_iso,
+        "contradictions": contradictions,
+        "streak": int(_ground_fault_streak),
+        "clear_streak": int(_ground_fault_clear_streak),
+        "window_id": _ground_fault_window_id,
+        "window_started_at": _ground_fault_window_started_at,
+        "evidence": {
+            "touch_feedback_grounded": tf_grounded,
+            "touch_world_grounded": tw_grounded,
+            "motor_feedback_grounded": mf_grounded,
+            "vertical_speed": round(vertical_speed, 4),
+            "foot_pressure": round(foot_pressure, 4),
+            "ground_distance": round(ground_distance, 4),
+        },
+        "tag_fragments_with": ["sensor_incoherent"] if _ground_fault_active else [],
+        "aggressive_map_training_allowed": not _ground_fault_active,
+    }
+    update_inastate("ground_sense_fault", payload)
+    update_inastate(
+        "map_training_guard",
+        {
+            "timestamp": now_iso,
+            "aggressive_training_allowed": not _ground_fault_active,
+            "reason": "ground_sense_fault_active" if _ground_fault_active else "ground_sense_consistent",
+            "fault_window_id": _ground_fault_window_id,
+        },
+    )
+
+    should_log = False
+    if previous_active != _ground_fault_active:
+        should_log = True
+    elif contradictions and (_last_ground_fault_log == 0.0 or (now - _last_ground_fault_log) >= _GROUND_FAULT_LOG_COOLDOWN):
+        should_log = True
+    if should_log:
+        if _ground_fault_active:
+            log_to_statusbox(f"[Manager] Ground-sense fault active: {', '.join(contradictions)}.")
+        elif previous_active and not _ground_fault_active:
+            log_to_statusbox("[Manager] Ground-sense fault cleared; aggressive map training re-enabled.")
+        _last_ground_fault_log = now
+
+    return bool(_ground_fault_active)
+
+
+def _maybe_emit_motor_intent() -> None:
+    global _last_motor_intent_ts
+    now = time.time()
+    world_connected = bool(get_inastate("world_connected", False))
+    dreaming = bool(get_inastate("dreaming", False))
+
     move_urge = get_inastate("urge_to_move") or {}
-    urge_level = _clamp01(move_urge.get("level") or 0.0, default=0.0)
+    if not isinstance(move_urge, dict):
+        move_urge = {}
+    urge_level = _resolve_meta_adjusted_level(move_urge, default=0.0)
 
     config = load_config()
     try:
         threshold = float(config.get("motor_urge_threshold", _MOTOR_URGE_THRESHOLD))
     except Exception:
         threshold = _MOTOR_URGE_THRESHOLD
-    if urge_level < threshold:
-        return
 
     try:
         cooldown = float(config.get("motor_intent_cooldown", _MOTOR_INTENT_COOLDOWN))
@@ -2498,38 +4630,133 @@ def _maybe_emit_motor_intent() -> None:
         cooldown = _MOTOR_INTENT_COOLDOWN
     cooldown = max(0.0, cooldown)
 
-    now = time.time()
+    heartbeat_age = _age_seconds(get_inastate("last_world_heartbeat"), now=now)
+    last_intent_age = _age_seconds(get_inastate("last_motor_intent"), now=now)
+    last_feedback_age = _age_seconds(get_inastate("last_motor_update"), now=now)
+
+    if _maybe_run_walk_to_marker_experiment(
+        now=now,
+        world_connected=world_connected,
+        dreaming=dreaming,
+        urge_level=urge_level,
+        threshold=threshold,
+        cooldown=cooldown,
+        heartbeat_age=heartbeat_age,
+        last_intent_age=last_intent_age,
+        last_feedback_age=last_feedback_age,
+    ):
+        return
+
+    if not world_connected:
+        _update_motor_control_status(
+            now=now,
+            decision="hold_world_disconnected",
+            reason="world_not_connected",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return
+
+    if dreaming:
+        _update_motor_control_status(
+            now=now,
+            decision="hold_dreaming",
+            reason="dreaming_active",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return
+
+    if urge_level < threshold:
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="urge_below_threshold",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
+        return
+
     if cooldown > 0 and _last_motor_intent_ts and (now - _last_motor_intent_ts) < cooldown:
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="intent_cooldown_active",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
         return
 
-    def _age_seconds(raw: Any) -> Optional[float]:
-        if raw is None:
-            return None
-        if isinstance(raw, dict):
-            raw = raw.get("timestamp")
-        if isinstance(raw, (int, float)):
-            try:
-                return max(0.0, now - float(raw))
-            except Exception:
-                return None
-        if isinstance(raw, str):
-            try:
-                ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-                return max(0.0, now - ts)
-            except Exception:
-                return None
-        return None
-
-    heartbeat_age = _age_seconds(get_inastate("last_world_heartbeat"))
     if heartbeat_age is not None and heartbeat_age > 30.0:
+        _update_motor_control_status(
+            now=now,
+            decision="hold_world_sync",
+            reason="world_heartbeat_stale",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
         return
 
-    last_intent_age = _age_seconds(get_inastate("last_motor_intent"))
     if last_intent_age is not None and last_intent_age < max(2.0, cooldown * 0.5):
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="recent_intent_still_active",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
         return
 
-    last_feedback_age = _age_seconds(get_inastate("last_motor_update"))
     if last_feedback_age is not None and last_feedback_age < 2.5:
+        _update_motor_control_status(
+            now=now,
+            decision="stand_still_by_choice",
+            reason="recent_feedback_settling",
+            world_connected=world_connected,
+            dreaming=dreaming,
+            urge_level=urge_level,
+            threshold=threshold,
+            cooldown=cooldown,
+            heartbeat_age=heartbeat_age,
+            last_intent_age=last_intent_age,
+            last_feedback_age=last_feedback_age,
+        )
         return
 
     scale = max(0.2, min(1.0, urge_level))
@@ -2556,6 +4783,20 @@ def _maybe_emit_motor_intent() -> None:
         },
     )
     _last_motor_intent_ts = now
+    _update_motor_control_status(
+        now=now,
+        decision="move_intent_issued",
+        reason="urge_to_move",
+        world_connected=world_connected,
+        dreaming=dreaming,
+        urge_level=urge_level,
+        threshold=threshold,
+        cooldown=cooldown,
+        heartbeat_age=heartbeat_age,
+        last_intent_age=0.0,
+        last_feedback_age=last_feedback_age,
+        intent_issued=True,
+    )
     log_to_statusbox(f"[Manager] Motor intent issued (urge {urge_level:.2f}).")
 
 
@@ -2854,8 +5095,12 @@ def _update_machine_semantics():
 
     snapshot = get_inastate("emotion_snapshot") or {}
     emo = snapshot.get("values") if isinstance(snapshot, dict) else {}
-    if isinstance(emo, dict) and not emo:
+    if not isinstance(emo, dict):
+        emo = {}
+    if not emo and isinstance(snapshot, dict):
         emo = snapshot if isinstance(snapshot, dict) else {}
+    if not isinstance(emo, dict):
+        emo = {}
 
     identity_hint = {}
     last_reflection = get_inastate("last_reflection_event") or {}
@@ -2865,12 +5110,20 @@ def _update_machine_semantics():
     energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
     sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
     urge_voice = get_inastate("urge_to_voice") or get_inastate("urge_to_communicate") or {}
+    if not isinstance(urge_voice, dict):
+        urge_voice = {}
     urge_type = get_inastate("urge_to_type") or {}
-    urge_voice_level = _clamp01(urge_voice.get("level") or 0.0, default=0.0)
-    urge_type_level = _clamp01(urge_type.get("level") or 0.0, default=0.0)
+    if not isinstance(urge_type, dict):
+        urge_type = {}
+    urge_voice_level = _resolve_meta_adjusted_level(urge_voice, default=0.0)
+    urge_type_level = _resolve_meta_adjusted_level(urge_type, default=0.0)
 
     prediction = get_inastate("current_prediction") or {}
+    if not isinstance(prediction, dict):
+        prediction = {}
     pred_vec = prediction.get("predicted_vector") or {}
+    if not isinstance(pred_vec, dict):
+        pred_vec = {}
     pred_conf = _clamp01(pred_vec.get("confidence") or 0.0, default=0.0)
     pred_clarity = _clamp01(pred_vec.get("clarity") or 0.0, default=0.0)
 
@@ -3072,6 +5325,64 @@ def _scan_fragment_health():
     )
     _fragment_health_thread.start()
 
+
+def _maybe_repair_corrupt_fragments():
+    """
+    Optionally repair or quarantine corrupted fragments using Ina's choice
+    and conservative safety rails.
+    """
+    global _last_fragment_repair_run
+
+    policy = _fragment_repair_policy()
+    if not policy.get("enabled", False):
+        return
+    if _memory_guard_state.get("level") in {"soft", "hard"}:
+        return
+
+    now = time.time()
+    cooldown = float(policy.get("cooldown_seconds") or 0.0)
+    if cooldown > 0 and _last_fragment_repair_run and (now - _last_fragment_repair_run) < cooldown:
+        return
+
+    intent = get_inastate("fragment_repair_intent")
+    intent_allowed = False
+    intent_mode = None
+    if isinstance(intent, dict):
+        intent_allowed = _coerce_bool(intent.get("allow", False), False) or _coerce_bool(intent.get("enabled", False), False)
+        intent_mode = intent.get("mode")
+    else:
+        intent_allowed = _coerce_bool(intent, False)
+
+    if policy.get("require_intent", True) and not intent_allowed:
+        return
+
+    if intent_mode:
+        mode = str(intent_mode).lower()
+        if mode in {"quarantine", "delete", "repair", "inspect"}:
+            policy["mode"] = mode
+
+    queue = get_inastate("corrupt_fragments") or []
+    if not isinstance(queue, list) or not queue:
+        return
+
+    remaining, summary = process_corrupt_queue(CHILD, queue, policy)
+    update_inastate("corrupt_fragments", remaining)
+    update_inastate("fragment_repair_last_run", summary)
+    _last_fragment_repair_run = now
+
+    if policy.get("consume_intent", True) and intent_allowed:
+        update_inastate("fragment_repair_intent", False)
+
+    counts = summary.get("counts", {}) if isinstance(summary, dict) else {}
+    log_to_statusbox(
+        "[Fragments] Repair pass "
+        f"({policy.get('mode')}): "
+        f"repaired {counts.get('repaired', 0)}, "
+        f"quarantined {counts.get('quarantined', 0)}, "
+        f"deleted {counts.get('deleted', 0)}, "
+        f"remaining {summary.get('remaining', 0)}."
+    )
+
 def rebuild_maps_if_needed():
     emo = get_inastate("emotion_snapshot") or {}
     fuzz = emo.get("fuzz_level", 0.0)
@@ -3086,11 +5397,17 @@ def rebuild_maps_if_needed():
         update_inastate("last_map_rebuild", datetime.now(timezone.utc).isoformat())
 
 def run_internal_loop():
+    _maybe_update_runtime_heartbeat()
     _ensure_continuity_thread()
     _apply_world_sense_override()
     _maybe_ensure_ina_client()
+    guard_limits = _memory_guard_limits()
+    _consume_operator_memory_signal(guard_limits)
     memory_guard = _refresh_memory_guard_state()
     memory_level = memory_guard.get("level")
+    _maybe_enqueue_memory_pressure_event(memory_guard, guard_limits)
+    _process_memory_pressure_queue(guard_limits)
+    _maybe_shed_memory_pressure(str(memory_level or ""), guard_limits)
     defer_optional = memory_level in {"soft", "hard"}
     defer_spawns = memory_level == "hard"
     monitor_hunger()
@@ -3123,6 +5440,7 @@ def run_internal_loop():
 
 
     world_connected = bool(get_inastate("world_connected", False))
+    ground_fault_active = _update_ground_sense_fault_state()
 
     if not defer_optional and get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
         safe_popen(["python", "meditation_state.py"])
@@ -3148,12 +5466,14 @@ def run_internal_loop():
         boredom_check()
         paint_check()
         _maybe_self_read()
-        rebuild_maps_if_needed()
+        if not ground_fault_active:
+            rebuild_maps_if_needed()
     _check_self_adjustment()
     _update_contact_urges()
-    _maybe_emit_motor_intent()
     _update_stable_pattern_urge()
     _update_self_read_exploration_opportunities()
+    _update_meta_arbitration_signal(memory_guard=memory_guard)
+    _maybe_emit_motor_intent()
     _update_humor_bridge()
     _maybe_run_trauma_processor()
     _run_passive_reflection()
@@ -3162,6 +5482,7 @@ def run_internal_loop():
     _update_machine_semantics()
     if not defer_optional:
         _scan_fragment_health()
+        _maybe_repair_corrupt_fragments()
         _run_prediction_meta_analysis()
         _maybe_bundle_memory(defer_optional)
     # Periodically evaluate alignment metrics and surface warnings if needed
@@ -3175,6 +5496,7 @@ def schedule_runtime():
             time.sleep(10)
         except Exception as e:
             log_to_statusbox(f"[Manager ERROR] Runtime loop crashed: {e}")
+            log_to_statusbox(traceback.format_exc())
             time.sleep(5)
 
 if __name__ == "__main__":  

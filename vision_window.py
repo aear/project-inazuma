@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 from model_manager import load_config, get_inastate
 from gui_hook import log_to_statusbox
+from io_utils import atomic_write_json
 from optic_nerve import DesktopOpticNerve
 from obs_bridge import OBSWebSocketBridge
 
@@ -134,8 +135,7 @@ def video_flush(child):
         "video_features": flat[:512]
     }
     frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag['id']}.json"
-    with open(frag_path, "w") as f:
-        json.dump(frag, f, indent=4)
+    atomic_write_json(frag_path, frag, indent=4, ensure_ascii=True)
 
     webcam_buffer.clear()
     last_video_flush = time.time()

@@ -16,10 +16,37 @@ import platform
 from birth_system import boot
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
+from collections import deque
+
+STATUS_RETENTION_SEC = float(os.environ.get("INA_STATUS_RETENTION_SEC", "600"))
+_status_buffer = deque()
+_status_buffer_lock = threading.Lock()
+
+def _status_line_count(msg: str) -> int:
+    if not msg:
+        return 0
+    return msg.count("\n") + (0 if msg.endswith("\n") else 1)
+
+def _record_status_entry(msg: str) -> int:
+    now = time.time()
+    line_count = _status_line_count(msg)
+    removed_lines = 0
+    with _status_buffer_lock:
+        _status_buffer.append((now, line_count))
+        cutoff = now - STATUS_RETENTION_SEC
+        while _status_buffer and _status_buffer[0][0] < cutoff:
+            removed_lines += _status_buffer.popleft()[1]
+    return removed_lines
 
 def append_status(msg, tag=None):
     """Safely append to the status box from any thread."""
+    removed_lines = _record_status_entry(msg)
     def _append():
+        if removed_lines > 0:
+            try:
+                status_box.delete("1.0", f"{removed_lines + 1}.0")
+            except Exception:
+                pass
         if tag:
             status_box.insert(tk.END, msg, tag)
         else:
@@ -67,6 +94,8 @@ def clear_status_log():
     status_box.delete("1.0", tk.END)
     status_box.insert(tk.END, "[Log] Cleared status log.\n")
     status_box.see(tk.END)
+    with _status_buffer_lock:
+        _status_buffer.clear()
 
     # Purge all __pycache__ directories
     root = Path(".").resolve()
@@ -97,6 +126,21 @@ def stream_subprocess_to_status(command, label="Process"):
             append_status(f"[{label}] Failed to start.\n", "error")
 
     threading.Thread(target=stream_output, daemon=True).start()
+
+
+def signal_memory_too_high(source="gui", note=None):
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "too_much_memory",
+        "source": source,
+        "note": note or "operator requested memory shed",
+    }
+    update_inastate("operator_memory_signal", payload)
+    append_status("[Operator] Memory pressure signal queued.\n")
+
+
+def _shortcut_memory_too_high(event=None):
+    signal_memory_too_high(source="gui_shortcut", note="Ctrl+Shift+M")
 
 
 
@@ -711,6 +755,15 @@ def open_logs():
 def emergency_shutdown():
     global model_running
     model_running = False
+    now = datetime.now(timezone.utc).isoformat()
+    shutdown_payload = {
+        "timestamp": now,
+        "source": "gui",
+        "mode": "emergency",
+        "clean": False,
+    }
+    update_inastate("shutdown_intent", shutdown_payload)
+    update_inastate("last_shutdown", shutdown_payload)
     update_inastate("dreaming", False)
     update_inastate("runtime_disruption", True)
 
@@ -839,6 +892,7 @@ options_menu.add_command(label="Precision Settings", command=precision_settings)
 options_menu.add_command(label="Timers", command=open_timers_config)
 options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
 options_menu.add_command(label="Vitals / Emotions", command=open_vitals_window)
+options_menu.add_command(label="Signal High Memory", command=lambda: signal_memory_too_high(source="gui_menu"))
 menu_bar.add_cascade(label="Options", menu=options_menu)
 
 root.config(menu=menu_bar)
@@ -906,6 +960,9 @@ tk.Button(button_frame, text="Vitals + Sliders", command=open_vitals_window, wid
 tk.Button(button_frame, text="View Self Questions", command=open_logs, width=20).grid(row=0, column=5, padx=5)
 
 
+
+
+root.bind_all("<Control-Shift-M>", _shortcut_memory_too_high)
 
 
 root.protocol("WM_DELETE_WINDOW", quit_program)

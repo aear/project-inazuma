@@ -13,6 +13,7 @@ from model_manager import (
     get_inastate,
 )
 from transformers.fractal_multidimensional_transformers import FractalTransformer
+from precision_requests import precision_request
 from gui_hook import log_to_statusbox
 
 def cosine_similarity(v1, v2):
@@ -81,108 +82,166 @@ def load_symbol_words(child):
         except:
             return []
 
+
+def _load_precision_policy() -> dict:
+    path = Path("precision_config.json")
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            policy = data.get("precision_policy")
+            return policy if isinstance(policy, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _extract_prediction_stakes():
+    stakes = get_inastate("prediction_stakes")
+    if stakes is None:
+        stakes = get_inastate("stakes")
+    if stakes is None:
+        semantics = get_inastate("machine_semantics") or {}
+        if isinstance(semantics, dict):
+            why = semantics.get("why_it_matters") or {}
+            if isinstance(why, dict):
+                stakes = why.get("score")
+    try:
+        return float(stakes)
+    except Exception:
+        return None
+
 def run_prediction():
     config = load_config()
     child = config.get("current_child", "default_child")
     log_to_statusbox(f"[Predict] Running prediction for {child}...")
 
-    fragments = load_recent_fragments(child)
-    if not fragments:
-        log_to_statusbox("[Predict] No recent fragments found.")
+    policy = _load_precision_policy()
+    stakes = _extract_prediction_stakes()
+    threshold = 0.7
+    if policy:
+        try:
+            threshold = float(policy.get("high_stakes_threshold", threshold))
+        except Exception:
+            threshold = 0.7
+    auto_request = True
+    if policy:
+        auto_request = bool(policy.get("auto_high_stakes_request", True))
+
+    def _run():
+        fragments = load_recent_fragments(child)
+        if not fragments:
+            log_to_statusbox("[Predict] No recent fragments found.")
+            return
+
+        log_to_statusbox(f"[Predict] Loaded {len(fragments)} recent fragments.")
+
+        transformer = FractalTransformer()
+        encoded = transformer.encode_many(fragments)
+        avg_vector = [sum(x)/len(x) for x in zip(*[e["vector"] for e in encoded])]
+
+        # Richer signal: energy, spread, and stress-aware clarity/confidence
+        mean_abs = sum(abs(v) for v in avg_vector) / max(len(avg_vector), 1)
+        mean_val = sum(avg_vector) / max(len(avg_vector), 1)
+        var = sum((v - mean_val) ** 2 for v in avg_vector) / max(len(avg_vector), 1)
+        spread = math.sqrt(var)
+
+        base_clarity = mean_abs / (1 + spread)
+        confidence = 1 / (1 + spread)
+        clarity = round(base_clarity, 4)
+        confidence = round(confidence, 4)
+
+        emotion = get_inastate("emotion_snapshot") or {}
+        stress = emotion.get("stress", 0.0)
+        adj_clarity = round(clarity * (1 - stress), 4)
+        log_to_statusbox(
+            f"[Predict] Encoded prediction vector. Clarity: {clarity:.4f} (stress-adjusted: {adj_clarity:.4f}) | Confidence: {confidence:.4f}"
+        )
+
+        predicted = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "predicted_vector": {
+                "vector": avg_vector,
+                "clarity": adj_clarity,
+                "confidence": confidence,
+            },
+            "fragments_used": [f["id"] for f in fragments],
+            "emotion_snapshot": emotion,
+            "base_clarity": clarity,
+        }
+
+        # Match to known symbol word
+        symbol_words = load_symbol_words(child)
+        best_match = None
+        best_sim = 0.0
+
+        for word in symbol_words:
+            if not word.get("components"): continue
+            sum_text = word.get("summary", "")
+            result = transformer.encode({"summary": sum_text})
+            sim = cosine_similarity(avg_vector, result["vector"])
+            if sim > best_sim:
+                best_sim = sim
+                best_match = word
+
+        if best_match:
+            predicted["predicted_symbol_word"] = {
+                "symbol_word_id": best_match["symbol_word_id"],
+                "symbol": best_match["symbol"],
+                "confidence": round(best_sim, 4)
+            }
+            log_to_statusbox(f"[Predict] Closest match: {best_match['symbol_word_id']} ({best_sim:.4f})")
+            if best_sim < 0.5:
+                map_status = inspect_map_health(child)
+                seed_self_question(
+                    "Prediction feels unclear. Do I need to rebuild or enrich my neural/logic maps "
+                    f"(neural {map_status['neural_neurons']}n/{map_status['neural_synapses']}s, "
+                    f"logic {map_status['logic_neurons']}n/{map_status['logic_synapses']}s)?"
+                )
+            elif best_sim > 0.9:
+                seed_self_question(f"Do I understand what '{best_match['symbol_word_id']}' means?")
+        else:
+            log_to_statusbox("[Predict] No symbol word match found.")
+            seed_self_question("What am I feeling right now?")
+
+        # === Save prediction to memory
+        pred_path = Path("AI_Children") / child / "memory" / "prediction_log.json"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if pred_path.exists():
+                with open(pred_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            else:
+                history = []
+        except:
+            history = []
+
+        history.append(predicted)
+        history = history[-100:]
+
+        with open(pred_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        log_to_statusbox(f"[Predict] Prediction saved: {pred_path.name}")
+        update_inastate("last_prediction", predicted["timestamp"])
+        update_inastate("current_prediction", predicted)
+
+    if auto_request and stakes is not None and stakes >= threshold:
+        with precision_request(
+            task="high_stakes_prediction",
+            child=child,
+            ttl_sec=4.0,
+            reason=f"stakes:{stakes:.3f}",
+            stakes=stakes,
+            source="predictive_layer",
+        ):
+            _run()
         return
 
-    log_to_statusbox(f"[Predict] Loaded {len(fragments)} recent fragments.")
-
-    transformer = FractalTransformer()
-    encoded = transformer.encode_many(fragments)
-    avg_vector = [sum(x)/len(x) for x in zip(*[e["vector"] for e in encoded])]
-
-    # Richer signal: energy, spread, and stress-aware clarity/confidence
-    mean_abs = sum(abs(v) for v in avg_vector) / max(len(avg_vector), 1)
-    mean_val = sum(avg_vector) / max(len(avg_vector), 1)
-    var = sum((v - mean_val) ** 2 for v in avg_vector) / max(len(avg_vector), 1)
-    spread = math.sqrt(var)
-
-    base_clarity = mean_abs / (1 + spread)
-    confidence = 1 / (1 + spread)
-    clarity = round(base_clarity, 4)
-    confidence = round(confidence, 4)
-
-    emotion = get_inastate("emotion_snapshot") or {}
-    stress = emotion.get("stress", 0.0)
-    adj_clarity = round(clarity * (1 - stress), 4)
-    log_to_statusbox(
-        f"[Predict] Encoded prediction vector. Clarity: {clarity:.4f} (stress-adjusted: {adj_clarity:.4f}) | Confidence: {confidence:.4f}"
-    )
-
-    predicted = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "predicted_vector": {
-            "vector": avg_vector,
-            "clarity": adj_clarity,
-            "confidence": confidence,
-        },
-        "fragments_used": [f["id"] for f in fragments],
-        "emotion_snapshot": emotion,
-        "base_clarity": clarity,
-    }
-
-    # Match to known symbol word
-    symbol_words = load_symbol_words(child)
-    best_match = None
-    best_sim = 0.0
-
-    for word in symbol_words:
-        if not word.get("components"): continue
-        sum_text = word.get("summary", "")
-        result = transformer.encode({"summary": sum_text})
-        sim = cosine_similarity(avg_vector, result["vector"])
-        if sim > best_sim:
-            best_sim = sim
-            best_match = word
-
-    if best_match:
-        predicted["predicted_symbol_word"] = {
-            "symbol_word_id": best_match["symbol_word_id"],
-            "symbol": best_match["symbol"],
-            "confidence": round(best_sim, 4)
-        }
-        log_to_statusbox(f"[Predict] Closest match: {best_match['symbol_word_id']} ({best_sim:.4f})")
-        if best_sim < 0.5:
-            map_status = inspect_map_health(child)
-            seed_self_question(
-                "Prediction feels unclear. Do I need to rebuild or enrich my neural/logic maps "
-                f"(neural {map_status['neural_neurons']}n/{map_status['neural_synapses']}s, "
-                f"logic {map_status['logic_neurons']}n/{map_status['logic_synapses']}s)?"
-            )
-        elif best_sim > 0.9:
-            seed_self_question(f"Do I understand what '{best_match['symbol_word_id']}' means?")
-    else:
-        log_to_statusbox("[Predict] No symbol word match found.")
-        seed_self_question("What am I feeling right now?")
-
-    # === Save prediction to memory
-    pred_path = Path("AI_Children") / child / "memory" / "prediction_log.json"
-    pred_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if pred_path.exists():
-            with open(pred_path, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        else:
-            history = []
-    except:
-        history = []
-
-    history.append(predicted)
-    history = history[-100:]
-
-    with open(pred_path, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
-
-    log_to_statusbox(f"[Predict] Prediction saved: {pred_path.name}")
-    update_inastate("last_prediction", predicted["timestamp"])
-    update_inastate("current_prediction", predicted)
+    _run()
 
 if __name__ == "__main__":
     run_prediction()

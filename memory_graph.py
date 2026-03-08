@@ -6,6 +6,7 @@ import math
 import random
 import heapq
 import time
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -30,9 +31,17 @@ EXPERIENCE_GRAPH_BURST_DEFAULT = 200
 DEFAULT_INCREMENTAL_POLICY = {
     "mode": "incremental",
     "fragment_batch": None,
+    "batch_size": 24,
+    "build_budget_ms": 350.0,
     "position_blend": 0.25,
     "merge_slack": 0.03,
     "max_new_neurons": 120,
+    "max_edges_updated": 20000,
+    "max_synapse_pairs": 120000,
+    "dirty_index_enabled": True,
+    "full_mode_incremental": True,
+    "local_rebuild_max_fragments": 2000,
+    "emit_sparse_snapshot": True,
     "synapse_refresh_on_idle": True,
 }
 
@@ -41,6 +50,20 @@ DEFAULT_TIER_POLICY = {
     "working": {"max_age_hours": 72.0, "target_count": 12000},
     "long": {"max_age_hours": 24.0 * 30.0, "target_count": 40000},
     "cold": {},
+}
+DEFAULT_BOOT_POLICY = {
+    "boot_mode": "full",  # full | fast | auto
+    "rebalance_on_boot": True,
+    "prune_missing_on_boot": False,
+    "shutdown_intent_ttl_hours": 6.0,
+    "heartbeat_stale_seconds": 120.0,
+}
+DEFAULT_BUNDLE_PRUNE_POLICY = {
+    "enabled": False,
+    "allow_apply": False,
+    "verify_sha": True,
+    "require_bundle_ready": True,
+    "max_prune": 0,
 }
 
 
@@ -75,12 +98,21 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     policy = DEFAULT_INCREMENTAL_POLICY.copy()
     policy.update({k: raw.get(k, policy[k]) for k in policy.keys() if k in raw})
     mode = str(policy.get("mode", "incremental")).lower().strip()
+    full_mode_incremental = bool(policy.get("full_mode_incremental", True))
     incremental = mode not in {"rebuild", "overwrite", "legacy", "full"}
+    if mode == "full" and full_mode_incremental:
+        incremental = True
     fragment_batch = policy.get("fragment_batch")
     try:
         fragment_batch = int(fragment_batch) if fragment_batch is not None else None
     except (TypeError, ValueError):
         fragment_batch = None
+    try:
+        batch_size = int(policy.get("batch_size", 24))
+    except (TypeError, ValueError):
+        batch_size = 24
+    if batch_size <= 0:
+        batch_size = 1
     def _clamp(val: float, lo: float, hi: float) -> float:
         try:
             return max(lo, min(float(val), hi))
@@ -94,14 +126,48 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             max_new = 0
     except (TypeError, ValueError):
         max_new = 0
+    try:
+        max_edges_updated = int(policy.get("max_edges_updated", 20000))
+    except (TypeError, ValueError):
+        max_edges_updated = 20000
+    if max_edges_updated < 0:
+        max_edges_updated = 0
+    try:
+        max_synapse_pairs = int(policy.get("max_synapse_pairs", 120000))
+    except (TypeError, ValueError):
+        max_synapse_pairs = 120000
+    if max_synapse_pairs < 0:
+        max_synapse_pairs = 0
+    try:
+        build_budget_ms = float(policy.get("build_budget_ms", 350.0))
+    except (TypeError, ValueError):
+        build_budget_ms = 350.0
+    if build_budget_ms < 0:
+        build_budget_ms = 0.0
+    dirty_index_enabled = bool(policy.get("dirty_index_enabled", True))
+    try:
+        local_rebuild_max = int(policy.get("local_rebuild_max_fragments", 2000))
+    except (TypeError, ValueError):
+        local_rebuild_max = 2000
+    if local_rebuild_max < 0:
+        local_rebuild_max = 0
+    emit_sparse_snapshot = bool(policy.get("emit_sparse_snapshot", True))
     synapse_refresh = bool(policy.get("synapse_refresh_on_idle", True))
     return {
         "mode": mode,
         "incremental": incremental,
         "fragment_batch": fragment_batch,
+        "batch_size": batch_size,
+        "build_budget_ms": build_budget_ms,
         "position_blend": position_blend,
         "merge_slack": merge_slack,
         "max_new_neurons": max_new,
+        "max_edges_updated": max_edges_updated,
+        "max_synapse_pairs": max_synapse_pairs,
+        "dirty_index_enabled": dirty_index_enabled,
+        "full_mode_incremental": full_mode_incremental,
+        "local_rebuild_max_fragments": local_rebuild_max,
+        "emit_sparse_snapshot": emit_sparse_snapshot,
         "synapse_refresh_on_idle": synapse_refresh,
     }
 
@@ -183,9 +249,13 @@ EMOTION_SLIDERS: Tuple[str, ...] = (
 DEFAULT_NEURAL_SELECTOR = {
     "enabled": True,
     "candidate_pool_max": 420,
+    "prefilter_enabled": True,
+    "prefilter_multiplier": 3.0,
+    "prefilter_min": 48,
+    "prefilter_max": 180,
     "cooldown_seconds": 900.0,
     "cooldown_max": 120,
-    "blocked_tags": ["exception", "privacy", "high-risk"],
+    "blocked_tags": ["exception", "privacy", "high-risk", "sensor_incoherent"],
     "cost_max_bytes": 5_000_000,
     "dream_cost_max_bytes": 1_000_000,
     "risk_max": 0.85,
@@ -235,6 +305,57 @@ def _parse_iso_timestamp(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _age_seconds(value: Optional[str]) -> Optional[float]:
+    ts = _parse_iso_timestamp(value)
+    if ts is None:
+        return None
+    return max(0.0, time.time() - ts)
+
+
+def _boot_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    policy = DEFAULT_BOOT_POLICY.copy()
+    if not isinstance(cfg, dict):
+        return policy
+    mode = cfg.get("memory_graph_boot_mode", policy["boot_mode"])
+    policy["boot_mode"] = str(mode or policy["boot_mode"]).lower().strip()
+    policy["rebalance_on_boot"] = bool(cfg.get("memory_rebalance_on_boot", policy["rebalance_on_boot"]))
+    policy["prune_missing_on_boot"] = bool(cfg.get("memory_graph_prune_missing", policy["prune_missing_on_boot"]))
+    try:
+        ttl = float(cfg.get("shutdown_intent_ttl_hours", policy["shutdown_intent_ttl_hours"]))
+        policy["shutdown_intent_ttl_hours"] = max(0.0, ttl)
+    except (TypeError, ValueError):
+        pass
+    try:
+        stale = float(cfg.get("runtime_heartbeat_stale_seconds", policy["heartbeat_stale_seconds"]))
+        policy["heartbeat_stale_seconds"] = max(0.0, stale)
+    except (TypeError, ValueError):
+        pass
+    return policy
+
+
+def _bundle_prune_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    policy = DEFAULT_BUNDLE_PRUNE_POLICY.copy()
+    if not isinstance(cfg, dict):
+        return policy
+    raw = cfg.get("bundle_prune_policy") or {}
+    if not isinstance(raw, dict):
+        return policy
+    if "enabled" in raw:
+        policy["enabled"] = bool(raw.get("enabled"))
+    if "allow_apply" in raw:
+        policy["allow_apply"] = bool(raw.get("allow_apply"))
+    if "verify_sha" in raw:
+        policy["verify_sha"] = bool(raw.get("verify_sha"))
+    if "require_bundle_ready" in raw:
+        policy["require_bundle_ready"] = bool(raw.get("require_bundle_ready"))
+    if "max_prune" in raw:
+        try:
+            policy["max_prune"] = int(raw.get("max_prune") or 0)
+        except (TypeError, ValueError):
+            policy["max_prune"] = 0
+    return policy
+
+
 def _load_inastate(child: str) -> Dict[str, Any]:
     path = Path("AI_Children") / child / "memory" / "inastate.json"
     if not path.exists():
@@ -245,6 +366,107 @@ def _load_inastate(child: str) -> Dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _write_inastate_value(child: str, key: str, value: Any) -> None:
+    path = Path("AI_Children") / child / "memory" / "inastate.json"
+    data: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[key] = value
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        return
+
+
+def _extract_timestamp(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("timestamp")
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw, str):
+        return _parse_iso_timestamp(raw)
+    return None
+
+
+def _shutdown_context(child: str, policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg_policy = policy or DEFAULT_BOOT_POLICY
+    state = _load_inastate(child)
+    last_shutdown = state.get("last_shutdown") if isinstance(state.get("last_shutdown"), dict) else {}
+    shutdown_intent = state.get("shutdown_intent") if isinstance(state.get("shutdown_intent"), dict) else {}
+    runtime_disruption = bool(state.get("runtime_disruption"))
+
+    heartbeat_raw = state.get("runtime_heartbeat")
+    heartbeat_ts = _extract_timestamp(heartbeat_raw)
+    heartbeat_age = None
+    if heartbeat_ts is not None:
+        heartbeat_age = max(0.0, time.time() - heartbeat_ts)
+
+    shutdown_ts = _extract_timestamp(last_shutdown)
+    intent_ts = _extract_timestamp(shutdown_intent)
+
+    if heartbeat_ts is not None and shutdown_ts is not None and shutdown_ts < heartbeat_ts:
+        last_shutdown = {}
+        shutdown_ts = None
+    if heartbeat_ts is not None and intent_ts is not None and intent_ts < heartbeat_ts:
+        shutdown_intent = {}
+        intent_ts = None
+
+    ttl_hours = cfg_policy.get("shutdown_intent_ttl_hours", DEFAULT_BOOT_POLICY["shutdown_intent_ttl_hours"])
+    if intent_ts is not None and ttl_hours > 0:
+        if (time.time() - intent_ts) > (ttl_hours * 3600.0):
+            shutdown_intent = {}
+            intent_ts = None
+
+    return {
+        "last_shutdown": last_shutdown,
+        "shutdown_intent": shutdown_intent,
+        "runtime_disruption": runtime_disruption,
+        "heartbeat_age": heartbeat_age,
+        "heartbeat_ts": heartbeat_ts,
+        "shutdown_ts": shutdown_ts,
+        "intent_ts": intent_ts,
+    }
+
+
+def _resolve_boot_mode(policy: Dict[str, Any], shutdown: Dict[str, Any]) -> Tuple[str, str]:
+    mode = str(policy.get("boot_mode") or "full").lower().strip()
+    if mode in {"incremental", "fast"}:
+        return "fast", "config"
+    if mode == "full":
+        return "full", "config"
+
+    last_shutdown = shutdown.get("last_shutdown") or {}
+    shutdown_intent = shutdown.get("shutdown_intent") or {}
+    shutdown_source = (last_shutdown.get("source") or shutdown_intent.get("source") or "").lower()
+    shutdown_clean = bool(last_shutdown.get("clean"))
+
+    if shutdown_source == "gui":
+        return "fast", "gui_shutdown"
+    if shutdown_clean:
+        return "fast", "clean_shutdown"
+    if shutdown.get("runtime_disruption"):
+        return "full", "runtime_disruption"
+
+    heartbeat_age = shutdown.get("heartbeat_age")
+    stale_limit = float(policy.get("heartbeat_stale_seconds", DEFAULT_BOOT_POLICY["heartbeat_stale_seconds"]))
+    if heartbeat_age is not None and stale_limit > 0 and heartbeat_age > stale_limit:
+        return "full", "stale_heartbeat"
+
+    return "fast", "auto_default"
 
 
 def _selector_state_path(child: str) -> Path:
@@ -299,6 +521,10 @@ def _selector_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                     lane_weights[key] = _safe_float(raw_lanes.get(key), lane_weights[key])
         config["lane_weights"] = lane_weights
     config["candidate_pool_max"] = max(0, int(_safe_float(config.get("candidate_pool_max"), 0)))
+    config["prefilter_enabled"] = bool(config.get("prefilter_enabled", True))
+    config["prefilter_multiplier"] = max(1.0, _safe_float(config.get("prefilter_multiplier"), 3.0))
+    config["prefilter_min"] = max(0, int(_safe_float(config.get("prefilter_min"), 48)))
+    config["prefilter_max"] = max(0, int(_safe_float(config.get("prefilter_max"), 180)))
     config["cooldown_seconds"] = max(0.0, _safe_float(config.get("cooldown_seconds"), 0.0))
     config["cooldown_max"] = max(0, int(_safe_float(config.get("cooldown_max"), 0)))
     config["cost_max_bytes"] = int(_safe_float(config.get("cost_max_bytes"), 0.0)) or None
@@ -318,6 +544,17 @@ def _selector_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         config["blocked_tags"] = []
     return config
+
+
+def _selector_prefilter_target(limit: int, config: Dict[str, Any]) -> int:
+    if not config.get("prefilter_enabled", True):
+        return 0
+    target = int(math.ceil(max(1, limit) * config.get("prefilter_multiplier", 3.0)))
+    target = max(target, int(config.get("prefilter_min", 0) or 0))
+    prefilter_max = int(config.get("prefilter_max", 0) or 0)
+    if prefilter_max > 0:
+        target = min(target, prefilter_max)
+    return max(target, 0)
 
 
 def _collect_recent_symbol_ids(state: Dict[str, Any]) -> List[str]:
@@ -762,6 +999,10 @@ def select_fragments_for_neural_map(
     if not candidate_ids:
         fragments, total = load_fragments(child, limit=limit)
         return fragments, total, {"mode": "fallback"}
+    raw_pool = len(candidate_ids)
+    prefilter_target = _selector_prefilter_target(limit, config)
+    if prefilter_target and len(candidate_ids) > prefilter_target:
+        candidate_ids = candidate_ids[:prefilter_target]
 
     candidates: List[Dict[str, Any]] = []
     for frag_id in candidate_ids:
@@ -784,6 +1025,7 @@ def select_fragments_for_neural_map(
             "timestamp": frag_ts,
             "bytes": _safe_float(path.stat().st_size, 0.0) if path.exists() else 0.0,
             "risk": _risk_level(fragment),
+            "importance": _safe_float(meta.get("importance"), 0.0),
         })
 
     scored = _score_candidates(
@@ -840,6 +1082,8 @@ def select_fragments_for_neural_map(
         "temperature": round(temperature, 4),
         "limit": limit,
         "pool": len(candidate_ids),
+        "pool_raw": raw_pool,
+        "pool_prefilter": len(candidate_ids),
         "scored": len(scored),
         "lane_counts": lane_counts,
         "selected_ids": selected_ids[: min(10, len(selected_ids))],
@@ -971,14 +1215,14 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
             if "id" not in data:
                 continue
             total += 1
-            entry = (_ts_value(data, path), data)
+            entry = (_ts_value(data, path), path.name, data)
             if len(heap) < limit_val:
                 heapq.heappush(heap, entry)
             else:
                 if entry[0] > heap[0][0]:
                     heapq.heapreplace(heap, entry)
         heap.sort()
-        events = [item[1] for item in heap]
+        events = [item[2] for item in heap]
     else:
         for path in sorted(events_dir.glob("evt_*.json")):
             try:
@@ -1117,6 +1361,11 @@ def _slim_fragment(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     if not data or "id" not in data:
         return None
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        lowered = {str(tag).lower() for tag in tags if tag}
+        if "sensor_incoherent" in lowered:
+            return None
     keep_keys = {
         "id",
         "tags",
@@ -1240,14 +1489,32 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
             })
     return clusters
 
-def build_synaptic_links(neurons, threshold=0.91):
+def build_synaptic_links(
+    neurons,
+    threshold=0.91,
+    *,
+    max_edges: Optional[int] = None,
+    max_pairs: Optional[int] = None,
+    return_stats: bool = False,
+):
     synapses = []
     position_map = {n["id"]: n.get("position") for n in neurons}
+    pairs_evaluated = 0
+    truncated = False
+    edge_cap = max_edges if (isinstance(max_edges, int) and max_edges > 0) else None
+    pair_cap = max_pairs if (isinstance(max_pairs, int) and max_pairs > 0) else None
 
     for i, source in enumerate(neurons):
         for j, target in enumerate(neurons):
             if j <= i:
                 continue
+            if pair_cap is not None and pairs_evaluated >= pair_cap:
+                truncated = True
+                break
+            if edge_cap is not None and len(synapses) >= edge_cap:
+                truncated = True
+                break
+            pairs_evaluated += 1
             vec_a = source.get("vector")
             vec_b = target.get("vector")
             if vec_a and vec_b:
@@ -1268,6 +1535,14 @@ def build_synaptic_links(neurons, threshold=0.91):
                         "direction": direction,
                         "network_type": "memory_graph",
                     })
+        if truncated:
+            break
+    if return_stats:
+        return synapses, {
+            "pairs_evaluated": pairs_evaluated,
+            "edge_count": len(synapses),
+            "truncated": truncated,
+        }
     return synapses
 
 
@@ -1295,6 +1570,226 @@ def _save_neural_map(child: str, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
+
+
+def _neural_build_state_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_build_state.json"
+
+
+def _neural_dirty_index_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_dirty_index.json"
+
+
+def _neural_snapshot_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_snapshot_csr.json"
+
+
+def _load_json_dict(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return default
+    return payload if isinstance(payload, dict) else default
+
+
+def _save_json_dict(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+    except Exception:
+        return
+
+
+def _load_neural_build_state(child: str) -> Dict[str, Any]:
+    data = _load_json_dict(_neural_build_state_path(child), {"pending": [], "updated_at": None})
+    pending_raw = data.get("pending")
+    if isinstance(pending_raw, list):
+        data["pending"] = [str(fid) for fid in pending_raw if fid]
+    else:
+        data["pending"] = []
+    return data
+
+
+def _save_neural_build_state(child: str, state: Dict[str, Any]) -> None:
+    payload = dict(state)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_json_dict(_neural_build_state_path(child), payload)
+
+
+def _load_neural_dirty_index(child: str) -> Dict[str, str]:
+    data = _load_json_dict(_neural_dirty_index_path(child), {"fragments": {}})
+    fragments = data.get("fragments") if isinstance(data.get("fragments"), dict) else {}
+    return {str(fid): str(sig) for fid, sig in fragments.items() if fid and sig}
+
+
+def _save_neural_dirty_index(child: str, signatures: Dict[str, str]) -> None:
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "fragments": signatures,
+    }
+    _save_json_dict(_neural_dirty_index_path(child), payload)
+
+
+def _load_memory_index(child: str) -> Dict[str, Any]:
+    path = Path("AI_Children") / child / "memory" / "memory_map.json"
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _fragment_signature(child: str, frag_id: str, meta: Dict[str, Any]) -> Optional[str]:
+    path = _resolve_index_path(child, frag_id, meta)
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    tags = meta.get("tags") if isinstance(meta.get("tags"), list) else []
+    tag_text = ",".join(sorted(str(tag).lower() for tag in tags if tag))
+    digest = hashlib.sha1(tag_text.encode("utf-8")).hexdigest()[:12]
+    return (
+        f"{meta.get('tier') or ''}:{meta.get('filename') or ''}:"
+        f"{int(st.st_mtime_ns)}:{int(st.st_size)}:"
+        f"{_safe_float(meta.get('importance'), 0.0):.6f}:{digest}"
+    )
+
+
+def _collect_dirty_fragment_ids(
+    child: str,
+    index: Dict[str, Any],
+    previous_signatures: Dict[str, str],
+) -> Tuple[List[str], Dict[str, str], Set[str]]:
+    dirty: List[str] = []
+    current: Dict[str, str] = {}
+    for frag_id, meta in index.items():
+        if not frag_id or not isinstance(meta, dict):
+            continue
+        signature = _fragment_signature(child, frag_id, meta)
+        if not signature:
+            continue
+        current[frag_id] = signature
+        if previous_signatures.get(frag_id) != signature:
+            dirty.append(frag_id)
+    removed = {fid for fid in previous_signatures.keys() if fid not in current}
+    return dirty, current, removed
+
+
+def _prune_neurons_to_valid_fragments(
+    neurons: List[Dict[str, Any]],
+    valid_ids: Set[str],
+) -> Tuple[int, int]:
+    pruned_refs = 0
+    pruned_neurons = 0
+    kept: List[Dict[str, Any]] = []
+    for neuron in neurons:
+        original = [str(fid) for fid in neuron.get("fragments", []) if fid]
+        current = [fid for fid in original if fid in valid_ids]
+        pruned_refs += max(0, len(original) - len(current))
+        if not current:
+            pruned_neurons += 1
+            continue
+        neuron["fragments"] = current
+        kept.append(neuron)
+    if pruned_neurons:
+        neurons[:] = kept
+    return pruned_refs, pruned_neurons
+
+
+def _detach_neurons_for_dirty_rebuild(
+    neurons: List[Dict[str, Any]],
+    dirty_ids: Set[str],
+    *,
+    max_fragments: int,
+) -> Tuple[Set[str], int, bool]:
+    if not dirty_ids:
+        return set(), 0, False
+    affected_indices: List[int] = []
+    rebuild_ids: Set[str] = set()
+    for idx, neuron in enumerate(neurons):
+        frag_ids = [str(fid) for fid in neuron.get("fragments", []) if fid]
+        if not frag_ids:
+            continue
+        if any(fid in dirty_ids for fid in frag_ids):
+            affected_indices.append(idx)
+            rebuild_ids.update(frag_ids)
+            if max_fragments > 0 and len(rebuild_ids) > max_fragments:
+                return set(), 0, True
+    if not affected_indices:
+        return set(), 0, False
+    drop_set = set(affected_indices)
+    kept = [neuron for idx, neuron in enumerate(neurons) if idx not in drop_set]
+    neurons[:] = kept
+    return rebuild_ids, len(affected_indices), False
+
+
+def _load_fragments_by_id(
+    child: str,
+    fragment_ids: List[str],
+    index: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    loaded: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for frag_id in fragment_ids:
+        meta = index.get(frag_id)
+        if not isinstance(meta, dict):
+            missing.append(frag_id)
+            continue
+        path = _resolve_index_path(child, frag_id, meta)
+        if path is None:
+            missing.append(frag_id)
+            continue
+        fragment = _load_fragment_from_path(path)
+        if not fragment:
+            missing.append(frag_id)
+            continue
+        slim = _slim_fragment(fragment)
+        if slim:
+            loaded.append(slim)
+        else:
+            missing.append(frag_id)
+    return loaded, missing
+
+
+def _save_sparse_snapshot(child: str, neurons: List[Dict[str, Any]], synapses: List[Dict[str, Any]]) -> None:
+    node_ids = [str(neuron.get("id")) for neuron in neurons if neuron.get("id")]
+    node_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
+    rows: List[List[Tuple[int, float]]] = [[] for _ in node_ids]
+    for synapse in synapses:
+        source = node_to_index.get(str(synapse.get("source")))
+        target = node_to_index.get(str(synapse.get("target")))
+        if source is None or target is None:
+            continue
+        weight = _safe_float(synapse.get("weight"), 0.0)
+        rows[source].append((target, round(weight, 4)))
+    indptr: List[int] = [0]
+    indices: List[int] = []
+    weights: List[float] = []
+    for edges in rows:
+        edges.sort(key=lambda item: item[0])
+        for target_idx, weight in edges:
+            indices.append(int(target_idx))
+            weights.append(weight)
+        indptr.append(len(indices))
+    payload = {
+        "format": "csr_v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "node_ids": node_ids,
+        "indptr": indptr,
+        "indices": indices,
+        "weights": weights,
+        "edge_count": len(indices),
+    }
+    _save_json_dict(_neural_snapshot_path(child), payload)
 
 
 def _existing_fragment_ids(neurons: List[Dict[str, Any]]) -> Set[str]:
@@ -1373,7 +1868,7 @@ def _update_neuron_from_candidate(neuron: Dict[str, Any], candidate: Dict[str, A
     base_vec = neuron.get("vector")
     base_count = prior_count if base_vec else 0
     base_vec = base_vec or candidate["vector"]
-    new_count = max(len(new_ids), 1)
+    new_count = len(new_ids)
     combined_vec = _merge_vectors(
         base_vec,
         base_count,
@@ -1463,8 +1958,65 @@ def _merge_candidates_into_neurons(
         skipped += 1
     return merged, created, skipped
 
+
+def _integrate_fragment_batch(
+    fragments: List[Dict[str, Any]],
+    transformer: "FractalTransformer",
+    neurons: List[Dict[str, Any]],
+    *,
+    incremental: bool,
+    cluster_threshold: float,
+    tag_weight: float,
+    policy: Dict[str, Any],
+    anchors: Dict[str, Dict[str, float]],
+    fallback_anchor: Dict[str, Any],
+) -> Dict[str, int]:
+    if not fragments:
+        return {"input": 0, "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
+    encoded = transformer.encode_many(fragments)
+    if not encoded:
+        return {"input": len(fragments), "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
+    cache = {item["id"]: item["vector"] for item in encoded if item.get("id") and item.get("vector")}
+    usable = [frag for frag in fragments if frag.get("id") in cache]
+    if not usable:
+        return {"input": len(fragments), "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
+    clusters = cluster_fragments(
+        usable,
+        cache,
+        threshold=cluster_threshold,
+        tag_weight=tag_weight,
+    )
+    candidates = _prepare_candidates(clusters, cache, anchors, fallback_anchor)
+    if incremental:
+        merged, created, skipped = _merge_candidates_into_neurons(
+            neurons,
+            candidates,
+            cluster_threshold,
+            tag_weight,
+            policy,
+        )
+    else:
+        merged = 0
+        created = 0
+        skipped = 0
+        id_allocator = _node_id_allocator(neurons)
+        for candidate in candidates:
+            neurons.append(_materialize_candidate(next(id_allocator), candidate))
+            created += 1
+        merged = created
+    return {
+        "input": len(fragments),
+        "encoded": len(usable),
+        "clusters": len(clusters),
+        "merged": merged,
+        "created": created,
+        "skipped": skipped,
+    }
+
+
 def build_fractal_memory(child):
     start_time = datetime.now()
+    start_perf = time.perf_counter()
     from transformers.fractal_multidimensional_transformers import FractalTransformer
 
     cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
@@ -1479,103 +2031,254 @@ def build_fractal_memory(child):
         burst_limit = NEURAL_MAP_BURST_DEFAULT
     if burst_limit <= 0:
         burst_limit = NEURAL_MAP_BURST_DEFAULT
+    batch_size = max(1, min(int(policy.get("batch_size", 24)), burst_limit))
+    build_budget_ms = max(0.0, _safe_float(policy.get("build_budget_ms"), 0.0))
 
     transformer = FractalTransformer()
     incremental = policy.get("incremental", True)
     existing_map = _load_neural_map(child) if incremental else {"neurons": [], "synapses": [], "converted_from_legacy": False}
     neurons = existing_map.get("neurons", []) if incremental else []
+    if not isinstance(neurons, list):
+        neurons = []
     known_fragments = _existing_fragment_ids(neurons) if incremental else set()
 
-    fragments, total_count, selector_meta = select_fragments_for_neural_map(
-        child,
-        burst_limit,
-        cfg=cfg,
-        known_fragments=known_fragments if incremental else None,
-    )
-    if not fragments:
-        log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
-        return
-    if total_count > len(fragments):
-        log_to_statusbox(
-            f"[NeuralMap] Limiting to {len(fragments)} selected fragments (burst={burst_limit}, total={total_count})."
-        )
-    else:
-        log_to_statusbox(f"[NeuralMap] Loaded {len(fragments)} fragments.")
-    if selector_meta.get("mode") not in {"fallback", "disabled"}:
-        log_to_statusbox(
-            f"[NeuralMap] Selector lanes={selector_meta.get('lane_counts')} temp={selector_meta.get('temperature')} mode={selector_meta.get('mode')}."
-        )
+    index = _load_memory_index(child)
+    valid_ids = set(index.keys()) if isinstance(index, dict) else set()
 
-    target_fragments = [
-        frag for frag in fragments if not incremental or frag.get("id") not in known_fragments
-    ]
-    if not target_fragments:
-        if incremental and policy.get("synapse_refresh_on_idle", True):
-            synapses = build_synaptic_links(neurons, threshold=synapse_threshold)
-            existing_map["synapses"] = synapses
-            existing_map["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _save_neural_map(child, existing_map)
-            log_to_statusbox("[NeuralMap] No new fragments; refreshed synapses to keep map current.")
-        else:
-            log_to_statusbox("[NeuralMap] No new fragments detected; skipping rebuild.")
-        return
-
-    encoded = transformer.encode_many(target_fragments)
-    if not encoded:
-        log_to_statusbox("[NeuralMap] Encoder returned no vectors for the selected fragments.")
-        return
-
-    cache = {e["id"]: e["vector"] for e in encoded}
-    clusters = cluster_fragments(
-        target_fragments,
-        cache,
-        threshold=cluster_threshold,
-        tag_weight=tag_weight,
-    )
-    log_to_statusbox(
-        f"[NeuralMap] Clustered {len(target_fragments)} new fragments into {len(clusters)} nodes "
-        f"(threshold={cluster_threshold:.2f}, tag_weight={tag_weight:.2f})."
-    )
+    pruned_refs = 0
+    pruned_neurons = 0
+    if incremental and valid_ids:
+        pruned_refs, pruned_neurons = _prune_neurons_to_valid_fragments(neurons, valid_ids)
+        if pruned_refs or pruned_neurons:
+            known_fragments = _existing_fragment_ids(neurons)
+            log_to_statusbox(
+                f"[NeuralMap] Pruned {pruned_refs} stale fragment refs and dropped {pruned_neurons} empty neuron(s)."
+            )
 
     anchors = _load_body_anchors()
     fallback_anchor = anchors.get("head", {"center": [0.0, 0.0, 0.0], "radius": 2.0})
-    candidates = _prepare_candidates(clusters, cache, anchors, fallback_anchor)
 
-    if incremental:
-        merged, created, skipped = _merge_candidates_into_neurons(
-            neurons,
-            candidates,
-            cluster_threshold,
-            tag_weight,
-            policy,
-        )
-        log_to_statusbox(
-            f"[NeuralMap] Incremental update — merged {merged}, added {created}, skipped {skipped} (max_new={policy.get('max_new_neurons')})."
-        )
+    dirty_mode = bool(policy.get("dirty_index_enabled", True) and incremental and index)
+    queue_state = _load_neural_build_state(child) if dirty_mode else {"pending": []}
+    pending_ids = [fid for fid in queue_state.get("pending", []) if fid in valid_ids] if dirty_mode else []
+    dirty_signatures = _load_neural_dirty_index(child) if dirty_mode else {}
+    current_signatures: Dict[str, str] = {}
+    removed_signatures: Set[str] = set()
+    processed_ids: List[str] = []
+    detached_neurons = 0
+    detached_overflow = False
+    detected_dirty = 0
+    source = "selector"
+    selector_meta: Dict[str, Any] = {}
+    selector_total = 0
+    selector_loaded = 0
+    selector_targets: List[Dict[str, Any]] = []
+
+    if dirty_mode:
+        source = "dirty_index"
+        dirty_ids, current_signatures, removed_signatures = _collect_dirty_fragment_ids(child, index, dirty_signatures)
+        detected_dirty = len(dirty_ids)
+        dirty_set = set(dirty_ids)
+        if dirty_set:
+            known_dirty = dirty_set & known_fragments
+            if known_dirty:
+                local_rebuild_ids, detached_neurons, detached_overflow = _detach_neurons_for_dirty_rebuild(
+                    neurons,
+                    known_dirty,
+                    max_fragments=int(policy.get("local_rebuild_max_fragments", 0)),
+                )
+                if detached_overflow:
+                    log_to_statusbox(
+                        "[NeuralMap] Dirty-set touched too many existing neurons; keeping current map and deferring local rebuild."
+                    )
+                else:
+                    dirty_set.update(local_rebuild_ids)
+                    known_fragments = _existing_fragment_ids(neurons)
+            pending_set = set(pending_ids)
+            for frag_id in dirty_set:
+                if frag_id in valid_ids and frag_id not in pending_set:
+                    pending_ids.append(frag_id)
+                    pending_set.add(frag_id)
+        if pending_ids:
+            def _queue_sort_key(frag_id: str) -> Tuple[float, float]:
+                meta = index.get(frag_id, {}) if isinstance(index, dict) else {}
+                ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp")) or 0.0
+                importance = _safe_float(meta.get("importance"), 0.0)
+                return ts, importance
+            pending_ids = sorted(dict.fromkeys(pending_ids), key=_queue_sort_key, reverse=True)
+        queue_state["last_source"] = source
     else:
-        neurons = []
-        id_allocator = _node_id_allocator(neurons)
-        for candidate in candidates:
-            neurons.append(_materialize_candidate(next(id_allocator), candidate))
-        merged = len(candidates)
-        created = len(candidates)
-        skipped = 0
+        fragments, selector_total, selector_meta = select_fragments_for_neural_map(
+            child,
+            burst_limit,
+            cfg=cfg,
+            known_fragments=known_fragments if incremental else None,
+        )
+        selector_loaded = len(fragments)
+        if selector_total > selector_loaded:
+            log_to_statusbox(
+                f"[NeuralMap] Limiting to {selector_loaded} selected fragments (burst={burst_limit}, total={selector_total})."
+            )
+        elif selector_loaded:
+            log_to_statusbox(f"[NeuralMap] Loaded {selector_loaded} fragments.")
+        if selector_meta.get("mode") not in {"fallback", "disabled"}:
+            log_to_statusbox(
+                f"[NeuralMap] Selector lanes={selector_meta.get('lane_counts')} temp={selector_meta.get('temperature')} mode={selector_meta.get('mode')}."
+            )
+        selector_targets = [frag for frag in fragments if not incremental or frag.get("id") not in known_fragments]
 
-    needs_synapse_refresh = not incremental or merged > 0 or created > 0 or policy.get("synapse_refresh_on_idle", True)
-    synapses = build_synaptic_links(neurons, threshold=synapse_threshold) if needs_synapse_refresh else existing_map.get("synapses", [])
+    totals = {"input": 0, "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
+    batches_run = 0
+    budget_hit = False
 
-    result = existing_map if incremental else {}
-    result.update({
-        "neurons": neurons,
-        "synapses": synapses,
-        "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    })
-    _save_neural_map(child, result)
+    if source == "dirty_index":
+        while pending_ids and totals["input"] < burst_limit:
+            elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
+            if build_budget_ms > 0 and elapsed_ms >= build_budget_ms and totals["input"] > 0:
+                budget_hit = True
+                break
+            step = min(batch_size, burst_limit - totals["input"], len(pending_ids))
+            batch_ids = pending_ids[:step]
+            pending_ids = pending_ids[step:]
+            batch_fragments, missing_ids = _load_fragments_by_id(child, batch_ids, index)
+            if missing_ids:
+                for frag_id in missing_ids:
+                    current_signatures.pop(frag_id, None)
+                    dirty_signatures.pop(frag_id, None)
+            if not batch_fragments:
+                continue
+            stats = _integrate_fragment_batch(
+                batch_fragments,
+                transformer,
+                neurons,
+                incremental=incremental,
+                cluster_threshold=cluster_threshold,
+                tag_weight=tag_weight,
+                policy=policy,
+                anchors=anchors,
+                fallback_anchor=fallback_anchor,
+            )
+            for key in totals:
+                totals[key] += stats.get(key, 0)
+            processed_ids.extend([str(frag.get("id")) for frag in batch_fragments if frag.get("id")])
+            batches_run += 1
+    else:
+        cursor = 0
+        while cursor < len(selector_targets) and totals["input"] < burst_limit:
+            elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
+            if build_budget_ms > 0 and elapsed_ms >= build_budget_ms and totals["input"] > 0:
+                budget_hit = True
+                break
+            step = min(batch_size, burst_limit - totals["input"], len(selector_targets) - cursor)
+            batch_fragments = selector_targets[cursor : cursor + step]
+            cursor += step
+            if not batch_fragments:
+                continue
+            stats = _integrate_fragment_batch(
+                batch_fragments,
+                transformer,
+                neurons,
+                incremental=incremental,
+                cluster_threshold=cluster_threshold,
+                tag_weight=tag_weight,
+                policy=policy,
+                anchors=anchors,
+                fallback_anchor=fallback_anchor,
+            )
+            for key in totals:
+                totals[key] += stats.get(key, 0)
+            batches_run += 1
+
+    if dirty_mode:
+        for frag_id in removed_signatures:
+            dirty_signatures.pop(frag_id, None)
+        for frag_id in processed_ids:
+            sig = current_signatures.get(frag_id)
+            if sig:
+                dirty_signatures[frag_id] = sig
+        queue_state["pending"] = pending_ids
+        queue_state["dirty_detected"] = detected_dirty
+        queue_state["processed"] = len(processed_ids)
+        queue_state["detached_neurons"] = detached_neurons
+        _save_neural_build_state(child, queue_state)
+        _save_neural_dirty_index(child, dirty_signatures)
+        log_to_statusbox(
+            f"[NeuralMap] Dirty queue: detected {detected_dirty}, processed {len(processed_ids)}, remaining {len(pending_ids)}."
+        )
+
+    map_changed = bool(
+        pruned_refs
+        or pruned_neurons
+        or detached_neurons
+        or totals["merged"]
+        or totals["created"]
+    )
+    queue_remaining = len(pending_ids) if dirty_mode else 0
+    needs_synapse_refresh = False
+    if not incremental:
+        needs_synapse_refresh = True
+    elif queue_remaining == 0 and map_changed:
+        needs_synapse_refresh = True
+    elif queue_remaining == 0 and totals["input"] == 0 and policy.get("synapse_refresh_on_idle", True):
+        needs_synapse_refresh = True
+
+    prior_synapses = existing_map.get("synapses", []) if incremental else []
+    if not isinstance(prior_synapses, list):
+        prior_synapses = []
+    synapses = prior_synapses
+    synapse_stats = {"pairs_evaluated": 0, "edge_count": len(synapses), "truncated": False}
+    if needs_synapse_refresh:
+        synapses, synapse_stats = build_synaptic_links(
+            neurons,
+            threshold=synapse_threshold,
+            max_edges=int(policy.get("max_edges_updated", 0) or 0),
+            max_pairs=int(policy.get("max_synapse_pairs", 0) or 0),
+            return_stats=True,
+        )
+        if synapse_stats.get("truncated"):
+            log_to_statusbox(
+                f"[NeuralMap] Synapse refresh hit budget ({synapse_stats.get('edge_count')} edges, {synapse_stats.get('pairs_evaluated')} pairs)."
+            )
+
+    should_save_map = bool(not incremental or map_changed or needs_synapse_refresh)
+    if should_save_map:
+        result = existing_map if incremental else {}
+        result.update({
+            "neurons": neurons,
+            "synapses": synapses,
+            "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _save_neural_map(child, result)
+        if policy.get("emit_sparse_snapshot", True):
+            _save_sparse_snapshot(child, neurons, synapses)
+
+    if source == "selector" and selector_loaded and not selector_targets and incremental:
+        log_to_statusbox("[NeuralMap] No new fragments detected after selector filtering.")
+    if totals["clusters"] > 0:
+        log_to_statusbox(
+            f"[NeuralMap] Clustered {totals['encoded']} fragment(s) into {totals['clusters']} cluster(s) "
+            f"(threshold={cluster_threshold:.2f}, tag_weight={tag_weight:.2f})."
+        )
+    if incremental and (totals["merged"] or totals["created"] or totals["skipped"]):
+        log_to_statusbox(
+            f"[NeuralMap] Incremental update — merged {totals['merged']}, added {totals['created']}, "
+            f"skipped {totals['skipped']} (max_new={policy.get('max_new_neurons')})."
+        )
+    if budget_hit:
+        log_to_statusbox(
+            f"[NeuralMap] Build budget reached after {totals['input']} fragment(s) and {batches_run} batch(es); resuming next cycle."
+        )
+    if totals["input"] == 0 and not map_changed and not needs_synapse_refresh:
+        if source == "dirty_index":
+            log_to_statusbox("[NeuralMap] No dirty fragments to process.")
+        else:
+            log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
 
     duration = datetime.now() - start_time
     log_to_statusbox(
-        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | Policy={policy.get('mode')} | Saved."
+        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | "
+        f"Policy={policy.get('mode')} | Source={source} | Batches={batches_run}."
     )
     log_to_statusbox(f"[NeuralMap] Mapping time: {duration}.")
 
@@ -1589,6 +2292,14 @@ class MemoryManager:
         self.policy = tier_policy or _memory_policy()
         self.cold_storage_policy = _cold_storage_policy()
         self.load_map()
+
+    @staticmethod
+    def _stat_payload(path: Path) -> Dict[str, Any]:
+        try:
+            st = path.stat()
+        except OSError:
+            return {}
+        return {"mtime_ns": int(st.st_mtime_ns), "size_bytes": int(st.st_size)}
 
     def ensure_tier_directories(self):
         for tier in MEMORY_TIERS:
@@ -1614,6 +2325,7 @@ class MemoryManager:
                         data.get("timestamp", datetime.now(timezone.utc).isoformat())
                     ),
                     "filename": frag.name,
+                    **self._stat_payload(frag),
                 }
             except Exception:
                 continue
@@ -1748,6 +2460,7 @@ class MemoryManager:
                         data.get("timestamp", datetime.now(timezone.utc).isoformat())
                     ),
                     "filename": frag.name,
+                    **self._stat_payload(frag),
                 }
             except:
                 continue
@@ -1788,6 +2501,7 @@ class MemoryManager:
                                 datetime.now(timezone.utc).isoformat()
                             ),
                             "filename": frag.name,
+                            **self._stat_payload(frag),
                         }
                         added += 1
                     else:
@@ -1797,12 +2511,116 @@ class MemoryManager:
                             "tags": data.get("tags", []),
                             "importance": data.get("importance", 0),
                             "filename": frag.name,
+                            **self._stat_payload(frag),
                         })
                         self.memory_map[data["id"]] = existing
                 except:
                     continue
         self.save_map()
         log_to_statusbox(f"[Memory] Reindexed {added} new fragments across tiers. Current total: {len(self.memory_map)}")
+
+    def fast_reindex(self, rebalance: bool = False, prune_missing: bool = False):
+        """
+        Fast reindex that avoids JSON parsing for unchanged files by using size+mtime.
+        """
+        self.ensure_tier_directories()
+        existing_by_path: Dict[str, str] = {}
+        for frag_id, meta in self.memory_map.items():
+            filename = meta.get("filename", f"frag_{frag_id}.json")
+            tier = meta.get("tier")
+            if tier in MEMORY_TIERS:
+                existing_by_path[f"{tier}/{filename}"] = frag_id
+            existing_by_path[filename] = frag_id
+
+        scanned = 0
+        added = 0
+        updated = 0
+        unchanged = 0
+        skipped = 0
+        seen_ids: Set[str] = set()
+
+        for path in _iter_fragment_files(self.base_path):
+            scanned += 1
+            try:
+                st = path.stat()
+            except OSError:
+                skipped += 1
+                continue
+            rel = path.relative_to(self.base_path).as_posix()
+            tier = path.parent.name if path.parent.name in MEMORY_TIERS else "short"
+
+            frag_id = existing_by_path.get(rel)
+            if frag_id:
+                meta = self.memory_map.get(frag_id, {})
+                cached_mtime = meta.get("mtime_ns")
+                cached_size = meta.get("size_bytes")
+                if cached_mtime == st.st_mtime_ns and cached_size == st.st_size:
+                    changed = False
+                    if meta.get("filename") != path.name:
+                        meta["filename"] = path.name
+                        changed = True
+                    if meta.get("tier") != tier:
+                        meta["tier"] = tier
+                        changed = True
+                    if cached_mtime is None or cached_size is None:
+                        meta["mtime_ns"] = int(st.st_mtime_ns)
+                        meta["size_bytes"] = int(st.st_size)
+                        changed = True
+                    if changed:
+                        self.memory_map[frag_id] = meta
+                        updated += 1
+                    else:
+                        unchanged += 1
+                    seen_ids.add(frag_id)
+                    continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                skipped += 1
+                continue
+            frag_id = data.get("id")
+            if not frag_id:
+                skipped += 1
+                continue
+
+            existing = self.memory_map.get(frag_id, {})
+            entry = {
+                "tier": tier,
+                "tags": data.get("tags", existing.get("tags", [])),
+                "importance": data.get("importance", existing.get("importance", 0)),
+                "last_seen": existing.get(
+                    "last_seen",
+                    data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                ),
+                "filename": path.name,
+                "mtime_ns": int(st.st_mtime_ns),
+                "size_bytes": int(st.st_size),
+            }
+
+            if frag_id in seen_ids:
+                prior = self.memory_map.get(frag_id, {})
+                prior_mtime = prior.get("mtime_ns") or 0
+                if prior_mtime >= entry["mtime_ns"]:
+                    continue
+
+            if frag_id in self.memory_map:
+                updated += 1
+            else:
+                added += 1
+            self.memory_map[frag_id] = entry
+            seen_ids.add(frag_id)
+
+        self.save_map()
+        log_to_statusbox(
+            f"[Memory] Fast reindex: scanned {scanned}, added {added}, updated {updated}, "
+            f"unchanged {unchanged}, skipped {skipped}."
+        )
+        if prune_missing:
+            self.prune_missing()
+        if rebalance:
+            self.rebalance_tiers()
 
     def ingest_fragment_file(self, fragment_path, to_tier):
         try:
@@ -1830,6 +2648,7 @@ class MemoryManager:
             "importance": data.get("importance", 0),
             "last_seen": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             "filename": target_path.name,
+            **self._stat_payload(target_path),
         }
         self.save_map()
         return True
@@ -2031,9 +2850,214 @@ class MemoryManager:
         log_to_statusbox(f"[Memory] Stats: {json.dumps(counts)}")
         return counts
 
+
+def _resolve_bundle_paths(child: str, cfg: Optional[Dict[str, Any]], inastate: Dict[str, Any]) -> Tuple[Path, Path]:
+    status = inastate.get("bundle_status") if isinstance(inastate.get("bundle_status"), dict) else {}
+    root_value = status.get("root")
+    bundle_dir_value = status.get("bundle_dir")
+
+    root = Path(root_value) if root_value else Path("AI_Children") / child / "memory"
+    root = root.expanduser()
+
+    if not bundle_dir_value:
+        policy = cfg.get("bundle_policy", {}) if isinstance(cfg, dict) else {}
+        bundle_dir_value = policy.get("bundle_dir") or "bundles"
+    bundle_dir = Path(str(bundle_dir_value)).expanduser()
+    if not bundle_dir.is_absolute():
+        bundle_dir = root / bundle_dir
+    return root, bundle_dir
+
+
+def _iter_bundle_index_entries(bundle_dir: Path) -> Iterable[Dict[str, Any]]:
+    if not bundle_dir.exists():
+        return
+    for index_path in sorted(bundle_dir.glob("*.index.jsonl")):
+        try:
+            with index_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        yield payload
+        except OSError:
+            continue
+
+
+def _hash_file(path: Path) -> Optional[str]:
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except OSError:
+        return None
+    return hasher.hexdigest()
+
+
+def _plan_or_apply_bundle_prune(
+    manager: MemoryManager,
+    root: Path,
+    bundle_dir: Path,
+    *,
+    apply: bool,
+    verify_sha: bool,
+    max_prune: int,
+) -> Dict[str, Any]:
+    fragment_root = root / "fragments"
+    rel_to_id: Dict[str, str] = {}
+    for frag_id, meta in manager.memory_map.items():
+        filename = meta.get("filename", f"frag_{frag_id}.json")
+        tier = meta.get("tier")
+        if tier in MEMORY_TIERS:
+            rel_path = f"fragments/{tier}/{filename}"
+        else:
+            rel_path = f"fragments/{filename}"
+        rel_to_id[rel_path] = frag_id
+
+    candidates = 0
+    pruned = 0
+    bytes_total = 0
+    verified = 0
+    skipped = 0
+
+    for entry in _iter_bundle_index_entries(bundle_dir):
+        rel_path = entry.get("rel_path")
+        if not rel_path or rel_path not in rel_to_id:
+            continue
+        frag_id = rel_to_id.get(rel_path)
+        if not frag_id:
+            continue
+        abs_path = root / rel_path
+        if not abs_path.exists():
+            skipped += 1
+            continue
+        if verify_sha:
+            expected = entry.get("sha256")
+            actual = _hash_file(abs_path)
+            if not expected or actual != expected:
+                skipped += 1
+                continue
+            verified += 1
+
+        size_hint = entry.get("size")
+        try:
+            size_value = int(size_hint) if size_hint is not None else abs_path.stat().st_size
+        except (TypeError, ValueError, OSError):
+            size_value = 0
+
+        candidates += 1
+        bytes_total += size_value
+
+        if apply:
+            try:
+                abs_path.unlink()
+            except OSError:
+                skipped += 1
+                continue
+            manager.memory_map.pop(frag_id, None)
+            pruned += 1
+            if max_prune > 0 and pruned >= max_prune:
+                break
+
+    if apply and pruned:
+        manager.save_map()
+
+    return {
+        "status": "applied" if apply else "planned",
+        "candidates": candidates,
+        "pruned": pruned,
+        "bytes": bytes_total,
+        "verified": verified,
+        "skipped": skipped,
+        "root": str(root),
+        "bundle_dir": str(bundle_dir),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def handle_bundle_prune(child: str, cfg: Optional[Dict[str, Any]], manager: MemoryManager) -> None:
+    state = _load_inastate(child)
+    request_raw = state.get("bundle_prune_request")
+    if not request_raw:
+        return
+    request = str(request_raw).lower().strip()
+    if request not in {"plan", "apply"}:
+        log_to_statusbox(f"[BundlePrune] Ignoring unknown request: {request_raw}")
+        _write_inastate_value(child, "bundle_prune_request", None)
+        return
+
+    policy = _bundle_prune_policy(cfg)
+    if not policy.get("enabled", False):
+        log_to_statusbox("[BundlePrune] Prune request ignored; bundle_prune_policy.enabled is false.")
+        _write_inastate_value(child, "bundle_prune_request", None)
+        return
+
+    if request == "apply" and not policy.get("allow_apply", False):
+        log_to_statusbox("[BundlePrune] Apply requested but bundle_prune_policy.allow_apply is false.")
+        _write_inastate_value(child, "bundle_prune_request", None)
+        return
+
+    if policy.get("require_bundle_ready", True):
+        ready = state.get("bundle_prune_ready") if isinstance(state.get("bundle_prune_ready"), dict) else {}
+        if not ready.get("ready", False):
+            log_to_statusbox("[BundlePrune] Bundle prune request ignored; bundle_prune_ready is false.")
+            _write_inastate_value(child, "bundle_prune_request", None)
+            return
+
+    root, bundle_dir = _resolve_bundle_paths(child, cfg, state)
+    if not bundle_dir.exists():
+        log_to_statusbox(f"[BundlePrune] Bundle directory missing: {bundle_dir}")
+        _write_inastate_value(child, "bundle_prune_request", None)
+        return
+
+    report = _plan_or_apply_bundle_prune(
+        manager,
+        root,
+        bundle_dir,
+        apply=request == "apply",
+        verify_sha=policy.get("verify_sha", True),
+        max_prune=int(policy.get("max_prune") or 0),
+    )
+    report_path = Path("AI_Children") / child / "memory" / "bundle_prune_report.json"
+    try:
+        with report_path.open("w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+    except Exception:
+        pass
+    _write_inastate_value(child, "bundle_prune_report", report)
+    _write_inastate_value(child, "bundle_prune_request", None)
+    log_to_statusbox(
+        f"[BundlePrune] {report['status']} {report['pruned']} of {report['candidates']} candidate fragment(s)."
+    )
+
 if __name__ == "__main__":
-    mgr = MemoryManager()
-    mgr.reindex_all()
+    cfg = _load_config()
+    child = cfg.get("current_child", "Inazuma_Yagami")
+    mgr = MemoryManager(child)
+
+    boot_policy = _boot_policy(cfg)
+    shutdown_ctx = _shutdown_context(child, boot_policy)
+    boot_mode, reason = _resolve_boot_mode(boot_policy, shutdown_ctx)
+    log_to_statusbox(f"[Memory] Boot mode: {boot_mode} (reason={reason}).")
+
+    if boot_mode == "full":
+        mgr.reindex_all(rebalance=boot_policy.get("rebalance_on_boot", True))
+        if boot_policy.get("prune_missing_on_boot", False):
+            mgr.prune_missing()
+    else:
+        mgr.fast_reindex(
+            rebalance=boot_policy.get("rebalance_on_boot", False),
+            prune_missing=boot_policy.get("prune_missing_on_boot", False),
+        )
+
     mgr.stats()
-    build_fractal_memory(mgr.child)
-    build_experience_graph(mgr.child)
+    handle_bundle_prune(child, cfg, mgr)
+    build_fractal_memory(child)
+    build_experience_graph(child)

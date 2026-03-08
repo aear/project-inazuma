@@ -1,24 +1,55 @@
 # === logic_map_builder.py (Neural Rewrite) ===
 
-import os
 import json
 import math
 import random
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from transformers.fractal_multidimensional_transformers import FractalTransformer
+from typing import Any, Dict, List, Optional, Tuple
 from model_manager import load_config
 from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts, available_symbol_components
 from body_schema import get_region_anchors
 
 LOGIC_MAP_BURST_DEFAULT = 150  # neurons per pass before pausing
+DEFAULT_LOGIC_POLICY = {
+    "burst": LOGIC_MAP_BURST_DEFAULT,
+    "edge_knn": 6,
+    "edge_min_similarity": 0.35,
+    "max_pairs": 12000,
+    "max_edges": 3200,
+    "build_budget_ms": 260.0,
+}
 
 def cosine_similarity(v1, v2):
     dot = sum(a * b for a, b in zip(v1, v2))
     norm1 = math.sqrt(sum(a * a for a in v1))
     norm2 = math.sqrt(sum(b * b for b in v2))
     return dot / (norm1 * norm2 + 1e-8)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _logic_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    policy = DEFAULT_LOGIC_POLICY.copy()
+    raw = cfg.get("logic_map_policy", {}) if isinstance(cfg, dict) else {}
+    if isinstance(raw, dict):
+        for key in policy.keys():
+            if key in raw:
+                policy[key] = raw.get(key)
+    policy["burst"] = max(10, int(_safe_float(policy.get("burst"), LOGIC_MAP_BURST_DEFAULT)))
+    policy["edge_knn"] = max(1, int(_safe_float(policy.get("edge_knn"), 6)))
+    policy["edge_min_similarity"] = max(0.0, min(1.0, _safe_float(policy.get("edge_min_similarity"), 0.35)))
+    policy["max_pairs"] = max(0, int(_safe_float(policy.get("max_pairs"), 12000)))
+    policy["max_edges"] = max(0, int(_safe_float(policy.get("max_edges"), 3200)))
+    policy["build_budget_ms"] = max(0.0, _safe_float(policy.get("build_budget_ms"), 260.0))
+    return policy
 
 def _flatten_numeric(value):
     """
@@ -116,15 +147,26 @@ def load_logic_memory(child):
     path = Path("AI_Children") / child / "memory" / "logic_memory.json"
     if not path.exists():
         return []
-    with open(path, "r") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
 
-def build_logic_neural_map(logic_entries):
-    transformer = FractalTransformer()
+def build_logic_neural_map(logic_entries: List[Dict[str, Any]], *, policy: Dict[str, Any]):
+    start_perf = time.perf_counter()
     anchors = _load_body_anchors()
     fallback_anchor = anchors.get("head", {"center": [0.0, 0.0, 0.0], "radius": 2.0})
     neurons = []
     edges = []
+    pair_cap = int(policy.get("max_pairs", 0))
+    edge_cap = int(policy.get("max_edges", 0))
+    edge_knn = int(policy.get("edge_knn", 6))
+    edge_min_similarity = float(policy.get("edge_min_similarity", 0.35))
+    build_budget_ms = float(policy.get("build_budget_ms", 0.0))
+    pairs_evaluated = 0
+    truncated = False
 
     component_keys = available_symbol_components()
     for i, entry in enumerate(logic_entries):
@@ -143,7 +185,7 @@ def build_logic_neural_map(logic_entries):
         position = _project_vector_to_anchor(vector, anchor, seed=node_id)
         neurons.append({
             "id": node_id,
-            "timestamp": entry["timestamp"],
+            "timestamp": entry.get("timestamp"),
             "description": entry.get("description", ""),
             "symbol_word_id": entry.get("symbol_word_id", ""),
             "symbol": symbol,
@@ -155,10 +197,25 @@ def build_logic_neural_map(logic_entries):
 
     pos_map = {n["id"]: n.get("position") for n in neurons}
     for i, a in enumerate(neurons):
-        for j, b in enumerate(neurons):
-            if j <= i:
-                continue
+        local: List[Tuple[float, int]] = []
+        for j in range(i + 1, len(neurons)):
+            if pair_cap > 0 and pairs_evaluated >= pair_cap:
+                truncated = True
+                break
+            elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
+            if build_budget_ms > 0 and elapsed_ms >= build_budget_ms and pairs_evaluated > 0:
+                truncated = True
+                break
+            b = neurons[j]
+            pairs_evaluated += 1
             sim = cosine_similarity(a["vector"], b["vector"])
+            if sim < edge_min_similarity:
+                continue
+            local.append((sim, j))
+        if local:
+            local.sort(key=lambda item: item[0], reverse=True)
+        for sim, j in local[:edge_knn]:
+            b = neurons[j]
             edge_type = "reinforces" if sim > 0.8 else "contradicts" if sim < 0.4 else "curious"
             direction = None
             pos_a = pos_map.get(a["id"])
@@ -176,11 +233,22 @@ def build_logic_neural_map(logic_entries):
                 "direction": direction,
                 "network_type": "logic"
             })
+            if edge_cap > 0 and len(edges) >= edge_cap:
+                truncated = True
+                break
+        if truncated:
+            break
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "neurons": neurons,
-        "synapses": edges
+        "synapses": edges,
+        "build_stats": {
+            "pairs_evaluated": pairs_evaluated,
+            "edges_emitted": len(edges),
+            "edge_knn": edge_knn,
+            "truncated": truncated,
+        },
     }
 
 def save_logic_neural_map(child, logic_map):
@@ -193,13 +261,9 @@ def save_logic_neural_map(child, logic_map):
 def run_logic_map_builder():
     config = load_config()
     child = config.get("current_child", "default_child")
+    policy = _logic_policy(config)
     logic_entries = load_logic_memory(child)
-    burst_limit = config.get("logic_map_burst") or LOGIC_MAP_BURST_DEFAULT
-    try:
-        burst_limit = int(burst_limit)
-    except (TypeError, ValueError):
-        burst_limit = LOGIC_MAP_BURST_DEFAULT
-    burst_limit = max(10, burst_limit)
+    burst_limit = policy["burst"]
 
     if not logic_entries:
         log_to_statusbox("[LogicMap] No logic entries found. Skipping map generation.")
@@ -211,8 +275,14 @@ def run_logic_map_builder():
     else:
         log_to_statusbox(f"[LogicMap] Loaded {len(logic_entries)} logic entries.")
 
-    logic_map = build_logic_neural_map(logic_entries)
+    logic_map = build_logic_neural_map(logic_entries, policy=policy)
     save_logic_neural_map(child, logic_map)
+    stats = logic_map.get("build_stats", {}) if isinstance(logic_map, dict) else {}
+    if isinstance(stats, dict):
+        log_to_statusbox(
+            f"[LogicMap] Pair budget: evaluated {stats.get('pairs_evaluated', 0)}, "
+            f"emitted {stats.get('edges_emitted', 0)}, truncated={bool(stats.get('truncated'))}."
+        )
     log_to_statusbox("[LogicMap] Logic neural mapping complete.")
 
 if __name__ == "__main__":

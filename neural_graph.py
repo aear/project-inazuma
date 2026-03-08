@@ -7,13 +7,15 @@ English learning without replacing existing memory systems.
 import json
 import math
 import re
+import time
+import heapq
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from gui_hook import log_to_statusbox
-from model_manager import load_config, update_inastate
+from model_manager import get_inastate, load_config, update_inastate
 
 GRAPH_FILENAME = "typed_neural_graph.json"
 DEFAULT_BURST = 40  # number of expression fragments to fold in per run
@@ -339,33 +341,56 @@ class TypedGraphBuilder:
                 self._upsert_edge(word_id, tok_id, "word->token", weight=weight, source_tag="text_vocab")
 
     # --- burst processing ----------------------------------------------
-    def _iter_expression_fragments(self) -> List[Tuple[Path, datetime]]:
-        frag_dir = self.memory_root / "fragments"
-        paths = list(frag_dir.glob("frag_expression_*.json"))
-        timed: List[Tuple[Path, datetime]] = []
-        for path in paths:
-            ts = _parse_ts(path.stem.split("_")[-1])  # coarse fallback
-            if ts is None:
-                data = _load_json(path) or {}
-                ts = _parse_ts(data.get("timestamp"))
-            if ts:
-                timed.append((path, ts))
-        timed.sort(key=lambda pair: pair[1])
-        return timed
+    def _fragment_timestamp(self, path: Path) -> Optional[datetime]:
+        ts = _parse_ts(path.stem.split("_")[-1])
+        if ts is not None:
+            return ts
+        try:
+            st = path.stat()
+            return datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
 
-    def fold_expression_fragments(self, limit: int = DEFAULT_BURST) -> int:
+    def _iter_expression_fragments_since(self, cursor_ts: Optional[datetime], limit: int) -> List[Tuple[Path, datetime]]:
+        frag_dir = self.memory_root / "fragments"
+        if limit <= 0 or not frag_dir.exists():
+            return []
+        heap: List[Tuple[float, str, Path, datetime]] = []
+        for path in frag_dir.glob("frag_expression_*.json"):
+            ts = self._fragment_timestamp(path)
+            if ts is None:
+                continue
+            if cursor_ts and ts <= cursor_ts:
+                continue
+            ts_epoch = ts.timestamp()
+            item = (-ts_epoch, path.name, path, ts)
+            if len(heap) < limit:
+                heapq.heappush(heap, item)
+            else:
+                current_largest_epoch = -heap[0][0]
+                if ts_epoch < current_largest_epoch:
+                    heapq.heapreplace(heap, item)
+        selected = [(entry[2], entry[3]) for entry in heap]
+        selected.sort(key=lambda pair: pair[1])
+        return selected
+
+    def fold_expression_fragments(self, limit: int = DEFAULT_BURST, build_budget_ms: float = 0.0) -> int:
         progress = self.metadata.setdefault("progress", {})
         cursor_ts = _parse_ts(progress.get("expression_cursor"))
         processed = 0
         last_seen_ts = cursor_ts
-
-        for path, ts in self._iter_expression_fragments():
-            if cursor_ts and ts <= cursor_ts:
-                continue
-            if processed >= limit:
-                break
+        start_perf = time.perf_counter()
+        for path, ts in self._iter_expression_fragments_since(cursor_ts, limit):
+            if build_budget_ms > 0 and processed > 0:
+                elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
+                if elapsed_ms >= build_budget_ms:
+                    break
 
             data = _load_json(path) or {}
+            tags = data.get("tags") if isinstance(data.get("tags"), list) else []
+            lowered_tags = {str(tag).lower() for tag in tags if tag}
+            if "sensor_incoherent" in lowered_tags:
+                continue
             sound = data.get("sound_symbol")
             symbol_word = data.get("symbol_word_id")
             vocab_word = (data.get("vocab_word") or "").strip()
@@ -439,6 +464,28 @@ class TypedGraphBuilder:
 def build_typed_neural_graph(child: Optional[str] = None, *, base_path: Optional[Path] = None, burst: int = DEFAULT_BURST) -> Dict[str, Any]:
     cfg = load_config()
     child_name = child or cfg.get("current_child", "Inazuma_Yagami")
+    raw_policy = cfg.get("typed_neural_graph_policy", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(raw_policy, dict):
+        raw_policy = {}
+    try:
+        policy_burst = int(raw_policy.get("burst", burst))
+    except (TypeError, ValueError):
+        policy_burst = burst
+    policy_burst = max(8, policy_burst)
+    try:
+        build_budget_ms = float(raw_policy.get("build_budget_ms", 0.0))
+    except (TypeError, ValueError):
+        build_budget_ms = 0.0
+    build_budget_ms = max(0.0, build_budget_ms)
+    ground_fault = get_inastate("ground_sense_fault") or {}
+    if isinstance(ground_fault, dict) and bool(ground_fault.get("active")):
+        policy_burst = min(policy_burst, 8)
+        if build_budget_ms <= 0:
+            build_budget_ms = 120.0
+        else:
+            build_budget_ms = min(build_budget_ms, 120.0)
+        log_to_statusbox("[TypedNeuralGraph] Ground sensor fault active: throttling graph fold.")
+
     builder = TypedGraphBuilder(child_name, base_path=base_path)
     builder.load_existing()
 
@@ -447,13 +494,15 @@ def build_typed_neural_graph(child: Optional[str] = None, *, base_path: Optional
     builder.ingest_symbol_vocab()
     builder.ingest_text_vocab()
 
-    processed = builder.fold_expression_fragments(limit=burst)
+    processed = builder.fold_expression_fragments(limit=policy_burst, build_budget_ms=build_budget_ms)
     builder.save()
 
     summary = {
         "nodes": len(builder.nodes),
         "edges": len(builder.edges),
         "burst_processed": processed,
+        "burst_limit": policy_burst,
+        "build_budget_ms": build_budget_ms,
         "last_run": _now_iso(),
     }
     update_inastate("typed_neural_graph_status", summary)

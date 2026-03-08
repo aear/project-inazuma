@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from io_utils import atomic_write_json
 
 # --- Soft imports: GUI + config + gatekeeper ---------------------------------
 
@@ -138,6 +139,33 @@ def _maybe_attach_body_state(fragment: Dict[str, Any], emotions: Optional[Dict[s
         fragment["body_state"] = state
 
 
+def _apply_sensor_incoherence_tag(fragment: Dict[str, Any]) -> None:
+    """
+    Safety guard: when ground sensing is flagged incoherent, mark newly
+    produced fragments so map builders can down-rank/skip them.
+    """
+    try:
+        fault = get_inastate("ground_sense_fault")
+    except Exception:
+        fault = None
+    if not isinstance(fault, dict) or not bool(fault.get("active")):
+        return
+
+    tags_raw = fragment.get("tags")
+    tags = list(tags_raw) if isinstance(tags_raw, list) else []
+    lowered = {str(tag).lower() for tag in tags if tag}
+    if "sensor_incoherent" not in lowered:
+        tags.append("sensor_incoherent")
+    fragment["tags"] = tags
+
+    meta = fragment.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+        fragment["meta"] = meta
+    meta["sensor_fault_window"] = fault.get("window_id")
+    meta["sensor_fault_reason"] = "ground_sense_incoherent"
+
+
 # === Gatekeeper integration ===================================================
 
 
@@ -186,8 +214,7 @@ def _write_fragment_direct(
 
     path = root / f"{frag_id}.json"
     try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(fragment, f, indent=2)
+        atomic_write_json(path, fragment, indent=2, ensure_ascii=True)
         log_to_statusbox(f"[Fragments] Wrote fragment {frag_id} → {path}")
     except Exception as e:  # noqa: BLE001
         log_to_statusbox(f"[Fragments] FAILED to write fragment {frag_id}: {e}")
@@ -209,6 +236,7 @@ def store_fragment(fragment: Dict[str, Any], reason: str = "") -> Optional[Path]
     fragment.setdefault("tags", [])
     fragment.setdefault("importance", 0.0)
     fragment.setdefault("meta", {})
+    _apply_sensor_incoherence_tag(fragment)
 
     if "id" not in fragment:
         fragment["id"] = _make_fragment_id(f"frag_{fragment['type']}")

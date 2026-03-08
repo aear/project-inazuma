@@ -28,9 +28,9 @@ SHIFT_STEP = 0.25
 ROT_STEP_DEG = 2.0
 
 DETAIL_LEVELS = {
-    "Low": {"max_nodes": 4000, "max_edges": 12500, "show_edges": False},
-    "Medium": {"max_nodes": 8000, "max_edges": 25000, "show_edges": True},
-    "High": {"max_nodes": 12000, "max_edges": 50000, "show_edges": True},
+    "Low": {"max_nodes": 4000, "max_edges": 25000, "show_edges": False},
+    "Medium": {"max_nodes": 8000, "max_edges": 50000, "show_edges": True},
+    "High": {"max_nodes": 12000, "max_edges": 100000, "show_edges": True},
 }
 
 NETWORK_COLORS: Dict[str, Tuple[float, float, float]] = {

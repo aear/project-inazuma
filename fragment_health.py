@@ -66,72 +66,91 @@ def scan_fragment_integrity(
     Returns a summary dict suitable for publishing into inastate, or None
     if no fragments were found.
     """
-    root = Path("AI_Children") / child / "memory" / "fragments"
-    if not root.exists():
-        return None
+    def _scan() -> Optional[Dict[str, Any]]:
+        root = Path("AI_Children") / child / "memory" / "fragments"
+        if not root.exists():
+            return None
 
-    fragment_paths = sorted(root.rglob("frag_*.json"))
-    if not fragment_paths:
-        return {
+        fragment_paths = sorted(root.rglob("frag_*.json"))
+        if not fragment_paths:
+            return {
+                "child": child,
+                "scanned_at": _now_iso(),
+                "total_fragments_checked": 0,
+                "corrupted_count": 0,
+                "status": "empty",
+                "note": "No fragment files found to scan.",
+            }
+
+        total = 0
+        corrupted = 0
+        samples: List[Dict[str, Any]] = []
+
+        for path in fragment_paths:
+            if not path.is_file():
+                continue
+
+            total += 1
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    json.load(handle)
+            except Exception as exc:
+                corrupted += 1
+                if len(samples) < max_samples:
+                    try:
+                        stats = path.stat()
+                        size_bytes = stats.st_size
+                        modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
+                    except Exception:
+                        size_bytes = None
+                        modified = None
+
+                    samples.append(
+                        {
+                            "path": str(path),
+                            "filename": path.name,
+                            "tier": _tier_label(root, path),
+                            "error": str(exc),
+                            "size_bytes": size_bytes,
+                            "modified": modified,
+                            "preview": _preview_fragment(path, preview_chars),
+                            "recommendation": _recommend_action(str(exc), size_bytes),
+                        }
+                    )
+
+        summary: Dict[str, Any] = {
             "child": child,
             "scanned_at": _now_iso(),
-            "total_fragments_checked": 0,
-            "corrupted_count": 0,
-            "status": "empty",
-            "note": "No fragment files found to scan.",
+            "total_fragments_checked": total,
+            "corrupted_count": corrupted,
+            "status": "attention_needed" if corrupted else "ok",
         }
 
-    total = 0
-    corrupted = 0
-    samples: List[Dict[str, Any]] = []
+        if corrupted:
+            summary["corrupted_samples"] = samples
+            summary["sampled_count"] = len(samples)
+        else:
+            summary["note"] = "All scanned fragments loaded cleanly."
 
-    for path in fragment_paths:
-        if not path.is_file():
-            continue
+        return summary
 
-        total += 1
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                json.load(handle)
-        except Exception as exc:
-            corrupted += 1
-            if len(samples) < max_samples:
-                try:
-                    stats = path.stat()
-                    size_bytes = stats.st_size
-                    modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
-                except Exception:
-                    size_bytes = None
-                    modified = None
+    try:
+        from precision_requests import precision_request
+    except Exception:
+        precision_request = None
 
-                samples.append(
-                    {
-                        "path": str(path),
-                        "filename": path.name,
-                        "tier": _tier_label(root, path),
-                        "error": str(exc),
-                        "size_bytes": size_bytes,
-                        "modified": modified,
-                        "preview": _preview_fragment(path, preview_chars),
-                        "recommendation": _recommend_action(str(exc), size_bytes),
-                    }
-                )
+    if precision_request:
+        with precision_request(
+            task="integrity_check",
+            child=child,
+            ttl_sec=4.0,
+            reason="fragment_integrity_scan",
+            integrity_threat=True,
+            source="fragment_health",
+        ):
+            return _scan()
 
-    summary: Dict[str, Any] = {
-        "child": child,
-        "scanned_at": _now_iso(),
-        "total_fragments_checked": total,
-        "corrupted_count": corrupted,
-        "status": "attention_needed" if corrupted else "ok",
-    }
-
-    if corrupted:
-        summary["corrupted_samples"] = samples
-        summary["sampled_count"] = len(samples)
-    else:
-        summary["note"] = "All scanned fragments loaded cleanly."
-
-    return summary
+    return _scan()
 
 
 def main() -> None:

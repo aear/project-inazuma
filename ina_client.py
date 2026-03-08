@@ -76,6 +76,8 @@ class InaClient:
         self._world_bounds: Optional[tuple[float, float, float, float]] = None
         self._touch_last_key: Optional[tuple] = None
         self._touch_last_ts = 0.0
+        self._pose_last_key: Optional[tuple] = None
+        self._pose_last_ts = 0.0
 
     def connect(self) -> None:
         self._connect_once()
@@ -270,6 +272,7 @@ class InaClient:
                 pass
         if isinstance(pos, (list, tuple)) and len(pos) >= 3:
             self._update_world_touch(pos)
+            self._update_world_pose(pos, vel, yaw)
 
     def _mark_connected(self) -> None:
         self._connected_event.set()
@@ -453,7 +456,13 @@ class InaClient:
             add_contact("bounds_max_y", max_y - y)
 
         grounded = z <= threshold
-        key = (grounded, tuple((c["surface"], c["pressure"]) for c in contacts))
+        support_confidence = 1.0 - max(0.0, min(ground_dist / threshold, 1.0)) if grounded else 0.0
+        key = (
+            grounded,
+            round(max(0.0, ground_dist), 4),
+            round(support_confidence, 4),
+            tuple((c["surface"], c["pressure"]) for c in contacts),
+        )
         now = time.monotonic()
         if self._touch_last_key == key and (now - self._touch_last_ts) < 5.0:
             return
@@ -463,7 +472,57 @@ class InaClient:
             "touch_world",
             {
                 "grounded": grounded,
+                "ground_distance": round(max(0.0, ground_dist), 4),
+                "ground_surface": {
+                    "type": "solid_plane",
+                    "support": grounded,
+                    "solidity": round(support_confidence, 4),
+                },
                 "contacts": contacts,
+                "timestamp": _now_iso(),
+            },
+        )
+
+    def _update_world_pose(self, pos: list[Any], vel: Any, yaw: Any) -> None:
+        if update_inastate is None:
+            return
+        try:
+            x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        except Exception:
+            return
+
+        vx = vy = vz = 0.0
+        if isinstance(vel, (list, tuple)) and len(vel) >= 3:
+            try:
+                vx, vy, vz = float(vel[0]), float(vel[1]), float(vel[2])
+            except Exception:
+                vx = vy = vz = 0.0
+        try:
+            yaw_val = float(yaw) if yaw is not None else None
+        except Exception:
+            yaw_val = None
+
+        key = (
+            round(x, 3),
+            round(y, 3),
+            round(z, 3),
+            round(vx, 3),
+            round(vy, 3),
+            round(vz, 3),
+            round(yaw_val, 2) if yaw_val is not None else None,
+        )
+        now = time.monotonic()
+        if self._pose_last_key == key and (now - self._pose_last_ts) < 2.0:
+            return
+        self._pose_last_key = key
+        self._pose_last_ts = now
+        self._set_inastate(
+            "world_pose",
+            {
+                "entity": "ina",
+                "position": [round(x, 4), round(y, 4), round(z, 4)],
+                "velocity": [round(vx, 4), round(vy, 4), round(vz, 4)],
+                "yaw_deg": round(yaw_val, 2) if yaw_val is not None else None,
                 "timestamp": _now_iso(),
             },
         )

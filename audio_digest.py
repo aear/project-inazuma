@@ -16,6 +16,7 @@ from gui_hook import log_to_statusbox
 from fragmentation_engine import fragment_audio_digest
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from model_manager import load_config
+from io_utils import atomic_write_json
 
 try:  # optional meaning map hook
     from meaning_map import update_proto_word_stats  # type: ignore
@@ -662,8 +663,7 @@ def generate_fragment(clip_path, analysis, child=None, label="unknown"):
         legacy_dir = Path("AI_Children") / child / "memory" / "fragments"
         legacy_dir.mkdir(parents=True, exist_ok=True)
         legacy_path = legacy_dir / f"{frag.get('id', uuid.uuid4().hex)}.json"
-        with legacy_path.open("w", encoding="utf-8") as f:
-            json.dump(frag, f, indent=2)
+        atomic_write_json(legacy_path, frag, indent=2, ensure_ascii=True)
     except Exception as e:
         log_to_statusbox(f"[AudioDigest] Legacy fragment save failed: {e}")
 

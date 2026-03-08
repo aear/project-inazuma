@@ -1,11 +1,25 @@
 import os
 import platform
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 IS_WINDOWS = platform.system() == "Windows"
 STATUS_PIPE_PATH = r"\\.\pipe\ina_status" if IS_WINDOWS else "/tmp/ina_status.pipe"
+STATUS_LOG_PATH = Path(os.environ.get("INA_STATUS_LOG", "logs/ina_status.log"))
+
+def _write_disk_log(message: str) -> None:
+    try:
+        STATUS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with STATUS_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{timestamp} {message}\n")
+    except Exception:
+        # Avoid recursive logging failures
+        pass
 
 def log_to_statusbox(message: str):
+    _write_disk_log(message)
     print(message)
     try:
         if IS_WINDOWS:
@@ -33,6 +47,7 @@ def fallback_log(message: str):
     Fallback logging to stdout or a file if the pipe is unavailable.
     """
     print(f"[LogHook] Logging to fallback method: {message}")
+    _write_disk_log(message)
     try:
         with open("/tmp/ina_status_fallback.log", "a") as f:
             f.write(message + "\n")

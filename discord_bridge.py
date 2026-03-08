@@ -10,6 +10,10 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import asyncio
+try:
+    import fcntl  # type: ignore
+except Exception:
+    fcntl = None  # type: ignore
 
 import discord
 
@@ -77,6 +81,31 @@ IMAGE_ATTACHMENT_MIME_MAP = {
 }
 DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT = 4
+
+_DISCORD_BRIDGE_LOCK_HANDLE = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    if fcntl is None:
+        return True
+    child = get_current_child()
+    lock_path = Path("AI_Children") / child / "memory" / "discord_bridge.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        handle.write(str(os.getpid()))
+        handle.flush()
+    except Exception:
+        logger.exception("Failed to acquire discord bridge lock at %s", lock_path)
+        return True
+    global _DISCORD_BRIDGE_LOCK_HANDLE
+    _DISCORD_BRIDGE_LOCK_HANDLE = handle
+    return True
 
 
 def _load_discord_sinks():
@@ -231,6 +260,20 @@ def get_outbox_policy() -> dict:
 def get_current_child() -> str:
     cfg = load_root_config()
     return cfg.get("current_child", "Inazuma_Yagami") if isinstance(cfg, dict) else "Inazuma_Yagami"
+
+
+def _resolve_adjusted_urge_level(state: object) -> float:
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        base = float(state.get("level", 0.0))
+    except Exception:
+        base = 0.0
+    try:
+        adjusted = float(state.get("adjusted_level", base))
+    except Exception:
+        adjusted = base
+    return max(0.0, min(1.0, adjusted))
 
 
 def get_chat_adapter():
@@ -527,10 +570,7 @@ def process_inbound_message(msg) -> CommsResponse:
     except Exception:
         state = {}
     urge_state = state.get("urge_to_type") or state.get("urge_to_communicate") or {}
-    try:
-        urge_level = float(urge_state.get("level", 0.0))
-    except Exception:
-        urge_level = 0.0
+    urge_level = _resolve_adjusted_urge_level(urge_state)
     ignore_urge = bool(root_cfg.get("ignore_urge_for_typing", False)) if isinstance(root_cfg, dict) else False
     if not ignore_urge and urge_level < min_urge:
         return CommsResponse(
@@ -672,6 +712,7 @@ class InaDiscordClient(discord.Client):
         archive_override = self._outbox_policy.get("archive_path")
         self._typed_archive_path = Path(archive_override) if archive_override else child_memory / "typed_outbox_archive.jsonl"
         self._typed_outbox_seen = set()
+        self._typed_outbox_history_offset = 0
         self._load_outbox_history()
         self._typed_outbox_task = None
 
@@ -1025,6 +1066,7 @@ class InaDiscordClient(discord.Client):
     def _read_typed_outbox(self):
         if not self._typed_outbox_path.exists():
             return []
+        self._refresh_outbox_history()
         entries = []
         max_batch = int(self._outbox_policy.get("max_burst") or 0)
         max_age_minutes = float(self._outbox_policy.get("max_age_minutes") or 0.0)
@@ -1064,10 +1106,19 @@ class InaDiscordClient(discord.Client):
         return entries
 
     def _load_outbox_history(self) -> None:
+        self._typed_outbox_history_offset = 0
+        self._refresh_outbox_history()
+
+    def _refresh_outbox_history(self) -> None:
         if not self._typed_outbox_history_path.exists():
+            self._typed_outbox_history_offset = 0
             return
         try:
+            size = self._typed_outbox_history_path.stat().st_size
+            if size < self._typed_outbox_history_offset:
+                self._typed_outbox_history_offset = 0
             with self._typed_outbox_history_path.open("r", encoding="utf-8") as fh:
+                fh.seek(self._typed_outbox_history_offset)
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -1079,8 +1130,9 @@ class InaDiscordClient(discord.Client):
                     entry_id = str(entry.get("id") or entry.get("entry_id") or "")
                     if entry_id:
                         self._typed_outbox_seen.add(entry_id)
+                self._typed_outbox_history_offset = fh.tell()
         except Exception:
-            logger.exception("Failed to load typed outbox history from %s", self._typed_outbox_history_path)
+            logger.exception("Failed to refresh typed outbox history from %s", self._typed_outbox_history_path)
 
     def _log_outbox_history(self, entry_id: str, status: str, *, reason: Optional[str] = None) -> None:
         if not entry_id:
@@ -1513,6 +1565,9 @@ def get_discord_token() -> str:
 
 
 def main() -> None:
+    if not _acquire_single_instance_lock():
+        logger.error("discord_bridge already running; exiting duplicate instance.")
+        return
     # Python 3.12+ does not create a default event loop; set one explicitly
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

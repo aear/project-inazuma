@@ -327,10 +327,11 @@ class PrecisionWindow(tk.Tk):
         """
         Save the precision settings to a JSON file and close the window.
         """
-        config = {
-            "software_simulation": self.software_var.get(),
-            "max_precision": self.max_precision_var.get()
-        }
+        config = load_precision_config()
+        if not isinstance(config, dict):
+            config = {}
+        config["software_simulation"] = self.software_var.get()
+        config["max_precision"] = self.max_precision_var.get()
         save_precision_config(config)
         messagebox.showinfo(
             "Settings Saved",

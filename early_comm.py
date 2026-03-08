@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from gui_hook import log_to_statusbox
+from io_utils import atomic_write_json
 from language_processing import (
     associate_symbol_with_word,
     backprop_symbol_confidence,
@@ -42,6 +43,20 @@ def _normalize_symbol_map(raw):
 def _proto_confidence(uses: int, base: float = 0.2) -> float:
     uses = max(1, int(uses))
     return round(min(0.9, base + math.log1p(uses) / 5.0), 3)
+
+
+def _resolve_adjusted_urge_level(state: Any) -> float:
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        base = float(state.get("level", 0.0))
+    except Exception:
+        base = 0.0
+    try:
+        adjusted = float(state.get("adjusted_level", base))
+    except Exception:
+        adjusted = base
+    return max(0.0, min(1.0, adjusted))
 
 
 def _ensure_vocab_embeddings(vocab_map: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
@@ -1082,8 +1097,7 @@ def create_expression_fragment(
     if symbol_embedding:
         frag["symbol_embedding"] = symbol_embedding
 
-    with open(frag_path, "w", encoding="utf-8") as f:
-        json.dump(frag, f, indent=4)
+    atomic_write_json(frag_path, frag, indent=4, ensure_ascii=True)
 
     print(f"[Comms] Expression saved: {frag_id}")
     return frag
@@ -1193,18 +1207,12 @@ def early_communicate():
 
     min_urge_to_speak = float(config.get("min_urge_to_speak", 0.25))
     voice_urge_state = get_inastate("urge_to_voice") or get_inastate("urge_to_communicate") or {}
-    try:
-        voice_urge_level = float(voice_urge_state.get("level", 0.0))
-    except Exception:
-        voice_urge_level = 0.0
+    voice_urge_level = _resolve_adjusted_urge_level(voice_urge_state)
     allow_speech = voice_urge_level >= min_urge_to_speak or bool(config.get("ignore_urge_for_speech", False))
     min_urge_to_type = float(config.get("min_urge_to_type", 0.35))
     type_contact_cooldown = int(config.get("type_contact_cooldown", TYPE_CONTACT_COOLDOWN))
     type_urge_state = get_inastate("urge_to_type") or {}
-    try:
-        type_urge_level = float(type_urge_state.get("level", 0.0))
-    except Exception:
-        type_urge_level = 0.0
+    type_urge_level = _resolve_adjusted_urge_level(type_urge_state)
     last_typed_contact = get_inastate("last_typed_contact")
     since_last_typed = (time.time() - last_typed_contact) if last_typed_contact else None
     allow_high_trust_dm = bool(config.get("allow_high_trust_dm", True))

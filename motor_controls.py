@@ -346,9 +346,20 @@ def motor_feedback_to_touch(feedback: MotorFeedback) -> Dict[str, Any]:
             {"region": "left_foot", "pressure": round(pressure, 4)},
             {"region": "right_foot", "pressure": round(pressure, 4)},
         ]
+    standing_still = (
+        grounded
+        and movement < 0.03
+        and abs(feedback.vertical_speed) < 0.03
+        and abs(feedback.turn_rate) < 6.0
+    )
+    stance = "standing_still" if standing_still else ("moving_grounded" if grounded else "airborne")
+    surface_solidity = clamp((0.75 * pressure) + (0.25 * (1.0 - impact)), 0.0, 1.0) if grounded else 0.0
     return {
         "grounded": grounded,
         "foot_pressure": round(pressure, 4),
+        "support_surface": "solid" if grounded else "none",
+        "surface_solidity": round(surface_solidity, 4),
+        "stance": stance,
         "movement": round(movement, 4),
         "impact": round(impact, 4),
         "sway": round(sway, 4),
