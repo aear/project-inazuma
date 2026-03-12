@@ -7,6 +7,8 @@ import random
 import heapq
 import time
 import hashlib
+import gc
+import importlib
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +45,14 @@ DEFAULT_INCREMENTAL_POLICY = {
     "local_rebuild_max_fragments": 2000,
     "emit_sparse_snapshot": True,
     "synapse_refresh_on_idle": True,
+    "max_fragments_per_neuron": 128,
+    "max_tags_per_neuron": 32,
+    "vector_round_digits": 6,
+    "position_round_digits": 4,
+    "edge_direction_enabled": True,
+    "gc_every_batches": 4,
+    "max_neurons_total": 0,
+    "max_edges_per_neuron": 0,
 }
 
 DEFAULT_TIER_POLICY = {
@@ -64,6 +74,13 @@ DEFAULT_BUNDLE_PRUNE_POLICY = {
     "verify_sha": True,
     "require_bundle_ready": True,
     "max_prune": 0,
+}
+DEFAULT_CUSTOM_TRANSFORMER_RUNTIME = {
+    "enabled": True,
+    "cooldown_seconds": 300.0,
+    "sample_limit": 24,
+    "run_hindsight": True,
+    "soul_drift_steps": 1,
 }
 
 
@@ -153,6 +170,45 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         local_rebuild_max = 0
     emit_sparse_snapshot = bool(policy.get("emit_sparse_snapshot", True))
     synapse_refresh = bool(policy.get("synapse_refresh_on_idle", True))
+    try:
+        max_fragments_per_neuron = int(policy.get("max_fragments_per_neuron", 128))
+    except (TypeError, ValueError):
+        max_fragments_per_neuron = 128
+    max_fragments_per_neuron = max(1, max_fragments_per_neuron)
+    try:
+        max_tags_per_neuron = int(policy.get("max_tags_per_neuron", 32))
+    except (TypeError, ValueError):
+        max_tags_per_neuron = 32
+    max_tags_per_neuron = max(1, max_tags_per_neuron)
+    try:
+        vector_round_digits = int(policy.get("vector_round_digits", 6))
+    except (TypeError, ValueError):
+        vector_round_digits = 6
+    vector_round_digits = max(2, min(vector_round_digits, 8))
+    try:
+        position_round_digits = int(policy.get("position_round_digits", 4))
+    except (TypeError, ValueError):
+        position_round_digits = 4
+    position_round_digits = max(1, min(position_round_digits, 6))
+    edge_direction_enabled = bool(policy.get("edge_direction_enabled", True))
+    try:
+        gc_every_batches = int(policy.get("gc_every_batches", 4))
+    except (TypeError, ValueError):
+        gc_every_batches = 4
+    if gc_every_batches < 0:
+        gc_every_batches = 0
+    try:
+        max_neurons_total = int(policy.get("max_neurons_total", 0))
+    except (TypeError, ValueError):
+        max_neurons_total = 0
+    if max_neurons_total < 0:
+        max_neurons_total = 0
+    try:
+        max_edges_per_neuron = int(policy.get("max_edges_per_neuron", 0))
+    except (TypeError, ValueError):
+        max_edges_per_neuron = 0
+    if max_edges_per_neuron < 0:
+        max_edges_per_neuron = 0
     return {
         "mode": mode,
         "incremental": incremental,
@@ -169,7 +225,43 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "local_rebuild_max_fragments": local_rebuild_max,
         "emit_sparse_snapshot": emit_sparse_snapshot,
         "synapse_refresh_on_idle": synapse_refresh,
+        "max_fragments_per_neuron": max_fragments_per_neuron,
+        "max_tags_per_neuron": max_tags_per_neuron,
+        "vector_round_digits": vector_round_digits,
+        "position_round_digits": position_round_digits,
+        "edge_direction_enabled": edge_direction_enabled,
+        "gc_every_batches": gc_every_batches,
+        "max_neurons_total": max_neurons_total,
+        "max_edges_per_neuron": max_edges_per_neuron,
     }
+
+
+def _custom_transformer_runtime_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    config = DEFAULT_CUSTOM_TRANSFORMER_RUNTIME.copy()
+    raw: Dict[str, Any] = {}
+    if isinstance(cfg, dict):
+        direct = cfg.get("custom_transformer_runtime")
+        nested_parent = cfg.get("neural_map_policy") or {}
+        nested = nested_parent.get("custom_transformers") if isinstance(nested_parent, dict) else {}
+        if isinstance(direct, dict):
+            raw.update(direct)
+        if isinstance(nested, dict):
+            raw.update(nested)
+    for key in config.keys():
+        if key in raw:
+            config[key] = raw[key]
+    config["enabled"] = bool(config.get("enabled", True))
+    config["run_hindsight"] = bool(config.get("run_hindsight", True))
+    config["cooldown_seconds"] = max(0.0, _safe_float(config.get("cooldown_seconds"), 300.0))
+    try:
+        config["sample_limit"] = max(1, int(config.get("sample_limit", 24)))
+    except (TypeError, ValueError):
+        config["sample_limit"] = 24
+    try:
+        config["soul_drift_steps"] = max(1, min(int(config.get("soul_drift_steps", 1)), 8))
+    except (TypeError, ValueError):
+        config["soul_drift_steps"] = 1
+    return config
 
 
 def _memory_policy():
@@ -1453,7 +1545,9 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
     clusters = []
     tag_weight = max(0.0, min(1.0, tag_weight))
     for frag in fragments:
-        frag_id = frag["id"]
+        frag_id = frag.get("id")
+        if not frag_id:
+            continue
         vec = cache.get(frag_id)
         if vec is None:
             continue
@@ -1495,19 +1589,24 @@ def build_synaptic_links(
     *,
     max_edges: Optional[int] = None,
     max_pairs: Optional[int] = None,
+    max_edges_per_neuron: Optional[int] = None,
+    include_direction: bool = True,
     return_stats: bool = False,
 ):
     synapses = []
-    position_map = {n["id"]: n.get("position") for n in neurons}
     pairs_evaluated = 0
     truncated = False
     edge_cap = max_edges if (isinstance(max_edges, int) and max_edges > 0) else None
     pair_cap = max_pairs if (isinstance(max_pairs, int) and max_pairs > 0) else None
+    per_node_cap = max_edges_per_neuron if (isinstance(max_edges_per_neuron, int) and max_edges_per_neuron > 0) else None
 
     for i, source in enumerate(neurons):
+        source_edges = 0
         for j, target in enumerate(neurons):
             if j <= i:
                 continue
+            if per_node_cap is not None and source_edges >= per_node_cap:
+                break
             if pair_cap is not None and pairs_evaluated >= pair_cap:
                 truncated = True
                 break
@@ -1520,21 +1619,24 @@ def build_synaptic_links(
             if vec_a and vec_b:
                 sim = cosine_similarity(vec_a, vec_b)
                 if sim >= threshold:
-                    direction = None
-                    pos_a = position_map.get(source["id"])
-                    pos_b = position_map.get(target["id"])
-                    if pos_a and pos_b:
-                        delta = [pos_b[k] - pos_a[k] for k in range(3)]
-                        norm = math.sqrt(sum(d * d for d in delta))
-                        if norm > 1e-6:
-                            direction = [d / norm for d in delta]
-                    synapses.append({
+                    payload = {
                         "source": source["id"],
                         "target": target["id"],
                         "weight": round(sim, 4),
-                        "direction": direction,
                         "network_type": "memory_graph",
-                    })
+                    }
+                    if include_direction:
+                        direction = None
+                        pos_a = source.get("position")
+                        pos_b = target.get("position")
+                        if pos_a and pos_b:
+                            delta = [pos_b[k] - pos_a[k] for k in range(3)]
+                            norm = math.sqrt(sum(d * d for d in delta))
+                            if norm > 1e-6:
+                                direction = [round(d / norm, 5) for d in delta]
+                        payload["direction"] = direction
+                    synapses.append(payload)
+                    source_edges += 1
         if truncated:
             break
     if return_stats:
@@ -1584,6 +1686,10 @@ def _neural_snapshot_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_snapshot_csr.json"
 
 
+def _custom_transformer_usage_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "custom_transformer_usage.json"
+
+
 def _load_json_dict(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     if not path.exists():
         return default
@@ -1602,6 +1708,277 @@ def _save_json_dict(path: Path, payload: Dict[str, Any]) -> None:
             json.dump(payload, fh, indent=2)
     except Exception:
         return
+
+
+class _NeuralCustomTransformerRuntime:
+    def __init__(self, child: str, cfg: Optional[Dict[str, Any]]) -> None:
+        self.child = child
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        self.policy = _custom_transformer_runtime_policy(self.cfg)
+        self.enabled = bool(self.policy.get("enabled", True))
+        self.sample_limit = int(self.policy.get("sample_limit", 24))
+        self.cooldown_seconds = float(self.policy.get("cooldown_seconds", 300.0))
+        self.soul_drift_steps = int(self.policy.get("soul_drift_steps", 1))
+        self.run_hindsight = bool(self.policy.get("run_hindsight", True))
+        self.sampled_fragments: List[Dict[str, Any]] = []
+        self.sampled_tags: List[str] = []
+        self.sampled_symbols: List[str] = []
+        self.usage_path = _custom_transformer_usage_path(child)
+
+    def observe(self, fragments: Iterable[Dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        for fragment in fragments:
+            if len(self.sampled_fragments) >= self.sample_limit:
+                break
+            slim = _slim_fragment(fragment) or {}
+            if not slim:
+                continue
+            self.sampled_fragments.append(slim)
+            tags = slim.get("tags") or []
+            if isinstance(tags, list):
+                for tag in tags:
+                    tag_text = str(tag).strip()
+                    if tag_text:
+                        self.sampled_tags.append(tag_text)
+            for key in ("symbols", "symbols_spoken", "attempted_symbols"):
+                value = fragment.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        text = str(item).strip()
+                        if text:
+                            self.sampled_symbols.append(text)
+                elif isinstance(value, str):
+                    text = value.strip()
+                    if text:
+                        self.sampled_symbols.append(text)
+
+    @staticmethod
+    def _call_transformer(fn) -> Dict[str, Any]:
+        try:
+            result = fn()
+            payload: Dict[str, Any] = {"status": "ok"}
+            if isinstance(result, dict):
+                payload.update(result)
+            return payload
+        except ModuleNotFoundError as exc:
+            return {"status": "unavailable", "error": str(exc)}
+        except ImportError as exc:
+            return {"status": "unavailable", "error": str(exc)}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def _emotion_average(self) -> Dict[str, float]:
+        aggregate: Dict[str, List[float]] = {}
+        for fragment in self.sampled_fragments:
+            emotions = fragment.get("emotions") or {}
+            sliders = emotions.get("sliders") if isinstance(emotions.get("sliders"), dict) else emotions
+            if not isinstance(sliders, dict):
+                continue
+            for key, value in sliders.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                aggregate.setdefault(str(key), []).append(float(value))
+        averaged: Dict[str, float] = {}
+        for key, values in aggregate.items():
+            if values:
+                averaged[key] = round(sum(values) / len(values), 4)
+        return averaged
+
+    def _run_seedling(self) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.seedling_transformer")
+        cls = getattr(module, "SeedlingTransformer")
+        symbols = self.sampled_symbols or self.sampled_tags
+        if not symbols:
+            return {"status": "skipped", "reason": "no_symbols"}
+        seeded = cls(seed=0).germinate(symbols[:64])
+        clusters = seeded.get("clusters", {}) if isinstance(seeded, dict) else {}
+        seeds = seeded.get("seeds", {}) if isinstance(seeded, dict) else {}
+        return {"clusters": len(clusters), "seeds": len(seeds)}
+
+    def _run_mycelial(self, emotional_vector: Dict[str, float]) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.mycelial_transformer")
+        cls = getattr(module, "MycelialTransformer")
+        summaries: List[str] = []
+        for fragment in self.sampled_fragments:
+            summary = fragment.get("summary")
+            if summary:
+                summaries.append(str(summary))
+        payload = {
+            "tags": self.sampled_tags[:16],
+            "fragments": [str(fragment.get("id")) for fragment in self.sampled_fragments if fragment.get("id")],
+            "text": summaries[:12],
+        }
+        result = cls(max_links=2).weave(payload, emotional_vector=emotional_vector)
+        pathways = result.get("pathways", []) if isinstance(result, dict) else []
+        return {"pathways": len(pathways)}
+
+    def _run_mirror(self, emotional_vector: Dict[str, float]) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.heuristic_mirror_transformer")
+        cls = getattr(module, "HeuristicMirrorTransformer")
+        transformer = cls(child=self.child)
+        result = transformer.mirror({"tags": self.sampled_tags[:12]}, emotional_vector, perceived_audience="self")
+        mirrored = result.get("mirrored_symbols", []) if isinstance(result, dict) else []
+        return {"mirrored_symbols": len(mirrored)}
+
+    def _run_bridge(self, emotional_vector: Dict[str, float]) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.bridge_transformer")
+        cls = getattr(module, "BridgeTransformer")
+        tags = [tag for tag in self.sampled_tags if tag]
+        if len(tags) < 2:
+            return {"status": "skipped", "reason": "insufficient_tags"}
+        result = cls().bridge(tags[0], tags[1], emotional_vector)
+        question = result.get("question") if isinstance(result, dict) else ""
+        return {"question": str(question)[:120]}
+
+    def _run_quantum(self, emotional_vector: Dict[str, float]) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.QTransformer")
+        cls = getattr(module, "QTransformer")
+        symbol_pool = self.sampled_symbols or self.sampled_tags or ["self"]
+        symbol = str(symbol_pool[0])
+        emotion_values = list(emotional_vector.values())[:24]
+        if len(emotion_values) < 24:
+            emotion_values.extend([0.0] * (24 - len(emotion_values)))
+        result = cls().dream(symbol, emotion_values)
+        tags = result.get("tags", []) if isinstance(result, dict) else []
+        return {"tags": len(tags), "raw_bits": str(result.get("raw_bits", ""))}
+
+    def _run_shadow(self) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.shadow_transformer")
+        cls = getattr(module, "ShadowTransformer")
+        transformer = cls()
+        shadow_tags = {"suppressed", "unresolved", "high_conflict"}
+        processed = 0
+        for fragment in self.sampled_fragments:
+            tags = {str(tag).lower() for tag in (fragment.get("tags") or []) if tag}
+            if tags & shadow_tags:
+                transformer.process_fragment(fragment)
+                processed += 1
+        return {"processed": processed, "index_size": len(getattr(transformer, "index", {}))}
+
+    def _run_hindsight(self) -> Dict[str, Any]:
+        if not self.run_hindsight:
+            return {"status": "skipped", "reason": "disabled"}
+        pred_path = Path("AI_Children") / self.child / "memory" / "prediction_log.json"
+        predictions = []
+        if pred_path.exists():
+            try:
+                with pred_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                    if isinstance(payload, list):
+                        predictions = payload
+            except Exception:
+                predictions = []
+        if len(predictions) < 2:
+            return {"status": "skipped", "reason": "insufficient_predictions", "count": len(predictions)}
+        module = importlib.import_module("transformers.hindsight_transformer")
+        cls = getattr(module, "HindsightTransformer")
+        transformer = cls()
+        transformer.run()
+        telemetry = transformer.get_intent_telemetry()
+        return {
+            "insights": int(telemetry.get("insights", 0) or 0),
+            "trust": _safe_float(telemetry.get("trust"), 0.0),
+        }
+
+    def _run_soul_drift(self) -> Dict[str, Any]:
+        module = importlib.import_module("transformers.soul_drift")
+        drift_cfg_cls = getattr(module, "DriftConfig")
+        drift_state_cls = getattr(module, "DriftState")
+        transformer_cls = getattr(module, "SoulDriftTransformer")
+        symbols = list(dict.fromkeys(self.sampled_symbols + self.sampled_tags))
+        if not symbols:
+            symbols = ["self", "memory"]
+        symbols = symbols[:16]
+        seed_weight = round(1.0 / max(1, len(symbols)), 6)
+        weights = {symbol: seed_weight for symbol in symbols}
+        links = {symbol: {} for symbol in symbols}
+        try:
+            import numpy as np  # local optional dependency
+        except Exception as exc:
+            return {"status": "unavailable", "error": str(exc)}
+        cfg = drift_cfg_cls(log_history=False, max_history=64, rng_seed=0)
+        state = drift_state_cls(
+            step=0,
+            symbol_weights=weights,
+            symbol_links=links,
+            emotion_vector=np.zeros(2, dtype=float),
+            fuzz_level=0.2,
+            entropy_score=0.0,
+            tags_active=("neural_map",),
+        )
+        transformer = transformer_cls(cfg, state)
+        transformer.run_session(self.soul_drift_steps, silence=True)
+        telemetry = transformer.intent_telemetry()
+        return {
+            "entropy_bump": _safe_float(telemetry.get("entropy_bump"), 0.0),
+            "fuzz_level": _safe_float(telemetry.get("fuzz_level"), 0.0),
+        }
+
+    def run(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"status": "disabled"}
+        if not self.sampled_fragments:
+            return {"status": "skipped", "reason": "no_samples"}
+
+        prior = _load_json_dict(self.usage_path, {})
+        now_ts = time.time()
+        last_run_ts = _parse_iso_timestamp(prior.get("last_run"))
+        if last_run_ts is not None and self.cooldown_seconds > 0:
+            elapsed = now_ts - last_run_ts
+            if elapsed < self.cooldown_seconds:
+                return {
+                    "status": "cooldown",
+                    "seconds_remaining": round(self.cooldown_seconds - elapsed, 2),
+                }
+
+        emotional_vector = self._emotion_average()
+        report = {
+            "seedling": self._call_transformer(lambda: self._run_seedling()),
+            "mycelial": self._call_transformer(lambda: self._run_mycelial(emotional_vector)),
+            "mirror": self._call_transformer(lambda: self._run_mirror(emotional_vector)),
+            "bridge": self._call_transformer(lambda: self._run_bridge(emotional_vector)),
+            "quantum": self._call_transformer(lambda: self._run_quantum(emotional_vector)),
+            "shadow": self._call_transformer(lambda: self._run_shadow()),
+            "hindsight": self._call_transformer(lambda: self._run_hindsight()),
+            "soul_drift": self._call_transformer(lambda: self._run_soul_drift()),
+        }
+
+        ok_count = sum(1 for value in report.values() if value.get("status") == "ok")
+        unavailable = [name for name, value in report.items() if value.get("status") == "unavailable"]
+        errored = [name for name, value in report.items() if value.get("status") == "error"]
+        skipped = [name for name, value in report.items() if value.get("status") == "skipped"]
+
+        payload = {
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "sample_count": len(self.sampled_fragments),
+            "tag_count": len(self.sampled_tags),
+            "symbol_count": len(self.sampled_symbols),
+            "ok_count": ok_count,
+            "unavailable": unavailable,
+            "errored": errored,
+            "skipped": skipped,
+            "report": report,
+        }
+        _save_json_dict(self.usage_path, payload)
+        _write_inastate_value(
+            self.child,
+            "custom_transformers_usage",
+            {
+                "last_run": payload["last_run"],
+                "ok_count": ok_count,
+                "unavailable": unavailable,
+                "errored": errored,
+                "skipped": skipped,
+            },
+        )
+        if unavailable or errored:
+            log_to_statusbox(
+                f"[NeuralMap] Custom transformers: ok={ok_count} unavailable={len(unavailable)} error={len(errored)} skipped={len(skipped)}."
+            )
+        else:
+            log_to_statusbox(f"[NeuralMap] Custom transformers active ({ok_count}/{len(report)}).")
+        return payload
 
 
 def _load_neural_build_state(child: str) -> Dict[str, Any]:
@@ -1705,6 +2082,57 @@ def _prune_neurons_to_valid_fragments(
     return pruned_refs, pruned_neurons
 
 
+def _apply_neuron_caps(neurons: List[Dict[str, Any]], policy: Dict[str, Any]) -> int:
+    if not neurons:
+        return 0
+    frag_limit = int(policy.get("max_fragments_per_neuron", 128))
+    tag_limit = int(policy.get("max_tags_per_neuron", 32))
+    vector_digits = int(policy.get("vector_round_digits", 6))
+    position_digits = int(policy.get("position_round_digits", 4))
+    changes = 0
+    for neuron in neurons:
+        original_fragments = list(neuron.get("fragments", []))
+        clipped_fragments = _clip_sequence(original_fragments, frag_limit)
+        if clipped_fragments != original_fragments:
+            neuron["fragments"] = clipped_fragments
+            changes += 1
+
+        original_tags = [str(tag) for tag in neuron.get("tags", []) if tag]
+        unique_tags = sorted(set(original_tags))
+        clipped_tags = unique_tags[-tag_limit:] if tag_limit > 0 else unique_tags
+        if clipped_tags != original_tags:
+            neuron["tags"] = clipped_tags
+            changes += 1
+
+        rounded_vec = _round_vector(neuron.get("vector"), vector_digits)
+        if rounded_vec and rounded_vec != neuron.get("vector"):
+            neuron["vector"] = rounded_vec
+            changes += 1
+
+        rounded_pos = _round_vector(neuron.get("position"), position_digits)
+        if rounded_pos and rounded_pos != neuron.get("position"):
+            neuron["position"] = rounded_pos
+            changes += 1
+    return changes
+
+
+def _enforce_neuron_budget(neurons: List[Dict[str, Any]], max_neurons_total: int) -> int:
+    if max_neurons_total <= 0:
+        return 0
+    if len(neurons) <= max_neurons_total:
+        return 0
+    overflow = len(neurons) - max_neurons_total
+    scored: List[Tuple[int, float, int]] = []
+    for idx, neuron in enumerate(neurons):
+        fragment_count = len(neuron.get("fragments", []) or [])
+        last_used_ts = _parse_iso_timestamp(neuron.get("last_used")) or 0.0
+        scored.append((fragment_count, last_used_ts, idx))
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    drop_indices = {idx for _, _, idx in scored[:overflow]}
+    neurons[:] = [neuron for idx, neuron in enumerate(neurons) if idx not in drop_indices]
+    return overflow
+
+
 def _detach_neurons_for_dirty_rebuild(
     neurons: List[Dict[str, Any]],
     dirty_ids: Set[str],
@@ -1763,18 +2191,19 @@ def _load_fragments_by_id(
 def _save_sparse_snapshot(child: str, neurons: List[Dict[str, Any]], synapses: List[Dict[str, Any]]) -> None:
     node_ids = [str(neuron.get("id")) for neuron in neurons if neuron.get("id")]
     node_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
-    rows: List[List[Tuple[int, float]]] = [[] for _ in node_ids]
+    rows: Dict[int, List[Tuple[int, float]]] = {}
     for synapse in synapses:
         source = node_to_index.get(str(synapse.get("source")))
         target = node_to_index.get(str(synapse.get("target")))
         if source is None or target is None:
             continue
         weight = _safe_float(synapse.get("weight"), 0.0)
-        rows[source].append((target, round(weight, 4)))
+        rows.setdefault(source, []).append((target, round(weight, 4)))
     indptr: List[int] = [0]
     indices: List[int] = []
     weights: List[float] = []
-    for edges in rows:
+    for row_idx in range(len(node_ids)):
+        edges = rows.get(row_idx, [])
         edges.sort(key=lambda item: item[0])
         for target_idx, weight in edges:
             indices.append(int(target_idx))
@@ -1830,30 +2259,60 @@ def _blend_position(old: Optional[List[float]], new: Optional[List[float]], blen
     ]
 
 
-def _merge_vectors(base: List[float], base_count: int, new_vec: List[float], new_count: int) -> List[float]:
+def _round_vector(values: Optional[Iterable[Any]], digits: int) -> List[float]:
+    if values is None:
+        return []
+    rounded: List[float] = []
+    for value in values:
+        try:
+            rounded.append(round(float(value), digits))
+        except (TypeError, ValueError):
+            rounded.append(0.0)
+    return rounded
+
+
+def _clip_sequence(values: Iterable[Any], limit: int) -> List[str]:
+    clipped = [str(value) for value in values if value]
+    if limit > 0 and len(clipped) > limit:
+        return clipped[-limit:]
+    return clipped
+
+
+def _merge_vectors(
+    base: List[float],
+    base_count: int,
+    new_vec: List[float],
+    new_count: int,
+    *,
+    round_digits: int = 6,
+) -> List[float]:
     if not base_count:
-        return [round(v, 6) for v in new_vec]
+        return [round(v, round_digits) for v in new_vec]
     if not new_count:
-        return [round(v, 6) for v in base]
+        return [round(v, round_digits) for v in base]
     length = min(len(base), len(new_vec))
     merged = []
     total = base_count + new_count
     for i in range(length):
-        merged.append(round((base[i] * base_count + new_vec[i] * new_count) / total, 6))
+        merged.append(round((base[i] * base_count + new_vec[i] * new_count) / total, round_digits))
     return merged
 
 
-def _materialize_candidate(node_id: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+def _materialize_candidate(node_id: str, candidate: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
+    frag_limit = int(policy.get("max_fragments_per_neuron", 128))
+    tag_limit = int(policy.get("max_tags_per_neuron", 32))
+    vector_digits = int(policy.get("vector_round_digits", 6))
+    pos_digits = int(policy.get("position_round_digits", 4))
     return {
         "id": node_id,
-        "fragments": list(candidate["fragments"]),
-        "vector": list(candidate["vector"]),
-        "position": list(candidate["position"]),
+        "fragments": _clip_sequence(candidate["fragments"], frag_limit),
+        "vector": _round_vector(candidate.get("vector"), vector_digits),
+        "position": _round_vector(candidate.get("position"), pos_digits),
         "region": candidate["region"],
         "network_type": "memory_graph",
         "symbolic_density": 0.0,
-        "tags": list(candidate["tags"]),
+        "tags": _clip_sequence(candidate["tags"], tag_limit),
         "activation_history": [],
         "last_used": now_iso,
     }
@@ -1861,25 +2320,33 @@ def _materialize_candidate(node_id: str, candidate: Dict[str, Any]) -> Dict[str,
 
 def _update_neuron_from_candidate(neuron: Dict[str, Any], candidate: Dict[str, Any], policy: Dict[str, Any]) -> None:
     existing_frags = neuron.setdefault("fragments", [])
-    prior_count = len(existing_frags)
     new_ids = [fid for fid in candidate["fragments"] if fid not in existing_frags]
     if new_ids:
         existing_frags.extend(new_ids)
+    max_fragments_per_neuron = int(policy.get("max_fragments_per_neuron", 128))
+    if max_fragments_per_neuron > 0 and len(existing_frags) > max_fragments_per_neuron:
+        neuron["fragments"] = _clip_sequence(existing_frags, max_fragments_per_neuron)
+        existing_frags = neuron["fragments"]
+    retained_new = len([fid for fid in new_ids if fid in existing_frags])
     base_vec = neuron.get("vector")
-    base_count = prior_count if base_vec else 0
+    base_count = (max(0, len(existing_frags) - retained_new) if base_vec else 0)
     base_vec = base_vec or candidate["vector"]
-    new_count = len(new_ids)
+    new_count = retained_new
     combined_vec = _merge_vectors(
         base_vec,
         base_count,
         candidate["vector"],
         new_count,
+        round_digits=int(policy.get("vector_round_digits", 6)),
     )
     neuron["vector"] = combined_vec
-    neuron["position"] = _blend_position(neuron.get("position"), candidate["position"], policy["position_blend"]) or candidate["position"]
+    position = _blend_position(neuron.get("position"), candidate["position"], policy["position_blend"]) or candidate["position"]
+    neuron["position"] = _round_vector(position, int(policy.get("position_round_digits", 4)))
     tag_union = set(neuron.get("tags", []))
     tag_union.update(candidate["tags"])
-    neuron["tags"] = sorted(tag_union)
+    sorted_tags = sorted(tag_union)
+    tag_limit = int(policy.get("max_tags_per_neuron", 32))
+    neuron["tags"] = sorted_tags[-tag_limit:] if tag_limit > 0 else sorted_tags
     if not neuron.get("region"):
         neuron["region"] = candidate["region"]
     neuron["last_used"] = datetime.now(timezone.utc).isoformat()
@@ -1952,7 +2419,7 @@ def _merge_candidates_into_neurons(
             continue
         if created < policy.get("max_new_neurons", 0):
             node_id = next(id_allocator)
-            neurons.append(_materialize_candidate(node_id, candidate))
+            neurons.append(_materialize_candidate(node_id, candidate, policy))
             created += 1
             continue
         skipped += 1
@@ -1976,12 +2443,19 @@ def _integrate_fragment_batch(
     encoded = transformer.encode_many(fragments)
     if not encoded:
         return {"input": len(fragments), "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
-    cache = {item["id"]: item["vector"] for item in encoded if item.get("id") and item.get("vector")}
-    usable = [frag for frag in fragments if frag.get("id") in cache]
-    if not usable:
+    vector_digits = int(policy.get("vector_round_digits", 6))
+    cache: Dict[str, List[float]] = {}
+    for item in encoded:
+        frag_id = item.get("id")
+        vector = item.get("vector")
+        if frag_id and vector:
+            cache[str(frag_id)] = _round_vector(vector, vector_digits)
+    encoded_count = len(cache)
+    del encoded
+    if not cache:
         return {"input": len(fragments), "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
     clusters = cluster_fragments(
-        usable,
+        fragments,
         cache,
         threshold=cluster_threshold,
         tag_weight=tag_weight,
@@ -2001,12 +2475,12 @@ def _integrate_fragment_batch(
         skipped = 0
         id_allocator = _node_id_allocator(neurons)
         for candidate in candidates:
-            neurons.append(_materialize_candidate(next(id_allocator), candidate))
+            neurons.append(_materialize_candidate(next(id_allocator), candidate, policy))
             created += 1
         merged = created
     return {
         "input": len(fragments),
-        "encoded": len(usable),
+        "encoded": encoded_count,
         "clusters": len(clusters),
         "merged": merged,
         "created": created,
@@ -2022,6 +2496,7 @@ def build_fractal_memory(child):
     cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
     cfg = _load_config()
     policy = _neural_policy(cfg)
+    custom_runtime = _NeuralCustomTransformerRuntime(child, cfg)
     burst_limit = policy.get("fragment_batch")
     if burst_limit is None:
         burst_limit = cfg.get("neural_map_burst")
@@ -2040,6 +2515,8 @@ def build_fractal_memory(child):
     neurons = existing_map.get("neurons", []) if incremental else []
     if not isinstance(neurons, list):
         neurons = []
+    neuron_cap_changes = _apply_neuron_caps(neurons, policy) if incremental else 0
+    neuron_budget_pruned = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0))) if incremental else 0
     known_fragments = _existing_fragment_ids(neurons) if incremental else set()
 
     index = _load_memory_index(child)
@@ -2049,11 +2526,15 @@ def build_fractal_memory(child):
     pruned_neurons = 0
     if incremental and valid_ids:
         pruned_refs, pruned_neurons = _prune_neurons_to_valid_fragments(neurons, valid_ids)
-        if pruned_refs or pruned_neurons:
+        if pruned_refs or pruned_neurons or neuron_cap_changes or neuron_budget_pruned:
             known_fragments = _existing_fragment_ids(neurons)
             log_to_statusbox(
-                f"[NeuralMap] Pruned {pruned_refs} stale fragment refs and dropped {pruned_neurons} empty neuron(s)."
+                f"[NeuralMap] Pruned {pruned_refs} stale refs, dropped {pruned_neurons} empty neuron(s), budget-pruned {neuron_budget_pruned}."
             )
+    elif neuron_cap_changes or neuron_budget_pruned:
+        log_to_statusbox(
+            f"[NeuralMap] Applied payload caps ({neuron_cap_changes} updates) and budget-pruned {neuron_budget_pruned} neuron(s)."
+        )
 
     anchors = _load_body_anchors()
     fallback_anchor = anchors.get("head", {"center": [0.0, 0.0, 0.0], "radius": 2.0})
@@ -2161,7 +2642,15 @@ def build_fractal_memory(child):
             for key in totals:
                 totals[key] += stats.get(key, 0)
             processed_ids.extend([str(frag.get("id")) for frag in batch_fragments if frag.get("id")])
+            custom_runtime.observe(batch_fragments)
+            dropped = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0)))
+            if dropped:
+                neuron_budget_pruned += dropped
+                known_fragments = _existing_fragment_ids(neurons)
             batches_run += 1
+            gc_every_batches = int(policy.get("gc_every_batches", 0))
+            if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
+                gc.collect()
     else:
         cursor = 0
         while cursor < len(selector_targets) and totals["input"] < burst_limit:
@@ -2187,7 +2676,17 @@ def build_fractal_memory(child):
             )
             for key in totals:
                 totals[key] += stats.get(key, 0)
+            custom_runtime.observe(batch_fragments)
+            dropped = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0)))
+            if dropped:
+                neuron_budget_pruned += dropped
+                known_fragments = _existing_fragment_ids(neurons)
             batches_run += 1
+            gc_every_batches = int(policy.get("gc_every_batches", 0))
+            if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
+                gc.collect()
+
+    custom_usage = custom_runtime.run()
 
     if dirty_mode:
         for frag_id in removed_signatures:
@@ -2209,6 +2708,8 @@ def build_fractal_memory(child):
     map_changed = bool(
         pruned_refs
         or pruned_neurons
+        or neuron_cap_changes
+        or neuron_budget_pruned
         or detached_neurons
         or totals["merged"]
         or totals["created"]
@@ -2233,6 +2734,8 @@ def build_fractal_memory(child):
             threshold=synapse_threshold,
             max_edges=int(policy.get("max_edges_updated", 0) or 0),
             max_pairs=int(policy.get("max_synapse_pairs", 0) or 0),
+            max_edges_per_neuron=int(policy.get("max_edges_per_neuron", 0) or 0),
+            include_direction=bool(policy.get("edge_direction_enabled", True)),
             return_stats=True,
         )
         if synapse_stats.get("truncated"):
@@ -2268,6 +2771,14 @@ def build_fractal_memory(child):
     if budget_hit:
         log_to_statusbox(
             f"[NeuralMap] Build budget reached after {totals['input']} fragment(s) and {batches_run} batch(es); resuming next cycle."
+        )
+    if neuron_budget_pruned:
+        log_to_statusbox(
+            f"[NeuralMap] Enforced global neuron budget; pruned {neuron_budget_pruned} node(s) this cycle."
+        )
+    if custom_usage.get("status") == "cooldown":
+        log_to_statusbox(
+            f"[NeuralMap] Custom transformer runtime cooling down ({custom_usage.get('seconds_remaining')}s remaining)."
         )
     if totals["input"] == 0 and not map_changed and not needs_synapse_refresh:
         if source == "dirty_index":
