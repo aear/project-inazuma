@@ -17,8 +17,11 @@ def test_neural_policy_includes_memory_caps():
             "position_round_digits": 3,
             "edge_direction_enabled": False,
             "gc_every_batches": 2,
+            "compact_save_enabled": True,
             "max_neurons_total": 123,
             "max_edges_per_neuron": 7,
+            "max_synapses_total": 19,
+            "max_pending_dirty_fragments": 11,
         }
     }
     policy = mg._neural_policy(cfg)
@@ -28,8 +31,11 @@ def test_neural_policy_includes_memory_caps():
     assert policy["position_round_digits"] == 3
     assert policy["edge_direction_enabled"] is False
     assert policy["gc_every_batches"] == 2
+    assert policy["compact_save_enabled"] is True
     assert policy["max_neurons_total"] == 123
     assert policy["max_edges_per_neuron"] == 7
+    assert policy["max_synapses_total"] == 19
+    assert policy["max_pending_dirty_fragments"] == 11
 
 
 def test_update_neuron_from_candidate_applies_caps_and_rounding():
@@ -113,6 +119,89 @@ def test_enforce_neuron_budget_drops_low_priority_nodes():
     assert dropped == 1
     remaining = {node["id"] for node in neurons}
     assert remaining == {"n2", "n3"}
+
+
+def test_enforce_synapse_budget_keeps_strongest_edges():
+    synapses = [
+        {"source": "n1", "target": "n2", "weight": 0.4},
+        {"source": "n1", "target": "n3", "weight": 0.9},
+        {"source": "n2", "target": "n3", "weight": 0.7},
+    ]
+
+    dropped = mg._enforce_synapse_budget(synapses, 2)
+
+    assert dropped == 1
+    assert synapses == [
+        {"source": "n1", "target": "n3", "weight": 0.9},
+        {"source": "n2", "target": "n3", "weight": 0.7},
+    ]
+
+
+def test_trim_pending_fragment_ids_applies_hard_limit():
+    index = {
+        "f1": {"timestamp": "2024-01-01T00:00:00+00:00", "importance": 0.1},
+        "f2": {"timestamp": "2024-01-03T00:00:00+00:00", "importance": 0.2},
+        "f3": {"timestamp": "2024-01-02T00:00:00+00:00", "importance": 0.9},
+    }
+
+    pending, dropped = mg._trim_pending_fragment_ids(["f1", "f2", "f2", "f3"], index, 2)
+
+    assert dropped == 1
+    assert pending == ["f2", "f3"]
+
+
+def test_compact_graph_for_storage_drops_default_fields():
+    neurons = [{
+        "id": "n1",
+        "fragments": ["a", "b"],
+        "vector": [0.123456, 0.987654],
+        "position": [1.23456, 2.34567, 3.45678],
+        "region": "head",
+        "network_type": "memory_graph",
+        "symbolic_density": 0.0,
+        "tags": ["beta", "alpha"],
+        "activation_history": [],
+        "last_used": "2024-01-01T00:00:00+00:00",
+    }]
+    synapses = [{
+        "source": "n1",
+        "target": "n2",
+        "weight": 0.98765,
+        "network_type": "memory_graph",
+    }]
+    policy = {
+        "max_fragments_per_neuron": 8,
+        "max_tags_per_neuron": 8,
+        "vector_round_digits": 4,
+        "position_round_digits": 2,
+    }
+
+    compact_neurons, compact_synapses = mg._compact_graph_for_storage(neurons, synapses, policy)
+
+    assert compact_neurons == [{
+        "id": "n1",
+        "fragments": ["a", "b"],
+        "vector": [0.1235, 0.9877],
+        "position": [1.23, 2.35, 3.46],
+        "region": "head",
+        "tags": ["beta", "alpha"],
+        "last_used": "2024-01-01T00:00:00+00:00",
+    }]
+    assert compact_synapses == [{"source": "n1", "target": "n2", "weight": 0.9877}]
+
+
+def test_cluster_fragments_uses_compact_centroids():
+    fragments = [
+        {"id": "f1", "tags": ["a"]},
+        {"id": "f2", "tags": ["a"]},
+    ]
+    cache = {"f1": [1.0, 0.0], "f2": [1.0, 0.0]}
+
+    clusters = mg.cluster_fragments(fragments, cache, threshold=0.5, tag_weight=0.0)
+
+    assert len(clusters) == 1
+    assert "centroid" in clusters[0]
+    assert "vector_sum" not in clusters[0]
 
 
 def test_custom_runtime_respects_cooldown(monkeypatch, tmp_path):

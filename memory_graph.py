@@ -6,6 +6,7 @@ import math
 import random
 import heapq
 import time
+from collections import deque
 import hashlib
 import gc
 import importlib
@@ -53,6 +54,9 @@ DEFAULT_INCREMENTAL_POLICY = {
     "gc_every_batches": 4,
     "max_neurons_total": 0,
     "max_edges_per_neuron": 0,
+    "max_synapses_total": 0,
+    "max_pending_dirty_fragments": 0,
+    "compact_save_enabled": True,
 }
 
 DEFAULT_TIER_POLICY = {
@@ -209,6 +213,19 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         max_edges_per_neuron = 0
     if max_edges_per_neuron < 0:
         max_edges_per_neuron = 0
+    try:
+        max_synapses_total = int(policy.get("max_synapses_total", 0))
+    except (TypeError, ValueError):
+        max_synapses_total = 0
+    if max_synapses_total < 0:
+        max_synapses_total = 0
+    try:
+        max_pending_dirty_fragments = int(policy.get("max_pending_dirty_fragments", 0))
+    except (TypeError, ValueError):
+        max_pending_dirty_fragments = 0
+    if max_pending_dirty_fragments < 0:
+        max_pending_dirty_fragments = 0
+    compact_save_enabled = bool(policy.get("compact_save_enabled", True))
     return {
         "mode": mode,
         "incremental": incremental,
@@ -233,6 +250,9 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "gc_every_batches": gc_every_batches,
         "max_neurons_total": max_neurons_total,
         "max_edges_per_neuron": max_edges_per_neuron,
+        "max_synapses_total": max_synapses_total,
+        "max_pending_dirty_fragments": max_pending_dirty_fragments,
+        "compact_save_enabled": compact_save_enabled,
     }
 
 
@@ -1557,10 +1577,7 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
         best_score = 0.0
 
         for node in clusters:
-            node_vec = [
-                val / node["count"] for val in node["vector_sum"]
-            ]
-            vec_score = cosine_similarity(vec, node_vec)
+            vec_score = cosine_similarity(vec, node["centroid"])
             tag_score = tag_similarity(frag_tags, node["tags"])
             score = ((1 - tag_weight) * vec_score) + (tag_weight * tag_score)
             if score >= threshold and score > best_score:
@@ -1568,17 +1585,16 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
                 best = node
 
         if best:
+            count = int(best["count"])
             best["fragments"].append(frag_id)
             best["tags"].update(frag_tags)
-            best["count"] += 1
-            best["vector_sum"] = [
-                a + b for a, b in zip(best["vector_sum"], vec)
-            ]
+            best["centroid"] = _merge_vectors(best["centroid"], count, vec, 1, round_digits=6)
+            best["count"] = count + 1
         else:
             clusters.append({
                 "fragments": [frag_id],
                 "tags": set(frag_tags),
-                "vector_sum": list(vec),
+                "centroid": list(vec),
                 "count": 1
             })
     return clusters
@@ -2133,6 +2149,49 @@ def _enforce_neuron_budget(neurons: List[Dict[str, Any]], max_neurons_total: int
     return overflow
 
 
+def _enforce_synapse_budget(synapses: List[Dict[str, Any]], max_synapses_total: int) -> int:
+    if max_synapses_total <= 0:
+        return 0
+    if len(synapses) <= max_synapses_total:
+        return 0
+    synapses.sort(
+        key=lambda synapse: (
+            _safe_float(synapse.get("weight"), 0.0),
+            str(synapse.get("source") or ""),
+            str(synapse.get("target") or ""),
+        ),
+        reverse=True,
+    )
+    overflow = len(synapses) - max_synapses_total
+    del synapses[max_synapses_total:]
+    return overflow
+
+
+def _pending_fragment_sort_key(fragment_id: str, index: Dict[str, Any]) -> Tuple[float, float]:
+    meta = index.get(fragment_id, {}) if isinstance(index, dict) else {}
+    ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp")) or 0.0
+    importance = _safe_float(meta.get("importance"), 0.0)
+    return ts, importance
+
+
+def _trim_pending_fragment_ids(
+    fragment_ids: Iterable[str],
+    index: Dict[str, Any],
+    max_pending_dirty_fragments: int,
+) -> Tuple[List[str], int]:
+    deduped = [str(fragment_id) for fragment_id in dict.fromkeys(fragment_ids) if fragment_id]
+    if max_pending_dirty_fragments <= 0 or len(deduped) <= max_pending_dirty_fragments:
+        ordered = sorted(deduped, key=lambda fragment_id: _pending_fragment_sort_key(fragment_id, index), reverse=True)
+        return ordered, 0
+    kept = heapq.nlargest(
+        max_pending_dirty_fragments,
+        deduped,
+        key=lambda fragment_id: _pending_fragment_sort_key(fragment_id, index),
+    )
+    ordered = sorted(kept, key=lambda fragment_id: _pending_fragment_sort_key(fragment_id, index), reverse=True)
+    return ordered, len(deduped) - len(ordered)
+
+
 def _detach_neurons_for_dirty_rebuild(
     neurons: List[Dict[str, Any]],
     dirty_ids: Set[str],
@@ -2298,6 +2357,61 @@ def _merge_vectors(
     return merged
 
 
+def _compact_neuron_for_storage(neuron: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+    compact = {
+        "id": neuron.get("id"),
+        "fragments": _clip_sequence(neuron.get("fragments", []), int(policy.get("max_fragments_per_neuron", 128))),
+        "vector": _round_vector(neuron.get("vector"), int(policy.get("vector_round_digits", 6))),
+        "position": _round_vector(neuron.get("position"), int(policy.get("position_round_digits", 4))),
+        "region": neuron.get("region"),
+        "tags": _clip_sequence(neuron.get("tags", []), int(policy.get("max_tags_per_neuron", 32))),
+        "last_used": neuron.get("last_used"),
+    }
+    network_type = str(neuron.get("network_type") or "memory_graph")
+    if network_type != "memory_graph":
+        compact["network_type"] = network_type
+    symbolic_density = _safe_float(neuron.get("symbolic_density"), 0.0)
+    if abs(symbolic_density) > 1e-6:
+        compact["symbolic_density"] = round(symbolic_density, 4)
+    activation_history = [
+        round(float(value), 4)
+        for value in (neuron.get("activation_history") or [])
+        if isinstance(value, (int, float))
+    ]
+    if activation_history:
+        compact["activation_history"] = activation_history[-32:]
+    return {key: value for key, value in compact.items() if value not in (None, [], {}, "")}
+
+
+def _compact_synapse_for_storage(synapse: Dict[str, Any]) -> Dict[str, Any]:
+    compact = {
+        "source": synapse.get("source"),
+        "target": synapse.get("target"),
+        "weight": round(_safe_float(synapse.get("weight"), 0.0), 4),
+    }
+    direction = synapse.get("direction")
+    if isinstance(direction, list) and direction:
+        compact["direction"] = [round(float(value), 5) for value in direction[:3]]
+    relation = synapse.get("relation")
+    if relation:
+        compact["relation"] = str(relation)
+    network_type = str(synapse.get("network_type") or "memory_graph")
+    if network_type != "memory_graph":
+        compact["network_type"] = network_type
+    return {key: value for key, value in compact.items() if value not in (None, [], {}, "")}
+
+
+def _compact_graph_for_storage(
+    neurons: List[Dict[str, Any]],
+    synapses: List[Dict[str, Any]],
+    policy: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    return (
+        [_compact_neuron_for_storage(neuron, policy) for neuron in neurons if neuron.get("id")],
+        [_compact_synapse_for_storage(synapse) for synapse in synapses if synapse.get("source") and synapse.get("target")],
+    )
+
+
 def _materialize_candidate(node_id: str, candidate: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     frag_limit = int(policy.get("max_fragments_per_neuron", 128))
@@ -2369,9 +2483,12 @@ def _prepare_candidates(clusters: List[Dict[str, Any]], cache: Dict[str, List[fl
         fragment_ids = group["fragments"]
         if not fragment_ids:
             continue
+        centroid = group.get("centroid")
         vector_sum = group.get("vector_sum")
         count = group.get("count", len(fragment_ids))
-        if vector_sum and count:
+        if isinstance(centroid, list) and centroid:
+            avg_vec = [round(float(v), 6) for v in centroid]
+        elif vector_sum and count:
             avg_vec = [round(v / count, 6) for v in vector_sum]
         else:
             avg_vec = vector_average([cache[fid] for fid in fragment_ids if fid in cache])
@@ -2545,7 +2662,7 @@ def build_fractal_memory(child):
     dirty_signatures = _load_neural_dirty_index(child) if dirty_mode else {}
     current_signatures: Dict[str, str] = {}
     removed_signatures: Set[str] = set()
-    processed_ids: List[str] = []
+    processed_count = 0
     detached_neurons = 0
     detached_overflow = False
     detected_dirty = 0
@@ -2554,6 +2671,7 @@ def build_fractal_memory(child):
     selector_total = 0
     selector_loaded = 0
     selector_targets: List[Dict[str, Any]] = []
+    selector_target_count = 0
 
     if dirty_mode:
         source = "dirty_index"
@@ -2580,13 +2698,15 @@ def build_fractal_memory(child):
                 if frag_id in valid_ids and frag_id not in pending_set:
                     pending_ids.append(frag_id)
                     pending_set.add(frag_id)
-        if pending_ids:
-            def _queue_sort_key(frag_id: str) -> Tuple[float, float]:
-                meta = index.get(frag_id, {}) if isinstance(index, dict) else {}
-                ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp")) or 0.0
-                importance = _safe_float(meta.get("importance"), 0.0)
-                return ts, importance
-            pending_ids = sorted(dict.fromkeys(pending_ids), key=_queue_sort_key, reverse=True)
+        pending_ids, pending_trimmed = _trim_pending_fragment_ids(
+            pending_ids,
+            index,
+            int(policy.get("max_pending_dirty_fragments", 0) or 0),
+        )
+        if pending_trimmed:
+            log_to_statusbox(
+                f"[NeuralMap] Trimmed dirty queue by {pending_trimmed} fragment(s) to stay within the pending hard cap."
+            )
         queue_state["last_source"] = source
     else:
         fragments, selector_total, selector_meta = select_fragments_for_neural_map(
@@ -2607,20 +2727,21 @@ def build_fractal_memory(child):
                 f"[NeuralMap] Selector lanes={selector_meta.get('lane_counts')} temp={selector_meta.get('temperature')} mode={selector_meta.get('mode')}."
             )
         selector_targets = [frag for frag in fragments if not incremental or frag.get("id") not in known_fragments]
+        selector_target_count = len(selector_targets)
 
     totals = {"input": 0, "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
     batches_run = 0
     budget_hit = False
 
     if source == "dirty_index":
-        while pending_ids and totals["input"] < burst_limit:
+        pending_queue = deque(pending_ids)
+        while pending_queue and totals["input"] < burst_limit:
             elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
             if build_budget_ms > 0 and elapsed_ms >= build_budget_ms and totals["input"] > 0:
                 budget_hit = True
                 break
-            step = min(batch_size, burst_limit - totals["input"], len(pending_ids))
-            batch_ids = pending_ids[:step]
-            pending_ids = pending_ids[step:]
+            step = min(batch_size, burst_limit - totals["input"], len(pending_queue))
+            batch_ids = [pending_queue.popleft() for _ in range(step)]
             batch_fragments, missing_ids = _load_fragments_by_id(child, batch_ids, index)
             if missing_ids:
                 for frag_id in missing_ids:
@@ -2641,7 +2762,12 @@ def build_fractal_memory(child):
             )
             for key in totals:
                 totals[key] += stats.get(key, 0)
-            processed_ids.extend([str(frag.get("id")) for frag in batch_fragments if frag.get("id")])
+            batch_processed_ids = [str(frag.get("id")) for frag in batch_fragments if frag.get("id")]
+            processed_count += len(batch_processed_ids)
+            for frag_id in batch_processed_ids:
+                sig = current_signatures.get(frag_id)
+                if sig:
+                    dirty_signatures[frag_id] = sig
             custom_runtime.observe(batch_fragments)
             dropped = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0)))
             if dropped:
@@ -2651,16 +2777,18 @@ def build_fractal_memory(child):
             gc_every_batches = int(policy.get("gc_every_batches", 0))
             if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
                 gc.collect()
+            del batch_fragments
+            del batch_processed_ids
+        pending_ids = list(pending_queue)
     else:
-        cursor = 0
-        while cursor < len(selector_targets) and totals["input"] < burst_limit:
+        selector_queue = deque(selector_targets)
+        while selector_queue and totals["input"] < burst_limit:
             elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
             if build_budget_ms > 0 and elapsed_ms >= build_budget_ms and totals["input"] > 0:
                 budget_hit = True
                 break
-            step = min(batch_size, burst_limit - totals["input"], len(selector_targets) - cursor)
-            batch_fragments = selector_targets[cursor : cursor + step]
-            cursor += step
+            step = min(batch_size, burst_limit - totals["input"], len(selector_queue))
+            batch_fragments = [selector_queue.popleft() for _ in range(step)]
             if not batch_fragments:
                 continue
             stats = _integrate_fragment_batch(
@@ -2685,24 +2813,22 @@ def build_fractal_memory(child):
             gc_every_batches = int(policy.get("gc_every_batches", 0))
             if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
                 gc.collect()
+            del batch_fragments
+        selector_targets = list(selector_queue)
 
     custom_usage = custom_runtime.run()
 
     if dirty_mode:
         for frag_id in removed_signatures:
             dirty_signatures.pop(frag_id, None)
-        for frag_id in processed_ids:
-            sig = current_signatures.get(frag_id)
-            if sig:
-                dirty_signatures[frag_id] = sig
         queue_state["pending"] = pending_ids
         queue_state["dirty_detected"] = detected_dirty
-        queue_state["processed"] = len(processed_ids)
+        queue_state["processed"] = processed_count
         queue_state["detached_neurons"] = detached_neurons
         _save_neural_build_state(child, queue_state)
         _save_neural_dirty_index(child, dirty_signatures)
         log_to_statusbox(
-            f"[NeuralMap] Dirty queue: detected {detected_dirty}, processed {len(processed_ids)}, remaining {len(pending_ids)}."
+            f"[NeuralMap] Dirty queue: detected {detected_dirty}, processed {processed_count}, remaining {len(pending_ids)}."
         )
 
     map_changed = bool(
@@ -2727,12 +2853,17 @@ def build_fractal_memory(child):
     if not isinstance(prior_synapses, list):
         prior_synapses = []
     synapses = prior_synapses
+    max_synapses_total = int(policy.get("max_synapses_total", 0) or 0)
+    synapse_budget_pruned = 0
     synapse_stats = {"pairs_evaluated": 0, "edge_count": len(synapses), "truncated": False}
     if needs_synapse_refresh:
+        max_edges_updated = int(policy.get("max_edges_updated", 0) or 0)
+        if max_synapses_total > 0 and (max_edges_updated <= 0 or max_synapses_total < max_edges_updated):
+            max_edges_updated = max_synapses_total
         synapses, synapse_stats = build_synaptic_links(
             neurons,
             threshold=synapse_threshold,
-            max_edges=int(policy.get("max_edges_updated", 0) or 0),
+            max_edges=max_edges_updated,
             max_pairs=int(policy.get("max_synapse_pairs", 0) or 0),
             max_edges_per_neuron=int(policy.get("max_edges_per_neuron", 0) or 0),
             include_direction=bool(policy.get("edge_direction_enabled", True)),
@@ -2742,21 +2873,28 @@ def build_fractal_memory(child):
             log_to_statusbox(
                 f"[NeuralMap] Synapse refresh hit budget ({synapse_stats.get('edge_count')} edges, {synapse_stats.get('pairs_evaluated')} pairs)."
             )
+    synapse_budget_pruned = _enforce_synapse_budget(synapses, max_synapses_total)
+    if synapse_budget_pruned:
+        log_to_statusbox(f"[NeuralMap] Applied hard synapse cap; pruned {synapse_budget_pruned} edge(s).")
 
-    should_save_map = bool(not incremental or map_changed or needs_synapse_refresh)
+    should_save_map = bool(not incremental or map_changed or needs_synapse_refresh or synapse_budget_pruned)
     if should_save_map:
+        storage_neurons = neurons
+        storage_synapses = synapses
+        if policy.get("compact_save_enabled", True):
+            storage_neurons, storage_synapses = _compact_graph_for_storage(neurons, synapses, policy)
         result = existing_map if incremental else {}
         result.update({
-            "neurons": neurons,
-            "synapses": synapses,
+            "neurons": storage_neurons,
+            "synapses": storage_synapses,
             "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
         _save_neural_map(child, result)
         if policy.get("emit_sparse_snapshot", True):
-            _save_sparse_snapshot(child, neurons, synapses)
+            _save_sparse_snapshot(child, storage_neurons, storage_synapses)
 
-    if source == "selector" and selector_loaded and not selector_targets and incremental:
+    if source == "selector" and selector_loaded and selector_target_count == 0 and incremental:
         log_to_statusbox("[NeuralMap] No new fragments detected after selector filtering.")
     if totals["clusters"] > 0:
         log_to_statusbox(

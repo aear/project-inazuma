@@ -13,7 +13,7 @@ import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from gui_hook import log_to_statusbox
 from alignment.metrics import evaluate_alignment
 from alignment import check_action
@@ -1202,18 +1202,19 @@ def _atomic_write_inastate(state: Dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def safe_popen(cmd, description=None):
+def safe_popen(cmd, description=None, **popen_kwargs):
     action = {"command": cmd, "description": description or " ".join(map(str, cmd))}
     feedback = check_action(action)
     if not feedback["overall"]["pass"]:
         log_to_statusbox(
             f"[Manager] Alignment blocked: {feedback['overall']['rationale']} ({action['description']})"
         )
-        return
+        return None
     try:
-        subprocess.Popen(cmd)
+        return subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
         log_to_statusbox(f"[Manager] Failed to start {' '.join(map(str, cmd))}: {e}")
+        return None
 
 
 def safe_call(cmd, description=None):

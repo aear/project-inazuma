@@ -2,6 +2,7 @@ import json
 import math
 import time
 import hashlib
+import gc
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +24,10 @@ DEFAULT_MEANING_POLICY = {
     "queue_max_items": 600,
     "max_components_per_word": 220,
     "max_new_words_per_run": 36,
+    "max_tags_per_word": 32,
+    "vector_round_digits": 6,
+    "gc_every_batches": 4,
+    "max_words_total": 0,
 }
 
 
@@ -113,6 +118,10 @@ def _meaning_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     policy["queue_max_items"] = max(40, int(_safe_float(policy.get("queue_max_items"), 600)))
     policy["max_components_per_word"] = max(20, int(_safe_float(policy.get("max_components_per_word"), 220)))
     policy["max_new_words_per_run"] = max(1, int(_safe_float(policy.get("max_new_words_per_run"), 36)))
+    policy["max_tags_per_word"] = max(4, int(_safe_float(policy.get("max_tags_per_word"), 32)))
+    policy["vector_round_digits"] = max(2, min(8, int(_safe_float(policy.get("vector_round_digits"), 6))))
+    policy["gc_every_batches"] = max(0, int(_safe_float(policy.get("gc_every_batches"), 4)))
+    policy["max_words_total"] = max(0, int(_safe_float(policy.get("max_words_total"), 0)))
     return policy
 
 
@@ -189,6 +198,48 @@ def _word_vector(word: Dict[str, Any]) -> Optional[List[float]]:
         if cleaned:
             return cleaned
     return None
+
+
+def _round_vector(values: List[float], digits: int) -> List[float]:
+    return [round(float(value), digits) for value in values]
+
+
+def _apply_word_caps(word: Dict[str, Any], policy: Dict[str, Any]) -> None:
+    max_components = int(policy.get("max_components_per_word", 220))
+    max_tags = int(policy.get("max_tags_per_word", 32))
+    digits = int(policy.get("vector_round_digits", 6))
+
+    components = [str(fid) for fid in (word.get("components") or []) if fid]
+    if max_components > 0 and len(components) > max_components:
+        components = components[-max_components:]
+    word["components"] = components
+
+    tags = sorted({str(tag) for tag in (word.get("tags") or []) if tag})
+    if max_tags > 0 and len(tags) > max_tags:
+        tags = tags[-max_tags:]
+    word["tags"] = tags
+
+    vector = _word_vector(word)
+    if vector:
+        word["vector"] = _round_vector(vector, digits)
+
+
+def _enforce_word_budget(words: List[Dict[str, Any]], max_words_total: int) -> int:
+    if max_words_total <= 0:
+        return 0
+    if len(words) <= max_words_total:
+        return 0
+    overflow = len(words) - max_words_total
+    scored: List[Tuple[int, int, float, int]] = []
+    for idx, word in enumerate(words):
+        usage = int(_safe_float(word.get("usage_count"), 0))
+        count = int(_safe_float(word.get("count"), 0))
+        updated = _parse_iso_ts(word.get("updated_at") or word.get("birth_time"))
+        scored.append((usage, count, updated, idx))
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    drop_indices = {idx for _, _, _, idx in scored[:overflow]}
+    words[:] = [word for idx, word in enumerate(words) if idx not in drop_indices]
+    return overflow
 
 
 def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
@@ -337,6 +388,11 @@ def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Di
         vec = enc.get("vector")
         if not isinstance(vec, list) or not vec:
             continue
+        member = {
+            "id": enc.get("id"),
+            "tags": list(enc.get("tags") or []),
+            "summary": enc.get("summary"),
+        }
         best_idx = -1
         best_score = 0.0
         for idx, cluster in enumerate(clusters):
@@ -348,11 +404,11 @@ def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Di
             target = clusters[best_idx]
             count = int(target["count"])
             centroid = target["centroid"]
-            target["members"].append(enc)
+            target["members"].append(member)
             target["centroid"] = _merge_vectors(centroid, count, vec, 1)
             target["count"] = count + 1
         else:
-            clusters.append({"members": [enc], "centroid": [float(v) for v in vec], "count": 1})
+            clusters.append({"members": [member], "centroid": [float(v) for v in vec], "count": 1})
     return clusters
 
 def load_base_model(child):
@@ -432,7 +488,11 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
         pending_ids = pending_ids[:queue_max]
 
     words, preserved = _load_symbol_words_payload(child)
+    for word in words:
+        _apply_word_caps(word, policy)
+    words_budget_pruned = _enforce_word_budget(words, policy["max_words_total"])
     next_word_idx = _next_word_index(words)
+    word_vectors: List[Optional[List[float]]] = [_word_vector(word) for word in words]
     component_keys = available_symbol_components(child)
     transformer = FractalTransformer()
 
@@ -453,13 +513,17 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
     merge_threshold = policy["word_merge_threshold"]
     max_components = policy["max_components_per_word"]
     max_new_words = policy["max_new_words_per_run"]
+    max_tags = policy["max_tags_per_word"]
+    vector_digits = policy["vector_round_digits"]
+    gc_every_batches = policy["gc_every_batches"]
 
-    processed_fragments: List[Dict[str, Any]] = []
+    processed_conflicts: List[Dict[str, Any]] = []
     processed_ids: List[str] = []
     encoded_total = 0
     clusters_total = 0
     merged_words = 0
     created_words = 0
+    batches_run = 0
     budget_hit = False
 
     while pending_ids and len(processed_ids) < burst_limit:
@@ -511,8 +575,7 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
 
             best_idx = -1
             best_score = 0.0
-            for idx, word in enumerate(words):
-                vec = _word_vector(word)
+            for idx, vec in enumerate(word_vectors):
                 if not vec:
                     continue
                 score = _cosine_similarity(vec, centroid)
@@ -533,15 +596,22 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
                 word["components"] = prior_components
                 existing_tags = {str(tag) for tag in (word.get("tags") or []) if tag}
                 existing_tags.update(tag_set)
-                word["tags"] = sorted(existing_tags)
+                merged_tags = sorted(existing_tags)
+                if len(merged_tags) > max_tags:
+                    merged_tags = merged_tags[-max_tags:]
+                word["tags"] = merged_tags
                 prior_count = int(_safe_float(word.get("count"), len(prior_components)))
                 word["count"] = prior_count + new_count
-                base_vec = _word_vector(word) or list(centroid)
-                base_vec_count = prior_count if _word_vector(word) else 0
-                word["vector"] = _merge_vectors(base_vec, base_vec_count, list(centroid), new_count)
+                prior_vec = word_vectors[best_idx]
+                base_vec = prior_vec or list(centroid)
+                base_vec_count = prior_count if prior_vec else 0
+                merged_vec = _merge_vectors(base_vec, base_vec_count, list(centroid), new_count)
+                word["vector"] = _round_vector(merged_vec, vector_digits)
+                word_vectors[best_idx] = word["vector"]
                 if not word.get("summary"):
                     word["summary"] = summary_text
                 word["updated_at"] = datetime.now(timezone.utc).isoformat()
+                _apply_word_caps(word, policy)
                 merged_words += 1
                 continue
 
@@ -562,19 +632,37 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
                 "generated_word": "unknown",
                 "usage_count": 0,
                 "confidence": 0.0,
-                "vector": [round(float(value), 6) for value in centroid],
+                "vector": _round_vector([float(value) for value in centroid], vector_digits),
             }
+            _apply_word_caps(new_word, policy)
             words.append(new_word)
+            word_vectors.append(_word_vector(new_word))
             next_word_idx += 1
             created_words += 1
 
-        processed_fragments.extend(fragments)
+        for frag in fragments:
+            sid = frag.get("sound_symbol")
+            sw = frag.get("symbol_word_id")
+            if sid and sw:
+                processed_conflicts.append({"sound_symbol": sid, "symbol_word_id": sw})
         processed_ids.extend([str(frag.get("id")) for frag in fragments if frag.get("id")])
+        batches_run += 1
+
+        dropped_words = _enforce_word_budget(words, policy["max_words_total"])
+        if dropped_words:
+            words_budget_pruned += dropped_words
+            word_vectors = [_word_vector(word) for word in words]
+
+        if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
+            gc.collect()
 
     for frag_id in processed_ids:
         signature = current_signatures.get(frag_id)
         if signature:
             processed_signatures[frag_id] = signature
+
+    for word in words:
+        _apply_word_caps(word, policy)
 
     state_payload = {
         "pending": pending_ids[:queue_max],
@@ -585,6 +673,7 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
             "processed_fragments": len(processed_ids),
             "remaining_queue": len(pending_ids),
             "budget_hit": budget_hit,
+            "words_budget_pruned": words_budget_pruned,
         },
     }
     _save_json_dict(_meaning_state_path(child), state_payload)
@@ -604,14 +693,15 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
 
     log_to_statusbox(
         f"[Symbols] Processed {len(processed_ids)} symbolic fragment(s), encoded {encoded_total}, "
-        f"clusters {clusters_total}, merged {merged_words}, created {created_words}, queue {len(pending_ids)}."
+        f"clusters {clusters_total}, merged {merged_words}, created {created_words}, "
+        f"word_pruned {words_budget_pruned}, queue {len(pending_ids)}."
     )
     if budget_hit:
         log_to_statusbox("[Symbols] Build budget reached; continuing next cycle.")
     log_to_statusbox("[Symbols] Checking for drift and underuse...")
     evolve_unused_symbols(words)
-    if processed_fragments:
-        detect_conflicted_symbols(processed_fragments, words)
+    if processed_conflicts:
+        detect_conflicted_symbols(processed_conflicts, words)
     log_to_statusbox("[Symbols] Completed symbol word update.")
 
 def run_meaning_map():
