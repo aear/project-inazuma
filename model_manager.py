@@ -1534,6 +1534,82 @@ def _norm_slider(value: Any, default: float = 0.5) -> float:
         return default
 
 
+def _resource_pressure_value(level: Any) -> float:
+    normalized = str(level or "").strip().lower()
+    if normalized == "hard":
+        return 1.0
+    if normalized == "soft":
+        return 0.72
+    if normalized == "stable":
+        return 0.25
+    return 0.0
+
+
+def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = resource_vitals if isinstance(resource_vitals, dict) else (get_inastate("resource_vitals") or {})
+    if not isinstance(payload, dict):
+        payload = {}
+
+    trend = payload.get("trend") if isinstance(payload.get("trend"), dict) else {}
+    short = trend.get("short") if isinstance(trend.get("short"), dict) else {}
+    long = trend.get("long") if isinstance(trend.get("long"), dict) else {}
+    top_modules = payload.get("top_modules") if isinstance(payload.get("top_modules"), list) else []
+    top_modules = [item for item in top_modules[:3] if isinstance(item, dict)]
+
+    pressure_level = str(payload.get("pressure_level") or "").strip().lower()
+    current_pressure = _resource_pressure_value(pressure_level)
+    short_direction = str(short.get("direction") or "unknown").strip().lower()
+    long_direction = str(long.get("direction") or "unknown").strip().lower()
+    short_delta_gb = max(0.0, _coerce_float(short.get("ram_delta_bytes"), 0.0) / (1024.0 ** 3))
+    long_delta_gb = max(0.0, _coerce_float(long.get("ram_delta_bytes"), 0.0) / (1024.0 ** 3))
+    system_ram_delta = _coerce_float(long.get("system_ram_delta_percent"), 0.0)
+
+    direction_pressure = 0.0
+    if short_direction == "rising":
+        direction_pressure += 0.55
+    elif short_direction == "stable":
+        direction_pressure += 0.15
+    elif short_direction not in {"falling", "unknown"}:
+        direction_pressure += 0.05
+    if long_direction == "rising":
+        direction_pressure += 0.35
+    elif long_direction == "stable":
+        direction_pressure += 0.10
+    elif long_direction not in {"falling", "unknown"}:
+        direction_pressure += 0.05
+
+    growth_pressure = _clamp01((0.65 * (short_delta_gb / 4.0)) + (0.35 * (long_delta_gb / 8.0)), default=0.0)
+    system_pressure = _clamp01(max(0.0, system_ram_delta) / 12.0, default=0.0)
+    trend_pressure = _clamp01(
+        (0.45 * current_pressure) + (0.35 * direction_pressure) + (0.15 * growth_pressure) + (0.05 * system_pressure),
+        default=0.0,
+    )
+
+    largest = top_modules[0] if top_modules else {}
+    trend_summary = str(trend.get("summary") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    optimization_hint = str(payload.get("optimization_hint") or "").strip()
+
+    return {
+        "available": bool(payload),
+        "pressure_level": pressure_level or "unknown",
+        "current_pressure": round(current_pressure, 3),
+        "trend_pressure": round(trend_pressure, 3),
+        "short_direction": short_direction,
+        "long_direction": long_direction,
+        "short_ram_delta_gb": round(short_delta_gb, 3),
+        "long_ram_delta_gb": round(long_delta_gb, 3),
+        "system_ram_delta_percent": round(system_ram_delta, 1),
+        "summary": summary,
+        "trend_summary": trend_summary,
+        "optimization_hint": optimization_hint,
+        "top_modules": top_modules,
+        "largest_module": str(largest.get("name") or ""),
+        "largest_module_ram": str(largest.get("ram_human") or ""),
+        "samples": int(_coerce_float(trend.get("samples"), 0.0)),
+    }
+
+
 def _default_semantic_axes() -> List[Dict[str, Any]]:
     return [
         {"id": "signal_integrity", "description": "coherence vs noise in perception and symbols", "importance_weight": 1.0},
@@ -3280,6 +3356,12 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
     if isinstance(guard_state, dict):
         ram_percent = _clamp01(_coerce_float(guard_state.get("ram_percent"), 0.0) / 100.0, default=0.0)
         memory_pressure = max(memory_pressure, ram_percent)
+    resource_context = _extract_resource_context()
+    resource_current_pressure = _clamp01(resource_context.get("current_pressure"), default=0.0)
+    resource_trend_pressure = _clamp01(resource_context.get("trend_pressure"), default=0.0)
+    memory_pressure = max(memory_pressure, resource_current_pressure)
+    resource_trend_summary = resource_context.get("trend_summary") or resource_context.get("summary") or ""
+    resource_pressure_level = str(resource_context.get("pressure_level") or "unknown")
 
     coherence_risk = _clamp01(
         (0.45 * (1.0 - clarity)) + (0.3 * fuzziness) + (0.15 * drift) + (0.1 * (1.0 - alignment)),
@@ -3287,7 +3369,7 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
     )
     energy_instability = _clamp01((0.6 * (1.0 - energy)) + (0.4 * sleep_pressure), default=0.0)
     global_load = _clamp01(
-        (0.4 * memory_pressure) + (0.35 * coherence_risk) + (0.25 * energy_instability),
+        (0.32 * memory_pressure) + (0.18 * resource_trend_pressure) + (0.30 * coherence_risk) + (0.20 * energy_instability),
         default=0.0,
     )
 
@@ -3473,6 +3555,16 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
             "note": "Memory/compute room for optional actions.",
         },
         {
+            "id": "resource_trend",
+            "value": (round(1.0 - resource_trend_pressure, 3) if resource_context.get("available") else None),
+            "status": (
+                "unknown"
+                if not resource_context.get("available")
+                else ("low" if resource_trend_pressure >= 0.75 else ("medium" if resource_trend_pressure >= 0.5 else "high"))
+            ),
+            "note": resource_trend_summary or "Whether RAM pressure is stabilizing or worsening over time.",
+        },
+        {
             "id": "feedback_loop",
             "value": round(1.0 - stall_pressure, 3),
             "status": "low" if stall_pressure >= 0.85 else ("medium" if stall_pressure >= 0.6 else "high"),
@@ -3583,6 +3675,26 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
             provider_modules=["model_manager.py", "fragment_limits.py"],
             expected_output="scalar [0..1] where higher means enough budget to branch",
         )
+    if resource_context.get("available") and (
+        resource_trend_pressure >= 0.68
+        or (
+            memory_pressure >= 0.6
+            and (
+                resource_context.get("short_direction") == "rising"
+                or resource_context.get("long_direction") == "rising"
+            )
+        )
+    ):
+        add_missing(
+            "resource_trend",
+            "high" if resource_trend_pressure >= 0.82 else "medium",
+            resource_trend_summary or "Resource pressure is trending upward over time.",
+            canonical_variable="context_scope",
+            suggested_probe="profile the largest live RAM holders and defer optional branching until the trend cools",
+            where_to_obtain="resource_vitals + resource_vitals_history + module RAM table",
+            provider_modules=["GUI.py", "model_manager.py"],
+            expected_output="ranked module RAM list + scalar [0..1] headroom estimate under the current trend",
+        )
     if stall_pressure >= 0.85:
         add_missing(
             "action_feedback",
@@ -3681,6 +3793,15 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
         "canonical_seed_variables": list(_NEED_CANONICAL_VARIABLES.keys()),
         "symbolic_needs": symbolic_needs,
         "canonical_to_symbolic_map": alias_map,
+        "resource_vitals": {
+            "available": resource_context.get("available", False),
+            "pressure_level": resource_pressure_level,
+            "trend_pressure": round(resource_trend_pressure, 3),
+            "summary": resource_context.get("summary"),
+            "trend_summary": resource_trend_summary,
+            "optimization_hint": resource_context.get("optimization_hint"),
+            "top_modules": resource_context.get("top_modules"),
+        },
     }
 
     advocacy_payload = {
@@ -3715,6 +3836,11 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
         "signals": signal_rows,
         "drivers": {
             "memory_pressure": round(memory_pressure, 3),
+            "resource_trend_pressure": round(resource_trend_pressure, 3),
+            "resource_pressure_level": resource_pressure_level,
+            "resource_short_direction": resource_context.get("short_direction"),
+            "resource_long_direction": resource_context.get("long_direction"),
+            "resource_optimization_hint": resource_context.get("optimization_hint"),
             "coherence_risk": round(coherence_risk, 3),
             "energy_instability": round(energy_instability, 3),
             "global_load": round(global_load, 3),
@@ -5145,6 +5271,8 @@ def _update_machine_semantics():
     boundary_gap = abs(identity_hint.get("boundary_gap", 0.0) or 0.0)
     boundary_blur = _clamp01(identity_hint.get("boundary_blur_hint") or 0.0, default=0.0)
     drift = _clamp01(emo.get("symbolic_drift") or get_inastate("symbolic_drift") or 0.0, default=0.0)
+    resource_context = _extract_resource_context()
+    resource_trend_pressure = _clamp01(resource_context.get("trend_pressure"), default=0.0)
 
     axes_out: Dict[str, Dict[str, Any]] = {}
 
@@ -5276,6 +5404,23 @@ def _update_machine_semantics():
             }
         )
 
+    if resource_context.get("available"):
+        resource_weight = 0.85
+        total_weight += resource_weight
+        total_contrib += resource_trend_pressure * resource_weight
+        reasons.append(
+            {
+                "axis": "resource_trend",
+                "value": round(1.0 - resource_trend_pressure, 3),
+                "pressure": round(resource_trend_pressure, 3),
+                "weight": round(resource_weight, 3),
+                "direction": "risk" if resource_trend_pressure >= 0.55 else "watch",
+                "reason": resource_context.get("trend_summary") or resource_context.get("summary") or "resource telemetry available",
+                "hint": resource_context.get("optimization_hint"),
+                "focus_module": resource_context.get("largest_module"),
+            }
+        )
+
     reasons = sorted(reasons, key=lambda r: r["pressure"] * r["weight"], reverse=True)
     importance_score = _clamp01(total_contrib / max(total_weight, 1.0), default=0.0)
 
@@ -5283,6 +5428,14 @@ def _update_machine_semantics():
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "scaffold_version": scaffold.get("version", 1),
         "axes": axes_out,
+        "resource_context": {
+            "available": resource_context.get("available", False),
+            "pressure_level": resource_context.get("pressure_level"),
+            "trend_pressure": round(resource_trend_pressure, 3),
+            "trend_summary": resource_context.get("trend_summary"),
+            "optimization_hint": resource_context.get("optimization_hint"),
+            "top_modules": resource_context.get("top_modules"),
+        },
         "why_it_matters": {
             "score": round(importance_score, 3),
             "reasons": reasons[:5],

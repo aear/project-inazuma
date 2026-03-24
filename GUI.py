@@ -165,6 +165,12 @@ last_meal_status_var = None
 metabolic_status_var = None
 offer_status_var = None
 offer_note_var = None
+_last_resource_publish_ts = 0.0
+_last_resource_publish_key = None
+RESOURCE_PUBLISH_INTERVAL_SEC = float(os.environ.get("INA_RESOURCE_PUBLISH_INTERVAL_SEC", "15"))
+RESOURCE_HISTORY_MAX_SAMPLES = max(12, int(float(os.environ.get("INA_RESOURCE_HISTORY_MAX_SAMPLES", "240"))))
+RESOURCE_TREND_SHORT_SAMPLES = max(4, int(float(os.environ.get("INA_RESOURCE_TREND_SHORT_SAMPLES", "8"))))
+RESOURCE_TREND_LONG_SAMPLES = max(8, int(float(os.environ.get("INA_RESOURCE_TREND_LONG_SAMPLES", "40"))))
 
 
 def refresh_config():
@@ -433,35 +439,253 @@ def _prime_usage_counters():
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
+
+def _module_process_name(proc):
+    try:
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        cmdline = []
+    for part in cmdline[1:]:
+        name = os.path.basename(str(part))
+        if name.endswith('.py'):
+            return name
+    try:
+        return proc.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return f'pid:{proc.pid}'
+
+
+def _format_ram_value(num_bytes):
+    if not num_bytes:
+        return '0 MB'
+    units = (
+        (1024 ** 3, 'GB'),
+        (1024 ** 2, 'MB'),
+        (1024, 'KB'),
+    )
+    for scale, suffix in units:
+        if num_bytes >= scale:
+            value = num_bytes / scale
+            if suffix == 'GB':
+                return f'{value:.2f} {suffix}'
+            return f'{value:.1f} {suffix}'
+    return f'{int(num_bytes)} B'
+
+
+def _format_module_usage(modules):
+    if not modules:
+        return 'Per-process modules: none detected.'
+    header = f"{'Module':<24} {'RAM':>10} {'CPU':>7} {'Thr':>5} {'Proc':>5}"
+    lines = [header, '-' * len(header)]
+    for item in modules:
+        lines.append(
+            f"{item['name'][:24]:<24} {_format_ram_value(item['mem_bytes']):>10} {item['cpu']:>6.1f}% {item['threads']:>5} {item['processes']:>5}"
+        )
+    return '\n'.join(lines)
+
+
+def _resource_pressure_level(stats):
+    system_mem = float(stats.get('system_mem') or 0.0)
+    if system_mem >= 92.0:
+        return 'hard'
+    if system_mem >= 82.0:
+        return 'soft'
+    return 'normal'
+
+
+def _resource_delta_label(delta_bytes):
+    if abs(delta_bytes) < (128 * 1024 * 1024):
+        return 'stable'
+    return 'rising' if delta_bytes > 0 else 'falling'
+
+
+def _percent_delta_label(delta_value):
+    if abs(delta_value) < 1.0:
+        return 'stable'
+    return 'rising' if delta_value > 0 else 'falling'
+
+
+def _history_window(history, window_size):
+    if not history:
+        return []
+    if len(history) <= window_size:
+        return list(history)
+    return list(history[-window_size:])
+
+
+def _compute_resource_trends(history):
+    if not history:
+        return {
+            'samples': 0,
+            'short': {'direction': 'unknown', 'ram_delta_bytes': 0, 'system_ram_delta_percent': 0.0, 'seconds': 0},
+            'long': {'direction': 'unknown', 'ram_delta_bytes': 0, 'system_ram_delta_percent': 0.0, 'seconds': 0},
+            'summary': 'No resource trend data yet.',
+        }
+
+    def _window_trend(items):
+        if len(items) < 2:
+            return {'direction': 'stable', 'ram_delta_bytes': 0, 'system_ram_delta_percent': 0.0, 'seconds': 0}
+        first = items[0]
+        last = items[-1]
+        ram_delta = int(last.get('ina_ram_bytes') or 0) - int(first.get('ina_ram_bytes') or 0)
+        sys_delta = float(last.get('system_ram_percent') or 0.0) - float(first.get('system_ram_percent') or 0.0)
+        direction = _resource_delta_label(ram_delta)
+        try:
+            start_ts = datetime.fromisoformat(str(first.get('timestamp')))
+            end_ts = datetime.fromisoformat(str(last.get('timestamp')))
+            seconds = max(0, int((end_ts - start_ts).total_seconds()))
+        except Exception:
+            seconds = 0
+        return {
+            'direction': direction,
+            'ram_delta_bytes': ram_delta,
+            'system_ram_delta_percent': round(sys_delta, 1),
+            'seconds': seconds,
+        }
+
+    short = _window_trend(_history_window(history, RESOURCE_TREND_SHORT_SAMPLES))
+    long = _window_trend(_history_window(history, RESOURCE_TREND_LONG_SAMPLES))
+    latest = history[-1]
+    largest = (latest.get('top_modules') or [{}])[0]
+    largest_name = largest.get('name') or 'unknown module'
+    summary = (
+        f"RAM trend is {short['direction']} over the short window ({_format_ram_value(abs(short['ram_delta_bytes']))} over {short['seconds']}s) "
+        f"and {long['direction']} over the long window ({_format_ram_value(abs(long['ram_delta_bytes']))} over {long['seconds']}s). "
+        f"System RAM is {_percent_delta_label(long['system_ram_delta_percent'])}. Biggest current holder: {largest_name}."
+    )
+    return {
+        'samples': len(history),
+        'short': short,
+        'long': long,
+        'summary': summary,
+    }
+
+
+def _summarize_resource_usage(stats):
+    level = _resource_pressure_level(stats)
+    top_modules = (stats.get('modules') or [])[:3]
+    top_text = ', '.join(
+        f"{item['name']} {_format_ram_value(item['mem_bytes'])}"
+        for item in top_modules
+    ) if top_modules else 'no child modules detected'
+    if level == 'hard':
+        note = 'Pressure is high. Large RAM holders should shed memory before new work starts.'
+    elif level == 'soft':
+        note = 'Pressure is rising. Watch the largest RAM holders first.'
+    else:
+        note = 'Pressure is stable. The largest RAM holders are the clearest optimisation targets.'
+    return (
+        f"Total Ina RAM is {_format_ram_value(int(stats.get('mem_bytes') or 0))} across {int(stats.get('processes') or 0)} process(es). "
+        f"System RAM is at {float(stats.get('system_mem') or 0.0):.1f}%. "
+        f"Top modules: {top_text}. {note}"
+    )
+
+
+def _publish_resource_snapshot(stats):
+    global _last_resource_publish_ts, _last_resource_publish_key
+    now = time.time()
+    top_modules = []
+    for item in (stats.get('modules') or [])[:6]:
+        top_modules.append({
+            'name': item['name'],
+            'ram_bytes': int(item['mem_bytes']),
+            'ram_human': _format_ram_value(item['mem_bytes']),
+            'cpu_percent': round(float(item['cpu']), 1),
+            'threads': int(item['threads']),
+            'processes': int(item['processes']),
+        })
+    timestamp = datetime.now(timezone.utc).isoformat()
+    summary = _summarize_resource_usage(stats)
+    optimization_hint = (
+        f"Start optimisation with {top_modules[0]['name']} because it currently holds the most RAM."
+        if top_modules else
+        'No active child modules detected; measure the largest live process before optimising.'
+    )
+    key = (
+        round(float(stats.get('mem_bytes') or 0) / (1024.0 ** 3), 2),
+        round(float(stats.get('system_mem') or 0.0), 1),
+        tuple((item['name'], item['ram_human']) for item in top_modules[:3]),
+    )
+    if _last_resource_publish_key == key and _last_resource_publish_ts and (now - _last_resource_publish_ts) < RESOURCE_PUBLISH_INTERVAL_SEC:
+        return
+    history = get_inastate('resource_vitals_history') or []
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        'timestamp': timestamp,
+        'pressure_level': _resource_pressure_level(stats),
+        'ina_ram_bytes': int(stats.get('mem_bytes') or 0),
+        'system_ram_percent': round(float(stats.get('system_mem') or 0.0), 1),
+        'top_modules': top_modules[:3],
+    })
+    history = history[-RESOURCE_HISTORY_MAX_SAMPLES:]
+    trends = _compute_resource_trends(history)
+    update_inastate('resource_vitals_history', history)
+    update_inastate('resource_vitals', {
+        'timestamp': timestamp,
+        'source': 'gui_vitals',
+        'pressure_level': _resource_pressure_level(stats),
+        'ina_cpu_percent': round(float(stats.get('cpu') or 0.0), 1),
+        'ina_ram_bytes': int(stats.get('mem_bytes') or 0),
+        'ina_ram_human': _format_ram_value(int(stats.get('mem_bytes') or 0)),
+        'system_cpu_percent': round(float(stats.get('system_cpu') or 0.0), 1),
+        'system_ram_percent': round(float(stats.get('system_mem') or 0.0), 1),
+        'process_count': int(stats.get('processes') or 0),
+        'thread_count': int(stats.get('threads') or 0),
+        'top_modules': top_modules,
+        'summary': summary,
+        'optimization_hint': optimization_hint,
+        'trend': trends,
+    })
+    _last_resource_publish_ts = now
+    _last_resource_publish_key = key
+
+
 def _collect_usage_snapshot():
     stats = {
-        "cpu": 0.0,
-        "mem_bytes": 0,
-        "threads": 0,
-        "processes": 0,
-        "system_cpu": 0.0,
-        "system_mem": 0.0,
+        'cpu': 0.0,
+        'mem_bytes': 0,
+        'threads': 0,
+        'processes': 0,
+        'system_cpu': 0.0,
+        'system_mem': 0.0,
+        'modules': [],
     }
+    modules = {}
 
     for proc in _ina_processes():
         try:
-            stats["cpu"] += proc.cpu_percent(interval=None)
-            stats["mem_bytes"] += proc.memory_info().rss
-            stats["threads"] += proc.num_threads()
-            stats["processes"] += 1
+            cpu = proc.cpu_percent(interval=None)
+            mem_bytes = int(proc.memory_info().rss)
+            threads = proc.num_threads()
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
+        stats['cpu'] += cpu
+        stats['mem_bytes'] += mem_bytes
+        stats['threads'] += threads
+        stats['processes'] += 1
+        name = _module_process_name(proc)
+        bucket = modules.setdefault(name, {'name': name, 'cpu': 0.0, 'mem_bytes': 0, 'threads': 0, 'processes': 0})
+        bucket['cpu'] += cpu
+        bucket['mem_bytes'] += mem_bytes
+        bucket['threads'] += threads
+        bucket['processes'] += 1
 
     try:
-        stats["system_cpu"] = psutil.cpu_percent(interval=None)
+        stats['system_cpu'] = psutil.cpu_percent(interval=None)
     except Exception:
-        stats["system_cpu"] = 0.0
+        stats['system_cpu'] = 0.0
 
     try:
-        stats["system_mem"] = psutil.virtual_memory().percent
+        stats['system_mem'] = psutil.virtual_memory().percent
     except Exception:
-        stats["system_mem"] = 0.0
+        stats['system_mem'] = 0.0
 
+    stats['modules'] = sorted(
+        modules.values(),
+        key=lambda item: (item['mem_bytes'], item['cpu'], item['name']),
+        reverse=True,
+    )
     return stats
 
 def _refresh_energy_label():
@@ -596,19 +820,28 @@ def _update_usage_labels():
         return
 
     stats = _collect_usage_snapshot()
-    mem_mb = stats["mem_bytes"] / (1024 * 1024) if stats["mem_bytes"] else 0
+    summary = _summarize_resource_usage(stats)
 
-    if _usage_labels.get("ina_cpu"):
-        _usage_labels["ina_cpu"].config(text=f"Ina CPU (sum): {stats['cpu']:.1f}%")
-    if _usage_labels.get("ina_mem"):
-        _usage_labels["ina_mem"].config(text=f"Ina RAM: {mem_mb:.1f} MB")
-    if _usage_labels.get("ina_threads"):
-        _usage_labels["ina_threads"].config(text=f"Threads: {stats['threads']}  ·  Processes: {stats['processes']}")
-    if _usage_labels.get("sys_cpu"):
-        _usage_labels["sys_cpu"].config(text=f"System CPU: {stats['system_cpu']:.1f}%")
-    if _usage_labels.get("sys_mem"):
-        _usage_labels["sys_mem"].config(text=f"System RAM: {stats['system_mem']:.1f}%")
+    if _usage_labels.get('ina_cpu'):
+        _usage_labels['ina_cpu'].config(text=f"Ina CPU (sum): {stats['cpu']:.1f}%")
+    if _usage_labels.get('ina_mem'):
+        _usage_labels['ina_mem'].config(text=f"Ina RAM: {_format_ram_value(stats['mem_bytes'])}")
+    if _usage_labels.get('ina_threads'):
+        _usage_labels['ina_threads'].config(text=f"Threads: {stats['threads']}  ·  Processes: {stats['processes']}")
+    if _usage_labels.get('sys_cpu'):
+        _usage_labels['sys_cpu'].config(text=f"System CPU: {stats['system_cpu']:.1f}%")
+    if _usage_labels.get('sys_mem'):
+        _usage_labels['sys_mem'].config(text=f"System RAM: {stats['system_mem']:.1f}%")
+    history = get_inastate('resource_vitals_history') or []
+    trends = _compute_resource_trends(history if isinstance(history, list) else [])
+    if _usage_labels.get('resource_note'):
+        _usage_labels['resource_note'].config(text=summary)
+    if _usage_labels.get('resource_trend'):
+        _usage_labels['resource_trend'].config(text=trends.get('summary', 'No resource trend data yet.'))
+    if _usage_labels.get('module_mem'):
+        _usage_labels['module_mem'].config(text=_format_module_usage(stats.get('modules', [])))
 
+    _publish_resource_snapshot(stats)
     _refresh_energy_label()
     _refresh_nutrition_section()
     vitals_window.after(1500, _update_usage_labels)
@@ -616,94 +849,156 @@ def _update_usage_labels():
 def open_vitals_window():
     global vitals_window, _usage_labels, energy_var, energy_status_var, emotion_vars
     global hunger_status_var, fitness_status_var, nutrition_info_var, last_meal_status_var, metabolic_status_var
+    global offer_status_var, offer_note_var
 
     if vitals_window is not None and vitals_window.winfo_exists():
         vitals_window.lift()
         return
 
     vitals_window = tk.Toplevel(root)
-    vitals_window.title("Ina Vitals & Control")
-    vitals_window.geometry("700x720")
+    vitals_window.title('Ina Vitals & Control')
+    vitals_window.geometry('760x760')
+    vitals_window.minsize(640, 520)
 
-    usage_frame = tk.LabelFrame(vitals_window, text="Resource usage (Ina process tree)")
+    outer = tk.Frame(vitals_window)
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    canvas = tk.Canvas(outer, highlightthickness=0)
+    scrollbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    content = tk.Frame(canvas)
+    canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
+
+    def _sync_scroll_region(_event=None):
+        canvas.configure(scrollregion=canvas.bbox('all'))
+
+    def _sync_canvas_width(event):
+        canvas.itemconfigure(canvas_window, width=event.width)
+
+    content.bind('<Configure>', _sync_scroll_region)
+    canvas.bind('<Configure>', _sync_canvas_width)
+
+    usage_frame = tk.LabelFrame(content, text='Resource usage (Ina process tree)')
     usage_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
 
     _usage_labels = {
-        "ina_cpu": tk.Label(usage_frame, text="Ina CPU (sum): --"),
-        "ina_mem": tk.Label(usage_frame, text="Ina RAM: --"),
-        "ina_threads": tk.Label(usage_frame, text="Threads: --"),
-        "sys_cpu": tk.Label(usage_frame, text="System CPU: --"),
-        "sys_mem": tk.Label(usage_frame, text="System RAM: --"),
+        'ina_cpu': tk.Label(usage_frame, text='Ina CPU (sum): --'),
+        'ina_mem': tk.Label(usage_frame, text='Ina RAM: --'),
+        'ina_threads': tk.Label(usage_frame, text='Threads: --'),
+        'sys_cpu': tk.Label(usage_frame, text='System CPU: --'),
+        'sys_mem': tk.Label(usage_frame, text='System RAM: --'),
+        'resource_note': tk.Label(
+            usage_frame,
+            text='Readable summary: gathering…',
+            justify=tk.LEFT,
+            anchor='w',
+            wraplength=680,
+        ),
+        'resource_trend': tk.Label(
+            usage_frame,
+            text='Trend summary: gathering…',
+            justify=tk.LEFT,
+            anchor='w',
+            wraplength=680,
+        ),
+        'module_mem': tk.Label(
+            usage_frame,
+            text='Per-process modules: gathering…',
+            justify=tk.LEFT,
+            anchor='w',
+            font='TkFixedFont',
+        ),
     }
 
-    _usage_labels["ina_cpu"].pack(anchor="w")
-    _usage_labels["ina_mem"].pack(anchor="w")
-    _usage_labels["ina_threads"].pack(anchor="w")
-    _usage_labels["sys_cpu"].pack(anchor="w", pady=(4, 0))
-    _usage_labels["sys_mem"].pack(anchor="w")
+    _usage_labels['ina_cpu'].pack(anchor='w')
+    _usage_labels['ina_mem'].pack(anchor='w')
+    _usage_labels['ina_threads'].pack(anchor='w')
+    _usage_labels['sys_cpu'].pack(anchor='w', pady=(4, 0))
+    _usage_labels['sys_mem'].pack(anchor='w')
+    tk.Label(usage_frame, text='Readable summary for Ina').pack(anchor='w', pady=(8, 0))
+    _usage_labels['resource_note'].pack(anchor='w', fill=tk.X, pady=(2, 0))
+    tk.Label(usage_frame, text='Trend summary for Ina').pack(anchor='w', pady=(8, 0))
+    _usage_labels['resource_trend'].pack(anchor='w', fill=tk.X, pady=(2, 0))
+    tk.Label(usage_frame, text='Per-process module RAM / CPU').pack(anchor='w', pady=(8, 0))
+    _usage_labels['module_mem'].pack(anchor='w', fill=tk.X, pady=(2, 0))
 
-    energy_frame = tk.LabelFrame(vitals_window, text="Energy")
+    energy_frame = tk.LabelFrame(content, text='Energy')
     energy_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
 
-    energy_var = tk.DoubleVar(value=_clamp_value(get_inastate("current_energy") or 0.5, 0.0, 1.0))
-    energy_status_var = tk.StringVar(value="Current energy: --")
+    energy_var = tk.DoubleVar(value=_clamp_value(get_inastate('current_energy') or 0.5, 0.0, 1.0))
+    energy_status_var = tk.StringVar(value='Current energy: --')
 
     energy_row = tk.Frame(energy_frame)
     energy_row.pack(fill=tk.X, padx=5, pady=4)
-    tk.Label(energy_row, text="Energy (0-1)").pack(side=tk.LEFT)
-    tk.Scale(energy_row, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
-             variable=energy_var, length=320).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+    tk.Label(energy_row, text='Energy (0-1)').pack(side=tk.LEFT)
+    tk.Scale(
+        energy_row,
+        from_=0.0,
+        to=1.0,
+        resolution=0.01,
+        orient=tk.HORIZONTAL,
+        variable=energy_var,
+        length=320,
+    ).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
     tk.Label(energy_row, textvariable=energy_status_var).pack(side=tk.LEFT, padx=5)
 
     energy_buttons = tk.Frame(energy_frame)
     energy_buttons.pack(fill=tk.X, padx=5, pady=(0, 4))
-    tk.Button(energy_buttons, text="Nudge -0.05", command=lambda: _nudge_energy(-0.05)).pack(side=tk.LEFT, padx=4)
-    tk.Button(energy_buttons, text="Apply", command=lambda: _apply_energy_value(reason="slider")).pack(side=tk.LEFT, padx=4)
-    tk.Button(energy_buttons, text="Nudge +0.05", command=lambda: _nudge_energy(0.05)).pack(side=tk.LEFT, padx=4)
-    tk.Button(energy_buttons, text="Reload", command=lambda: energy_var.set(_clamp_value(get_inastate("current_energy") or 0.5, 0.0, 1.0))).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text='Nudge -0.05', command=lambda: _nudge_energy(-0.05)).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text='Apply', command=lambda: _apply_energy_value(reason='slider')).pack(side=tk.LEFT, padx=4)
+    tk.Button(energy_buttons, text='Nudge +0.05', command=lambda: _nudge_energy(0.05)).pack(side=tk.LEFT, padx=4)
+    tk.Button(
+        energy_buttons,
+        text='Reload',
+        command=lambda: energy_var.set(_clamp_value(get_inastate('current_energy') or 0.5, 0.0, 1.0)),
+    ).pack(side=tk.LEFT, padx=4)
 
-    nutrition_frame = tk.LabelFrame(vitals_window, text="Nutrition & Fitness")
+    nutrition_frame = tk.LabelFrame(content, text='Nutrition & Fitness')
     nutrition_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
 
-    hunger_status_var = tk.StringVar(value="Hunger: --")
-    fitness_status_var = tk.StringVar(value="Fitness: --")
-    metabolic_status_var = tk.StringVar(value="Metabolic efficiency: --")
-    last_meal_status_var = tk.StringVar(value="Last meal: --")
-    nutrition_info_var = tk.StringVar(value="Meal scores pending…")
-    offer_status_var = tk.StringVar(value="Offers: --")
+    hunger_status_var = tk.StringVar(value='Hunger: --')
+    fitness_status_var = tk.StringVar(value='Fitness: --')
+    metabolic_status_var = tk.StringVar(value='Metabolic efficiency: --')
+    last_meal_status_var = tk.StringVar(value='Last meal: --')
+    nutrition_info_var = tk.StringVar(value='Meal scores pending…')
+    offer_status_var = tk.StringVar(value='Offers: --')
     offer_note_var = tk.StringVar()
 
-    tk.Label(nutrition_frame, textvariable=hunger_status_var).pack(anchor="w", padx=6, pady=(4, 0))
-    tk.Label(nutrition_frame, textvariable=fitness_status_var).pack(anchor="w", padx=6)
-    tk.Label(nutrition_frame, textvariable=metabolic_status_var).pack(anchor="w", padx=6)
-    tk.Label(nutrition_frame, textvariable=last_meal_status_var, wraplength=420, justify=tk.LEFT).pack(anchor="w", padx=6, pady=(0, 4))
+    tk.Label(nutrition_frame, textvariable=hunger_status_var).pack(anchor='w', padx=6, pady=(4, 0))
+    tk.Label(nutrition_frame, textvariable=fitness_status_var).pack(anchor='w', padx=6)
+    tk.Label(nutrition_frame, textvariable=metabolic_status_var).pack(anchor='w', padx=6)
+    tk.Label(nutrition_frame, textvariable=last_meal_status_var, wraplength=520, justify=tk.LEFT).pack(anchor='w', padx=6, pady=(0, 4))
 
-    tk.Label(nutrition_frame, text="Meal gate scores:").pack(anchor="w", padx=6)
-    tk.Label(nutrition_frame, textvariable=nutrition_info_var, justify=tk.LEFT, wraplength=420).pack(anchor="w", padx=6, pady=(0, 4))
+    tk.Label(nutrition_frame, text='Meal gate scores:').pack(anchor='w', padx=6)
+    tk.Label(nutrition_frame, textvariable=nutrition_info_var, justify=tk.LEFT, wraplength=520).pack(anchor='w', padx=6, pady=(0, 4))
 
-    tk.Label(nutrition_frame, textvariable=offer_status_var, justify=tk.LEFT, wraplength=420).pack(anchor="w", padx=6, pady=(0, 4))
+    tk.Label(nutrition_frame, textvariable=offer_status_var, justify=tk.LEFT, wraplength=520).pack(anchor='w', padx=6, pady=(0, 4))
 
     note_row = tk.Frame(nutrition_frame)
     note_row.pack(fill=tk.X, padx=6, pady=(0, 4))
-    tk.Label(note_row, text="Offer note:").pack(side=tk.LEFT)
+    tk.Label(note_row, text='Offer note:').pack(side=tk.LEFT)
     tk.Entry(note_row, textvariable=offer_note_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
     meal_buttons = tk.Frame(nutrition_frame)
     meal_buttons.pack(fill=tk.X, padx=6, pady=(0, 4))
-    tk.Button(meal_buttons, text="Snack", command=lambda: _request_meal_from_gui("snack")).pack(side=tk.LEFT, padx=4)
-    tk.Button(meal_buttons, text="Small Meal", command=lambda: _request_meal_from_gui("small_meal")).pack(side=tk.LEFT, padx=4)
-    tk.Button(meal_buttons, text="Meal", command=lambda: _request_meal_from_gui("meal")).pack(side=tk.LEFT, padx=4)
-    tk.Button(meal_buttons, text="Large Meal", command=lambda: _request_meal_from_gui("large_meal")).pack(side=tk.LEFT, padx=4)
-    tk.Button(meal_buttons, text="Reload", command=_refresh_nutrition_section).pack(side=tk.RIGHT, padx=4)
+    tk.Button(meal_buttons, text='Snack', command=lambda: _request_meal_from_gui('snack')).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text='Small Meal', command=lambda: _request_meal_from_gui('small_meal')).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text='Meal', command=lambda: _request_meal_from_gui('meal')).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text='Large Meal', command=lambda: _request_meal_from_gui('large_meal')).pack(side=tk.LEFT, padx=4)
+    tk.Button(meal_buttons, text='Reload', command=_refresh_nutrition_section).pack(side=tk.RIGHT, padx=4)
 
     offer_buttons = tk.Frame(nutrition_frame)
     offer_buttons.pack(fill=tk.X, padx=6, pady=(0, 4))
-    tk.Button(offer_buttons, text="Offer Snack", command=lambda: _offer_meal_from_gui("snack")).pack(side=tk.LEFT, padx=4)
-    tk.Button(offer_buttons, text="Offer Small Meal", command=lambda: _offer_meal_from_gui("small_meal")).pack(side=tk.LEFT, padx=4)
-    tk.Button(offer_buttons, text="Offer Meal", command=lambda: _offer_meal_from_gui("meal")).pack(side=tk.LEFT, padx=4)
-    tk.Button(offer_buttons, text="Offer Large Meal", command=lambda: _offer_meal_from_gui("large_meal")).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text='Offer Snack', command=lambda: _offer_meal_from_gui('snack')).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text='Offer Small Meal', command=lambda: _offer_meal_from_gui('small_meal')).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text='Offer Meal', command=lambda: _offer_meal_from_gui('meal')).pack(side=tk.LEFT, padx=4)
+    tk.Button(offer_buttons, text='Offer Large Meal', command=lambda: _offer_meal_from_gui('large_meal')).pack(side=tk.LEFT, padx=4)
 
-    emotion_frame = tk.LabelFrame(vitals_window, text="Emotion sliders (-1 to 1)")
+    emotion_frame = tk.LabelFrame(content, text='Emotion sliders (-1 to 1)')
     emotion_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 10))
 
     emotion_vars = {}
@@ -711,19 +1006,26 @@ def open_vitals_window():
     for idx, slider_name in enumerate(EMOTION_SLIDERS):
         col = idx // 12
         row = idx % 12
-        tk.Label(emotion_frame, text=slider_name).grid(row=row, column=col * 2, sticky="w", padx=4, pady=2)
+        tk.Label(emotion_frame, text=slider_name).grid(row=row, column=col * 2, sticky='w', padx=4, pady=2)
         var = tk.DoubleVar(value=seed.get(slider_name, 0.0))
         emotion_vars[slider_name] = var
-        tk.Scale(emotion_frame, from_=-1.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
-                 variable=var, length=240).grid(row=row, column=col * 2 + 1, sticky="ew", padx=4, pady=2)
+        tk.Scale(
+            emotion_frame,
+            from_=-1.0,
+            to=1.0,
+            resolution=0.01,
+            orient=tk.HORIZONTAL,
+            variable=var,
+            length=240,
+        ).grid(row=row, column=col * 2 + 1, sticky='ew', padx=4, pady=2)
 
     for col in range(4):
         emotion_frame.columnconfigure(col, weight=1)
 
     controls_row = tk.Frame(emotion_frame)
-    controls_row.grid(row=12, column=0, columnspan=4, sticky="ew", padx=4, pady=(8, 2))
-    tk.Button(controls_row, text="Reload from state", command=_reload_emotion_sliders).pack(side=tk.LEFT, padx=4)
-    tk.Button(controls_row, text="Apply to Ina", command=_apply_emotion_sliders).pack(side=tk.LEFT, padx=4)
+    controls_row.grid(row=12, column=0, columnspan=4, sticky='ew', padx=4, pady=(8, 2))
+    tk.Button(controls_row, text='Reload from state', command=_reload_emotion_sliders).pack(side=tk.LEFT, padx=4)
+    tk.Button(controls_row, text='Apply to Ina', command=_apply_emotion_sliders).pack(side=tk.LEFT, padx=4)
 
     _prime_usage_counters()
     _refresh_energy_label()
