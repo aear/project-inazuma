@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from io_utils import atomic_write_json, file_lock, load_json_dict
 
 try:
     from gui_hook import log_to_statusbox
@@ -65,11 +66,8 @@ def _inastate_path() -> Path:
 
 def _read_inastate() -> Dict[str, Any]:
     path = _inastate_path()
-    if not path.exists():
-        return {}
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+        return load_json_dict(path)
     except Exception:
         _log("Failed to read inastate; returning empty state.")
         return {}
@@ -77,11 +75,7 @@ def _read_inastate() -> Dict[str, Any]:
 
 def _write_inastate(state: Dict[str, Any]) -> None:
     path = _inastate_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    atomic_write_json(path, state, indent=2, ensure_ascii=False)
 
 
 def _get_inastate(key: str, default: Any = None) -> Any:
@@ -90,9 +84,12 @@ def _get_inastate(key: str, default: Any = None) -> Any:
 
 
 def _update_inastate(key: str, value: Any) -> None:
-    state = _read_inastate()
-    state[key] = value
-    _write_inastate(state)
+    path = _inastate_path()
+    lock_path = path.with_name("inastate.lock")
+    with file_lock(lock_path):
+        state = load_json_dict(path)
+        state[key] = value
+        _write_inastate(state)
 
 
 def _playfulness_snapshot() -> Dict[str, Any]:

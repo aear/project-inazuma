@@ -6,6 +6,7 @@ from tkinter.scrolledtext import ScrolledText
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+from io_utils import atomic_write_json, file_lock, load_json_dict
 
 try:
     import fcntl  # type: ignore
@@ -24,22 +25,11 @@ def _iso_now() -> str:
 
 
 def _load_json_dict(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return load_json_dict(path)
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=4, ensure_ascii=True)
-    os.replace(tmp, path)
+    atomic_write_json(path, payload, indent=4)
 
 
 def _load_config() -> Dict[str, Any]:
@@ -95,9 +85,11 @@ def _read_inastate() -> Dict[str, Any]:
 
 def _update_inastate_fields(updates: Dict[str, Any]) -> None:
     path = _inastate_path()
-    current = _load_json_dict(path)
-    current.update(updates)
-    _atomic_write_json(path, current)
+    lock_path = path.with_name("inastate.lock")
+    with file_lock(lock_path):
+        current = _load_json_dict(path)
+        current.update(updates)
+        _atomic_write_json(path, current)
 
 
 def _set_popup_active(active: bool) -> None:

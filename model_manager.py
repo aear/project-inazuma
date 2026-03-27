@@ -25,6 +25,7 @@ from continuity_manager import ContinuityManager
 from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
+from io_utils import atomic_write_json
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 try:
@@ -1194,12 +1195,7 @@ def _load_inastate_state() -> Dict[str, Any]:
 
 
 def _atomic_write_inastate(state: Dict[str, Any]) -> None:
-    path = MEMORY_PATH / "inastate.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=4)
-    os.replace(tmp_path, path)
+    atomic_write_json(MEMORY_PATH / "inastate.json", state, indent=4)
 
 
 def safe_popen(cmd, description=None, **popen_kwargs):

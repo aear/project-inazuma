@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
+from io_utils import atomic_write_json, file_lock, load_json_dict
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -470,31 +471,17 @@ def _bundle_prune_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _load_inastate(child: str) -> Dict[str, Any]:
     path = Path("AI_Children") / child / "memory" / "inastate.json"
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    return load_json_dict(path)
 
 
 def _write_inastate_value(child: str, key: str, value: Any) -> None:
     path = Path("AI_Children") / child / "memory" / "inastate.json"
-    data: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh) or {}
-        except Exception:
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data[key] = value
+    lock_path = path.with_name("inastate.lock")
     try:
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
+        with file_lock(lock_path):
+            data = load_json_dict(path)
+            data[key] = value
+            atomic_write_json(path, data)
     except Exception:
         return
 

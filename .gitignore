@@ -23,6 +23,7 @@ logs/
 *.odt
 *.jsonl
 *.glb
+logic_pause.flag
 
 
 # --- WORK DIRECTORIES ---
@@ -49,3 +50,4 @@ __pycache__/
 dist/
 build/
 logs/comms_core.jsonl
+logic_pause.flag
