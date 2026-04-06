@@ -74,3 +74,43 @@ def test_cluster_encoded_keeps_light_members():
     members = clusters[0]["members"]
     assert len(members) == 2
     assert "vector" not in members[0]
+
+
+def test_promote_symbol_pairs_updates_proto_and_multi_word_state():
+    preserved = {}
+    cluster_members = [{"id": "frag1"}, {"id": "frag2"}]
+    fragments_by_id = {
+        "frag1": {
+            "id": "frag1",
+            "summary": "soft trust pulse",
+            "tags": ["symbolic", "comm"],
+            "symbols_spoken": ["snd_a", "snd_b"],
+        },
+        "frag2": {
+            "id": "frag2",
+            "summary": "soft trust pulse",
+            "tags": ["symbolic", "comm"],
+            "symbols_spoken": ["snd_a", "snd_b"],
+        },
+    }
+    policy = {"max_tags_per_word": 4, "vector_round_digits": 3}
+
+    proto_updates, multi_updates = mm._promote_symbol_pairs(
+        preserved,
+        cluster_members,
+        fragments_by_id,
+        [0.9, 0.1],
+        ["symbolic", "comm"],
+        "soft trust cluster",
+        policy,
+    )
+
+    assert proto_updates == 1
+    assert multi_updates == 1
+    proto_entry = preserved["proto_words"]["snd_a_snd_b"]
+    multi_entry = preserved["multi_symbol_words"]["pair:snd_a_snd_b"]
+    assert proto_entry["uses"] == 2
+    assert proto_entry["summary"] == "soft trust pulse"
+    assert proto_entry["vector"] == [0.9, 0.1]
+    assert multi_entry["uses"] == 2
+    assert multi_entry["source"] == "meaning_cluster"

@@ -28,10 +28,13 @@ from model_manager import load_config, seed_self_question, update_inastate, get_
 from social_map import get_high_trust_contacts, get_owner_user_id
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
+from symbol_word_utils import proto_confidence as shared_proto_confidence, score_symbol_word_candidates
 
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
 TYPE_CONTACT_COOLDOWN = 180  # seconds between proactive typed contacts
+PATTERN_PROMOTION_COOLDOWN = 300  # seconds between repeated-tone promotion scans
+PATTERN_FRAGMENT_SCAN_LIMIT = 192  # cap pattern mining to recent expression fragments
 EMBEDDER = MultimodalEmbedder(dim=128)
 
 
@@ -42,8 +45,7 @@ def _normalize_symbol_map(raw):
 
 
 def _proto_confidence(uses: int, base: float = 0.2) -> float:
-    uses = max(1, int(uses))
-    return round(min(0.9, base + math.log1p(uses) / 5.0), 3)
+    return shared_proto_confidence(uses, base=base)
 
 
 def _resolve_adjusted_urge_level(state: Any) -> float:
@@ -60,15 +62,34 @@ def _resolve_adjusted_urge_level(state: Any) -> float:
     return max(0.0, min(1.0, adjusted))
 
 
-def _ensure_vocab_embeddings(vocab_map: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
+def _ensure_vocab_embeddings(
+    vocab_map: Dict[str, Any],
+    candidate_ids: Optional[List[str]] = None,
+    language_hint: Optional[str] = None,
+) -> bool:
     """
-    Attach text embeddings and language hints to vocab entries if missing.
+    Attach text embeddings and language hints to touched vocab entries.
     Returns True if any entry was modified.
     """
+    if not isinstance(vocab_map, dict) or not vocab_map:
+        return False
+
+    if candidate_ids:
+        entries = []
+        seen = set()
+        for symbol_id in candidate_ids:
+            key = str(symbol_id or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            entry = vocab_map.get(key)
+            if isinstance(entry, dict):
+                entries.append(entry)
+    else:
+        entries = [entry for entry in vocab_map.values() if isinstance(entry, dict)]
+
     updated = False
-    for entry in vocab_map.values():
-        if not isinstance(entry, dict):
-            continue
+    for entry in entries:
         word = (entry.get("word") or "").strip()
         if not word:
             continue
@@ -639,26 +660,59 @@ def combine_tones_and_register(child, tone_candidates, symbol_map, vocab_map, *,
     return new_id, new_word, lang_choice
 
 
-def _load_fragments(child):
+def _load_recent_expression_fragments(child: str, limit: int = PATTERN_FRAGMENT_SCAN_LIMIT):
     frag_dir = Path("AI_Children") / child / "memory" / "fragments"
     if not frag_dir.exists():
         return []
+
+    try:
+        paths = sorted(
+            frag_dir.glob("frag_expression_*.json"),
+            key=lambda frag_path: frag_path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        paths = []
+
     frags = []
-    for f in frag_dir.glob("frag_*.json"):
+    for frag_path in paths[:max(1, int(limit))]:
         try:
-            with f.open("r", encoding="utf-8") as fh:
-                frags.append(json.load(fh))
+            with frag_path.open("r", encoding="utf-8") as fh:
+                frag = json.load(fh)
         except Exception:
             continue
+        if isinstance(frag, dict):
+            frags.append(frag)
     return frags
 
 
-def detect_repeated_tone_patterns(child, vocab_map, *, min_count=2, min_coherence=0.82):
+
+def _should_promote_tone_patterns(now: Optional[float] = None, cooldown: int = PATTERN_PROMOTION_COOLDOWN) -> bool:
+    current = float(now if now is not None else time.time())
+    last_scan = get_inastate("last_tone_pattern_scan") or 0.0
+    try:
+        last_scan = float(last_scan)
+    except Exception:
+        last_scan = 0.0
+    if current - last_scan < max(1, int(cooldown)):
+        return False
+    update_inastate("last_tone_pattern_scan", current)
+    return True
+
+
+def detect_repeated_tone_patterns(
+    child,
+    vocab_map,
+    *,
+    min_count=2,
+    min_coherence=0.82,
+    limit=PATTERN_FRAGMENT_SCAN_LIMIT,
+):
     """
     If a multi-tone pattern recurs in similar emotional states, promote it
     into its own sound symbol and map a word to it.
     """
-    frags = _load_fragments(child)
+    frags = _load_recent_expression_fragments(child, limit=limit)
     patterns: Dict[tuple, Dict[str, object]] = {}
 
     for frag in frags:
@@ -1248,10 +1302,14 @@ def early_communicate():
 
     symbol_map = load_sound_symbol_map(child)
     vocab_map = load_symbol_to_token(child)
-    if _ensure_vocab_embeddings(vocab_map, language_hint=context_language):
-        save_symbol_to_token(child, vocab_map)
 
     tone_candidates = rank_sound_symbols(pred_vec, symbol_map, transformer, top_n=3)
+    if _ensure_vocab_embeddings(
+        vocab_map,
+        candidate_ids=[sid for sid, _ in tone_candidates],
+        language_hint=context_language,
+    ):
+        save_symbol_to_token(child, vocab_map)
     symbol_id, best_sim = (tone_candidates[0] if tone_candidates else (None, 0.0))
     tone_library = load_tone_library(child)
     tone_riff_option = select_tone_riff(tone_library, inferred or {})
@@ -1311,7 +1369,18 @@ def early_communicate():
     word_state = load_symbol_word_state(child)
     proto_words = word_state.get("proto_words", {})
     multi_symbol_words = word_state.get("multi_symbol_words", {})
-    pair_choice = select_proto_pair_word(tone_candidates, proto_words, multi_symbol_words) if tone_candidates else None
+    best_word_match = score_symbol_word_candidates(pred_vec, transformer, word_state)
+    pair_choice = None
+    if best_word_match and best_word_match.get("sequence"):
+        pair_choice = {
+            "key": best_word_match["symbol_word_id"],
+            "sequence": list(best_word_match.get("sequence") or []),
+            "confidence": float(best_word_match.get("confidence", 0.0) or 0.0),
+            "flexible": bool((best_word_match.get("entry") or {}).get("flexible", False)),
+            "source": best_word_match.get("kind"),
+        }
+    elif tone_candidates:
+        pair_choice = select_proto_pair_word(tone_candidates, proto_words, multi_symbol_words)
     proto_word_used = None
     tone_exploration_used = None
     log_to_statusbox(
@@ -1351,14 +1420,14 @@ def early_communicate():
     word_id, word_conf = None, 0.0
     word_creation_prompt = None
     vocab_size = len(word_map) + len(proto_words) + len(multi_symbol_words)
-    for word in word_map:
-        if not word.get("components"): continue
-        sum_text = word.get("summary", "")
-        vec = transformer.encode({"summary": sum_text})["vector"]
-        sim = cosine_similarity(pred_vec, vec)
-        if sim > word_conf:
-            word_id, word_conf = word["symbol_word_id"], sim
-    log_to_statusbox(f"[Comms] Best word: {word_id} (conf: {word_conf:.4f})")
+    if best_word_match:
+        word_id = best_word_match["symbol_word_id"]
+        word_conf = float(best_word_match.get("confidence", 0.0) or 0.0)
+    log_to_statusbox(
+        f"[Comms] Best word: {word_id} (conf: {word_conf:.4f})"
+        if word_id
+        else "[Comms] No symbol-word candidate cleared the current matcher."
+    )
     word_creation_prompt = maybe_prompt_new_symbol_word(
         child, prediction, word_id, word_conf, symbol_id, vocab_size
     )
@@ -1461,13 +1530,6 @@ def early_communicate():
     update_inastate("sound_exploration_options", sound_explorations)
 
     log_to_statusbox(f"[Comms] Final expression: '{expression}'")
-    symbol_seq_for_embed = speech_symbols or ([symbol_id] if symbol_id else [])
-    symbol_embedding = (
-        EMBEDDER.embed_symbol_sequence(symbol_seq_for_embed, language=context_language)
-        if symbol_seq_for_embed
-        else None
-    )
-    text_embedding = EMBEDDER.embed_text(expression, language=context_language) if expression else None
     frag = create_expression_fragment(
         child,
         expression,
@@ -1499,8 +1561,6 @@ def early_communicate():
         ),
         voice_target=voice_pref,
         language_hint=context_language,
-        embedding=text_embedding,
-        symbol_embedding=symbol_embedding,
     )
     if proto_word_used:
         record_proto_pair_usage(child, proto_word_used)
@@ -1718,7 +1778,9 @@ def early_communicate():
         associate_symbol_with_word(child, combo_symbol_id, combo_word, 0.2, language=combo_lang)
         log_to_statusbox(f"[Comms] Associated combo {combo_symbol_id} with '{combo_word}'.")
 
-    created_patterns = detect_repeated_tone_patterns(child, vocab_map)
+    created_patterns = []
+    if _should_promote_tone_patterns():
+        created_patterns = detect_repeated_tone_patterns(child, vocab_map)
     if created_patterns:
         for sid, word, coh, cnt in created_patterns:
             log_to_statusbox(

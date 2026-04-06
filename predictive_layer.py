@@ -15,6 +15,7 @@ from model_manager import (
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from precision_requests import precision_request
 from gui_hook import log_to_statusbox
+from symbol_word_utils import score_symbol_word_candidates
 
 def cosine_similarity(v1, v2):
     dot = sum(a * b for a, b in zip(v1, v2))
@@ -72,15 +73,26 @@ def load_recent_fragments(child, limit=10):
             continue
     return fragments
 
-def load_symbol_words(child):
+def load_symbol_word_state(child):
     path = Path("AI_Children") / child / "memory" / "symbol_words.json"
+    default = {"words": [], "proto_words": {}, "multi_symbol_words": {}}
     if not path.exists():
-        return []
-    with open(path, "r") as f:
-        try:
-            return json.load(f).get("words", [])
-        except:
-            return []
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return default
+    if not isinstance(data, dict):
+        return default
+    data.setdefault("words", [])
+    data.setdefault("proto_words", {})
+    data.setdefault("multi_symbol_words", {})
+    return data
+
+
+def load_symbol_words(child):
+    return load_symbol_word_state(child).get("words", [])
 
 
 def _load_precision_policy() -> dict:
@@ -172,27 +184,21 @@ def run_prediction():
             "base_clarity": clarity,
         }
 
-        # Match to known symbol word
-        symbol_words = load_symbol_words(child)
-        best_match = None
-        best_sim = 0.0
-
-        for word in symbol_words:
-            if not word.get("components"): continue
-            sum_text = word.get("summary", "")
-            result = transformer.encode({"summary": sum_text})
-            sim = cosine_similarity(avg_vector, result["vector"])
-            if sim > best_sim:
-                best_sim = sim
-                best_match = word
+        # Match to known symbol words, including recurring paired structures.
+        word_state = load_symbol_word_state(child)
+        best_match = score_symbol_word_candidates(avg_vector, transformer, word_state)
+        best_sim = float(best_match.get("confidence", 0.0) or 0.0) if best_match else 0.0
 
         if best_match:
             predicted["predicted_symbol_word"] = {
                 "symbol_word_id": best_match["symbol_word_id"],
-                "symbol": best_match["symbol"],
-                "confidence": round(best_sim, 4)
+                "symbol": best_match.get("symbol"),
+                "confidence": round(best_sim, 4),
+                "kind": best_match.get("kind"),
             }
-            log_to_statusbox(f"[Predict] Closest match: {best_match['symbol_word_id']} ({best_sim:.4f})")
+            log_to_statusbox(
+                f"[Predict] Closest match: {best_match['symbol_word_id']} ({best_sim:.4f})"
+            )
             if best_sim < 0.5:
                 map_status = inspect_map_health(child)
                 seed_self_question(

@@ -1598,7 +1598,7 @@ def _scheduler_running_counts(state: Dict[str, Any]) -> Dict[str, Any]:
         counts["task_keys"].add(profile["task_key"])
         if profile.get("memory_class") == "high":
             counts["memory_heavy"] += 1
-        if profile.get("cpu_class") in {"medium", "high"}:
+        if profile.get("cpu_class") == "high":
             counts["cpu_heavy"] += 1
         if profile.get("gpu_class") not in {None, "none", ""}:
             counts["gpu_tasks"] += 1
@@ -1622,7 +1622,8 @@ def _scheduler_can_start_task(entry: Dict[str, Any], state: Dict[str, Any], reso
         return False, "parallel_slots_full"
     if profile.get("memory_class") == "high" and counts["memory_heavy"] >= int(limits.get("max_memory_heavy_tasks", 1)):
         return False, "memory_heavy_slot_full"
-    if profile.get("cpu_class") in {"medium", "high"} and counts["cpu_heavy"] >= int(limits.get("max_cpu_heavy_tasks", 2)):
+    # Reserve scarce cpu-heavy slots for the genuinely high-cost reasoning/graph jobs.
+    if profile.get("cpu_class") == "high" and counts["cpu_heavy"] >= int(limits.get("max_cpu_heavy_tasks", 2)):
         return False, "cpu_heavy_slot_full"
     if profile.get("gpu_class") not in {None, "none", ""} and counts["gpu_tasks"] >= int(limits.get("max_gpu_tasks", 1)):
         return False, "gpu_slot_full"
@@ -2639,6 +2640,17 @@ def _is_process_running(pattern: str) -> bool:
         return False
 
 
+def _emotion_focus_level(snapshot: Optional[Dict[str, Any]] = None) -> float:
+    raw = snapshot if isinstance(snapshot, dict) else (get_inastate("emotion_snapshot") or {})
+    values = raw.get("values") if isinstance(raw, dict) else {}
+    if not isinstance(values, dict):
+        values = raw if isinstance(raw, dict) else {}
+    focus = _coerce_float(values.get("focus"), 0.0)
+    attention = _coerce_float(values.get("attention"), 0.0)
+    return max(0.0, focus, attention)
+
+
+
 def _derive_attention_allocation(
     memory_guard: Optional[Dict[str, Any]] = None,
     scheduler_state: Optional[Dict[str, Any]] = None,
@@ -2650,13 +2662,7 @@ def _derive_attention_allocation(
     dreaming = bool(get_inastate("dreaming", False))
     meditating = bool(get_inastate("meditating", False))
     snapshot = get_inastate("emotion_snapshot") or {}
-    values = snapshot.get("values") if isinstance(snapshot, dict) else {}
-    if not isinstance(values, dict):
-        values = snapshot if isinstance(snapshot, dict) else {}
-    try:
-        focus = float(values.get("focus", 0.0) or 0.0)
-    except Exception:
-        focus = 0.0
+    focus = _emotion_focus_level(snapshot)
 
     scheduler = scheduler_state if isinstance(scheduler_state, dict) else (get_inastate("process_scheduler") or {})
     scheduler = scheduler if isinstance(scheduler, dict) else {}
@@ -8029,7 +8035,7 @@ def run_internal_loop():
     world_connected = bool(get_inastate("world_connected", False))
     ground_fault_active = _update_ground_sense_fault_state()
 
-    if not defer_optional and get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
+    if not defer_optional and _emotion_focus_level(get_inastate("emotion_snapshot") or {}) > 0.5:
         request_scheduler_task("meditation_state_run", reason="focus_state", priority=82)
 
     if not defer_optional:

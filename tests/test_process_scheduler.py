@@ -213,6 +213,32 @@ def test_attention_allocation_suppresses_audio_on_hard_guard():
     finally:
         mm.get_inastate = original_get
 
+
+def test_attention_allocation_uses_attention_when_focus_missing():
+    original_get = mm.get_inastate
+    try:
+        state = {
+            "world_connected": False,
+            "dreaming": False,
+            "meditating": False,
+            "emotion_snapshot": {"values": {"attention": 0.81}},
+            "process_scheduler": {
+                "planner": {
+                    "running": [{"task_key": "logic_engine_run"}],
+                    "next_slots": [],
+                    "queue_depth": 1,
+                    "cpu_percent": 42.0,
+                }
+            },
+        }
+        mm.get_inastate = lambda key, default=None: state.get(key, default)
+        plan = mm._derive_attention_allocation(memory_guard={"level": "normal"})
+        assert plan["vision_mode"] == "suppressed"
+        assert "deep_focus_allocation" in plan["reasons"]
+    finally:
+        mm.get_inastate = original_get
+
+
 def test_attention_allocation_honors_explicit_request():
     original_get = mm.get_inastate
     try:
@@ -341,6 +367,22 @@ def test_scheduler_blocks_task_when_managed_budget_would_be_exceeded():
     allowed, reason = mm._scheduler_can_start_task({"task_key": "logic_map_refresh", "id": "task_next"}, state, resources, limits)
     assert allowed is False
     assert reason == "scheduler_managed_rss_limit"
+
+
+
+def test_scheduler_allows_high_cpu_reasoning_when_only_medium_cpu_task_is_running():
+    limits = mm._process_scheduler_limits({"process_scheduler": {"max_parallel_tasks": 3, "max_cpu_heavy_tasks": 1}})
+    state = mm._new_process_scheduler_state()
+    state["running"] = [{"task_key": "emotion_engine_run", "id": "task_running"}]
+    resources = {
+        "memory_guard_level": "normal",
+        "cpu_percent": 18.0,
+        "gpu_utilization_percent": 0.0,
+        "gpu_memory_percent": 0.0,
+    }
+    allowed, reason = mm._scheduler_can_start_task({"task_key": "logic_engine_run", "id": "task_next"}, state, resources, limits)
+    assert allowed is True
+    assert reason == "ok"
 
 
 def test_scheduler_enforce_memory_limits_requests_stop_for_low_priority_task():

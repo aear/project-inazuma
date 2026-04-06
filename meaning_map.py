@@ -12,6 +12,7 @@ from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts, available_symbol_components
 import random
 from text_memory import build_text_symbol_links
+from symbol_word_utils import proto_confidence
 
 _CORRUPT_QUEUE_LIMIT = 120
 _CORRUPT_PROMPT_STEP = 5
@@ -265,6 +266,161 @@ def _merge_vectors(base: List[float], base_count: int, new: List[float], new_cou
         round(((base[i] * max(0, base_count)) + (new[i] * max(0, new_count))) / total, 6)
         for i in range(length)
     ]
+
+
+
+def _coalesce_summary(chunks: List[str], fallback: str) -> str:
+    seen: List[str] = []
+    for chunk in chunks:
+        value = str(chunk or "").strip()
+        if value and value not in seen:
+            seen.append(value)
+        if len(seen) >= 2:
+            break
+    return " + ".join(seen) if seen else fallback
+
+
+
+def _upsert_symbol_pair_entry(
+    store: Dict[str, Any],
+    key: str,
+    *,
+    sequence: List[str],
+    pair_count: int,
+    centroid: List[float],
+    tags: List[str],
+    summary_text: str,
+    policy: Dict[str, Any],
+    base_confidence: float,
+    source: Optional[str] = None,
+    stability_divisor: float = 10.0,
+    flexible_limit: int = 5,
+) -> Dict[str, Any]:
+    entry = store.get(key) if isinstance(store.get(key), dict) else {}
+    now = datetime.now(timezone.utc).isoformat()
+    prior_uses = int(_safe_float(entry.get("uses"), 0))
+    total_uses = prior_uses + max(1, int(pair_count))
+    merged_tags = sorted({str(tag) for tag in (entry.get("tags") or []) if tag} | {str(tag) for tag in tags if tag})
+    max_tags = int(policy.get("max_tags_per_word", 32))
+    if max_tags > 0 and len(merged_tags) > max_tags:
+        merged_tags = merged_tags[-max_tags:]
+    prior_vec = _word_vector(entry)
+    if prior_vec:
+        merged_vec = _merge_vectors(prior_vec, prior_uses, list(centroid), pair_count)
+    else:
+        merged_vec = list(centroid)
+    if summary_text and not entry.get("summary"):
+        entry["summary"] = summary_text
+    entry.update(
+        {
+            "sequence": list(sequence),
+            "components": list(sequence),
+            "uses": total_uses,
+            "last_seen": now,
+            "confidence": proto_confidence(total_uses, base=base_confidence),
+            "flexible": total_uses < int(flexible_limit),
+            "stability": round(min(1.0, total_uses / max(1.0, float(stability_divisor))), 3),
+            "length": len(sequence),
+            "tags": merged_tags,
+            "vector": _round_vector([float(value) for value in merged_vec], int(policy.get("vector_round_digits", 6))),
+            "updated_at": now,
+        }
+    )
+    if summary_text:
+        entry["summary"] = summary_text
+    if source:
+        entry["source"] = source
+    if not entry.get("created"):
+        entry["created"] = now
+    store[key] = entry
+    return entry
+
+
+
+def _promote_symbol_pairs(
+    preserved: Dict[str, Any],
+    cluster_members: List[Dict[str, Any]],
+    fragments_by_id: Dict[str, Dict[str, Any]],
+    centroid: List[float],
+    tag_set: List[str],
+    summary_text: str,
+    policy: Dict[str, Any],
+) -> Tuple[int, int]:
+    proto_store = preserved.get("proto_words") if isinstance(preserved.get("proto_words"), dict) else {}
+    multi_store = preserved.get("multi_symbol_words") if isinstance(preserved.get("multi_symbol_words"), dict) else {}
+    preserved["proto_words"] = proto_store
+    preserved["multi_symbol_words"] = multi_store
+
+    pair_counts: Dict[Tuple[str, str], int] = {}
+    pair_tags: Dict[Tuple[str, str], set] = {}
+    pair_summaries: Dict[Tuple[str, str], List[str]] = {}
+
+    for member in cluster_members:
+        frag_id = str(member.get("id") or "").strip()
+        frag = fragments_by_id.get(frag_id)
+        if not isinstance(frag, dict):
+            continue
+        sequence = frag.get("symbols_spoken")
+        if not isinstance(sequence, list) or len(sequence) < 2:
+            continue
+        cleaned = [str(symbol_id) for symbol_id in sequence if symbol_id]
+        if len(cleaned) < 2:
+            continue
+        frag_tags = {str(tag) for tag in (frag.get("tags") or []) if tag}
+        frag_summary = str(frag.get("summary") or member.get("summary") or summary_text)
+        for idx in range(len(cleaned) - 1):
+            pair = (cleaned[idx], cleaned[idx + 1])
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+            pair_tags.setdefault(pair, set()).update(frag_tags)
+            pair_summaries.setdefault(pair, []).append(frag_summary)
+
+    proto_updates = 0
+    multi_updates = 0
+    for pair, pair_count in pair_counts.items():
+        sequence = list(pair)
+        proto_key = "_".join(sequence)
+        pair_key = f"pair:{proto_key}"
+        merged_tags = sorted(set(tag_set) | pair_tags.get(pair, set()))
+        pair_summary = _coalesce_summary(pair_summaries.get(pair, []), summary_text)
+        previous_proto_uses = int(_safe_float((proto_store.get(proto_key) or {}).get("uses"), 0)) if isinstance(proto_store.get(proto_key), dict) else 0
+        proto_entry = _upsert_symbol_pair_entry(
+            proto_store,
+            proto_key,
+            sequence=sequence,
+            pair_count=pair_count,
+            centroid=centroid,
+            tags=merged_tags,
+            summary_text=pair_summary,
+            policy=policy,
+            base_confidence=0.18,
+            stability_divisor=10.0,
+            flexible_limit=5,
+        )
+        if int(_safe_float(proto_entry.get("uses"), 0)) > previous_proto_uses:
+            proto_updates += 1
+
+        total_proto_uses = int(_safe_float(proto_entry.get("uses"), 0))
+        if pair_count < 2 and total_proto_uses < 2:
+            continue
+        previous_multi_uses = int(_safe_float((multi_store.get(pair_key) or {}).get("uses"), 0)) if isinstance(multi_store.get(pair_key), dict) else 0
+        multi_entry = _upsert_symbol_pair_entry(
+            multi_store,
+            pair_key,
+            sequence=sequence,
+            pair_count=pair_count,
+            centroid=centroid,
+            tags=merged_tags,
+            summary_text=pair_summary,
+            policy=policy,
+            base_confidence=0.24,
+            source="meaning_cluster",
+            stability_divisor=8.0,
+            flexible_limit=4,
+        )
+        if int(_safe_float(multi_entry.get("uses"), 0)) > previous_multi_uses:
+            multi_updates += 1
+
+    return proto_updates, multi_updates
 
 
 def _fragment_signature(child: str, frag_id: str, meta: Dict[str, Any]) -> Optional[str]:
@@ -523,6 +679,8 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
     clusters_total = 0
     merged_words = 0
     created_words = 0
+    proto_promoted = 0
+    multi_promoted = 0
     batches_run = 0
     budget_hit = False
 
@@ -546,6 +704,7 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
         encoded = [entry for entry in encoded if isinstance(entry, dict) and entry.get("id") and entry.get("vector")]
         if not encoded:
             continue
+        fragments_by_id = {str(frag.get("id")): frag for frag in fragments if frag.get("id")}
         encoded_total += len(encoded)
         clusters = _cluster_encoded(encoded, cluster_threshold)
         clusters_total += len(clusters)
@@ -572,6 +731,17 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
                     summary_parts.append(str(summary))
             summary_text = " + ".join(summary_parts) if summary_parts else "symbolic cluster"
             new_count = len(component_ids)
+            promoted_proto, promoted_multi = _promote_symbol_pairs(
+                preserved,
+                members,
+                fragments_by_id,
+                [float(value) for value in centroid],
+                sorted(tag_set),
+                summary_text,
+                policy,
+            )
+            proto_promoted += promoted_proto
+            multi_promoted += promoted_multi
 
             best_idx = -1
             best_score = 0.0
@@ -694,6 +864,7 @@ def cluster_symbols_and_generate_words(child: str, cfg: Optional[Dict[str, Any]]
     log_to_statusbox(
         f"[Symbols] Processed {len(processed_ids)} symbolic fragment(s), encoded {encoded_total}, "
         f"clusters {clusters_total}, merged {merged_words}, created {created_words}, "
+        f"proto_promoted {proto_promoted}, multi_promoted {multi_promoted}, "
         f"word_pruned {words_budget_pruned}, queue {len(pending_ids)}."
     )
     if budget_hit:
