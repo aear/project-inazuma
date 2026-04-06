@@ -1030,6 +1030,25 @@ def open_vitals_window():
     def _sync_canvas_width(event):
         canvas.itemconfigure(canvas_window, width=event.width)
 
+    def _scroll_vitals_canvas(event):
+        if getattr(event, 'delta', 0):
+            step = -1 if event.delta > 0 else 1
+        elif getattr(event, 'num', None) == 4:
+            step = -1
+        elif getattr(event, 'num', None) == 5:
+            step = 1
+        else:
+            return None
+        canvas.yview_scroll(step, 'units')
+        return 'break'
+
+    def _bind_vitals_mousewheel(widget):
+        widget.bind('<MouseWheel>', _scroll_vitals_canvas, add='+')
+        widget.bind('<Button-4>', _scroll_vitals_canvas, add='+')
+        widget.bind('<Button-5>', _scroll_vitals_canvas, add='+')
+        for child in widget.winfo_children():
+            _bind_vitals_mousewheel(child)
+
     content.bind('<Configure>', _sync_scroll_region)
     canvas.bind('<Configure>', _sync_canvas_width)
 
@@ -1194,6 +1213,8 @@ def open_vitals_window():
     controls_row.grid(row=12, column=0, columnspan=4, sticky='ew', padx=4, pady=(8, 2))
     tk.Button(controls_row, text='Reload from state', command=_reload_emotion_sliders).pack(side=tk.LEFT, padx=4)
     tk.Button(controls_row, text='Apply to Ina', command=_apply_emotion_sliders).pack(side=tk.LEFT, padx=4)
+
+    _bind_vitals_mousewheel(vitals_window)
 
     _prime_usage_counters()
     _refresh_energy_label()

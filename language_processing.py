@@ -276,6 +276,7 @@ def load_generated_symbols(child: str, base_path: Optional[Path] = None):
                 entry.setdefault("clarity", row.get("clarity"))
                 entry.setdefault("tags", row.get("tags"))
                 entry.setdefault("components", row.get("components"))
+                entry.setdefault("transformer_insights", row.get("transformer_insights"))
                 entry.setdefault("source", row.get("origin", "self_generated"))
                 if "image_features" not in entry and "image_features" in row:
                     entry["image_features"] = row["image_features"]
@@ -1140,6 +1141,67 @@ def respond_to_word(child, word, *, base_path: Optional[Path] = None):
     print(f"[LangLearn] No audio response found for: '{word}'")
 
 
+def _build_reply_transformer_insights(
+    symbols: List[str],
+    vocab: Dict[str, Any],
+    unknown: List[str],
+) -> Optional[Dict[str, Any]]:
+    known_words = [
+        str((vocab.get(sym, {}) or {}).get("word") or sym).strip()
+        for sym in symbols
+        if str((vocab.get(sym, {}) or {}).get("word") or sym).strip()
+    ]
+    seed_inputs = []
+    for value in known_words + list(unknown[:4]) + list(symbols[:4]):
+        token = str(value or "").strip()
+        if token and token not in seed_inputs:
+            seed_inputs.append(token)
+
+    insights: Dict[str, Any] = {}
+
+    if seed_inputs:
+        try:
+            from transformers.seedling_transformer import SeedlingTransformer
+
+            germinated = SeedlingTransformer(seed=_stable_symbol_seed("|".join(seed_inputs))).germinate(seed_inputs[:8])
+            clusters = germinated.get("clusters") if isinstance(germinated, dict) else {}
+            seeds = germinated.get("seeds") if isinstance(germinated, dict) else {}
+            seed_suggestions = []
+            if isinstance(seeds, dict):
+                for value in seeds.values():
+                    token = str(value or "").strip()
+                    if token and token not in seed_suggestions:
+                        seed_suggestions.append(token)
+            insights["seedling"] = {
+                "cluster_count": len(clusters) if isinstance(clusters, dict) else 0,
+                "seed_suggestions": seed_suggestions[:4],
+            }
+        except Exception:
+            pass
+
+    if symbols or known_words or unknown:
+        try:
+            from transformers.mycelial_transformer import MycelialTransformer
+
+            result = MycelialTransformer(max_links=2).weave(
+                {
+                    "tags": list(symbols[:4]),
+                    "fragments": list(unknown[:4]),
+                    "text": list(known_words[:4]),
+                }
+            )
+            pathways = result.get("pathways") if isinstance(result, dict) else []
+            pathways = pathways if isinstance(pathways, list) else []
+            insights["mycelial"] = {
+                "pathway_count": len(pathways),
+                "sample_pathways": [item for item in pathways[:4] if isinstance(item, dict)],
+            }
+        except Exception:
+            pass
+
+    return insights or None
+
+
 def generate_symbolic_reply_from_text(
     text: str,
     *,
@@ -1223,6 +1285,7 @@ def generate_symbolic_reply_from_text(
         base_path=base_path,
         human_text=" ".join(labels),
     )
+    transformer_insights = _build_reply_transformer_insights(symbols_to_speak, vocab, unknown)
     return {
         "text": (dual_message or {}).get("text") or " ".join(labels),
         "symbols": symbols_to_speak,
@@ -1230,6 +1293,7 @@ def generate_symbolic_reply_from_text(
         "native_text": (dual_message or {}).get("native_text"),
         "gloss_text": (dual_message or {}).get("gloss_text"),
         "unresolved_symbols": (dual_message or {}).get("unresolved_symbols") or [],
+        "transformer_insights": transformer_insights,
     }
 
 

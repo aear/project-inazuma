@@ -22,6 +22,42 @@ def available_symbol_components(child: Optional[str] = None) -> Dict[str, List[s
     return {kind: list(entries.keys()) for kind, entries in maps.items()}
 
 
+def _stable_symbol_seed(value: str) -> int:
+    total = 0
+    for idx, char in enumerate(str(value or '')):
+        total += (idx + 1) * ord(char)
+    return total % (2 ** 31)
+
+
+def _attach_seedling_insights(entries: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    symbols = [str(entry.get('symbol') or '').strip() for entry in entries if str(entry.get('symbol') or '').strip()]
+    if not symbols:
+        return entries
+    try:
+        from transformers.seedling_transformer import SeedlingTransformer
+    except Exception:
+        return entries
+
+    transformer = SeedlingTransformer(seed=_stable_symbol_seed('|'.join(sorted(symbols))))
+    result = transformer.germinate(symbols)
+    clusters = result.get('clusters') if isinstance(result, dict) else {}
+    seeds = result.get('seeds') if isinstance(result, dict) else {}
+    clusters = clusters if isinstance(clusters, dict) else {}
+    seeds = seeds if isinstance(seeds, dict) else {}
+
+    for entry in entries:
+        symbol = str(entry.get('symbol') or '').strip()
+        key = symbol[:1] if symbol else ''
+        insights = entry.get('transformer_insights') if isinstance(entry.get('transformer_insights'), dict) else {}
+        insights.update({
+            'seedling_cluster': key or None,
+            'seedling_seed': seeds.get(key),
+            'seedling_cluster_size': len(clusters.get(key, [])) if isinstance(clusters.get(key), list) else 0,
+        })
+        entry['transformer_insights'] = insights
+    return entries
+
+
 # Procedural map
 def generate_symbol_from_parts(emotion_key, mod_key, concept_key, length=None, *, child=None):
     """
@@ -91,7 +127,7 @@ def enrich_symbols(symbols, transformer):
         entry["clarity"] = clarity
         entry["tags"] = ["symbolic", "procedural", "self_generated"]
         enriched.append(entry)
-    return enriched
+    return _attach_seedling_insights(enriched)
 
 def load_self_reflection(child):
     path = Path("AI_Children") / child / "identity" / "self_reflection.json"
