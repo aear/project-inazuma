@@ -60,6 +60,7 @@ class PlayerClient:
         self.stop_event = threading.Event()
         self._state_lock = threading.Lock()
         self._last_state: Optional[Dict[str, Any]] = None
+        self._state_version = 0
         self._comms_lock = threading.Lock()
         self._comms_seq = 0
         self._comms_log: Deque[Tuple[int, Dict[str, Any]]] = deque(maxlen=200)
@@ -194,8 +195,8 @@ class PlayerClient:
     @staticmethod
     def _decode_payload(line: bytes) -> Optional[Dict[str, Any]]:
         try:
-            return json.loads(line.decode("utf-8"))
-        except json.JSONDecodeError:
+            return json.loads(line)
+        except (TypeError, json.JSONDecodeError):
             return None
 
     def _handle_payload(self, payload: Dict[str, Any]) -> None:
@@ -203,11 +204,7 @@ class PlayerClient:
             state = payload.get("state")
             if isinstance(state, dict):
                 self._update_state(state)
-            entities = (state or {}).get("entities", {})
-            player = entities.get("player")
-            if player:
-                print(f"[state] Player pos={player.get('position')} yaw={player.get('yaw_deg')}")
-                return
+            return
         if payload.get("type") == "comms":
             name = payload.get("name") or payload.get("entity_id") or "unknown"
             text = payload.get("text") or ""
@@ -227,6 +224,15 @@ class PlayerClient:
     def _update_state(self, state: Dict[str, Any]) -> None:
         with self._state_lock:
             self._last_state = state
+            self._state_version += 1
+
+    def get_state_view(self) -> Optional[Dict[str, Any]]:
+        with self._state_lock:
+            return self._last_state
+
+    def get_state_version(self) -> int:
+        with self._state_lock:
+            return int(self._state_version)
 
     def get_state_snapshot(self) -> Optional[Dict[str, Any]]:
         with self._state_lock:

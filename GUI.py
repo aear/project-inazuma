@@ -502,7 +502,7 @@ def _format_process_usage(process_rows):
 def _scheduler_snapshot():
     raw = get_inastate('process_scheduler') or {}
     if not isinstance(raw, dict):
-        return {'available': False, 'summary': 'Scheduler data is not available yet.', 'learning_hint': '', 'running': [], 'next_slots': [], 'last_decisions': []}
+        return {'available': False, 'summary': 'Scheduler data is not available yet.', 'learning_hint': '', 'running': [], 'next_slots': [], 'last_decisions': [], 'recent_activity': [], 'module_history': []}
     planner = raw.get('planner') if isinstance(raw.get('planner'), dict) else {}
     slot_summary = raw.get('slot_summary') if isinstance(raw.get('slot_summary'), dict) else {}
     return {
@@ -512,6 +512,10 @@ def _scheduler_snapshot():
         'running': [item for item in (planner.get('running') or [])[:4] if isinstance(item, dict)],
         'next_slots': [item for item in (planner.get('next_slots') or [])[:10] if isinstance(item, dict)],
         'last_decisions': [item for item in (planner.get('last_decisions') or [])[-4:] if isinstance(item, dict)],
+        'recent_activity': [item for item in (planner.get('recent_activity') or [])[:12] if isinstance(item, dict)],
+        'module_history': [item for item in (planner.get('module_history') or [])[:8] if isinstance(item, dict)],
+        'history_window_hours': round(float(planner.get('history_window_hours') or 24.0), 2),
+        'cancelled_count': int(planner.get('cancelled_count') or 0),
         'queue_depth': int(planner.get('queue_depth') or slot_summary.get('queued_slots') or 0),
         'running_count': int(planner.get('running_count') or slot_summary.get('running_slots') or 0),
         'blocked_count': int(planner.get('blocked_count') or 0),
@@ -562,6 +566,30 @@ def _format_scheduler_slots(scheduler):
     if blocked:
         last = blocked[-1]
         lines.append(f"Last block: {last.get('label') or last.get('task_key')} ({str(last.get('reason') or '').replace('_', ' ')})")
+    module_history = scheduler.get('module_history') or []
+    if module_history:
+        lines.append(f"24h module history ({float(scheduler.get('history_window_hours') or 24.0):.0f}h):")
+        for item in module_history[:5]:
+            counts = []
+            if int(item.get('queued_count') or 0):
+                counts.append(f"q{int(item.get('queued_count') or 0)}")
+            if int(item.get('started_count') or 0):
+                counts.append(f"run{int(item.get('started_count') or 0)}")
+            if int(item.get('completed_count') or 0):
+                counts.append(f"done{int(item.get('completed_count') or 0)}")
+            if int(item.get('cancelled_count') or 0):
+                counts.append(f"cancel{int(item.get('cancelled_count') or 0)}")
+            if int(item.get('dropped_count') or 0):
+                counts.append(f"drop{int(item.get('dropped_count') or 0)}")
+            spectrum = ', '.join(str(val) for val in (item.get('status_spectrum') or []) if val)
+            details = ' '.join(counts) if counts else 'events logged'
+            suffix = f" | spectrum {spectrum}" if spectrum else ''
+            lines.append(f"- {item.get('label') or item.get('module')}: {details} | last {item.get('last_status') or 'unknown'}{suffix}")
+    recent_activity = scheduler.get('recent_activity') or []
+    cancelled = [item for item in recent_activity if str(item.get('status') or '').strip().lower() == 'cancelled']
+    if cancelled:
+        last = cancelled[0]
+        lines.append(f"Last cancel: {last.get('label') or last.get('task_key')} ({str(last.get('reason') or '').replace('_', ' ')})")
     return '\n'.join(lines)
 
 
@@ -730,6 +758,10 @@ def _publish_resource_snapshot(stats):
             'running': scheduler.get('running'),
             'next_slots': scheduler.get('next_slots'),
             'last_decisions': scheduler.get('last_decisions'),
+            'recent_activity': scheduler.get('recent_activity'),
+            'module_history': scheduler.get('module_history'),
+            'history_window_hours': round(float(scheduler.get('history_window_hours') or 24.0), 2),
+            'cancelled_count': int(scheduler.get('cancelled_count') or 0),
             'queue_depth': int(scheduler.get('queue_depth') or 0),
             'running_count': int(scheduler.get('running_count') or 0),
             'blocked_count': int(scheduler.get('blocked_count') or 0),

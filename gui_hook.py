@@ -4,6 +4,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from self_read_reporting import report_self_read_broken_pipe
+
 IS_WINDOWS = platform.system() == "Windows"
 STATUS_PIPE_PATH = r"\\.\pipe\ina_status" if IS_WINDOWS else "/tmp/ina_status.pipe"
 STATUS_LOG_PATH = Path(os.environ.get("INA_STATUS_LOG", "logs/ina_status.log"))
@@ -17,6 +19,28 @@ def _write_disk_log(message: str) -> None:
     except Exception:
         # Avoid recursive logging failures
         pass
+
+def _report_self_read_status_pipe_issue(message: str, error: BaseException) -> None:
+    text = str(message or "").strip()
+    if "[SelfRead]" not in text:
+        return
+    report = report_self_read_broken_pipe(
+        component="status_pipe",
+        operation="status_log_write",
+        error=error,
+        source_message=text,
+        path_text=STATUS_PIPE_PATH,
+    )
+    explanation = str(report.get("explanation") or "").strip()
+    if not explanation:
+        return
+    note = f"[SelfRead] Broken pipe note: {explanation}"
+    issue_entry_id = str(report.get("issue_entry_id") or "").strip()
+    if issue_entry_id:
+        note += f" GitHub queue entry: {issue_entry_id}."
+    _write_disk_log(note)
+    print(note)
+
 
 def log_to_statusbox(message: str):
     _write_disk_log(message)
@@ -39,6 +63,8 @@ def log_to_statusbox(message: str):
             else:
                 fallback_log(message)
     except Exception as e:
+        if "broken pipe" in str(e).lower() or isinstance(e, BrokenPipeError):
+            _report_self_read_status_pipe_issue(message, e)
         print(f"[LogHook] Failed to write to status pipe: {e}")
         fallback_log(message)
 

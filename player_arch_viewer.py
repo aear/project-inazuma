@@ -381,11 +381,12 @@ class HouseViewerBridge(QtCore.QObject):
         if now - self._last_sync < (self.tick_ms / 1000.0):
             return
         self._last_sync = now
+        snapshot = self.client.get_state_view() if hasattr(self.client, "get_state_view") else self.client.get_state_snapshot()
         self._push_player_pose()
-        self._pull_ina_pose()
+        self._pull_ina_pose(snapshot)
         self._update_chat_log()
         self._update_desk_status(now)
-        self._update_presence(now)
+        self._update_presence(now, snapshot)
         self._export_frame(now)
 
     def _on_chat_focus(self) -> None:
@@ -478,13 +479,12 @@ class HouseViewerBridge(QtCore.QObject):
         self._last_desk_check = now
         self._chat_dock.set_discord_enabled(self._can_use_discord())
 
-    def _update_presence(self, now: float) -> None:
+    def _update_presence(self, now: float, snapshot: Optional[dict]) -> None:
         if self._chat_dock is None:
             return
         if now - self._last_presence_check < self._presence_interval:
             return
         self._last_presence_check = now
-        snapshot = self.client.get_state_snapshot()
         if not snapshot:
             self._chat_dock.set_presence([])
             return
@@ -593,8 +593,7 @@ class HouseViewerBridge(QtCore.QObject):
             self.client.send(payload)
             self._last_pose = payload
 
-    def _pull_ina_pose(self) -> None:
-        snapshot = self.client.get_state_snapshot()
+    def _pull_ina_pose(self, snapshot: Optional[dict]) -> None:
         if not snapshot:
             return
         self._sync_door_states(snapshot)

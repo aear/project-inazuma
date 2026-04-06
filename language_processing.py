@@ -509,6 +509,52 @@ def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
         _atomic_write_json(path, data, indent=4, ensure_ascii=True)
 
 
+def build_dual_symbolic_message(
+    symbols,
+    *,
+    child: str = "Inazuma_Yagami",
+    base_path: Optional[Path] = None,
+    human_text: Optional[str] = None,
+    native_label: str = "Ina native",
+    human_label: str = "Human guess",
+) -> Optional[Dict[str, Any]]:
+    if isinstance(symbols, str):
+        normalized = [symbols.strip()] if symbols.strip() else []
+    else:
+        normalized = [str(sym).strip() for sym in (symbols or []) if str(sym).strip()]
+    if not normalized:
+        return None
+
+    vocab = load_symbol_to_token(child, base_path=base_path)
+    guessed_words: List[str] = []
+    unresolved_symbols: List[str] = []
+    for sym in normalized:
+        entry = vocab.get(sym) if isinstance(vocab, dict) else {}
+        word = str(entry.get("word") or "").strip() if isinstance(entry, dict) else ""
+        if word:
+            guessed_words.append(word)
+        else:
+            guessed_words.append(sym)
+            unresolved_symbols.append(sym)
+
+    native_text = " ".join(normalized)
+    gloss_text = str(human_text or "").strip() or " ".join(guessed_words)
+    if not gloss_text:
+        gloss_text = native_text
+
+    if gloss_text == native_text:
+        combined = native_text
+    else:
+        combined = f"{native_label}: {native_text}\n{human_label}: {gloss_text}"
+
+    return {
+        "text": combined,
+        "native_text": native_text,
+        "gloss_text": gloss_text,
+        "unresolved_symbols": unresolved_symbols,
+    }
+
+
 def _ensure_vocab_embeddings(vocab: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
     """
     Attach deterministic text embeddings and language hints to vocab entries
@@ -1171,7 +1217,20 @@ def generate_symbolic_reply_from_text(
         pass
 
     labels = [(vocab.get(sym, {}) or {}).get("word") or sym for sym in symbols_to_speak]
-    return {"text": " ".join(labels), "symbols": symbols_to_speak, "unknown": unknown}
+    dual_message = build_dual_symbolic_message(
+        symbols_to_speak,
+        child=child,
+        base_path=base_path,
+        human_text=" ".join(labels),
+    )
+    return {
+        "text": (dual_message or {}).get("text") or " ".join(labels),
+        "symbols": symbols_to_speak,
+        "unknown": unknown,
+        "native_text": (dual_message or {}).get("native_text"),
+        "gloss_text": (dual_message or {}).get("gloss_text"),
+        "unresolved_symbols": (dual_message or {}).get("unresolved_symbols") or [],
+    }
 
 
 def ensure_word_grounded(

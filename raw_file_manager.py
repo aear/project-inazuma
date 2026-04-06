@@ -24,6 +24,7 @@ from PIL import Image
 import numpy as np
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
+from self_read_reporting import is_broken_pipe_error, report_self_read_broken_pipe
 from text_memory import update_text_vocab
 
 _VIDEO_IMPORT_ERROR = None
@@ -1247,6 +1248,22 @@ def self_read_and_train():
                     count += len(result)
 
             except Exception as e:
+                if is_broken_pipe_error(e):
+                    report = report_self_read_broken_pipe(
+                        child=child,
+                        component="self_read",
+                        operation=f"process_{category}",
+                        error=e,
+                        source_message=f"[SelfRead] PROCESSING {path.name} [{category}]",
+                        path_text=str(path),
+                    )
+                    note = f"[SelfRead] Broken pipe explanation: {report.get('explanation') or str(e)}"
+                    issue_entry_id = str(report.get("issue_entry_id") or "").strip()
+                    if issue_entry_id:
+                        note += f" GitHub queue entry: {issue_entry_id}."
+                    elif report.get("duplicate_within_cooldown"):
+                        note += " Existing cooldown report reused."
+                    log_to_statusbox(note)
                 log_to_statusbox(f"[SelfRead] ERROR processing {path.name}: {e}")
 
             if count >= FRAG_LIMIT:

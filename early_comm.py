@@ -18,6 +18,7 @@ from io_utils import atomic_write_json
 from language_processing import (
     associate_symbol_with_word,
     backprop_symbol_confidence,
+    build_dual_symbolic_message,
     load_experience_graph,
     load_symbol_to_token,
     save_symbol_to_token,
@@ -1530,6 +1531,16 @@ def early_communicate():
     symbol_labels = [label_for_symbol(sid) for sid in speech_symbols[:3] if sid]
     symbol_text = " ".join(symbol_labels) if symbol_labels else None
     fallback_text = vocab_word or word_id or symbol_text
+    dual_symbol_message = None
+    if speech_symbols:
+        dual_symbol_message = build_dual_symbolic_message(
+            speech_symbols[:3],
+            child=child,
+            base_path=Path("AI_Children"),
+            human_text=fallback_text,
+        )
+        if dual_symbol_message and dual_symbol_message.get("text"):
+            fallback_text = str(dual_symbol_message.get("text"))
     queued_id = None
     audio_clip_path = None
     if allow_symbol_autotype and speech_symbols:
@@ -1637,6 +1648,8 @@ def early_communicate():
                     "strategy": expression_strategy,
                     "urge_to_type": type_urge_level,
                     "urge_to_voice": voice_urge_level,
+                    "symbolic_native_text": dual_symbol_message.get("native_text") if dual_symbol_message else None,
+                    "symbolic_gloss_text": dual_symbol_message.get("gloss_text") if dual_symbol_message else None,
                 },
                 allow_empty=payload_allow_empty,
                 attachment_path=str(audio_clip_path) if audio_clip_path else None,

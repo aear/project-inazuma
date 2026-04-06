@@ -33,7 +33,7 @@ from social_map import (
 )
 from language_processing import generate_symbolic_reply_from_text
 from live_experience_bridge import LiveExperienceBridge
-from model_manager import update_inastate
+from model_manager import get_inastate, update_inastate
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -235,6 +235,8 @@ def get_outbox_policy() -> dict:
         "max_burst": 5,
         "max_age_minutes": 5.0,
         "archive_path": None,
+        "flush_burst": 24,
+        "flush_stale_mode": "drop",
     }
     if not isinstance(policy, dict):
         return defaults
@@ -244,6 +246,11 @@ def get_outbox_policy() -> dict:
             result["max_burst"] = max(0, int(policy["max_burst"]))
         except Exception:
             logger.warning("Invalid discord.outbox_policy.max_burst value; using default %s", defaults["max_burst"])
+    if policy.get("flush_burst") is not None:
+        try:
+            result["flush_burst"] = max(1, int(policy["flush_burst"]))
+        except Exception:
+            logger.warning("Invalid discord.outbox_policy.flush_burst value; using default %s", defaults["flush_burst"])
     if policy.get("max_age_minutes") is not None:
         try:
             result["max_age_minutes"] = max(0.0, float(policy["max_age_minutes"]))
@@ -251,6 +258,8 @@ def get_outbox_policy() -> dict:
             logger.warning(
                 "Invalid discord.outbox_policy.max_age_minutes; using default %s", defaults["max_age_minutes"]
             )
+    stale_mode = str(policy.get("flush_stale_mode") or defaults["flush_stale_mode"]).strip().lower() or defaults["flush_stale_mode"]
+    result["flush_stale_mode"] = stale_mode if stale_mode in {"drop", "archive"} else defaults["flush_stale_mode"]
     archive_path = policy.get("archive_path")
     if archive_path:
         result["archive_path"] = str(archive_path)
@@ -596,12 +605,16 @@ def process_inbound_message(msg) -> CommsResponse:
     )
     symbolic_unknown: list[str] = symbolic.get("unknown") if symbolic else []
     symbolic_text = symbolic.get("text") if symbolic else None
+    symbolic_native_text = symbolic.get("native_text") if symbolic else None
+    symbolic_gloss_text = symbolic.get("gloss_text") if symbolic else None
     if symbolic:
         metadata.update(
             {
                 "adapter": "language_processing",
                 "symbols": symbolic.get("symbols"),
                 "unknown_words": symbolic.get("unknown"),
+                "symbolic_native_text": symbolic_native_text,
+                "symbolic_gloss_text": symbolic_gloss_text,
             }
         )
         if not symbolic_unknown and not attachments:
@@ -639,6 +652,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 metadata["unknown_words"] = explain_targets
                 if symbolic_text:
                     metadata["symbolic_hint"] = symbolic_text
+                    reply_text = f"{symbolic_text}\n\n{reply_text}" if reply_text else symbolic_text
             else:
                 reply_text = adapter.handle_prompt(
                     prompt_text,
@@ -658,6 +672,9 @@ def process_inbound_message(msg) -> CommsResponse:
             for name in (entry.get("original_filename") or entry.get("filename") for entry in attachments)
             if name
         ]
+
+    if not reply_text and symbolic_text:
+        reply_text = symbolic_text
 
     if not reply_text:
         reply_text = f"{INA_INSTANCE_NAME}: {prompt_text}"
@@ -1063,16 +1080,68 @@ class InaDiscordClient(discord.Client):
         except Exception:
             logger.exception("Failed to record last DM contact in inastate.")
 
-    def _read_typed_outbox(self):
+    def _read_outbox_flush_request(self) -> Optional[dict]:
+        raw = get_inastate("discord_outbox_flush")
+        if not isinstance(raw, dict):
+            return None
+        status = str(raw.get("status") or "requested").strip().lower() or "requested"
+        if status in {"completed", "cancelled"}:
+            return None
+        try:
+            burst = max(1, int(raw.get("burst") or self._outbox_policy.get("flush_burst") or self._outbox_policy.get("max_burst") or 24))
+        except Exception:
+            burst = max(1, int(self._outbox_policy.get("flush_burst") or self._outbox_policy.get("max_burst") or 24))
+        stale_mode = str(raw.get("stale_mode") or self._outbox_policy.get("flush_stale_mode") or "drop").strip().lower() or "drop"
+        if stale_mode not in {"drop", "archive"}:
+            stale_mode = str(self._outbox_policy.get("flush_stale_mode") or "drop").strip().lower() or "drop"
+        normalized = dict(raw)
+        normalized["status"] = "active"
+        normalized["burst"] = burst
+        normalized["stale_mode"] = stale_mode
+        normalized.setdefault("requested_at", datetime.now(timezone.utc).isoformat())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if status != "active" or raw.get("burst") != burst or raw.get("stale_mode") != stale_mode:
+            normalized.setdefault("activated_at", now_iso)
+            normalized["updated_at"] = now_iso
+            update_inastate("discord_outbox_flush", normalized)
+        return normalized
+
+    def _complete_outbox_flush(self, request: Optional[dict], **extra) -> None:
+        if not isinstance(request, dict):
+            return
+        payload = dict(request)
+        payload.update(extra)
+        payload["status"] = "completed"
+        payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+        payload["updated_at"] = payload["completed_at"]
+        update_inastate("discord_outbox_flush", payload)
+
+    def _mark_outbox_entry_without_archive(self, entry: dict, reason: str, *, status: str = "flushed") -> None:
+        entry_id = str(entry.get("id") or entry.get("uuid") or entry.get("created_at") or "")
+        logger.info("Marked typed outbox entry %s as %s (%s) without archive", entry_id or "<unknown>", status, reason)
+        if entry_id:
+            self._log_outbox_history(entry_id, status, reason=reason)
+
+    def _read_typed_outbox(self, flush_request: Optional[dict] = None):
+        stats = {
+            "pending_count": 0,
+            "stale_count": 0,
+            "flushed_stale_count": 0,
+            "archived_stale_count": 0,
+            "more_available": False,
+        }
         if not self._typed_outbox_path.exists():
-            return []
+            return [], stats
         self._refresh_outbox_history()
         entries = []
-        max_batch = int(self._outbox_policy.get("max_burst") or 0)
+        max_batch = int((flush_request or {}).get("burst") or self._outbox_policy.get("max_burst") or 0)
         max_age_minutes = float(self._outbox_policy.get("max_age_minutes") or 0.0)
         expiry_cutoff = (
             datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes) if max_age_minutes > 0 else None
         )
+        stale_mode = str((flush_request or {}).get("stale_mode") or self._outbox_policy.get("flush_stale_mode") or "drop").strip().lower() or "drop"
+        if stale_mode not in {"drop", "archive"}:
+            stale_mode = "drop"
         try:
             with self._typed_outbox_path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -1091,19 +1160,26 @@ class InaDiscordClient(discord.Client):
                         continue
                     entry["id"] = entry_id
                     if expiry_cutoff and self._entry_is_stale(entry, expiry_cutoff):
-                        self._archive_outbox_entry(entry, "stale_buffer")
+                        stats["stale_count"] += 1
+                        if flush_request and stale_mode == "drop":
+                            self._mark_outbox_entry_without_archive(entry, "flush_stale", status="flushed")
+                            stats["flushed_stale_count"] += 1
+                        else:
+                            self._archive_outbox_entry(entry, "stale_buffer")
+                            stats["archived_stale_count"] += 1
                         continue
                     self._typed_outbox_seen.add(entry_id)
                     entries.append(entry)
+                    stats["pending_count"] = len(entries)
                     if max_batch and len(entries) >= max_batch:
+                        stats["more_available"] = True
                         break
         except Exception:
             logger.exception("Failed to read typed outbox at %s", self._typed_outbox_path)
 
         if len(self._typed_outbox_seen) > 5000:
-            # Avoid unbounded growth if the file grows large.
             self._typed_outbox_seen = set(list(self._typed_outbox_seen)[-2000:])
-        return entries
+        return entries, stats
 
     def _load_outbox_history(self) -> None:
         self._typed_outbox_history_offset = 0
@@ -1205,7 +1281,7 @@ class InaDiscordClient(discord.Client):
         if entry_id:
             self._log_outbox_history(entry_id, "archived", reason=reason)
 
-    async def _deliver_typed_outbox_entry(self, entry: dict) -> None:
+    async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:
         text = entry.get("text")
         allow_empty = bool(entry.get("allow_empty"))
         attachment_path = entry.get("attachment_path")
@@ -1225,12 +1301,12 @@ class InaDiscordClient(discord.Client):
 
         if text is None:
             if not allow_empty and not attachment_path:
-                return
+                return False
             text = ""
         text_str = str(text)
         if not text_str.strip() and not allow_empty and not attachment_path:
             logger.debug("Skipping empty typed outbox entry %s", entry.get("id"))
-            return
+            return False
 
         target = entry.get("target") or "owner_dm"
         channel_id = entry.get("channel_id")
@@ -1249,7 +1325,6 @@ class InaDiscordClient(discord.Client):
                 logger.exception("Failed to DM user %s for typed outbox entry %s", user_id, entry.get("id"))
                 return False
 
-        # Explicit user target first (owner or high-trust only)
         if target_user_id:
             try:
                 uid = int(target_user_id)
@@ -1264,11 +1339,9 @@ class InaDiscordClient(discord.Client):
             except Exception:
                 logger.exception("Invalid user_id on typed outbox entry %s: %s", entry.get("id"), target_user_id)
 
-        # Owner DM fallback
         if not sent and target == "owner_dm":
             sent = await _send_dm(SAKURA_USER_ID)
 
-        # High-trust DM selection
         if not sent and target in {"trusted_dm", "high_trust_dm"}:
             contacts = get_high_trust_contacts(limit=1)
             if contacts:
@@ -1278,7 +1351,6 @@ class InaDiscordClient(discord.Client):
                 except Exception:
                     logger.exception("Failed to DM high-trust contact for entry %s", entry.get("id"))
 
-        # Direct channel id
         if not sent and channel_id:
             try:
                 channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
@@ -1313,16 +1385,51 @@ class InaDiscordClient(discord.Client):
                 self._log_outbox_history(str(entry_id), "sent")
         else:
             logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
+        return sent
 
     async def _watch_typed_outbox(self):
         while not self.is_closed():
+            flush_request = None
+            sleep_sec = 3
             try:
-                pending = self._read_typed_outbox()
+                flush_request = self._read_outbox_flush_request()
+                if flush_request:
+                    sleep_sec = 1
+                pending, stats = self._read_typed_outbox(flush_request=flush_request)
+                delivered = 0
                 for entry in pending:
-                    await self._deliver_typed_outbox_entry(entry)
+                    if await self._deliver_typed_outbox_entry(entry):
+                        delivered += 1
+                if flush_request:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    if stats.get("more_available"):
+                        payload = dict(flush_request)
+                        payload.update(
+                            {
+                                "status": "active",
+                                "updated_at": now_iso,
+                                "last_polled_at": now_iso,
+                                "last_batch_size": len(pending),
+                                "last_delivered_count": delivered,
+                                "last_stale_count": stats.get("stale_count", 0),
+                                "last_flushed_stale_count": stats.get("flushed_stale_count", 0),
+                                "last_archived_stale_count": stats.get("archived_stale_count", 0),
+                            }
+                        )
+                        update_inastate("discord_outbox_flush", payload)
+                    else:
+                        self._complete_outbox_flush(
+                            flush_request,
+                            last_polled_at=now_iso,
+                            last_batch_size=len(pending),
+                            delivered_count=delivered,
+                            stale_count=stats.get("stale_count", 0),
+                            flushed_stale_count=stats.get("flushed_stale_count", 0),
+                            archived_stale_count=stats.get("archived_stale_count", 0),
+                        )
             except Exception:
                 logger.exception("Typed outbox dispatch loop failed.")
-            await asyncio.sleep(3)
+            await asyncio.sleep(sleep_sec)
 
     async def _ingest_message_history(self, limit: int = 50) -> None:
         """

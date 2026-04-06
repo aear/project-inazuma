@@ -42,6 +42,7 @@ if QtWidgets is not None:
             self._turn = 0.0
             self._run = False
             self._last_input = (0.0, 0.0, 0.0, 0.0, False)
+            self._last_state_version = -1
             self._last_mouse_ts = 0.0
             self._mouse_look = True
             self._recenter_mouse = True
@@ -88,9 +89,10 @@ if QtWidgets is not None:
 
             current = (forward, strafe, up, turn, run)
             has_input = any(abs(val) > 1e-3 for val in current[:4]) or run
+            previous_input = self._last_input
 
             if has_input:
-                if current != self._last_input:
+                if current != previous_input:
                     self.client.send(
                         {
                             "type": "move",
@@ -105,11 +107,16 @@ if QtWidgets is not None:
                     )
                     self._last_input = current
             else:
-                if self._last_input != (0.0, 0.0, 0.0, 0.0, False):
+                if previous_input != (0.0, 0.0, 0.0, 0.0, False):
                     self.client.send({"type": "stop"})
                     self._last_input = (0.0, 0.0, 0.0, 0.0, False)
 
-            self.update()
+            state_version = self.client.get_state_version() if hasattr(self.client, "get_state_version") else self._last_state_version
+            state_changed = state_version != self._last_state_version
+            if state_changed:
+                self._last_state_version = state_version
+            if state_changed or self._last_input != previous_input:
+                self.update()
 
         def _toggle_mouse_look(self) -> None:
             self._mouse_look = not self._mouse_look
@@ -195,7 +202,7 @@ if QtWidgets is not None:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
             painter.fillRect(self.rect(), QtGui.QColor(8, 10, 16))
 
-            state = self.client.get_state_snapshot()
+            state = self.client.get_state_view() if hasattr(self.client, "get_state_view") else self.client.get_state_snapshot()
             if not state:
                 painter.setPen(QtGui.QColor(200, 200, 200))
                 painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "Waiting for world state...")

@@ -134,3 +134,61 @@ def test_read_pending_entries_skips_completed_history_ids():
         assert second_id in ids
     finally:
         _cleanup_child(child)
+
+
+def test_maybe_queue_submission_discord_notice_writes_owner_dm():
+    child = "TestGitHubDiscordNotice"
+    _cleanup_child(child)
+    try:
+        entry = {
+            "id": "github_test_entry",
+            "title": "Self-read broken pipe",
+            "metadata": {
+                "notify_discord_on_submit": True,
+                "discord_explanation": "Broken pipe means the status reader closed first.",
+                "source": "self_read_broken_pipe",
+            },
+        }
+        result = {
+            "issue_number": 42,
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "title": "[Ina] Self-read broken pipe",
+        }
+
+        queued_id = gs.maybe_queue_submission_discord_notice(
+            child,
+            entry,
+            result,
+            cfg={"discord": {"enabled": True}},
+        )
+
+        assert queued_id
+        outbox_path = gs.typed_outbox_path(child)
+        assert outbox_path.exists()
+        lines = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(lines) == 1
+        notice = lines[0]
+        assert notice["id"] == queued_id
+        assert notice["target"] == "owner_dm"
+        assert "issue #42" in notice["text"].lower()
+        assert result["issue_url"] in notice["text"]
+        assert notice["metadata"]["reason"] == "self_read_broken_pipe"
+    finally:
+        _cleanup_child(child)
+
+
+
+def test_maybe_queue_submission_discord_notice_skips_without_opt_in():
+    child = "TestGitHubDiscordSkip"
+    _cleanup_child(child)
+    try:
+        queued_id = gs.maybe_queue_submission_discord_notice(
+            child,
+            {"id": "github_test_entry", "title": "No notify", "metadata": {}},
+            {"issue_number": 7, "issue_url": "https://example.invalid/7", "title": "No notify"},
+            cfg={"discord": {"enabled": True}},
+        )
+        assert queued_id is None
+        assert not gs.typed_outbox_path(child).exists()
+    finally:
+        _cleanup_child(child)

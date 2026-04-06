@@ -20,6 +20,7 @@ from github_submission import (
     load_config,
     load_submitted_count_for_day,
     log_history,
+    maybe_queue_submission_discord_notice,
     read_pending_entries,
     submit_issue,
 )
@@ -104,9 +105,12 @@ def process_once() -> int:
             issue_url=result.get("issue_url"),
             title=result.get("title"),
         )
+        notice_entry_id = maybe_queue_submission_discord_notice(child, entry, result, cfg=cfg)
         submitted += 1
         submitted_today += 1
         logger.info("Submitted %s to GitHub issue %s", entry_id, result.get("issue_url") or result.get("issue_number"))
+        if notice_entry_id:
+            logger.info("Queued Discord submission notice %s for %s", notice_entry_id, entry_id)
     return submitted
 
 

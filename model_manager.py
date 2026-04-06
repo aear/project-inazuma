@@ -161,7 +161,8 @@ _PROCESS_SCHEDULER_DEFAULTS = {
     "cpu_hard_percent": 85.0,
     "gpu_soft_percent": 70.0,
     "gpu_hard_percent": 90.0,
-    "history_limit": 160,
+    "history_limit": 512,
+    "history_window_hours": 24.0,
     "decision_limit": 24,
     "track_gpu": True,
     "memory_budget_enabled": True,
@@ -753,6 +754,7 @@ def _process_scheduler_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str,
         if key in raw:
             limits[key] = _clamp_percent(raw.get(key), limits[key])
     for key in (
+        "history_window_hours",
         "max_total_rss_gb",
         "max_managed_rss_gb",
         "min_available_gb",
@@ -774,6 +776,7 @@ def _process_scheduler_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str,
     limits["gpu_soft_percent"] = min(limits["gpu_soft_percent"], limits["gpu_hard_percent"])
     if limits["max_total_rss_gb"] > 0 and limits["max_managed_rss_gb"] > 0:
         limits["max_managed_rss_gb"] = min(limits["max_managed_rss_gb"], limits["max_total_rss_gb"])
+    limits["history_window_hours"] = max(0.25, _coerce_float(limits.get("history_window_hours"), 24.0))
     limits["terminate_grace_sec"] = max(1.0, limits["terminate_grace_sec"])
     return limits
 
@@ -929,6 +932,10 @@ def _load_process_scheduler_state() -> Dict[str, Any]:
     state["resources"] = state.get("resources") if isinstance(state.get("resources"), dict) else {}
     state["slot_summary"] = state.get("slot_summary") if isinstance(state.get("slot_summary"), dict) else {}
     state["planner"] = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    state["history"] = _scheduler_prune_history_entries(
+        state.get("history") if isinstance(state.get("history"), list) else [],
+        _process_scheduler_limits(),
+    )
     _sort_process_scheduler_queue(state)
     return state
 
@@ -1010,10 +1017,13 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
     limits = limits or _process_scheduler_limits()
     queue = state.get("queue") if isinstance(state.get("queue"), list) else []
     running = state.get("running") if isinstance(state.get("running"), list) else []
+    history = state.get("history") if isinstance(state.get("history"), list) else []
     resources = state.get("resources") if isinstance(state.get("resources"), dict) else {}
     decisions = state.get("last_decisions") if isinstance(state.get("last_decisions"), list) else []
     running_briefs = [_scheduler_brief_entry(entry) for entry in running if isinstance(entry, dict)]
     queue_briefs = [_scheduler_brief_entry(entry) for entry in queue if isinstance(entry, dict)]
+    recent_activity = _scheduler_recent_activity_briefs(history, limits)
+    module_history = _scheduler_module_history_briefs(recent_activity)
     decision_briefs = [
         {
             "timestamp": item.get("timestamp"),
@@ -1029,6 +1039,11 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
     blocked = [item for item in decision_briefs if item.get("decision") == "blocked"]
     last_blocked = blocked[-1] if blocked else {}
     memory = _scheduler_memory_overview(state, resources, limits)
+    cancelled_count = sum(
+        1
+        for item in recent_activity
+        if str(item.get("status") or "").strip().lower() == "cancelled"
+    )
 
     max_parallel = int(limits.get("max_parallel_tasks", 2))
     max_queue = int(limits.get("max_queue_slots", 10))
@@ -1067,6 +1082,8 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
         ) + "."
     if last_blocked:
         summary += f" Last block: {last_blocked['label']} held for {str(last_blocked.get('reason') or '').replace('_', ' ')}."
+    if cancelled_count:
+        summary += f" Cancelled in last 24h: {cancelled_count}."
 
     return {
         "available": True,
@@ -1080,12 +1097,16 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
         "next_slots": queue_briefs[:max_queue],
         "last_decisions": decision_briefs,
         "blocked_count": len(blocked),
+        "cancelled_count": cancelled_count,
         "queue_depth": len(queue_briefs),
         "running_count": len(running_briefs),
         "memory_guard_level": guard_level,
         "cpu_percent": cpu_percent,
         "gpu_utilization_percent": gpu_percent,
         "gpu_available": bool(resources.get("gpu_available", False)),
+        "history_window_hours": round(float(limits.get("history_window_hours", 24.0) or 24.0), 2),
+        "recent_activity": recent_activity[:12],
+        "module_history": module_history[:8],
         "ina_rss_gb": round(total_rss, 3),
         "managed_running_rss_gb": round(managed_rss, 3),
         "max_total_rss_gb": round(max_total, 3),
@@ -1104,7 +1125,7 @@ def _save_process_scheduler_state(state: Dict[str, Any], limits: Optional[Dict[s
 
     state["queue"] = queue[: max(1, int(limits.get("max_queue_slots", 10)))]
     state["running"] = running
-    state["history"] = history[-max(1, int(limits.get("history_limit", 160))):]
+    state["history"] = _scheduler_prune_history_entries(history, limits)
     state["last_decisions"] = decisions[-max(1, int(limits.get("decision_limit", 24))):]
     _sort_process_scheduler_queue(state)
     for index, entry in enumerate(state["queue"], 1):
@@ -1223,11 +1244,216 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
     }
 
 
+def _scheduler_history_order(status: str) -> int:
+    order = {
+        "queued": 0,
+        "started": 1,
+        "cancel_requested": 2,
+        "force_cancel_requested": 3,
+        "completed": 4,
+        "cancelled": 5,
+        "dropped": 6,
+        "deferred": 7,
+        "skipped": 8,
+    }
+    return order.get(str(status or "").strip().lower(), 99)
+
+
+def _scheduler_history_event_time(payload: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("timestamp", "finished_at", "started_at", "requested_at", "last_requested_at"):
+        raw = payload.get(key)
+        if not raw:
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc)
+    return None
+
+
+def _scheduler_prune_history_entries(
+    history: List[Dict[str, Any]],
+    limits: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    limits = limits or _process_scheduler_limits()
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=float(limits.get("history_window_hours", 24.0) or 24.0))
+    trimmed: List[Dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        event_time = _scheduler_history_event_time(item)
+        if event_time is not None and event_time < cutoff:
+            continue
+        trimmed.append(item)
+    return trimmed[-max(1, int(limits.get("history_limit", 512))):]
+
+
+def _scheduler_history_brief(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    task_key = str(payload.get("task_key") or "").strip()
+    if not task_key:
+        return None
+    profile = _scheduler_task_profile(task_key) or {}
+    resource_profile = payload.get("resource_profile") if isinstance(payload.get("resource_profile"), dict) else {}
+    module = str(
+        payload.get("module")
+        or profile.get("module")
+        or resource_profile.get("module")
+        or task_key
+    ).strip() or task_key
+    status = str(payload.get("status") or "").strip().lower()
+    reason = str(payload.get("reason") or "").strip().lower()
+    event_time = _scheduler_history_event_time(payload)
+    timestamp = event_time.isoformat() if event_time is not None else ""
+    return {
+        "timestamp": timestamp,
+        "task_key": task_key,
+        "label": str(payload.get("label") or _scheduler_task_label(task_key)).strip() or _scheduler_task_label(task_key),
+        "module": module,
+        "status": status,
+        "reason": reason,
+        "priority": int(payload.get("priority") or profile.get("priority") or 0),
+        "task_id": payload.get("task_id"),
+        "pid": _coerce_int(payload.get("pid"), 0) or None,
+        "signal": payload.get("signal"),
+        "duration_sec": payload.get("duration_sec"),
+    }
+
+
+def _scheduler_recent_activity_briefs(
+    history: List[Dict[str, Any]],
+    limits: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    trimmed = _scheduler_prune_history_entries(history, limits)
+    briefs = [brief for brief in (_scheduler_history_brief(item) for item in trimmed) if isinstance(brief, dict)]
+    return sorted(
+        briefs,
+        key=lambda item: (
+            str(item.get("timestamp") or ""),
+            _scheduler_history_order(str(item.get("status") or "")),
+            str(item.get("task_id") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def _scheduler_module_history_briefs(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    status_fields = {
+        "queued": "queued_count",
+        "started": "started_count",
+        "completed": "completed_count",
+        "cancel_requested": "cancel_requested_count",
+        "force_cancel_requested": "cancel_requested_count",
+        "cancelled": "cancelled_count",
+        "dropped": "dropped_count",
+        "deferred": "deferred_count",
+        "skipped": "skipped_count",
+    }
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        module_key = str(item.get("module") or item.get("task_key") or "").strip()
+        if not module_key:
+            continue
+        bucket = buckets.setdefault(
+            module_key,
+            {
+                "module": module_key,
+                "label": str(item.get("label") or module_key).strip() or module_key,
+                "task_keys": set(),
+                "status_spectrum": set(),
+                "event_count": 0,
+                "queued_count": 0,
+                "started_count": 0,
+                "completed_count": 0,
+                "cancel_requested_count": 0,
+                "cancelled_count": 0,
+                "dropped_count": 0,
+                "deferred_count": 0,
+                "skipped_count": 0,
+                "last_event_at": "",
+                "last_status": "",
+                "last_reason": "",
+            },
+        )
+        status = str(item.get("status") or "").strip().lower()
+        timestamp = str(item.get("timestamp") or "").strip()
+        bucket["event_count"] += 1
+        bucket["task_keys"].add(str(item.get("task_key") or "").strip())
+        if status:
+            bucket["status_spectrum"].add(status)
+        field = status_fields.get(status)
+        if field:
+            bucket[field] += 1
+        if timestamp >= str(bucket.get("last_event_at") or ""):
+            bucket["label"] = str(item.get("label") or bucket["label"]).strip() or bucket["label"]
+            bucket["last_event_at"] = timestamp
+            bucket["last_status"] = status
+            bucket["last_reason"] = str(item.get("reason") or "").strip().lower()
+
+    results: List[Dict[str, Any]] = []
+    for bucket in buckets.values():
+        results.append(
+            {
+                "module": bucket["module"],
+                "label": bucket["label"],
+                "task_keys": sorted(key for key in bucket["task_keys"] if key),
+                "status_spectrum": sorted(
+                    (status for status in bucket["status_spectrum"] if status),
+                    key=_scheduler_history_order,
+                ),
+                "event_count": int(bucket["event_count"]),
+                "queued_count": int(bucket["queued_count"]),
+                "started_count": int(bucket["started_count"]),
+                "completed_count": int(bucket["completed_count"]),
+                "cancel_requested_count": int(bucket["cancel_requested_count"]),
+                "cancelled_count": int(bucket["cancelled_count"]),
+                "dropped_count": int(bucket["dropped_count"]),
+                "deferred_count": int(bucket["deferred_count"]),
+                "skipped_count": int(bucket["skipped_count"]),
+                "last_event_at": str(bucket.get("last_event_at") or ""),
+                "last_status": str(bucket.get("last_status") or ""),
+                "last_reason": str(bucket.get("last_reason") or ""),
+            }
+        )
+    return sorted(
+        results,
+        key=lambda item: (
+            str(item.get("last_event_at") or ""),
+            int(item.get("cancelled_count") or 0),
+            int(item.get("event_count") or 0),
+            str(item.get("module") or ""),
+        ),
+        reverse=True,
+    )
+
+
 def _scheduler_record_history(state: Dict[str, Any], payload: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> None:
     limits = limits or _process_scheduler_limits()
     history = state.get("history") if isinstance(state.get("history"), list) else []
-    history.append(payload)
-    state["history"] = history[-max(1, int(limits.get("history_limit", 160))):]
+    entry = dict(payload)
+    entry.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    task_key = str(entry.get("task_key") or "").strip()
+    if task_key:
+        profile = _scheduler_task_profile(task_key) or {}
+        resource_profile = entry.get("resource_profile") if isinstance(entry.get("resource_profile"), dict) else {}
+        entry["task_key"] = task_key
+        entry.setdefault("label", _scheduler_task_label(task_key))
+        entry.setdefault(
+            "module",
+            str(entry.get("module") or profile.get("module") or resource_profile.get("module") or task_key).strip() or task_key,
+        )
+    if entry.get("status") is not None:
+        entry["status"] = str(entry.get("status") or "").strip().lower()
+    if entry.get("reason") is not None:
+        entry["reason"] = str(entry.get("reason") or "").strip().lower()
+    history.append(entry)
+    state["history"] = _scheduler_prune_history_entries(history, limits)
 
 
 def _scheduler_note_decision(state: Dict[str, Any], task_key: str, decision: str, reason: str, limits: Optional[Dict[str, Any]] = None, entry: Optional[Dict[str, Any]] = None) -> None:
@@ -1246,10 +1472,45 @@ def _scheduler_note_decision(state: Dict[str, Any], task_key: str, decision: str
     state["last_decisions"] = decisions[-max(1, int(limits.get("decision_limit", 24))):]
 
 
-def _remove_process_task(state: Dict[str, Any], task_key: str) -> None:
+def _remove_process_task(
+    state: Dict[str, Any],
+    task_key: str,
+    *,
+    limits: Optional[Dict[str, Any]] = None,
+    reason: str = "cancelled",
+) -> None:
     key = str(task_key or "").strip()
     queue = state.get("queue") if isinstance(state.get("queue"), list) else []
-    state["queue"] = [entry for entry in queue if str(entry.get("task_key") or "").strip() != key]
+    if not key:
+        state["queue"] = list(queue)
+        return
+    remaining = []
+    removed = []
+    for entry in queue:
+        if str(entry.get("task_key") or "").strip() == key:
+            removed.append(entry)
+        else:
+            remaining.append(entry)
+    state["queue"] = remaining
+    if not removed:
+        return
+    limits = limits or _process_scheduler_limits()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_reason = str(reason or "cancelled").strip().lower() or "cancelled"
+    for entry in removed:
+        _scheduler_record_history(
+            state,
+            {
+                "task_key": entry.get("task_key"),
+                "task_id": entry.get("id"),
+                "status": "cancelled",
+                "reason": clean_reason,
+                "timestamp": now_iso,
+                "priority": entry.get("priority"),
+                "resource_profile": entry.get("resource_profile"),
+            },
+            limits,
+        )
 
 
 def _enqueue_process_task(state: Dict[str, Any], task_key: str, *, limits: Dict[str, Any], priority: Optional[int] = None, reason: str = "", metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -1293,6 +1554,20 @@ def _enqueue_process_task(state: Dict[str, Any], task_key: str, *, limits: Dict[
     queue.append(entry)
     state["queue"] = queue
     _sort_process_scheduler_queue(state)
+    _scheduler_record_history(
+        state,
+        {
+            "task_key": entry.get("task_key"),
+            "task_id": entry.get("id"),
+            "status": "queued",
+            "reason": clean_reason or "requested",
+            "requested_at": now_iso,
+            "timestamp": now_iso,
+            "priority": entry.get("priority"),
+            "resource_profile": entry.get("resource_profile"),
+        },
+        limits,
+    )
     while len(state["queue"]) > int(limits.get("max_queue_slots", 10)):
         dropped = state["queue"].pop()
         _scheduler_record_history(state, {
@@ -1468,7 +1743,7 @@ def _scheduler_request_task_stop(
         {
             "task_key": entry.get("task_key"),
             "task_id": entry.get("id"),
-            "status": decision,
+            "status": "force_cancel_requested" if force else "cancel_requested",
             "reason": entry["stop_reason"],
             "timestamp": now_iso,
             "pid": pid,
@@ -1607,8 +1882,9 @@ def _reconcile_process_scheduler_running(state: Dict[str, Any], limits: Dict[str
         history_payload = {
             "task_key": entry.get("task_key"),
             "task_id": entry.get("id"),
-            "status": "stopped" if stop_reason else "completed",
+            "status": "cancelled" if stop_reason else "completed",
             "finished_at": finished_at,
+            "timestamp": finished_at,
             "duration_sec": duration_sec,
             "reason": stop_reason or "process_exit",
             "pid": pid,
@@ -2718,6 +2994,30 @@ def append_typed_outbox_entry(
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")
         return None
+
+
+def request_discord_outbox_flush(
+    *,
+    reason: str = "manual_flush",
+    burst: Optional[int] = None,
+    stale_mode: str = "drop",
+    source: str = "internal",
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": "requested",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "reason": str(reason or "manual_flush").strip().lower() or "manual_flush",
+        "source": str(source or "internal").strip().lower() or "internal",
+    }
+    if burst is not None:
+        try:
+            payload["burst"] = max(1, min(512, int(burst)))
+        except Exception:
+            pass
+    stale_value = str(stale_mode or "drop").strip().lower() or "drop"
+    payload["stale_mode"] = stale_value if stale_value in {"drop", "archive"} else "drop"
+    update_inastate("discord_outbox_flush", payload)
+    return payload
 
 
 def _load_github_submission_state() -> Dict[str, Any]:
@@ -3933,13 +4233,13 @@ def _request_memory_graph_neural_task(reason: str = "deferred_resume", *, priori
 
 def _enqueue_deep_recall_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
     if _deep_recall_manager is None:
-        _remove_process_task(state, "deep_recall_step")
+        _remove_process_task(state, "deep_recall_step", limits=limits, reason="deep_recall_inactive")
         return
     _ensure_deep_recall_ready()
     _maybe_restart_deep_recall_for_new_fragments()
     manager = _deep_recall_manager
     if manager is None or not manager.state.active or manager.state.completed:
-        _remove_process_task(state, "deep_recall_step")
+        _remove_process_task(state, "deep_recall_step", limits=limits, reason="deep_recall_complete")
         return
     _enqueue_process_task(
         state,
@@ -3956,11 +4256,26 @@ def _enqueue_deep_recall_task_if_needed(state: Dict[str, Any], limits: Dict[str,
 
 def _scheduler_run_step_task(entry: Dict[str, Any], state: Dict[str, Any], limits: Dict[str, Any]) -> None:
     task_key = str(entry.get("task_key") or "").strip()
+    started_at = datetime.now(timezone.utc).isoformat()
     started_ts = time.time()
+    _scheduler_record_history(
+        state,
+        {
+            "task_key": task_key,
+            "task_id": entry.get("id"),
+            "status": "started",
+            "reason": str(entry.get("last_request_reason") or entry.get("request_reason") or "step").strip().lower() or "step",
+            "started_at": started_at,
+            "timestamp": started_at,
+            "priority": entry.get("priority"),
+            "resource_profile": entry.get("resource_profile"),
+        },
+        limits,
+    )
     history_payload = {
         "task_key": task_key,
         "task_id": entry.get("id"),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": started_at,
         "resource_profile": entry.get("resource_profile"),
         "priority": entry.get("priority"),
     }
@@ -3981,11 +4296,12 @@ def _scheduler_run_step_task(entry: Dict[str, Any], state: Dict[str, Any], limit
         history_payload["status"] = "skipped"
         history_payload["reason"] = "unknown_step_task"
     history_payload["finished_at"] = datetime.now(timezone.utc).isoformat()
+    history_payload["timestamp"] = history_payload["finished_at"]
     history_payload["duration_sec"] = round(max(0.0, time.time() - started_ts), 4)
     _scheduler_record_history(state, history_payload, limits)
 
 
-def _scheduler_start_subprocess_task(entry: Dict[str, Any], state: Dict[str, Any]) -> bool:
+def _scheduler_start_subprocess_task(entry: Dict[str, Any], state: Dict[str, Any], limits: Dict[str, Any]) -> bool:
     profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
     if profile is None:
         return False
@@ -4008,6 +4324,21 @@ def _scheduler_start_subprocess_task(entry: Dict[str, Any], state: Dict[str, Any
         }
     )
     state.setdefault("running", []).append(running_entry)
+    _scheduler_record_history(
+        state,
+        {
+            "task_key": running_entry.get("task_key"),
+            "task_id": running_entry.get("id"),
+            "status": "started",
+            "reason": str(running_entry.get("last_request_reason") or running_entry.get("request_reason") or "subprocess").strip().lower() or "subprocess",
+            "started_at": started_at,
+            "timestamp": started_at,
+            "pid": int(process.pid),
+            "priority": running_entry.get("priority"),
+            "resource_profile": running_entry.get("resource_profile"),
+        },
+        limits,
+    )
     module_name = str(profile.get("module") or "").strip()
     if module_name:
         mark_module_running(module_name)
@@ -4043,7 +4374,7 @@ def _process_scheduler_tick(memory_guard: Optional[Dict[str, Any]] = None) -> Di
             _scheduler_note_decision(state, profile["task_key"], "started", "step", limits, entry=entry)
             _scheduler_run_step_task(entry, state, limits)
         else:
-            if _scheduler_start_subprocess_task(entry, state):
+            if _scheduler_start_subprocess_task(entry, state, limits):
                 _scheduler_note_decision(state, profile["task_key"], "started", "subprocess", limits, entry=entry)
             else:
                 state.setdefault("queue", []).append(entry)

@@ -128,6 +128,80 @@ def github_bridge_lock_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "github_bridge.lock"
 
 
+def typed_outbox_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "typed_outbox.jsonl"
+
+
+def append_typed_outbox_notice(
+    child: str,
+    text: str,
+    *,
+    target: str = "owner_dm",
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    allow_empty: bool = False,
+    attachment_path: Optional[str] = None,
+) -> Optional[str]:
+    payload = "" if text is None else str(text)
+    if not allow_empty and not payload.strip() and not attachment_path:
+        return None
+    entry = {
+        "id": f"typed_{uuid.uuid4().hex}",
+        "text": payload,
+        "target": str(target or "owner_dm").strip() or "owner_dm",
+        "user_id": str(user_id) if user_id is not None else None,
+        "metadata": metadata or {},
+        "allow_empty": bool(allow_empty),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if attachment_path:
+        entry["attachment_path"] = str(attachment_path)
+    return entry["id"] if _append_jsonl(typed_outbox_path(child), entry) else None
+
+
+def maybe_queue_submission_discord_notice(
+    child: str,
+    entry: Dict[str, Any],
+    result: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+    if not bool(metadata.get("notify_discord_on_submit")):
+        return None
+
+    payload = cfg if isinstance(cfg, dict) else load_config()
+    discord_cfg = payload.get("discord") if isinstance(payload, dict) else None
+    if not isinstance(discord_cfg, dict) or not bool(discord_cfg.get("enabled", False)):
+        return None
+
+    title = str(result.get("title") or entry.get("title") or "GitHub issue").strip() or "GitHub issue"
+    issue_number = result.get("issue_number")
+    issue_url = str(result.get("issue_url") or "").strip()
+    explanation = str(metadata.get("discord_explanation") or "").strip()
+    source = str(metadata.get("discord_reason") or metadata.get("source") or "github_submission").strip() or "github_submission"
+
+    header = f"Ina filed GitHub issue #{issue_number}: {title}" if issue_number is not None else f"Ina filed a GitHub issue: {title}"
+    lines = [header]
+    if explanation:
+        lines.append(explanation)
+    if issue_url:
+        lines.append(issue_url)
+
+    return append_typed_outbox_notice(
+        child,
+        "\n".join(lines),
+        target=str(metadata.get("discord_target") or "owner_dm").strip() or "owner_dm",
+        user_id=str(metadata.get("discord_user_id")) if metadata.get("discord_user_id") is not None else None,
+        metadata={
+            "source": "github_submission",
+            "reason": source,
+            "issue_number": issue_number,
+            "issue_url": issue_url or None,
+            "title": title,
+        },
+    )
+
+
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,6 +546,7 @@ __all__ = [
     "build_issue_title",
     "labels_for_kind",
     "DEFAULT_GITHUB_SUBMISSION",
+    "append_typed_outbox_notice",
     "get_current_child",
     "get_github_submission_config",
     "github_attachment_dir",
@@ -483,6 +558,8 @@ __all__ = [
     "load_config",
     "load_submitted_count_for_day",
     "log_history",
+    "maybe_queue_submission_discord_notice",
     "read_pending_entries",
     "submit_issue",
+    "typed_outbox_path",
 ]

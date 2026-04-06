@@ -2,7 +2,7 @@ import os
 import shutil
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -25,6 +25,7 @@ def test_process_scheduler_limits_parse_overrides():
             "gpu_soft_percent": 52,
             "gpu_hard_percent": 91,
             "history_limit": 40,
+            "history_window_hours": 6,
             "decision_limit": 12,
             "track_gpu": False,
         }
@@ -39,6 +40,7 @@ def test_process_scheduler_limits_parse_overrides():
     assert limits["gpu_soft_percent"] == 52
     assert limits["gpu_hard_percent"] == 91
     assert limits["history_limit"] == 40
+    assert limits["history_window_hours"] == 6
     assert limits["decision_limit"] == 12
     assert limits["track_gpu"] is False
 
@@ -373,3 +375,79 @@ def test_scheduler_enforce_memory_limits_requests_stop_for_low_priority_task():
     finally:
         mm._scheduler_request_task_stop = original_stop
 
+
+def test_request_discord_outbox_flush_persists_payload():
+    original_update = mm.update_inastate
+    captured = {}
+    try:
+        mm.update_inastate = lambda key, value: captured.update({"key": key, "value": value})
+        payload = mm.request_discord_outbox_flush(reason="backlog", burst=40, stale_mode="drop", source="unit_test")
+        assert captured["key"] == "discord_outbox_flush"
+        assert captured["value"] == payload
+        assert payload["status"] == "requested"
+        assert payload["reason"] == "backlog"
+        assert payload["burst"] == 40
+        assert payload["stale_mode"] == "drop"
+        assert payload["source"] == "unit_test"
+    finally:
+        mm.update_inastate = original_update
+
+
+def test_request_discord_outbox_flush_normalizes_values():
+    original_update = mm.update_inastate
+    captured = {}
+    try:
+        mm.update_inastate = lambda key, value: captured.update({"key": key, "value": value})
+        payload = mm.request_discord_outbox_flush(reason="", burst=9999, stale_mode="weird", source="")
+        assert payload["reason"] == "manual_flush"
+        assert payload["burst"] == 512
+        assert payload["stale_mode"] == "drop"
+        assert payload["source"] == "internal"
+    finally:
+        mm.update_inastate = original_update
+
+
+
+def test_remove_process_task_records_queue_cancellation():
+    limits = mm._process_scheduler_limits({"process_scheduler": {"history_limit": 10, "history_window_hours": 24}})
+    state = mm._new_process_scheduler_state()
+
+    task_id = mm._enqueue_process_task(state, "deep_recall_step", limits=limits, reason="unit_test")
+    assert task_id
+    mm._remove_process_task(state, "deep_recall_step", limits=limits, reason="unit_test_cancel")
+
+    assert state["queue"] == []
+    assert state["history"][-1]["status"] == "cancelled"
+    assert state["history"][-1]["reason"] == "unit_test_cancel"
+
+
+def test_build_process_scheduler_summary_includes_recent_module_history():
+    limits = mm._process_scheduler_limits({"process_scheduler": {"history_limit": 20, "history_window_hours": 24}})
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(hours=30)).isoformat()
+    recent = now.isoformat()
+    state = mm._new_process_scheduler_state()
+    state["history"] = [
+        {"task_key": "memory_graph_neural", "status": "queued", "timestamp": recent},
+        {"task_key": "memory_graph_neural", "status": "started", "timestamp": recent},
+        {"task_key": "memory_graph_neural", "status": "cancelled", "timestamp": recent, "reason": "scheduler_total_rss_limit"},
+        {"task_key": "logic_engine_run", "status": "completed", "timestamp": recent},
+        {"task_key": "dreamstate_run", "status": "queued", "timestamp": stale},
+    ]
+    state["resources"] = {
+        "memory_guard_level": "normal",
+        "cpu_percent": 18.0,
+        "gpu_available": False,
+        "gpu_utilization_percent": 0.0,
+    }
+
+    summary = mm._build_process_scheduler_summary(state, limits)
+
+    assert summary["history_window_hours"] == 24.0
+    assert summary["cancelled_count"] == 1
+    assert all(item["module"] != "dreamstate" for item in summary["recent_activity"])
+    memory_graph = next(item for item in summary["module_history"] if item["module"] == "memory_graph")
+    assert memory_graph["queued_count"] == 1
+    assert memory_graph["started_count"] == 1
+    assert memory_graph["cancelled_count"] == 1
+    assert "cancelled" in memory_graph["status_spectrum"]
