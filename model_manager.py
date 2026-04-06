@@ -3,15 +3,18 @@
 import json
 import time
 import subprocess
+import sqlite3
+import hashlib
 import uuid
 import threading
 import os
 import random
+import signal
 import gc
 import traceback
 import math
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from gui_hook import log_to_statusbox
@@ -26,6 +29,7 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
+from github_submission import append_github_issue_entry, get_github_submission_config, labels_for_kind
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 try:
@@ -52,6 +56,7 @@ _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.js
 RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
 TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
+GITHUB_SUBMISSION_STATE_PATH = MEMORY_PATH / "github_submission_state.json"
 _DECISION_PANIC_LOG_PATH = MEMORY_PATH / "decision_panic_log.jsonl"
 _SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"
 _FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
@@ -142,6 +147,218 @@ _last_memory_queue_event_ts = 0.0
 _last_memory_queue_process_ts = 0.0
 _RUNTIME_HEARTBEAT_INTERVAL = 30.0
 _last_runtime_heartbeat = 0.0
+_PROCESS_SCHEDULER_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
+_PROCESS_SCHEDULER_TICK_INTERVAL = 5.0
+_last_process_scheduler_tick = 0.0
+_PROCESS_SCHEDULER_DEFAULTS = {
+    "enabled": True,
+    "max_queue_slots": 10,
+    "max_parallel_tasks": 2,
+    "max_memory_heavy_tasks": 1,
+    "max_cpu_heavy_tasks": 2,
+    "max_gpu_tasks": 1,
+    "cpu_soft_percent": 70.0,
+    "cpu_hard_percent": 85.0,
+    "gpu_soft_percent": 70.0,
+    "gpu_hard_percent": 90.0,
+    "history_limit": 160,
+    "decision_limit": 24,
+    "track_gpu": True,
+    "memory_budget_enabled": True,
+    "max_total_rss_gb": 96.0,
+    "max_managed_rss_gb": 72.0,
+    "min_available_gb": 8.0,
+    "memory_estimate_low_gb": 0.75,
+    "memory_estimate_medium_gb": 3.0,
+    "memory_estimate_high_gb": 12.0,
+    "terminate_over_budget_tasks": True,
+    "terminate_grace_sec": 10.0,
+}
+_ATTENTION_POLICY_DEFAULTS = {
+    "enabled": True,
+    "suppress_vision_for_memory_lane": True,
+    "suppress_vision_for_focus": True,
+    "deep_focus_threshold": 0.72,
+    "queue_pressure_depth": 3,
+    "vision_cpu_soft_percent": 70.0,
+    "audio_cpu_hard_percent": 84.0,
+    "suppress_audio_on_hard_guard": True,
+    "suppress_vision_during_dream": True,
+    "suppress_audio_during_dream": True,
+    "default_request_ttl_sec": 300.0,
+    "max_request_ttl_sec": 1800.0,
+}
+_PROCESS_TASK_PROFILES = {
+    "memory_graph_neural": {
+        "kind": "subprocess",
+        "command": ["python", "memory_graph.py", "--phase", "neural"],
+        "module": "memory_graph",
+        "priority": 90,
+        "memory_class": "high",
+        "cpu_class": "high",
+        "gpu_class": "none",
+        "exclusive_group": "memory_recall",
+    },
+    "deep_recall_step": {
+        "kind": "step",
+        "module": "deep_recall",
+        "priority": 70,
+        "memory_class": "high",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "memory_recall",
+    },
+    "dreamstate_run": {
+        "kind": "subprocess",
+        "command": ["python", "dreamstate.py"],
+        "module": "dreamstate",
+        "priority": 84,
+        "memory_class": "medium",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "conscious_mode",
+    },
+    "meditation_state_run": {
+        "kind": "subprocess",
+        "command": ["python", "meditation_state.py"],
+        "module": "meditation_state",
+        "priority": 82,
+        "memory_class": "medium",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "conscious_mode",
+    },
+    "emotion_engine_run": {
+        "kind": "subprocess",
+        "command": ["python", "emotion_engine.py"],
+        "module": "emotion_engine",
+        "priority": 72,
+        "memory_class": "low",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "instinct_engine_run": {
+        "kind": "subprocess",
+        "command": ["python", "instinct_engine.py"],
+        "module": "instinct_engine",
+        "priority": 74,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "early_comm_run": {
+        "kind": "subprocess",
+        "command": ["python", "early_comm.py"],
+        "module": "early_comm",
+        "priority": 58,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "predictive_layer_run": {
+        "kind": "subprocess",
+        "command": ["python", "predictive_layer.py"],
+        "module": "predictive_layer",
+        "priority": 76,
+        "memory_class": "medium",
+        "cpu_class": "high",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "logic_engine_run": {
+        "kind": "subprocess",
+        "command": ["python", "logic_engine.py"],
+        "module": "logic_engine",
+        "priority": 76,
+        "memory_class": "medium",
+        "cpu_class": "high",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "meaning_map_refresh": {
+        "kind": "subprocess",
+        "command": ["python", "meaning_map.py"],
+        "module": "meaning_map",
+        "priority": 78,
+        "memory_class": "high",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "map_build",
+    },
+    "neural_graph_refresh": {
+        "kind": "subprocess",
+        "command": ["python", "neural_graph.py"],
+        "module": "neural_graph",
+        "priority": 74,
+        "memory_class": "medium",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "map_build",
+    },
+    "logic_map_refresh": {
+        "kind": "subprocess",
+        "command": ["python", "logic_map_builder.py"],
+        "module": "logic_map",
+        "priority": 76,
+        "memory_class": "high",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "map_build",
+    },
+    "emotion_map_refresh": {
+        "kind": "subprocess",
+        "command": ["python", "emotion_map.py"],
+        "module": "emotion_map",
+        "priority": 72,
+        "memory_class": "medium",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "map_build",
+    },
+    "who_am_i_run": {
+        "kind": "subprocess",
+        "command": ["python", "who_am_i.py"],
+        "module": "who_am_i",
+        "priority": 68,
+        "memory_class": "low",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "trauma_processor_run": {
+        "kind": "subprocess",
+        "command": ["python", "trauma_processor.py"],
+        "module": "trauma_processor",
+        "priority": 80,
+        "memory_class": "medium",
+        "cpu_class": "medium",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "boredom_state_run": {
+        "kind": "subprocess",
+        "command": ["python", "boredom_state.py"],
+        "module": "boredom_state",
+        "priority": 54,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "",
+    },
+    "paint_window_open": {
+        "kind": "subprocess",
+        "command": ["python", "paint_window.py"],
+        "module": "paint_window",
+        "priority": 52,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "creative_ui",
+    },
+}
 _BUNDLE_POLICY_DEFAULTS = {
     "enabled": False,
     "allow_apply": False,
@@ -512,6 +729,897 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
         _maybe_log_memory_guard_state(state, limits)
     _publish_memory_guard_state(state)
     return state
+
+
+def _process_scheduler_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    raw = cfg.get("process_scheduler") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    limits = _PROCESS_SCHEDULER_DEFAULTS.copy()
+    limits["enabled"] = _coerce_bool(raw.get("enabled", limits["enabled"]), limits["enabled"])
+    for key in (
+        "max_queue_slots",
+        "max_parallel_tasks",
+        "max_memory_heavy_tasks",
+        "max_cpu_heavy_tasks",
+        "max_gpu_tasks",
+        "history_limit",
+        "decision_limit",
+    ):
+        if key in raw:
+            limits[key] = max(1, _coerce_int(raw.get(key), int(limits[key])))
+    for key in ("cpu_soft_percent", "cpu_hard_percent", "gpu_soft_percent", "gpu_hard_percent"):
+        if key in raw:
+            limits[key] = _clamp_percent(raw.get(key), limits[key])
+    for key in (
+        "max_total_rss_gb",
+        "max_managed_rss_gb",
+        "min_available_gb",
+        "memory_estimate_low_gb",
+        "memory_estimate_medium_gb",
+        "memory_estimate_high_gb",
+        "terminate_grace_sec",
+    ):
+        if key in raw:
+            limits[key] = max(0.0, _coerce_float(raw.get(key), limits[key]))
+    for key in ("memory_budget_enabled", "terminate_over_budget_tasks", "track_gpu"):
+        if key in raw:
+            limits[key] = _coerce_bool(raw.get(key), limits[key])
+
+    limits["max_memory_heavy_tasks"] = min(limits["max_memory_heavy_tasks"], limits["max_parallel_tasks"])
+    limits["max_cpu_heavy_tasks"] = min(limits["max_cpu_heavy_tasks"], limits["max_parallel_tasks"])
+    limits["max_gpu_tasks"] = min(limits["max_gpu_tasks"], limits["max_parallel_tasks"])
+    limits["cpu_soft_percent"] = min(limits["cpu_soft_percent"], limits["cpu_hard_percent"])
+    limits["gpu_soft_percent"] = min(limits["gpu_soft_percent"], limits["gpu_hard_percent"])
+    if limits["max_total_rss_gb"] > 0 and limits["max_managed_rss_gb"] > 0:
+        limits["max_managed_rss_gb"] = min(limits["max_managed_rss_gb"], limits["max_total_rss_gb"])
+    limits["terminate_grace_sec"] = max(1.0, limits["terminate_grace_sec"])
+    return limits
+
+
+def _attention_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    raw = cfg.get("attention_scheduler") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    policy = _ATTENTION_POLICY_DEFAULTS.copy()
+    for key in (
+        "enabled",
+        "suppress_vision_for_memory_lane",
+        "suppress_vision_for_focus",
+        "suppress_audio_on_hard_guard",
+        "suppress_vision_during_dream",
+        "suppress_audio_during_dream",
+    ):
+        if key in raw:
+            policy[key] = _coerce_bool(raw.get(key), policy[key])
+    for key in ("deep_focus_threshold",):
+        if key in raw:
+            policy[key] = _clamp01(raw.get(key), default=policy[key])
+    for key in ("vision_cpu_soft_percent", "audio_cpu_hard_percent"):
+        if key in raw:
+            policy[key] = _clamp_percent(raw.get(key), policy[key])
+    for key in ("default_request_ttl_sec", "max_request_ttl_sec"):
+        if key in raw:
+            policy[key] = max(1.0, _coerce_float(raw.get(key), policy[key]))
+    if "queue_pressure_depth" in raw:
+        policy["queue_pressure_depth"] = max(1, _coerce_int(raw.get("queue_pressure_depth"), int(policy["queue_pressure_depth"])))
+    policy["default_request_ttl_sec"] = min(policy["default_request_ttl_sec"], policy["max_request_ttl_sec"])
+    return policy
+
+
+def _new_process_scheduler_state() -> Dict[str, Any]:
+    return {
+        "queue": [],
+        "running": [],
+        "history": [],
+        "last_decisions": [],
+        "resources": {},
+        "slot_summary": {},
+        "planner": {},
+        "updated_at": None,
+    }
+
+
+def _scheduler_task_profile(task_key: str) -> Optional[Dict[str, Any]]:
+    key = str(task_key or "").strip()
+    profile = _PROCESS_TASK_PROFILES.get(key)
+    if not profile:
+        return None
+    payload = dict(profile)
+    payload["task_key"] = key
+    return payload
+
+
+def _scheduler_memory_estimate_gb(profile: Optional[Dict[str, Any]], limits: Optional[Dict[str, Any]] = None) -> float:
+    if not isinstance(profile, dict):
+        return 0.0
+    explicit = max(0.0, _coerce_float(profile.get("memory_estimate_gb"), 0.0))
+    if explicit > 0.0:
+        return round(explicit, 3)
+    limits = limits or _process_scheduler_limits()
+    memory_class = str(profile.get("memory_class") or "").strip().lower()
+    if memory_class == "high":
+        return round(max(0.0, _coerce_float(limits.get("memory_estimate_high_gb"), 12.0)), 3)
+    if memory_class == "medium":
+        return round(max(0.0, _coerce_float(limits.get("memory_estimate_medium_gb"), 3.0)), 3)
+    return round(max(0.0, _coerce_float(limits.get("memory_estimate_low_gb"), 0.75)), 3)
+
+
+def _scheduler_task_memory_limit_gb(profile: Optional[Dict[str, Any]], limits: Optional[Dict[str, Any]] = None) -> float:
+    if not isinstance(profile, dict):
+        return 0.0
+    explicit = max(0.0, _coerce_float(profile.get("memory_limit_gb"), 0.0))
+    if explicit > 0.0:
+        return round(explicit, 3)
+    return 0.0
+
+
+def _scheduler_entry_memory_usage_gb(entry: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> float:
+    rss_gb = max(0.0, _coerce_float(entry.get("rss_gb"), 0.0))
+    if rss_gb > 0.0:
+        return round(rss_gb, 3)
+    resource_profile = entry.get("resource_profile") if isinstance(entry.get("resource_profile"), dict) else {}
+    stored_estimate = max(0.0, _coerce_float(resource_profile.get("memory_estimate_gb"), 0.0))
+    if stored_estimate > 0.0:
+        return round(stored_estimate, 3)
+    profile = _scheduler_task_profile(str(entry.get("task_key") or "")) or resource_profile
+    return _scheduler_memory_estimate_gb(profile, limits)
+
+
+def _scheduler_memory_overview(state: Dict[str, Any], resources: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    limits = limits or _process_scheduler_limits()
+    running = state.get("running") if isinstance(state.get("running"), list) else []
+    managed_running_rss_gb = round(
+        sum(_scheduler_entry_memory_usage_gb(entry, limits) for entry in running if isinstance(entry, dict)),
+        3,
+    )
+    return {
+        "managed_running_rss_gb": managed_running_rss_gb,
+        "total_rss_gb": round(max(0.0, _coerce_float(resources.get("ina_rss_gb"), 0.0)), 3),
+        "ram_available_gb": round(max(0.0, _coerce_float(resources.get("ram_available_gb"), 0.0)), 3),
+        "max_total_rss_gb": round(max(0.0, _coerce_float(limits.get("max_total_rss_gb"), 0.0)), 3),
+        "max_managed_rss_gb": round(max(0.0, _coerce_float(limits.get("max_managed_rss_gb"), 0.0)), 3),
+        "min_available_gb": round(max(0.0, _coerce_float(limits.get("min_available_gb"), 0.0)), 3),
+    }
+
+
+def _scheduler_resource_profile(profile: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    limits = limits or _process_scheduler_limits()
+    return {
+        "kind": profile.get("kind"),
+        "module": profile.get("module"),
+        "memory_class": profile.get("memory_class"),
+        "cpu_class": profile.get("cpu_class"),
+        "gpu_class": profile.get("gpu_class"),
+        "exclusive_group": profile.get("exclusive_group"),
+        "memory_estimate_gb": _scheduler_memory_estimate_gb(profile, limits),
+        "memory_limit_gb": _scheduler_task_memory_limit_gb(profile, limits),
+    }
+
+
+def _sort_process_scheduler_queue(state: Dict[str, Any]) -> None:
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    queue.sort(
+        key=lambda item: (
+            -int(item.get("priority", 0) or 0),
+            str(item.get("requested_at") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    state["queue"] = queue
+
+
+def _load_process_scheduler_state() -> Dict[str, Any]:
+    if not _PROCESS_SCHEDULER_STATE_PATH.exists():
+        return _new_process_scheduler_state()
+    try:
+        with _PROCESS_SCHEDULER_STATE_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return _new_process_scheduler_state()
+    if not isinstance(payload, dict):
+        return _new_process_scheduler_state()
+    state = _new_process_scheduler_state()
+    state.update(payload)
+    for key in ("queue", "running", "history", "last_decisions"):
+        value = state.get(key)
+        state[key] = value if isinstance(value, list) else []
+    state["resources"] = state.get("resources") if isinstance(state.get("resources"), dict) else {}
+    state["slot_summary"] = state.get("slot_summary") if isinstance(state.get("slot_summary"), dict) else {}
+    state["planner"] = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    _sort_process_scheduler_queue(state)
+    return state
+
+
+def _scheduler_task_label(task_key: str) -> str:
+    key = str(task_key or "").strip()
+    labels = {
+        "memory_graph_neural": "memory graph neural",
+        "deep_recall_step": "deep recall step",
+    }
+    if key in labels:
+        return labels[key]
+    profile = _scheduler_task_profile(key)
+    base = str((profile or {}).get("module") or key or "task").replace("_", " ").strip()
+    return base or "task"
+
+
+def _scheduler_brief_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    task_key = str(entry.get("task_key") or "").strip()
+    profile = _scheduler_task_profile(task_key) or {}
+    resource_profile = entry.get("resource_profile") if isinstance(entry.get("resource_profile"), dict) else {}
+    pid = _coerce_int(entry.get("pid"), 0)
+    reason = str(
+        entry.get("last_request_reason")
+        or entry.get("request_reason")
+        or entry.get("reason")
+        or ""
+    ).strip().lower()
+    rss_gb = max(0.0, _coerce_float(entry.get("rss_gb"), 0.0))
+    memory_estimate = max(0.0, _coerce_float(resource_profile.get("memory_estimate_gb"), 0.0))
+    memory_limit = max(0.0, _coerce_float(resource_profile.get("memory_limit_gb"), 0.0))
+    status = str(entry.get("status") or ("running" if pid > 0 else "queued")).strip().lower()
+    return {
+        "task_key": task_key,
+        "label": _scheduler_task_label(task_key),
+        "module": str(profile.get("module") or task_key or "").strip(),
+        "status": status,
+        "priority": int(entry.get("priority", profile.get("priority", 0)) or 0),
+        "pid": pid if pid > 0 else None,
+        "reason": reason,
+        "requested_at": entry.get("requested_at") or entry.get("last_requested_at"),
+        "started_at": entry.get("started_at"),
+        "memory_class": str(profile.get("memory_class") or resource_profile.get("memory_class") or "").strip().lower() or "unknown",
+        "cpu_class": str(profile.get("cpu_class") or resource_profile.get("cpu_class") or "").strip().lower() or "unknown",
+        "gpu_class": str(profile.get("gpu_class") or resource_profile.get("gpu_class") or "").strip().lower() or "none",
+        "rss_gb": round(rss_gb, 3) if rss_gb > 0.0 else None,
+        "memory_estimate_gb": round(memory_estimate, 3) if memory_estimate > 0.0 else None,
+        "memory_limit_gb": round(memory_limit, 3) if memory_limit > 0.0 else None,
+        "stop_reason": str(entry.get("stop_reason") or "").strip().lower() or None,
+    }
+
+
+def _scheduler_learning_hint(last_blocked_reason: str, queue_depth: int, running_count: int) -> str:
+    reason = str(last_blocked_reason or "").strip().lower()
+    if reason == "exclusive_group_busy":
+        return "Deep recall and the neural memory graph share the same high-memory lane. Finish one before starting the other."
+    if reason in {"memory_guard_soft", "memory_guard_hard"}:
+        return "Memory guard is active. Delay high-memory work until RAM pressure drops."
+    if reason in {"scheduler_total_rss_limit", "scheduler_managed_rss_limit", "scheduler_available_ram_limit"}:
+        return "The scheduler memory budget is full. Wait for RSS to fall or free a lane before starting another heavy task."
+    if reason == "task_memory_limit":
+        return "A running task crossed its memory budget. Keep it smaller or split the work into shorter passes."
+    if reason in {"cpu_soft_limit", "cpu_hard_limit", "cpu_heavy_slot_full"}:
+        return "CPU pressure is already high. Prefer lighter work or wait for a free compute lane."
+    if reason in {"gpu_soft_limit", "gpu_hard_limit", "gpu_slot_full"}:
+        return "GPU pressure is already high. Avoid launching another GPU-leaning task yet."
+    if reason == "parallel_slots_full":
+        return "All parallel task slots are busy. Let one finish before starting another heavy job."
+    if reason == "memory_heavy_slot_full":
+        return "The high-memory lane is occupied. Keep only one memory-heavy task active at a time."
+    if queue_depth > 0 and running_count == 0:
+        return "The queue has pending work. Start the highest-priority slot that fits current resource pressure."
+    if queue_depth > 1:
+        return "The queue has multiple pending slots. Prefer shorter or lighter work first when pressure is rising."
+    return ""
+
+
+def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    limits = limits or _process_scheduler_limits()
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    running = state.get("running") if isinstance(state.get("running"), list) else []
+    resources = state.get("resources") if isinstance(state.get("resources"), dict) else {}
+    decisions = state.get("last_decisions") if isinstance(state.get("last_decisions"), list) else []
+    running_briefs = [_scheduler_brief_entry(entry) for entry in running if isinstance(entry, dict)]
+    queue_briefs = [_scheduler_brief_entry(entry) for entry in queue if isinstance(entry, dict)]
+    decision_briefs = [
+        {
+            "timestamp": item.get("timestamp"),
+            "task_key": str(item.get("task_key") or "").strip(),
+            "label": _scheduler_task_label(str(item.get("task_key") or "").strip()),
+            "decision": str(item.get("decision") or "").strip().lower(),
+            "reason": str(item.get("reason") or "").strip().lower(),
+            "priority": item.get("priority"),
+        }
+        for item in decisions[-6:]
+        if isinstance(item, dict)
+    ]
+    blocked = [item for item in decision_briefs if item.get("decision") == "blocked"]
+    last_blocked = blocked[-1] if blocked else {}
+    memory = _scheduler_memory_overview(state, resources, limits)
+
+    max_parallel = int(limits.get("max_parallel_tasks", 2))
+    max_queue = int(limits.get("max_queue_slots", 10))
+    guard_level = str(resources.get("memory_guard_level") or "unknown").strip().lower() or "unknown"
+    cpu_percent = round(float(resources.get("cpu_percent", 0.0) or 0.0), 1)
+    gpu_percent = round(float(resources.get("gpu_utilization_percent", 0.0) or 0.0), 1)
+
+    summary_parts = [
+        f"Running {len(running_briefs)}/{max_parallel} task(s)",
+        f"queue {len(queue_briefs)}/{max_queue}",
+        f"guard {guard_level}",
+        f"CPU {cpu_percent:.1f}%",
+    ]
+    total_rss = memory.get("total_rss_gb", 0.0)
+    max_total = memory.get("max_total_rss_gb", 0.0)
+    managed_rss = memory.get("managed_running_rss_gb", 0.0)
+    max_managed = memory.get("max_managed_rss_gb", 0.0)
+    if max_total > 0:
+        summary_parts.append(f"Ina RSS {total_rss:.1f}/{max_total:.1f}GB")
+    else:
+        summary_parts.append(f"Ina RSS {total_rss:.1f}GB")
+    if max_managed > 0:
+        summary_parts.append(f"managed {managed_rss:.1f}/{max_managed:.1f}GB")
+    available_gb = memory.get("ram_available_gb", 0.0)
+    min_available = memory.get("min_available_gb", 0.0)
+    if min_available > 0:
+        summary_parts.append(f"avail {available_gb:.1f}/{min_available:.1f}GB")
+    if bool(resources.get("gpu_available", False)):
+        summary_parts.append(f"GPU {gpu_percent:.1f}%")
+    summary = " | ".join(summary_parts) + "."
+    if running_briefs:
+        summary += " Active: " + ", ".join(item["label"] for item in running_briefs[:3]) + "."
+    if queue_briefs:
+        summary += " Next: " + ", ".join(
+            f"{item['label']} (p{item['priority']})" for item in queue_briefs[:3]
+        ) + "."
+    if last_blocked:
+        summary += f" Last block: {last_blocked['label']} held for {str(last_blocked.get('reason') or '').replace('_', ' ')}."
+
+    return {
+        "available": True,
+        "summary": summary.strip(),
+        "learning_hint": _scheduler_learning_hint(
+            str(last_blocked.get("reason") or ""),
+            len(queue_briefs),
+            len(running_briefs),
+        ),
+        "running": running_briefs,
+        "next_slots": queue_briefs[:max_queue],
+        "last_decisions": decision_briefs,
+        "blocked_count": len(blocked),
+        "queue_depth": len(queue_briefs),
+        "running_count": len(running_briefs),
+        "memory_guard_level": guard_level,
+        "cpu_percent": cpu_percent,
+        "gpu_utilization_percent": gpu_percent,
+        "gpu_available": bool(resources.get("gpu_available", False)),
+        "ina_rss_gb": round(total_rss, 3),
+        "managed_running_rss_gb": round(managed_rss, 3),
+        "max_total_rss_gb": round(max_total, 3),
+        "max_managed_rss_gb": round(max_managed, 3),
+        "ram_available_gb": round(available_gb, 3),
+        "min_available_gb": round(min_available, 3),
+    }
+
+
+def _save_process_scheduler_state(state: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> None:
+    limits = limits or _process_scheduler_limits()
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    running = state.get("running") if isinstance(state.get("running"), list) else []
+    history = state.get("history") if isinstance(state.get("history"), list) else []
+    decisions = state.get("last_decisions") if isinstance(state.get("last_decisions"), list) else []
+
+    state["queue"] = queue[: max(1, int(limits.get("max_queue_slots", 10)))]
+    state["running"] = running
+    state["history"] = history[-max(1, int(limits.get("history_limit", 160))):]
+    state["last_decisions"] = decisions[-max(1, int(limits.get("decision_limit", 24))):]
+    _sort_process_scheduler_queue(state)
+    for index, entry in enumerate(state["queue"], 1):
+        entry["slot"] = index
+    memory = _scheduler_memory_overview(state, state.get("resources") if isinstance(state.get("resources"), dict) else {}, limits)
+    state["slot_summary"] = {
+        "max_queue_slots": int(limits.get("max_queue_slots", 10)),
+        "queued_slots": len(state["queue"]),
+        "running_slots": len(state["running"]),
+        "max_parallel_tasks": int(limits.get("max_parallel_tasks", 2)),
+        "available_parallel_slots": max(0, int(limits.get("max_parallel_tasks", 2)) - len(state["running"])),
+        "max_memory_heavy_tasks": int(limits.get("max_memory_heavy_tasks", 1)),
+        "max_cpu_heavy_tasks": int(limits.get("max_cpu_heavy_tasks", 2)),
+        "max_gpu_tasks": int(limits.get("max_gpu_tasks", 1)),
+        "memory_budget_enabled": bool(limits.get("memory_budget_enabled", True)),
+        "max_total_rss_gb": memory.get("max_total_rss_gb"),
+        "max_managed_rss_gb": memory.get("max_managed_rss_gb"),
+        "managed_running_rss_gb": memory.get("managed_running_rss_gb"),
+        "ram_available_gb": memory.get("ram_available_gb"),
+        "min_available_gb": memory.get("min_available_gb"),
+    }
+    state["planner"] = _build_process_scheduler_summary(state, limits)
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        _PROCESS_SCHEDULER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_PROCESS_SCHEDULER_STATE_PATH, state)
+    except Exception as exc:
+        log_to_statusbox(f"[Scheduler] Failed to save process scheduler state: {exc}")
+    update_inastate("process_scheduler", state)
+
+
+def _scheduler_gpu_snapshot(track_gpu: bool = True) -> Dict[str, Any]:
+    snapshot = {
+        "available": False,
+        "device_count": 0,
+        "utilization_percent": 0.0,
+        "memory_used_mb": 0.0,
+        "memory_total_mb": 0.0,
+        "memory_percent": 0.0,
+    }
+    if not track_gpu:
+        return snapshot
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except Exception:
+        return snapshot
+    if result.returncode != 0:
+        return snapshot
+    rows = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if not rows:
+        return snapshot
+    utils: List[float] = []
+    mem_used: List[float] = []
+    mem_total: List[float] = []
+    for row in rows:
+        parts = [part.strip() for part in row.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            utils.append(float(parts[0]))
+            mem_used.append(float(parts[1]))
+            mem_total.append(float(parts[2]))
+        except (TypeError, ValueError):
+            continue
+    if not utils or not mem_total:
+        return snapshot
+    total_memory = sum(mem_total)
+    used_memory = sum(mem_used)
+    snapshot.update(
+        {
+            "available": True,
+            "device_count": len(utils),
+            "utilization_percent": round(sum(utils) / len(utils), 1),
+            "memory_used_mb": round(used_memory, 1),
+            "memory_total_mb": round(total_memory, 1),
+            "memory_percent": round((used_memory / total_memory) * 100.0, 1) if total_memory > 0 else 0.0,
+        }
+    )
+    return snapshot
+
+
+def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, limits: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    limits = limits or _process_scheduler_limits()
+    guard_state = memory_guard if isinstance(memory_guard, dict) else _refresh_memory_guard_state()
+    cpu_percent = 0.0
+    if psutil is not None:
+        try:
+            cpu_percent = float(psutil.cpu_percent(interval=None))
+        except Exception:
+            cpu_percent = 0.0
+    gpu = _scheduler_gpu_snapshot(track_gpu=bool(limits.get("track_gpu", True)))
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "memory_guard_level": str(guard_state.get("level") or "unknown").strip().lower() or "unknown",
+        "ina_rss_gb": round(_ina_process_tree_rss_gb(), 3),
+        "ram_available_gb": round(max(0.0, _coerce_float(guard_state.get("ram_available_gb"), 0.0)), 3),
+        "ram_used_gb": round(max(0.0, _coerce_float(guard_state.get("ram_used_gb"), 0.0)), 3),
+        "ram_percent": round(max(0.0, _coerce_float(guard_state.get("ram_percent"), 0.0)), 1),
+        "swap_percent": round(max(0.0, _coerce_float(guard_state.get("swap_percent"), 0.0)), 1),
+        "cpu_percent": round(cpu_percent, 1),
+        "gpu_available": bool(gpu.get("available", False)),
+        "gpu_utilization_percent": round(float(gpu.get("utilization_percent", 0.0) or 0.0), 1),
+        "gpu_memory_percent": round(float(gpu.get("memory_percent", 0.0) or 0.0), 1),
+        "gpu_memory_used_mb": round(float(gpu.get("memory_used_mb", 0.0) or 0.0), 1),
+        "running_modules": get_running_modules(),
+    }
+
+
+def _scheduler_record_history(state: Dict[str, Any], payload: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> None:
+    limits = limits or _process_scheduler_limits()
+    history = state.get("history") if isinstance(state.get("history"), list) else []
+    history.append(payload)
+    state["history"] = history[-max(1, int(limits.get("history_limit", 160))):]
+
+
+def _scheduler_note_decision(state: Dict[str, Any], task_key: str, decision: str, reason: str, limits: Optional[Dict[str, Any]] = None, entry: Optional[Dict[str, Any]] = None) -> None:
+    limits = limits or _process_scheduler_limits()
+    decisions = state.get("last_decisions") if isinstance(state.get("last_decisions"), list) else []
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "task_key": str(task_key or "").strip(),
+        "decision": str(decision or "").strip().lower(),
+        "reason": str(reason or "").strip().lower(),
+    }
+    if isinstance(entry, dict):
+        payload["task_id"] = entry.get("id")
+        payload["priority"] = entry.get("priority")
+    decisions.append(payload)
+    state["last_decisions"] = decisions[-max(1, int(limits.get("decision_limit", 24))):]
+
+
+def _remove_process_task(state: Dict[str, Any], task_key: str) -> None:
+    key = str(task_key or "").strip()
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    state["queue"] = [entry for entry in queue if str(entry.get("task_key") or "").strip() != key]
+
+
+def _enqueue_process_task(state: Dict[str, Any], task_key: str, *, limits: Dict[str, Any], priority: Optional[int] = None, reason: str = "", metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    profile = _scheduler_task_profile(task_key)
+    if profile is None:
+        return None
+    key = profile["task_key"]
+    final_priority = int(priority if priority is not None else profile.get("priority", 50))
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_reason = str(reason or "").strip().lower()
+
+    for entry in state.get("running", []):
+        if str(entry.get("task_key") or "").strip() == key:
+            return str(entry.get("id") or "") or None
+
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    for entry in queue:
+        if str(entry.get("task_key") or "").strip() != key:
+            continue
+        entry["priority"] = max(int(entry.get("priority", 0) or 0), final_priority)
+        entry["last_request_reason"] = clean_reason
+        entry["last_requested_at"] = now_iso
+        merged = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        merged.update(metadata or {})
+        entry["metadata"] = merged
+        entry["resource_profile"] = _scheduler_resource_profile(profile, limits)
+        _sort_process_scheduler_queue(state)
+        return str(entry.get("id") or "") or None
+
+    entry = {
+        "id": f"task_{uuid.uuid4().hex}",
+        "task_key": key,
+        "priority": final_priority,
+        "requested_at": now_iso,
+        "last_requested_at": now_iso,
+        "request_reason": clean_reason,
+        "last_request_reason": clean_reason,
+        "metadata": metadata or {},
+        "resource_profile": _scheduler_resource_profile(profile, limits),
+    }
+    queue.append(entry)
+    state["queue"] = queue
+    _sort_process_scheduler_queue(state)
+    while len(state["queue"]) > int(limits.get("max_queue_slots", 10)):
+        dropped = state["queue"].pop()
+        _scheduler_record_history(state, {
+            "task_key": dropped.get("task_key"),
+            "task_id": dropped.get("id"),
+            "status": "dropped",
+            "reason": "queue_cap",
+            "timestamp": now_iso,
+            "priority": dropped.get("priority"),
+        }, limits)
+    return entry["id"]
+
+
+def _scheduler_running_counts(state: Dict[str, Any]) -> Dict[str, Any]:
+    counts = {
+        "parallel": 0,
+        "memory_heavy": 0,
+        "cpu_heavy": 0,
+        "gpu_tasks": 0,
+        "exclusive_groups": set(),
+        "task_keys": set(),
+    }
+    for entry in state.get("running", []):
+        profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
+        if profile is None:
+            continue
+        counts["parallel"] += 1
+        counts["task_keys"].add(profile["task_key"])
+        if profile.get("memory_class") == "high":
+            counts["memory_heavy"] += 1
+        if profile.get("cpu_class") in {"medium", "high"}:
+            counts["cpu_heavy"] += 1
+        if profile.get("gpu_class") not in {None, "none", ""}:
+            counts["gpu_tasks"] += 1
+        group = str(profile.get("exclusive_group") or "").strip()
+        if group:
+            counts["exclusive_groups"].add(group)
+    return counts
+
+
+def _scheduler_can_start_task(entry: Dict[str, Any], state: Dict[str, Any], resources: Dict[str, Any], limits: Dict[str, Any]) -> Tuple[bool, str]:
+    profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
+    if profile is None:
+        return False, "unknown_task"
+    counts = _scheduler_running_counts(state)
+    if profile["task_key"] in counts["task_keys"]:
+        return False, "already_running"
+    group = str(profile.get("exclusive_group") or "").strip()
+    if group and group in counts["exclusive_groups"]:
+        return False, "exclusive_group_busy"
+    if counts["parallel"] >= int(limits.get("max_parallel_tasks", 2)):
+        return False, "parallel_slots_full"
+    if profile.get("memory_class") == "high" and counts["memory_heavy"] >= int(limits.get("max_memory_heavy_tasks", 1)):
+        return False, "memory_heavy_slot_full"
+    if profile.get("cpu_class") in {"medium", "high"} and counts["cpu_heavy"] >= int(limits.get("max_cpu_heavy_tasks", 2)):
+        return False, "cpu_heavy_slot_full"
+    if profile.get("gpu_class") not in {None, "none", ""} and counts["gpu_tasks"] >= int(limits.get("max_gpu_tasks", 1)):
+        return False, "gpu_slot_full"
+
+    guard_level = str(resources.get("memory_guard_level") or "unknown").strip().lower()
+    if profile.get("memory_class") == "high":
+        if guard_level == "hard":
+            return False, "memory_guard_hard"
+        if guard_level == "soft":
+            return False, "memory_guard_soft"
+
+    if bool(limits.get("memory_budget_enabled", True)):
+        estimate_gb = _scheduler_memory_estimate_gb(profile, limits)
+        memory = _scheduler_memory_overview(state, resources, limits)
+        max_total = float(memory.get("max_total_rss_gb", 0.0) or 0.0)
+        if max_total > 0 and (float(memory.get("total_rss_gb", 0.0) or 0.0) + estimate_gb) > max_total:
+            return False, "scheduler_total_rss_limit"
+        max_managed = float(memory.get("max_managed_rss_gb", 0.0) or 0.0)
+        if max_managed > 0 and (float(memory.get("managed_running_rss_gb", 0.0) or 0.0) + estimate_gb) > max_managed:
+            return False, "scheduler_managed_rss_limit"
+        min_available = float(memory.get("min_available_gb", 0.0) or 0.0)
+        available_gb = float(memory.get("ram_available_gb", 0.0) or 0.0)
+        if min_available > 0 and available_gb > 0 and (available_gb - estimate_gb) < min_available:
+            return False, "scheduler_available_ram_limit"
+
+    cpu_percent = float(resources.get("cpu_percent", 0.0) or 0.0)
+    if cpu_percent >= float(limits.get("cpu_hard_percent", 85.0)):
+        return False, "cpu_hard_limit"
+    if profile.get("cpu_class") == "high" and cpu_percent >= float(limits.get("cpu_soft_percent", 70.0)):
+        return False, "cpu_soft_limit"
+
+    gpu_util = float(resources.get("gpu_utilization_percent", 0.0) or 0.0)
+    gpu_mem = float(resources.get("gpu_memory_percent", 0.0) or 0.0)
+    if profile.get("gpu_class") not in {None, "none", ""}:
+        if gpu_util >= float(limits.get("gpu_hard_percent", 90.0)) or gpu_mem >= float(limits.get("gpu_hard_percent", 90.0)):
+            return False, "gpu_hard_limit"
+        if gpu_util >= float(limits.get("gpu_soft_percent", 70.0)) or gpu_mem >= float(limits.get("gpu_soft_percent", 70.0)):
+            return False, "gpu_soft_limit"
+    return True, "ok"
+
+
+def _scheduler_pid_metrics(pid: int) -> Tuple[bool, Dict[str, Any]]:
+    if pid <= 0:
+        return False, {}
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                return False, {}
+            status = proc.status()
+            if status == getattr(psutil, "STATUS_ZOMBIE", "zombie"):
+                return False, {}
+            rss_bytes = float(proc.memory_info().rss)
+            for child in proc.children(recursive=True):
+                try:
+                    rss_bytes += float(child.memory_info().rss)
+                except Exception:
+                    continue
+            return True, {
+                "rss_gb": round(rss_bytes / (1024.0 ** 3), 3),
+                "cpu_percent": round(float(proc.cpu_percent(interval=None)), 1),
+                "process_status": status,
+            }
+        except Exception:
+            pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False, {}
+    return True, {}
+
+
+def _scheduler_signal_process(pid: int, *, force: bool = False) -> bool:
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            return True
+        except Exception:
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+        return True
+    except Exception:
+        return False
+
+
+def _scheduler_request_task_stop(
+    entry: Dict[str, Any],
+    state: Dict[str, Any],
+    limits: Dict[str, Any],
+    reason: str,
+    *,
+    force: bool = False,
+) -> bool:
+    pid = _coerce_int(entry.get("pid"), 0)
+    if pid <= 0:
+        return False
+    signal_name = "sigkill" if force else "sigterm"
+    if not _scheduler_signal_process(pid, force=force):
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    entry["status"] = "stopping"
+    entry["stop_requested_at"] = now_iso
+    entry["stop_requested_ts"] = time.time()
+    entry["stop_reason"] = str(reason or "scheduler_stop").strip().lower() or "scheduler_stop"
+    entry["stop_signal"] = signal_name
+    entry["last_seen_at"] = now_iso
+    decision = "force_stopped" if force else "stop_requested"
+    _scheduler_note_decision(state, str(entry.get("task_key") or ""), decision, entry["stop_reason"], limits, entry=entry)
+    _scheduler_record_history(
+        state,
+        {
+            "task_key": entry.get("task_key"),
+            "task_id": entry.get("id"),
+            "status": decision,
+            "reason": entry["stop_reason"],
+            "timestamp": now_iso,
+            "pid": pid,
+            "signal": signal_name,
+            "priority": entry.get("priority"),
+            "rss_gb": entry.get("rss_gb"),
+            "resource_profile": entry.get("resource_profile"),
+        },
+        limits,
+    )
+    log_to_statusbox(
+        f"[Scheduler] {'Force stopping' if force else 'Stopping'} {_scheduler_task_label(str(entry.get('task_key') or ''))} "
+        f"pid={pid} due to {entry['stop_reason'].replace('_', ' ')}."
+    )
+    return True
+
+
+def _scheduler_enforce_memory_limits(state: Dict[str, Any], resources: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    if not bool(limits.get("memory_budget_enabled", True)):
+        return
+    if not bool(limits.get("terminate_over_budget_tasks", True)):
+        return
+    running = state.get("running") if isinstance(state.get("running"), list) else []
+    if not running:
+        return
+
+    for entry in running:
+        if not isinstance(entry, dict) or str(entry.get("status") or "running").strip().lower() == "stopping":
+            continue
+        profile = _scheduler_task_profile(str(entry.get("task_key") or "")) or {}
+        memory_limit = _scheduler_task_memory_limit_gb(profile or entry.get("resource_profile"), limits)
+        if memory_limit > 0.0 and _scheduler_entry_memory_usage_gb(entry, limits) > memory_limit:
+            _scheduler_request_task_stop(entry, state, limits, "task_memory_limit", force=False)
+
+    projected_total = max(0.0, _coerce_float(resources.get("ina_rss_gb"), 0.0))
+    projected_available = max(0.0, _coerce_float(resources.get("ram_available_gb"), 0.0))
+    projected_managed = round(
+        sum(
+            _scheduler_entry_memory_usage_gb(entry, limits)
+            for entry in running
+            if isinstance(entry, dict)
+        ),
+        3,
+    )
+
+    max_total = max(0.0, _coerce_float(limits.get("max_total_rss_gb"), 0.0))
+    max_managed = max(0.0, _coerce_float(limits.get("max_managed_rss_gb"), 0.0))
+    min_available = max(0.0, _coerce_float(limits.get("min_available_gb"), 0.0))
+
+    while True:
+        over_total = max_total > 0.0 and projected_total > max_total
+        over_managed = max_managed > 0.0 and projected_managed > max_managed
+        low_available = min_available > 0.0 and projected_available > 0.0 and projected_available < min_available
+        if not (over_total or over_managed or low_available):
+            break
+
+        reason = "scheduler_total_rss_limit" if over_total else "scheduler_managed_rss_limit"
+        if low_available and not over_total and not over_managed:
+            reason = "scheduler_available_ram_limit"
+
+        candidates = []
+        for entry in running:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("status") or "running").strip().lower() == "stopping":
+                continue
+            pid = _coerce_int(entry.get("pid"), 0)
+            if pid <= 0:
+                continue
+            usage = _scheduler_entry_memory_usage_gb(entry, limits)
+            priority = int(entry.get("priority", 0) or 0)
+            started_ts = _coerce_float(entry.get("started_ts"), 0.0)
+            candidates.append(((priority, -usage, -started_ts, str(entry.get("task_key") or "")), entry, usage))
+        if not candidates:
+            break
+        _, victim, usage = min(candidates, key=lambda item: item[0])
+        if not _scheduler_request_task_stop(victim, state, limits, reason, force=False):
+            break
+        projected_total = max(0.0, projected_total - usage)
+        projected_managed = max(0.0, projected_managed - usage)
+        projected_available += usage
+
+
+
+def _reconcile_process_scheduler_running(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    running = state.get("running") if isinstance(state.get("running"), list) else []
+    next_running: List[Dict[str, Any]] = []
+    finished_at = datetime.now(timezone.utc).isoformat()
+    for entry in running:
+        pid = _coerce_int(entry.get("pid"), 0)
+        alive, metrics = _scheduler_pid_metrics(pid)
+        if alive:
+            entry.update(metrics)
+            if str(entry.get("status") or "running").strip().lower() == "stopping":
+                stop_requested_ts = _coerce_float(entry.get("stop_requested_ts"), 0.0)
+                grace = max(1.0, _coerce_float(limits.get("terminate_grace_sec"), 10.0))
+                if stop_requested_ts and (time.time() - stop_requested_ts) >= grace:
+                    _scheduler_request_task_stop(
+                        entry,
+                        state,
+                        limits,
+                        str(entry.get("stop_reason") or "scheduler_stop_timeout"),
+                        force=True,
+                    )
+            entry["last_seen_at"] = finished_at
+            next_running.append(entry)
+            continue
+
+        profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
+        module_name = str((profile or {}).get("module") or "").strip()
+        if module_name:
+            clear_module_running(module_name)
+
+        stop_reason = str(entry.get("stop_reason") or "").strip().lower()
+        task_key = str(entry.get("task_key") or "")
+        if task_key == "memory_graph_neural":
+            graph_state_raw = get_inastate("memory_graph_deferred_build")
+            graph_state = graph_state_raw if isinstance(graph_state_raw, dict) else {}
+            graph_status = str(graph_state.get("status") or "").strip().lower()
+            if stop_reason:
+                graph_state["status"] = "queued"
+                graph_state["updated_at"] = finished_at
+                graph_state["queue_reason"] = stop_reason
+                graph_state["last_error"] = stop_reason
+                graph_state.pop("pid", None)
+                update_inastate("memory_graph_deferred_build", graph_state)
+            elif graph_status == "running":
+                graph_state["status"] = "failed"
+                graph_state["updated_at"] = finished_at
+                graph_state["last_error"] = "process_exited_without_state_update"
+                graph_state.pop("pid", None)
+                update_inastate("memory_graph_deferred_build", graph_state)
+
+        started_ts = float(entry.get("started_ts", 0.0) or 0.0)
+        duration_sec = round(max(0.0, time.time() - started_ts), 3) if started_ts else None
+        history_payload = {
+            "task_key": entry.get("task_key"),
+            "task_id": entry.get("id"),
+            "status": "stopped" if stop_reason else "completed",
+            "finished_at": finished_at,
+            "duration_sec": duration_sec,
+            "reason": stop_reason or "process_exit",
+            "pid": pid,
+            "resource_profile": entry.get("resource_profile"),
+        }
+        if entry.get("stop_signal"):
+            history_payload["signal"] = entry.get("stop_signal")
+        if metrics:
+            history_payload["last_metrics"] = metrics
+        _scheduler_record_history(state, history_payload, limits)
+    state["running"] = next_running
 
 
 def _default_shed_patterns() -> List[str]:
@@ -1026,7 +2134,7 @@ def _maybe_bundle_memory(defer_optional: bool) -> None:
 
 reflection_core = SelfReflectionCore(ina_reference="model_manager")
 adjustment_scheduler = SelfAdjustmentScheduler()
-memory_manager = MemoryManager(CHILD)
+memory_manager = MemoryManager(CHILD, autoload=False)
 continuity_manager = ContinuityManager(CHILD)
 intuition_engine = QuantumIntuitionEngine(CHILD)
 _last_opportunities = set()
@@ -1069,6 +2177,7 @@ _last_fragment_repair_run = 0.0
 _last_bundle_launch = 0.0
 _bundle_thread: Optional[threading.Thread] = None
 _last_world_sense_mode: Optional[str] = None
+_last_attention_signature: Optional[Tuple[Any, ...]] = None
 _last_exploration_invite_log = 0.0
 _EXPLORATION_INVITE_COOLDOWN = 240.0
 _last_humor_bridge_log = 0.0
@@ -1254,35 +2363,173 @@ def _is_process_running(pattern: str) -> bool:
         return False
 
 
-def _apply_world_sense_override() -> None:
-    global _last_world_sense_mode
+def _derive_attention_allocation(
+    memory_guard: Optional[Dict[str, Any]] = None,
+    scheduler_state: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    policy = _attention_policy(cfg)
     world_connected = bool(get_inastate("world_connected", False))
-    target_mode = "world" if world_connected else "default"
-    if target_mode == _last_world_sense_mode:
+    dreaming = bool(get_inastate("dreaming", False))
+    meditating = bool(get_inastate("meditating", False))
+    snapshot = get_inastate("emotion_snapshot") or {}
+    values = snapshot.get("values") if isinstance(snapshot, dict) else {}
+    if not isinstance(values, dict):
+        values = snapshot if isinstance(snapshot, dict) else {}
+    try:
+        focus = float(values.get("focus", 0.0) or 0.0)
+    except Exception:
+        focus = 0.0
+
+    scheduler = scheduler_state if isinstance(scheduler_state, dict) else (get_inastate("process_scheduler") or {})
+    scheduler = scheduler if isinstance(scheduler, dict) else {}
+    planner = scheduler.get("planner") if isinstance(scheduler.get("planner"), dict) else {}
+    resources = scheduler.get("resources") if isinstance(scheduler.get("resources"), dict) else {}
+    running = planner.get("running") if isinstance(planner.get("running"), list) else []
+    next_slots = planner.get("next_slots") if isinstance(planner.get("next_slots"), list) else []
+    running_keys = {str(item.get("task_key") or "").strip() for item in running if isinstance(item, dict)}
+    queued_keys = {str(item.get("task_key") or "").strip() for item in next_slots if isinstance(item, dict)}
+    queue_depth = int(_coerce_float(planner.get("queue_depth"), float(len(next_slots))))
+    cpu_percent = _coerce_float(planner.get("cpu_percent"), _coerce_float(resources.get("cpu_percent"), 0.0))
+
+    guard = memory_guard if isinstance(memory_guard, dict) else (get_inastate("memory_guard") or {})
+    guard_level = str(guard.get("level") or "unknown").strip().lower() or "unknown"
+    attention_request = _active_attention_request(cfg=cfg)
+
+    vision_mode = "world" if world_connected else "default"
+    audio_mode = "world" if world_connected else "default"
+    reasons: List[str] = []
+
+    if policy.get("enabled", True):
+        memory_lane_active = bool({"memory_graph_neural", "deep_recall_step"} & (running_keys | queued_keys))
+        focus_lane_active = bool({"logic_engine_run", "predictive_layer_run", "meditation_state_run"} & (running_keys | queued_keys))
+
+        if dreaming:
+            if policy.get("suppress_vision_during_dream", True):
+                vision_mode = "suppressed"
+                reasons.append("dreaming_internal_focus")
+            if policy.get("suppress_audio_during_dream", True):
+                audio_mode = "suppressed"
+                reasons.append("dreaming_internal_focus")
+
+        if policy.get("suppress_vision_for_memory_lane", True) and memory_lane_active:
+            vision_mode = "suppressed"
+            reasons.append("memory_recall_lane_active")
+
+        if policy.get("suppress_vision_for_focus", True) and focus >= float(policy.get("deep_focus_threshold", 0.72)) and (meditating or focus_lane_active):
+            vision_mode = "suppressed"
+            reasons.append("deep_focus_allocation")
+
+        if queue_depth >= int(policy.get("queue_pressure_depth", 3)) and cpu_percent >= float(policy.get("vision_cpu_soft_percent", 70.0)):
+            vision_mode = "suppressed"
+            reasons.append("queue_cpu_pressure")
+
+        if policy.get("suppress_audio_on_hard_guard", True) and guard_level == "hard":
+            audio_mode = "suppressed"
+            reasons.append("memory_guard_hard")
+        elif queue_depth >= int(policy.get("queue_pressure_depth", 3)) and cpu_percent >= float(policy.get("audio_cpu_hard_percent", 84.0)):
+            audio_mode = "suppressed"
+            reasons.append("cpu_pressure_hard")
+
+    if attention_request.get("suppress_vision"):
+        vision_mode = "suppressed"
+        reasons.append("attention_request_vision")
+    if attention_request.get("suppress_audio"):
+        audio_mode = "suppressed"
+        reasons.append("attention_request_audio")
+
+    if vision_mode == "suppressed" and audio_mode == "suppressed":
+        sensory_mode = "internal"
+    elif vision_mode == "suppressed":
+        sensory_mode = "audio_priority"
+    elif audio_mode == "suppressed":
+        sensory_mode = "vision_priority"
+    else:
+        sensory_mode = "world" if world_connected else "default"
+
+    reasons = list(dict.fromkeys(reasons))
+    summary = (
+        f"Attention allocation: sensory_mode={sensory_mode}, vision={vision_mode}, audio={audio_mode}, "
+        f"queue={queue_depth}, cpu={cpu_percent:.1f}%, guard={guard_level}."
+    )
+    if reasons:
+        summary += " Reasons: " + ", ".join(reasons) + "."
+    if attention_request:
+        request_summary = f" Request={attention_request.get('source') or 'internal'}"
+        if attention_request.get("remaining_sec") is not None:
+            request_summary += f" for {int(float(attention_request['remaining_sec']))}s"
+        if attention_request.get("reason"):
+            request_summary += f" ({attention_request['reason']})"
+        summary += request_summary + "."
+
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "enabled": bool(policy.get("enabled", True)),
+        "sensory_mode": sensory_mode,
+        "vision_mode": vision_mode,
+        "audio_mode": audio_mode,
+        "world_connected": world_connected,
+        "dreaming": dreaming,
+        "meditating": meditating,
+        "focus": round(focus, 3),
+        "queue_depth": queue_depth,
+        "cpu_percent": round(cpu_percent, 1),
+        "memory_guard_level": guard_level,
+        "running_tasks": sorted(key for key in running_keys if key),
+        "queued_tasks": sorted(key for key in queued_keys if key),
+        "reasons": reasons,
+        "attention_request": attention_request or None,
+        "summary": summary,
+    }
+
+
+def _apply_world_sense_override(memory_guard: Optional[Dict[str, Any]] = None) -> None:
+    global _last_world_sense_mode, _last_attention_signature
+    plan = _derive_attention_allocation(memory_guard=memory_guard)
+    signature = (
+        plan.get("sensory_mode"),
+        plan.get("vision_mode"),
+        plan.get("audio_mode"),
+        tuple(plan.get("reasons") or []),
+    )
+    update_inastate("attention_allocation", plan)
+    if signature == _last_attention_signature:
         return
-    _last_world_sense_mode = target_mode
+    _last_attention_signature = signature
+    _last_world_sense_mode = str(plan.get("sensory_mode") or "default")
 
-    update_inastate("sensory_mode", target_mode)
-    update_inastate("vision_mode", target_mode)
-    update_inastate("audio_mode", target_mode)
+    vision_mode = str(plan.get("vision_mode") or "default")
+    audio_mode = str(plan.get("audio_mode") or "default")
+    world_connected = bool(plan.get("world_connected", False))
 
-    if world_connected:
-        safe_call(["pkill", "-f", "audio_listener.py"])
+    update_inastate("sensory_mode", plan.get("sensory_mode"))
+    update_inastate("vision_mode", vision_mode)
+    update_inastate("audio_mode", audio_mode)
+
+    if audio_mode == "default":
+        if not _is_process_running("audio_listener.py"):
+            safe_popen(["python", "audio_listener.py"])
+    else:
+        if _is_process_running("audio_listener.py"):
+            safe_call(["pkill", "-f", "audio_listener.py"])
+
+    if vision_mode in {"default", "world"}:
         if not _is_process_running("vision_window.py"):
             safe_popen(["python", "vision_window.py"])
+    else:
+        if _is_process_running("vision_window.py"):
+            safe_call(["pkill", "-f", "vision_window.py"])
+
+    if world_connected and vision_mode == "world":
         try:
             auto_launch = bool(load_config().get("auto_launch_ina_viewer", False))
         except Exception:
             auto_launch = False
         if auto_launch and not _is_process_running("ina_arch_viewer.py"):
             safe_popen(["python", "ina_arch_viewer.py"])
-        log_to_statusbox("[Manager] World connected: overriding senses with 3D mode.")
-    else:
-        if not _is_process_running("audio_listener.py"):
-            safe_popen(["python", "audio_listener.py"])
-        if not _is_process_running("vision_window.py"):
-            safe_popen(["python", "vision_window.py"])
-        log_to_statusbox("[Manager] World disconnected: restoring default senses.")
+
+    log_to_statusbox(f"[Manager] {plan.get('summary')}")
 
 
 def _maybe_ensure_ina_client() -> None:
@@ -1329,6 +2576,83 @@ def update_inastate(key, value):
         state = _load_inastate_state()
         state[key] = value
         _atomic_write_inastate(state)
+
+
+def clear_attention_request() -> None:
+    update_inastate("attention_request", None)
+
+
+def request_attention_allocation(
+    suppress_vision: bool = False,
+    suppress_audio: bool = False,
+    duration_sec: Optional[float] = None,
+    reason: str = "",
+    source: str = "internal",
+) -> Optional[Dict[str, Any]]:
+    if not suppress_vision and not suppress_audio:
+        clear_attention_request()
+        return None
+    policy = _attention_policy(load_config())
+    ttl_default = float(policy.get("default_request_ttl_sec", 300.0) or 300.0)
+    ttl_max = float(policy.get("max_request_ttl_sec", 1800.0) or 1800.0)
+    ttl_value = ttl_default if duration_sec is None else _coerce_float(duration_sec, ttl_default)
+    ttl_sec = max(1.0, min(ttl_value, ttl_max))
+    now = datetime.now(timezone.utc)
+    payload = {
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=ttl_sec)).isoformat(),
+        "suppress_vision": bool(suppress_vision),
+        "suppress_audio": bool(suppress_audio),
+        "reason": str(reason or "").strip(),
+        "source": str(source or "internal").strip() or "internal",
+        "duration_sec": round(ttl_sec, 3),
+    }
+    update_inastate("attention_request", payload)
+    return payload
+
+
+def _active_attention_request(
+    request: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    stored_request = request is None
+    request = request if isinstance(request, dict) else (get_inastate("attention_request") or {})
+    if not isinstance(request, dict):
+        return {}
+    suppress_vision = _coerce_bool(request.get("suppress_vision"), False)
+    suppress_audio = _coerce_bool(request.get("suppress_audio"), False)
+    if not (suppress_vision or suppress_audio):
+        return {}
+    current_time = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    expires_raw = str(request.get("expires_at") or "").strip()
+    expires_at = None
+    if expires_raw:
+        try:
+            expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+        except Exception:
+            expires_at = None
+    if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if isinstance(expires_at, datetime) and expires_at <= current_time:
+        if stored_request:
+            clear_attention_request()
+        return {}
+    requested_at = str(request.get("requested_at") or "").strip()
+    reason = str(request.get("reason") or "").strip()
+    source = str(request.get("source") or "internal").strip() or "internal"
+    remaining_sec = None
+    if isinstance(expires_at, datetime):
+        remaining_sec = max(0.0, round((expires_at - current_time).total_seconds(), 3))
+    return {
+        "requested_at": requested_at,
+        "expires_at": expires_at.isoformat() if isinstance(expires_at, datetime) else None,
+        "suppress_vision": suppress_vision,
+        "suppress_audio": suppress_audio,
+        "reason": reason,
+        "source": source,
+        "remaining_sec": remaining_sec,
+    }
 
 
 def _maybe_update_runtime_heartbeat() -> None:
@@ -1394,6 +2718,373 @@ def append_typed_outbox_entry(
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")
         return None
+
+
+def _load_github_submission_state() -> Dict[str, Any]:
+    if not GITHUB_SUBMISSION_STATE_PATH.exists():
+        return {}
+    try:
+        with GITHUB_SUBMISSION_STATE_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_github_submission_state(payload: Dict[str, Any]) -> None:
+    try:
+        GITHUB_SUBMISSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(GITHUB_SUBMISSION_STATE_PATH, payload)
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to save GitHub submission state: {exc}")
+
+
+def append_github_proposal_entry(
+    title: str,
+    body: str,
+    *,
+    kind: str = "request",
+    labels: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    attachment_path: Optional[str] = None,
+    patch_text: Optional[str] = None,
+) -> Optional[str]:
+    entry_id = append_github_issue_entry(
+        CHILD,
+        title,
+        body,
+        kind=kind,
+        labels=labels,
+        metadata=metadata,
+        attachment_path=attachment_path,
+        patch_text=patch_text,
+    )
+    if entry_id:
+        update_inastate(
+            "last_github_submission",
+            {
+                "id": entry_id,
+                "title": str(title or "").strip(),
+                "kind": str(kind or "request").strip().lower() or "request",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "metadata": metadata or {},
+            },
+        )
+    return entry_id
+
+
+def _normalize_github_submission_mode(value: Any) -> str:
+    mode = str(value or "explain").strip().lower()
+    return mode if mode in {"explain", "code", "both"} else "explain"
+
+
+def queue_github_submission(
+    title: str,
+    summary: str,
+    *,
+    kind: str = "request",
+    submission_mode: str = "explain",
+    suggestion: Optional[str] = None,
+    evidence: Optional[List[str]] = None,
+    touched_files: Optional[List[str]] = None,
+    review_notes: Optional[List[str]] = None,
+    confidence: Optional[float] = None,
+    labels: Optional[List[str]] = None,
+    patch_text: Optional[str] = None,
+    attachment_path: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    cfg = load_config()
+    title_text = str(title or "").strip()
+    summary_text = str(summary or "").strip()
+    if not title_text or not summary_text:
+        return None
+
+    normalized_kind = str(kind or "request").strip().lower() or "request"
+    normalized_mode = _normalize_github_submission_mode(submission_mode)
+    has_code_attachment = bool(str(attachment_path or "").strip() or str(patch_text or "").strip())
+    if normalized_mode == "code" and not has_code_attachment:
+        return None
+    if normalized_mode == "both" and not has_code_attachment:
+        normalized_mode = "explain"
+
+    lines = [summary_text]
+    suggestion_text = str(suggestion or "").strip()
+    if suggestion_text:
+        lines.extend(["", "## Suggested Direction", suggestion_text])
+    if normalized_mode == "code":
+        lines.extend(["", "## Proposed Delivery", "A draft code change is attached for review."])
+    elif normalized_mode == "both":
+        lines.extend(["", "## Proposed Delivery", "This submission includes both an explanation and a draft code change."])
+
+    body = "\n".join(lines).strip()
+    meta = dict(metadata or {})
+    if evidence:
+        meta["evidence"] = [str(item).strip() for item in evidence if str(item).strip()]
+    if touched_files:
+        meta["touched_files"] = [str(item).strip() for item in touched_files if str(item).strip()]
+    if review_notes:
+        meta["review_notes"] = [str(item).strip() for item in review_notes if str(item).strip()]
+    if confidence is not None:
+        meta["confidence"] = round(max(0.0, min(1.0, float(confidence))), 3)
+    meta["submission_mode"] = normalized_mode
+
+    entry_id = append_github_proposal_entry(
+        title_text,
+        body,
+        kind=normalized_kind,
+        labels=labels or labels_for_kind(normalized_kind, cfg),
+        metadata=meta,
+        attachment_path=attachment_path,
+        patch_text=patch_text,
+    )
+    if entry_id:
+        log_to_statusbox(f"[Manager] Queued GitHub {normalized_kind} proposal {entry_id} ({normalized_mode}).")
+    return entry_id
+
+
+def queue_github_optimization_request(
+    title: str,
+    problem: str,
+    *,
+    submission_mode: str = "explain",
+    suggestion: Optional[str] = None,
+    evidence: Optional[List[str]] = None,
+    touched_files: Optional[List[str]] = None,
+    review_notes: Optional[List[str]] = None,
+    confidence: Optional[float] = None,
+    labels: Optional[List[str]] = None,
+    patch_text: Optional[str] = None,
+    attachment_path: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    meta = dict(metadata or {})
+    meta.setdefault("source", "resource_vitals")
+    kind = "optimization_patch" if _normalize_github_submission_mode(submission_mode) in {"code", "both"} and (patch_text or attachment_path) else "optimization_request"
+    return queue_github_submission(
+        title,
+        problem,
+        kind=kind,
+        submission_mode=submission_mode,
+        suggestion=suggestion,
+        evidence=evidence,
+        touched_files=touched_files,
+        review_notes=review_notes,
+        confidence=confidence,
+        labels=labels,
+        patch_text=patch_text,
+        attachment_path=attachment_path,
+        metadata=meta,
+    )
+
+
+def queue_github_feature_request(
+    title: str,
+    request: str,
+    *,
+    submission_mode: str = "explain",
+    suggestion: Optional[str] = None,
+    evidence: Optional[List[str]] = None,
+    touched_files: Optional[List[str]] = None,
+    review_notes: Optional[List[str]] = None,
+    confidence: Optional[float] = None,
+    labels: Optional[List[str]] = None,
+    patch_text: Optional[str] = None,
+    attachment_path: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    meta = dict(metadata or {})
+    meta.setdefault("source", "feature_request")
+    kind = "feature_patch" if _normalize_github_submission_mode(submission_mode) in {"code", "both"} and (patch_text or attachment_path) else "feature_request"
+    return queue_github_submission(
+        title,
+        request,
+        kind=kind,
+        submission_mode=submission_mode,
+        suggestion=suggestion,
+        evidence=evidence,
+        touched_files=touched_files,
+        review_notes=review_notes,
+        confidence=confidence,
+        labels=labels,
+        patch_text=patch_text,
+        attachment_path=attachment_path,
+        metadata=meta,
+    )
+
+
+def queue_github_patch_attempt(
+    title: str,
+    summary: str,
+    patch_text: str,
+    *,
+    proposal_kind: str = "optimization",
+    touched_files: Optional[List[str]] = None,
+    review_notes: Optional[List[str]] = None,
+    confidence: Optional[float] = None,
+    labels: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    normalized_kind = str(proposal_kind or "optimization").strip().lower()
+    if normalized_kind == "feature":
+        return queue_github_feature_request(
+            title,
+            summary,
+            submission_mode="code",
+            touched_files=touched_files,
+            review_notes=review_notes,
+            confidence=confidence,
+            labels=labels,
+            patch_text=patch_text,
+            metadata=metadata,
+        )
+
+    meta = dict(metadata or {})
+    meta.setdefault("source", "patch_attempt")
+    return queue_github_optimization_request(
+        title,
+        summary,
+        submission_mode="code",
+        touched_files=touched_files,
+        review_notes=review_notes,
+        confidence=confidence,
+        labels=labels,
+        patch_text=patch_text,
+        metadata=meta,
+    )
+
+
+def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    cfg = load_config()
+    policy = get_github_submission_config(cfg)
+    if not bool(policy.get("enabled", False)):
+        return None
+    if not bool(policy.get("auto_submit_optimization_requests", True)):
+        return None
+
+    resource_context = _extract_resource_context()
+    if not resource_context.get("available", False):
+        return None
+
+    guard_state = memory_guard if isinstance(memory_guard, dict) else (get_inastate("memory_guard") or {})
+    guard_level = str(guard_state.get("level") or "unknown").strip().lower()
+    trend_pressure = float(resource_context.get("trend_pressure", 0.0) or 0.0)
+    current_pressure = float(resource_context.get("current_pressure", 0.0) or 0.0)
+    short_direction = str(resource_context.get("short_direction") or "unknown").strip().lower()
+    long_direction = str(resource_context.get("long_direction") or "unknown").strip().lower()
+    if guard_level not in {"soft", "hard"} and trend_pressure < float(policy.get("min_resource_trend_pressure", 0.74)):
+        return None
+    if short_direction == "falling" and long_direction == "falling" and guard_level not in {"soft", "hard"}:
+        return None
+
+    state = _load_github_submission_state()
+    today = datetime.now(timezone.utc).date().isoformat()
+    daily_count = int(state.get("daily_count", 0) or 0) if state.get("day") == today else 0
+    if daily_count >= int(policy.get("daily_issue_cap", 4) or 4):
+        return None
+
+    largest_module = str(resource_context.get("largest_module") or "runtime").strip() or "runtime"
+    optimization_hint = str(resource_context.get("optimization_hint") or "").strip()
+    summary = str(resource_context.get("summary") or "").strip()
+    trend_summary = str(resource_context.get("trend_summary") or "").strip()
+    fingerprint_basis = "|".join(
+        [
+            guard_level,
+            str(round(trend_pressure, 3)),
+            str(round(current_pressure, 3)),
+            largest_module,
+            optimization_hint,
+            short_direction,
+            long_direction,
+        ]
+    )
+    fingerprint = hashlib.sha1(fingerprint_basis.encode("utf-8")).hexdigest()[:16]
+    now = time.time()
+    cooldown_sec = float(policy.get("cooldown_minutes", 180) or 180) * 60.0
+    if fingerprint == str(state.get("last_fingerprint") or ""):
+        last_ts = float(state.get("last_submitted_ts", 0.0) or 0.0)
+        if last_ts and (now - last_ts) < cooldown_sec:
+            return None
+
+    title = f"Optimisation request: {largest_module} is driving RAM pressure"
+    problem_lines = [
+        f"I am seeing sustained RAM pressure centered on `{largest_module}`.",
+        f"Current pressure level: `{resource_context.get('pressure_level', 'unknown')}`.",
+        f"Trend: short=`{short_direction}`, long=`{long_direction}`.",
+    ]
+    if summary:
+        problem_lines.append(summary)
+    if trend_summary:
+        problem_lines.append(trend_summary)
+    problem = " ".join(line for line in problem_lines if line)
+
+    evidence = [
+        f"resource trend pressure={trend_pressure:.3f}",
+        f"current pressure={current_pressure:.3f}",
+        f"largest module={largest_module} ({resource_context.get('largest_module_ram') or 'unknown RAM'})",
+    ]
+    if resource_context.get("short_ram_delta_gb"):
+        evidence.append(f"short RAM delta={resource_context.get('short_ram_delta_gb')} GB")
+    if resource_context.get("long_ram_delta_gb"):
+        evidence.append(f"long RAM delta={resource_context.get('long_ram_delta_gb')} GB")
+    if optimization_hint:
+        evidence.append(f"optimization hint={optimization_hint}")
+    top_modules = resource_context.get("top_modules") if isinstance(resource_context.get("top_modules"), list) else []
+    for item in top_modules[:3]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        ram_human = str(item.get("ram_human") or "").strip()
+        if name:
+            evidence.append(f"top module={name} ({ram_human or 'RAM unknown'})")
+
+    touched_files: List[str] = []
+    for item in top_modules[:3]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name.endswith(".py") and name not in touched_files:
+            touched_files.append(name)
+    if largest_module.endswith(".py") and largest_module not in touched_files:
+        touched_files.insert(0, largest_module)
+
+    review_notes = [
+        "Human review required before merge or execution.",
+        "Prefer profiling or bounded changes over broad deletions.",
+        "If a patch is proposed later, review it as a draft, not as an approved fix.",
+    ]
+    if guard_level in {"soft", "hard"}:
+        review_notes.append(f"memory_guard level is currently {guard_level}.")
+
+    entry_id = queue_github_optimization_request(
+        title,
+        problem,
+        submission_mode="explain",
+        suggestion=optimization_hint or "Please inspect the dominant RAM holder and propose a bounded optimisation path.",
+        evidence=evidence,
+        touched_files=touched_files,
+        review_notes=review_notes,
+        confidence=max(trend_pressure, current_pressure),
+        metadata={
+            "source": "resource_vitals",
+            "memory_guard_level": guard_level,
+            "largest_module": largest_module,
+        },
+    )
+    if not entry_id:
+        return None
+
+    state.update(
+        {
+            "day": today,
+            "daily_count": daily_count + 1,
+            "last_fingerprint": fingerprint,
+            "last_submitted_ts": now,
+            "last_entry_id": entry_id,
+        }
+    )
+    _save_github_submission_state(state)
+    return entry_id
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
@@ -1551,6 +3242,13 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
     long = trend.get("long") if isinstance(trend.get("long"), dict) else {}
     top_modules = payload.get("top_modules") if isinstance(payload.get("top_modules"), list) else []
     top_modules = [item for item in top_modules[:3] if isinstance(item, dict)]
+    scheduler = payload.get("process_scheduler") if isinstance(payload.get("process_scheduler"), dict) else {}
+    if not scheduler:
+        scheduler_state = get_inastate("process_scheduler") or {}
+        scheduler = scheduler_state if isinstance(scheduler_state, dict) else {}
+    scheduler_running = scheduler.get("running") if isinstance(scheduler.get("running"), list) else []
+    scheduler_next_slots = scheduler.get("next_slots") if isinstance(scheduler.get("next_slots"), list) else []
+    scheduler_decisions = scheduler.get("last_decisions") if isinstance(scheduler.get("last_decisions"), list) else []
 
     pressure_level = str(payload.get("pressure_level") or "").strip().lower()
     current_pressure = _resource_pressure_value(pressure_level)
@@ -1585,6 +3283,16 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
     trend_summary = str(trend.get("summary") or "").strip()
     summary = str(payload.get("summary") or "").strip()
     optimization_hint = str(payload.get("optimization_hint") or "").strip()
+    scheduler_summary = str(scheduler.get("summary") or "").strip()
+    scheduler_learning_hint = str(scheduler.get("learning_hint") or "").strip()
+    scheduler_running = [item for item in scheduler_running[:4] if isinstance(item, dict)]
+    scheduler_next_slots = [item for item in scheduler_next_slots[:10] if isinstance(item, dict)]
+    scheduler_decisions = [item for item in scheduler_decisions[-6:] if isinstance(item, dict)]
+    scheduler_blocked = [
+        item for item in scheduler_decisions
+        if str(item.get("decision") or "").strip().lower() == "blocked"
+    ]
+    scheduler_last_block = scheduler_blocked[-1] if scheduler_blocked else {}
 
     return {
         "available": bool(payload),
@@ -1603,6 +3311,17 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
         "largest_module": str(largest.get("name") or ""),
         "largest_module_ram": str(largest.get("ram_human") or ""),
         "samples": int(_coerce_float(trend.get("samples"), 0.0)),
+        "scheduler_available": bool(scheduler),
+        "scheduler_summary": scheduler_summary,
+        "scheduler_learning_hint": scheduler_learning_hint,
+        "scheduler_running": scheduler_running,
+        "scheduler_next_slots": scheduler_next_slots,
+        "scheduler_last_decisions": scheduler_decisions,
+        "scheduler_queue_depth": int(_coerce_float(scheduler.get("queue_depth"), float(len(scheduler_next_slots)))),
+        "scheduler_running_count": int(_coerce_float(scheduler.get("running_count"), float(len(scheduler_running)))),
+        "scheduler_blocked_count": int(_coerce_float(scheduler.get("blocked_count"), float(len(scheduler_blocked)))),
+        "scheduler_memory_guard_level": str(scheduler.get("memory_guard_level") or "").strip().lower() or "unknown",
+        "scheduler_last_block_reason": str(scheduler_last_block.get("reason") or "").strip().lower(),
     }
 
 
@@ -1679,25 +3398,136 @@ _deep_recall_ready = False
 _last_deep_recall_snapshot: Optional[Dict[str, Any]] = None
 
 
+def _memory_index_db_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "memory_map.sqlite"
+
+
+def _memory_index_db_is_current(json_path: Path, db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    if not json_path.exists():
+        return True
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT value FROM meta WHERE key = 'source_mtime_ns'").fetchone()
+        if not row or row[0] is None:
+            return False
+        return int(row[0]) == int(json_path.stat().st_mtime_ns)
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _sample_fragment_ids_for_reflection(child: str, limit: int = 12) -> List[str]:
+    limit = max(0, int(limit))
+    if limit <= 0:
+        return []
+
+    memory_map_path = Path("AI_Children") / child / "memory" / "memory_map.json"
+    db_path = _memory_index_db_path(child)
+    if _memory_index_db_is_current(memory_map_path, db_path):
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute("SELECT COUNT(*) FROM fragments").fetchone()
+            total = int(row[0] or 0) if row else 0
+            if total > 0:
+                offsets = sorted(random.sample(range(total), min(limit, total)))
+                sample: List[str] = []
+                for offset in offsets:
+                    item = conn.execute("SELECT frag_id FROM fragments LIMIT 1 OFFSET ?", (int(offset),)).fetchone()
+                    if item and item[0]:
+                        sample.append(str(item[0]))
+                if sample:
+                    return sample
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    fragments_root = Path("AI_Children") / child / "memory" / "fragments"
+    skip_dirs = {"pending", "archived", "pending_delete"}
+    sample: List[str] = []
+    seen = 0
+    for frag_path in fragments_root.rglob("frag_*.json"):
+        if any(part in skip_dirs for part in frag_path.parts):
+            continue
+        seen += 1
+        frag_id = frag_path.stem
+        if len(sample) < limit:
+            sample.append(frag_id)
+            continue
+        pick = random.randrange(seen)
+        if pick < limit:
+            sample[pick] = frag_id
+    return sample
+
+
 class _FragmentMemoryBackend:
     """
     Lightweight bridge between deep_recall and Ina's on-disk fragments.
-    Uses memory_map.json when available for stable ordering, falls back to
-    scanning fragment files directly.
+    Uses the SQLite sidecar when current, falling back to memory_map.json or
+    direct file scanning when needed.
     """
 
     def __init__(self, child: str):
         self.child = child
         self.fragments_root = Path("AI_Children") / child / "memory" / "fragments"
         self.memory_map_path = Path("AI_Children") / child / "memory" / "memory_map.json"
-        self._index_loaded = False
-        self._id_to_path: Dict[str, Path] = {}
-        self._meta: Dict[str, Dict[str, Any]] = {}
-        self._ordered_ids: List[str] = []
+        self.memory_db_path = _memory_index_db_path(child)
+        self._json_meta: Optional[Dict[str, Dict[str, Any]]] = None
+        self._db_enabled: Optional[bool] = None
+        self._db_conn: Optional[sqlite3.Connection] = None
+        self._meta_cache: Dict[str, Dict[str, Any]] = {}
+        self._path_cache: Dict[str, Path] = {}
+        self._cache_limit = 4096
         self._tier_names = set(MEMORY_TIERS)
 
-    def _load_index(self):
-        if self._index_loaded:
+    def __del__(self):
+        if self._db_conn is not None:
+            try:
+                self._db_conn.close()
+            except Exception:
+                pass
+            self._db_conn = None
+
+    def _remember(self, cache: Dict[str, Any], key: str, value: Any) -> None:
+        cache.pop(key, None)
+        cache[key] = value
+        while len(cache) > self._cache_limit:
+            oldest = next(iter(cache))
+            cache.pop(oldest, None)
+
+    def _sqlite_index_available(self) -> bool:
+        if self._db_enabled is None:
+            self._db_enabled = _memory_index_db_is_current(self.memory_map_path, self.memory_db_path)
+        return bool(self._db_enabled)
+
+    def _connect_db(self) -> Optional[sqlite3.Connection]:
+        if not self._sqlite_index_available():
+            return None
+        if self._db_conn is None:
+            try:
+                self._db_conn = sqlite3.connect(str(self.memory_db_path))
+                self._db_conn.execute("PRAGMA journal_mode=WAL")
+                self._db_conn.execute("PRAGMA synchronous=NORMAL")
+            except Exception:
+                self._db_conn = None
+                self._db_enabled = False
+        return self._db_conn
+
+    def _load_json_index(self):
+        if self._json_meta is not None:
             return
 
         meta: Dict[str, Dict[str, Any]] = {}
@@ -1711,41 +3541,29 @@ class _FragmentMemoryBackend:
                 for frag_id, entry in raw_map.items():
                     if not isinstance(entry, dict):
                         continue
-                    filename = entry.get("filename") or f"{frag_id}.json"
-                    tier = entry.get("tier")
-                    path = self._resolve_fragment_path(filename, tier)
-                    if path is None:
-                        continue
-                    tier = self._tier_from_path(path) or tier
-                    meta[frag_id] = {
-                        "path": path,
-                        "tier": tier,
+                    meta[str(frag_id)] = {
+                        "tier": entry.get("tier"),
                         "last_seen": entry.get("last_seen"),
                         "importance": entry.get("importance"),
                         "tags": entry.get("tags", []),
-                        "filename": filename,
+                        "filename": entry.get("filename") or f"{frag_id}.json",
                     }
 
         if not meta:
-            skip_dirs = {"pending", "archived"}
+            skip_dirs = {"pending", "archived", "pending_delete"}
             for frag_path in self.fragments_root.rglob("frag_*.json"):
                 if any(part in skip_dirs for part in frag_path.parts):
                     continue
                 frag_id = self._derive_fragment_id(frag_path)
-                tier = self._tier_from_path(frag_path)
                 meta[frag_id] = {
-                    "path": frag_path,
-                    "tier": tier,
+                    "tier": self._tier_from_path(frag_path),
                     "filename": frag_path.name,
                     "last_seen": None,
                     "importance": None,
                     "tags": [],
                 }
 
-        self._id_to_path = {fid: data["path"] for fid, data in meta.items()}
-        self._meta = meta
-        self._ordered_ids = self._order_fragment_ids(meta)
-        self._index_loaded = True
+        self._json_meta = meta
 
     def _derive_fragment_id(self, frag_path: Path) -> str:
         try:
@@ -1770,22 +3588,70 @@ class _FragmentMemoryBackend:
 
         return [fid for fid, _ in sorted(meta.items(), key=_key)]
 
+    def _list_fragment_ids_from_db(self) -> List[str]:
+        conn = self._connect_db()
+        if conn is None:
+            return []
+        cursor = conn.execute("SELECT frag_id FROM fragments ORDER BY COALESCE(last_seen, ''), frag_id")
+        return [str(row[0]) for row in cursor if row and row[0]]
+
+    def _meta_for_fragment(self, frag_id: str) -> Dict[str, Any]:
+        cached = self._meta_cache.get(frag_id)
+        if cached is not None:
+            return dict(cached)
+
+        meta: Dict[str, Any] = {}
+        conn = self._connect_db()
+        if conn is not None:
+            row = conn.execute(
+                "SELECT tier, filename, last_seen, importance, tags_json FROM fragments WHERE frag_id = ?",
+                (str(frag_id),),
+            ).fetchone()
+            if row:
+                tags = []
+                try:
+                    payload = json.loads(row[4]) if row[4] else []
+                    if isinstance(payload, list):
+                        tags = [str(tag) for tag in payload if tag]
+                except Exception:
+                    tags = []
+                meta = {
+                    "tier": str(row[0] or "") or None,
+                    "filename": str(row[1] or "") or f"{frag_id}.json",
+                    "last_seen": str(row[2] or "") or None,
+                    "importance": row[3],
+                    "tags": tags,
+                }
+        else:
+            self._load_json_index()
+            meta = dict((self._json_meta or {}).get(frag_id, {}))
+
+        self._remember(self._meta_cache, frag_id, meta)
+        return dict(meta)
+
     def get_total_fragment_count(self) -> int:
-        self._load_index()
-        return len(self._ordered_ids)
+        conn = self._connect_db()
+        if conn is not None:
+            row = conn.execute("SELECT COUNT(*) FROM fragments").fetchone()
+            return int(row[0] or 0) if row else 0
+        self._load_json_index()
+        return len(self._json_meta or {})
 
     def list_fragment_ids(self) -> List[str]:
-        self._load_index()
-        return list(self._ordered_ids)
+        conn = self._connect_db()
+        if conn is not None:
+            return self._list_fragment_ids_from_db()
+        self._load_json_index()
+        return self._order_fragment_ids(self._json_meta or {})
 
     def load_fragments_batch(self, fragment_ids: List[str]) -> List[Dict[str, Any]]:
-        self._load_index()
         loaded: List[Dict[str, Any]] = []
 
         for frag_id in fragment_ids:
-            path = self._id_to_path.get(frag_id)
+            meta = self._meta_for_fragment(frag_id)
+            path = self._path_cache.get(frag_id)
             if path is None or not path.exists():
-                path = self._refresh_path(frag_id)
+                path = self._refresh_path(frag_id, meta)
                 if path is None or not path.exists():
                     log_to_statusbox(f"[DeepRecall] Missing fragment file for {frag_id}")
                     continue
@@ -1794,7 +3660,7 @@ class _FragmentMemoryBackend:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception as exc:
-                path = self._refresh_path(frag_id)
+                path = self._refresh_path(frag_id, meta, force=True)
                 if path is None or not path.exists():
                     log_to_statusbox(f"[DeepRecall] Failed reading {frag_id}: {exc}")
                     continue
@@ -1809,7 +3675,6 @@ class _FragmentMemoryBackend:
                 continue
 
             data.setdefault("id", frag_id)
-            meta = self._meta.get(frag_id, {})
             tier = meta.get("tier") or self._tier_from_path(path)
             if tier and "tier" not in data:
                 data["tier"] = tier
@@ -1818,25 +3683,17 @@ class _FragmentMemoryBackend:
 
         return loaded
 
-    def _refresh_path(self, frag_id: str) -> Optional[Path]:
-        """
-        Resolve a fragment path again after tiers move; update caches if found.
-        """
-        meta = self._meta.get(frag_id, {})
+    def _refresh_path(self, frag_id: str, meta: Optional[Dict[str, Any]] = None, *, force: bool = False) -> Optional[Path]:
+        if not force:
+            cached = self._path_cache.get(frag_id)
+            if cached is not None and cached.exists():
+                return cached
+        meta = meta or self._meta_for_fragment(frag_id)
         filename = meta.get("filename") or f"{frag_id}.json"
         tier_hint = meta.get("tier")
         path = self._resolve_fragment_path(filename, tier_hint)
         if path:
-            meta = {
-                "path": path,
-                "tier": self._tier_from_path(path) or tier_hint,
-                "last_seen": meta.get("last_seen"),
-                "importance": meta.get("importance"),
-                "tags": meta.get("tags", []),
-                "filename": filename,
-            }
-            self._meta[frag_id] = meta
-            self._id_to_path[frag_id] = path
+            self._remember(self._path_cache, frag_id, path)
         return path
 
     def _tier_from_path(self, frag_path: Path) -> Optional[str]:
@@ -1886,6 +3743,8 @@ class _MemoryIndexUpdater:
         self.manager = manager
 
     def ingest_fragments(self, fragments: List[Dict[str, Any]]) -> None:
+        if not getattr(self.manager, "_map_loaded", False):
+            self.manager.load_map()
         now_iso = datetime.now(timezone.utc).isoformat()
         updated = False
 
@@ -2009,9 +3868,9 @@ def _maybe_restart_deep_recall_for_new_fragments():
         _publish_deep_recall_state()
 
 
-def _step_deep_recall():
+def _step_deep_recall() -> bool:
     if _deep_recall_manager is None:
-        return
+        return False
 
     _ensure_deep_recall_ready()
     _maybe_restart_deep_recall_for_new_fragments()
@@ -2019,6 +3878,184 @@ def _step_deep_recall():
     if _deep_recall_manager.should_run():
         _deep_recall_manager.step()
         _publish_deep_recall_state()
+        return True
+    return False
+
+
+def request_scheduler_task(
+    task_key: str,
+    *,
+    reason: str = "runtime",
+    priority: Optional[int] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    profile = _scheduler_task_profile(task_key)
+    if profile is None:
+        return None
+    state = _load_process_scheduler_state()
+    limits = _process_scheduler_limits()
+    task_id = _enqueue_process_task(
+        state,
+        profile["task_key"],
+        limits=limits,
+        priority=priority,
+        reason=reason,
+        metadata=metadata,
+    )
+    _save_process_scheduler_state(state, limits)
+    return task_id
+
+
+def _request_memory_graph_neural_task(reason: str = "deferred_resume", *, priority: Optional[int] = None, force: bool = False) -> Optional[str]:
+    graph_state_raw = get_inastate("memory_graph_deferred_build")
+    graph_state = graph_state_raw if isinstance(graph_state_raw, dict) else {}
+    status = str(graph_state.get("status") or "").strip().lower()
+    if not force and status not in {"queued", "failed"}:
+        return None
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    next_graph_state = dict(graph_state)
+    next_graph_state["status"] = "queued"
+    next_graph_state["updated_at"] = now_iso
+    next_graph_state["queue_reason"] = str(reason or "").strip().lower()
+    next_graph_state["requested_by"] = str(reason or "").strip().lower() or "scheduler"
+    next_graph_state.setdefault("requested_at", now_iso)
+    next_graph_state.pop("pid", None)
+    update_inastate("memory_graph_deferred_build", next_graph_state)
+
+    return request_scheduler_task(
+        "memory_graph_neural",
+        reason=reason,
+        priority=priority,
+        metadata={"graph_status": status or "queued", "requested_by": next_graph_state.get("requested_by")},
+    )
+
+
+def _enqueue_deep_recall_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    if _deep_recall_manager is None:
+        _remove_process_task(state, "deep_recall_step")
+        return
+    _ensure_deep_recall_ready()
+    _maybe_restart_deep_recall_for_new_fragments()
+    manager = _deep_recall_manager
+    if manager is None or not manager.state.active or manager.state.completed:
+        _remove_process_task(state, "deep_recall_step")
+        return
+    _enqueue_process_task(
+        state,
+        "deep_recall_step",
+        limits=limits,
+        reason=manager.state.reason or "active_session",
+        metadata={
+            "mode": manager.state.mode,
+            "last_index": manager.state.last_index,
+            "total_fragments": manager.state.total_fragments,
+        },
+    )
+
+
+def _scheduler_run_step_task(entry: Dict[str, Any], state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    task_key = str(entry.get("task_key") or "").strip()
+    started_ts = time.time()
+    history_payload = {
+        "task_key": task_key,
+        "task_id": entry.get("id"),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "resource_profile": entry.get("resource_profile"),
+        "priority": entry.get("priority"),
+    }
+    if task_key == "deep_recall_step":
+        ran = _step_deep_recall()
+        history_payload["status"] = "completed" if ran else "deferred"
+        history_payload["reason"] = "deep_recall_step" if ran else "deep_recall_paused"
+        manager = _deep_recall_manager
+        if manager is not None:
+            history_payload["summary"] = {
+                "last_index": manager.state.last_index,
+                "total_fragments": manager.state.total_fragments,
+                "mode": manager.state.mode,
+                "active": manager.state.active,
+                "completed": manager.state.completed,
+            }
+    else:
+        history_payload["status"] = "skipped"
+        history_payload["reason"] = "unknown_step_task"
+    history_payload["finished_at"] = datetime.now(timezone.utc).isoformat()
+    history_payload["duration_sec"] = round(max(0.0, time.time() - started_ts), 4)
+    _scheduler_record_history(state, history_payload, limits)
+
+
+def _scheduler_start_subprocess_task(entry: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
+    if profile is None:
+        return False
+    command = profile.get("command")
+    if not isinstance(command, list) or not command:
+        return False
+    process = safe_popen(command)
+    if process is None:
+        return False
+    started_at = datetime.now(timezone.utc).isoformat()
+    running_entry = dict(entry)
+    running_entry.update(
+        {
+            "status": "running",
+            "pid": int(process.pid),
+            "started_at": started_at,
+            "started_ts": time.time(),
+            "last_seen_at": started_at,
+            "resource_profile": _scheduler_resource_profile(profile, _process_scheduler_limits()),
+        }
+    )
+    state.setdefault("running", []).append(running_entry)
+    module_name = str(profile.get("module") or "").strip()
+    if module_name:
+        mark_module_running(module_name)
+    return True
+
+
+def _process_scheduler_tick(memory_guard: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    global _last_process_scheduler_tick
+    limits = _process_scheduler_limits()
+    state = _load_process_scheduler_state()
+    _reconcile_process_scheduler_running(state, limits)
+    _enqueue_deep_recall_task_if_needed(state, limits)
+    resources = _scheduler_resource_snapshot(memory_guard=memory_guard, limits=limits)
+    state["resources"] = resources
+    _scheduler_enforce_memory_limits(state, resources, limits)
+    if not limits.get("enabled", True):
+        _save_process_scheduler_state(state, limits)
+        _last_process_scheduler_tick = time.time()
+        return state
+
+    for entry in list(state.get("queue", [])):
+        allowed, reason = _scheduler_can_start_task(entry, state, resources, limits)
+        if not allowed:
+            _scheduler_note_decision(state, str(entry.get("task_key") or ""), "blocked", reason, limits, entry=entry)
+            continue
+        if entry in state.get("queue", []):
+            state["queue"].remove(entry)
+        profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
+        if profile is None:
+            _scheduler_note_decision(state, str(entry.get("task_key") or ""), "blocked", "unknown_task", limits, entry=entry)
+            continue
+        if profile.get("kind") == "step":
+            _scheduler_note_decision(state, profile["task_key"], "started", "step", limits, entry=entry)
+            _scheduler_run_step_task(entry, state, limits)
+        else:
+            if _scheduler_start_subprocess_task(entry, state):
+                _scheduler_note_decision(state, profile["task_key"], "started", "subprocess", limits, entry=entry)
+            else:
+                state.setdefault("queue", []).append(entry)
+                _sort_process_scheduler_queue(state)
+                _scheduler_note_decision(state, profile["task_key"], "blocked", "launch_failed", limits, entry=entry)
+        resources = _scheduler_resource_snapshot(memory_guard=memory_guard, limits=limits)
+        state["resources"] = resources
+        _scheduler_enforce_memory_limits(state, resources, limits)
+
+    _save_process_scheduler_state(state, limits)
+    _last_process_scheduler_tick = time.time()
+    return state
 
 
 def _load_running_modules():
@@ -2359,16 +4396,17 @@ def _persist_reflection_event(event):
 def _run_passive_reflection():
     """
     Runs the passive reflection core using the latest emotion snapshot,
-    memory index, and sound symbols, then stores the hint back into inastate.
+    a lightweight fragment-ID sample, and sound symbols, then stores the hint
+    back into inastate.
     """
     try:
-        memory_manager.load_map()
         emotion_snapshot = get_inastate("emotion_snapshot") or {}
         symbol_map = _load_symbol_map()
+        memory_sample = _sample_fragment_ids_for_reflection(CHILD, limit=12)
 
         event = reflection_core.reflect(
             emotional_state=emotion_snapshot.get("values") or emotion_snapshot,
-            memory_graph=memory_manager.memory_map,
+            memory_graph=memory_sample,
             symbol_map=symbol_map,
         )
 
@@ -2405,10 +4443,7 @@ def _check_self_adjustment():
 def launch_background_loops():
     if not _is_process_running("ina_client.py"):
         safe_popen(["python", "ina_client.py", "--daemon"])
-    if not _is_process_running("audio_listener.py"):
-        safe_popen(["python", "audio_listener.py"])
-    if not _is_process_running("vision_window.py"):
-        safe_popen(["python", "vision_window.py"])
+    _apply_world_sense_override()
     log_to_statusbox("[Manager] Background loops launched.")
 
 def monitor_energy():
@@ -2863,7 +4898,11 @@ def boredom_check():
     now = time.time()
     if boredom > 0.4 and (now - _last_boredom_launch) >= _BOREDOM_COOLDOWN:
         _last_boredom_launch = now
-        safe_popen(["python", "boredom_state.py"])
+        request_scheduler_task(
+            "boredom_state_run",
+            reason="boredom_trigger",
+            metadata={"boredom": round(float(boredom or 0.0), 3)},
+        )
         update_inastate("last_boredom_trigger", datetime.fromtimestamp(now, timezone.utc).isoformat())
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
@@ -2880,7 +4919,7 @@ def paint_check():
     if get_inastate("paint_request"):
         update_inastate("paint_request", False)
         _last_paint_launch = now
-        safe_popen(["python", "paint_window.py"])
+        request_scheduler_task("paint_window_open", reason="paint_request")
         update_inastate(
             "last_paint_trigger",
             {
@@ -2916,7 +4955,17 @@ def paint_check():
         return
 
     _last_paint_launch = now
-    safe_popen(["python", "paint_window.py"])
+    request_scheduler_task(
+        "paint_window_open",
+        reason="creative_urge",
+        metadata={
+            "curiosity": round(curiosity, 3),
+            "joy": round(joy, 3),
+            "playfulness": round(playfulness, 3),
+            "stress": round(stress, 3),
+            "boredom": round(boredom, 3),
+        },
+    )
     update_inastate(
         "last_paint_trigger",
         {
@@ -5203,7 +7252,7 @@ def _maybe_run_trauma_processor():
     if (now - _last_trauma_run) < _TRAUMA_COOLDOWN:
         return
     _last_trauma_run = now
-    safe_run(["python", "trauma_processor.py"])
+    request_scheduler_task("trauma_processor_run", reason="cooldown_elapsed")
 
 def _update_machine_semantics():
     """
@@ -5417,6 +7466,33 @@ def _update_machine_semantics():
             }
         )
 
+    scheduler_queue_depth = int(resource_context.get("scheduler_queue_depth") or 0)
+    scheduler_blocked_count = int(resource_context.get("scheduler_blocked_count") or 0)
+    scheduler_pressure = 0.0
+    if resource_context.get("scheduler_available"):
+        scheduler_pressure = _clamp01(
+            (0.45 if scheduler_blocked_count > 0 else 0.0)
+            + min(0.35, scheduler_queue_depth / 10.0)
+            + (0.2 if str(resource_context.get("scheduler_memory_guard_level") or "") in {"soft", "hard"} else 0.0),
+            default=0.0,
+        )
+        if scheduler_pressure > 0.0 or scheduler_queue_depth > 0:
+            scheduler_weight = 0.55
+            total_weight += scheduler_weight
+            total_contrib += scheduler_pressure * scheduler_weight
+            reasons.append(
+                {
+                    "axis": "process_scheduler",
+                    "value": round(1.0 - scheduler_pressure, 3),
+                    "pressure": round(scheduler_pressure, 3),
+                    "weight": round(scheduler_weight, 3),
+                    "direction": "risk" if scheduler_pressure >= 0.55 else "watch",
+                    "reason": resource_context.get("scheduler_summary") or "scheduler telemetry available",
+                    "hint": resource_context.get("scheduler_learning_hint"),
+                    "focus_module": resource_context.get("largest_module"),
+                }
+            )
+
     reasons = sorted(reasons, key=lambda r: r["pressure"] * r["weight"], reverse=True)
     importance_score = _clamp01(total_contrib / max(total_weight, 1.0), default=0.0)
 
@@ -5431,6 +7507,17 @@ def _update_machine_semantics():
             "trend_summary": resource_context.get("trend_summary"),
             "optimization_hint": resource_context.get("optimization_hint"),
             "top_modules": resource_context.get("top_modules"),
+            "process_scheduler": {
+                "available": resource_context.get("scheduler_available", False),
+                "summary": resource_context.get("scheduler_summary"),
+                "learning_hint": resource_context.get("scheduler_learning_hint"),
+                "queue_depth": resource_context.get("scheduler_queue_depth"),
+                "running_count": resource_context.get("scheduler_running_count"),
+                "blocked_count": resource_context.get("scheduler_blocked_count"),
+                "running": resource_context.get("scheduler_running"),
+                "next_slots": resource_context.get("scheduler_next_slots"),
+                "last_block_reason": resource_context.get("scheduler_last_block_reason"),
+            },
         },
         "why_it_matters": {
             "score": round(importance_score, 3),
@@ -5539,21 +7626,39 @@ def rebuild_maps_if_needed():
     drift = emo.get("symbolic_drift", 0.0)
     if fuzz > 0.7 or drift > 0.5:
         log_to_statusbox("[Manager] Rebuilding maps due to emotional drift.")
-        safe_call(["python", "memory_graph.py"])
-        safe_call(["python", "meaning_map.py"])
-        safe_call(["python", "neural_graph.py"])
-        safe_call(["python", "logic_map_builder.py"])
-        safe_call(["python", "emotion_map.py"])
+        graph_state = get_inastate("memory_graph_deferred_build") or {}
+        if str(graph_state.get("status") or "").strip().lower() != "running":
+            _request_memory_graph_neural_task(reason="emotion_drift", priority=95, force=True)
+        request_scheduler_task("meaning_map_refresh", reason="emotion_drift", priority=80)
+        request_scheduler_task("neural_graph_refresh", reason="emotion_drift", priority=76)
+        request_scheduler_task("logic_map_refresh", reason="emotion_drift", priority=78)
+        request_scheduler_task("emotion_map_refresh", reason="emotion_drift", priority=74)
         update_inastate("last_map_rebuild", datetime.now(timezone.utc).isoformat())
+
+
+def _maybe_run_deferred_memory_graph_build(memory_guard: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    state_raw = get_inastate("memory_graph_deferred_build")
+    state = state_raw if isinstance(state_raw, dict) else {}
+    status = str(state.get("status") or "").strip().lower()
+    if status not in {"queued", "failed"}:
+        return None
+
+    guard_state = memory_guard if isinstance(memory_guard, dict) else (get_inastate("memory_guard") or {})
+    guard_level = str(guard_state.get("level") or "").strip().lower()
+    if guard_level in {"soft", "hard"}:
+        return None
+
+    return _request_memory_graph_neural_task(reason="deferred_resume", priority=90, force=False)
+
 
 def run_internal_loop():
     _maybe_update_runtime_heartbeat()
     _ensure_continuity_thread()
-    _apply_world_sense_override()
     _maybe_ensure_ina_client()
     guard_limits = _memory_guard_limits()
     _consume_operator_memory_signal(guard_limits)
     memory_guard = _refresh_memory_guard_state()
+    _apply_world_sense_override(memory_guard=memory_guard)
     memory_level = memory_guard.get("level")
     _maybe_enqueue_memory_pressure_event(memory_guard, guard_limits)
     _process_memory_pressure_queue(guard_limits)
@@ -5585,7 +7690,8 @@ def run_internal_loop():
     if check_audio_index_change():
         safe_call(["pkill", "-f", "audio_listener.py"])
         time.sleep(2)  # Let config settle and avoid early InputStream calls
-        safe_popen(["python", "audio_listener.py"])
+        if str(get_inastate("audio_mode") or "default").strip().lower() == "default":
+            safe_popen(["python", "audio_listener.py"])
 
 
 
@@ -5593,42 +7699,43 @@ def run_internal_loop():
     ground_fault_active = _update_ground_sense_fault_state()
 
     if not defer_optional and get_inastate("emotion_snapshot", {}).get("focus", 0.0) > 0.5:
-        safe_popen(["python", "meditation_state.py"])
+        request_scheduler_task("meditation_state_run", reason="focus_state", priority=82)
 
     if not defer_optional:
         if not world_connected and get_inastate("emotion_snapshot", {}).get("fuzz_level", 0.0) > 0.7:
-            safe_popen(["python", "dreamstate.py"])
+            request_scheduler_task("dreamstate_run", reason="fuzz_state", priority=84)
         elif not world_connected and not get_inastate("dreaming", False):
-            safe_popen(["python", "dreamstate.py"])
+            request_scheduler_task("dreamstate_run", reason="rest_cycle", priority=80)
 
     if not defer_spawns:
-        safe_run(["python", "emotion_engine.py"])
-        safe_run(["python", "instinct_engine.py"])
+        request_scheduler_task("emotion_engine_run", reason="runtime_loop", priority=72)
+        request_scheduler_task("instinct_engine_run", reason="runtime_loop", priority=74)
 
     if not defer_optional:
-        safe_popen(["python", "early_comm.py"])
+        request_scheduler_task("early_comm_run", reason="runtime_loop", priority=58)
 
     if not defer_optional and not feedback_inhibition():
-        safe_popen(["python", "predictive_layer.py"])
-        safe_popen(["python", "logic_engine.py"])
+        request_scheduler_task("predictive_layer_run", reason="runtime_loop", priority=76)
+        request_scheduler_task("logic_engine_run", reason="runtime_loop", priority=76)
 
     if not defer_optional:
         boredom_check()
         paint_check()
         _maybe_self_read()
         if not ground_fault_active:
+            _maybe_run_deferred_memory_graph_build(memory_guard=memory_guard)
             rebuild_maps_if_needed()
     _check_self_adjustment()
     _update_contact_urges()
     _update_stable_pattern_urge()
     _update_self_read_exploration_opportunities()
     _update_meta_arbitration_signal(memory_guard=memory_guard)
+    _maybe_queue_github_optimization_request(memory_guard=memory_guard)
     _maybe_emit_motor_intent()
     _update_humor_bridge()
     _maybe_run_trauma_processor()
     _run_passive_reflection()
-    if not defer_optional:
-        _step_deep_recall()
+    _process_scheduler_tick(memory_guard=memory_guard)
     _update_machine_semantics()
     if not defer_optional:
         _scan_fragment_health()

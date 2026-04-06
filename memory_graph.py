@@ -1,17 +1,22 @@
 # === memory_graph.py (Logging Enhanced) ===
 
+import argparse
 import os
 import json
 import math
 import random
 import heapq
 import time
+import tempfile
+from array import array
 from collections import deque
 import hashlib
 import gc
 import importlib
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 from gui_hook import log_to_statusbox
@@ -49,15 +54,26 @@ DEFAULT_INCREMENTAL_POLICY = {
     "synapse_refresh_on_idle": True,
     "max_fragments_per_neuron": 128,
     "max_tags_per_neuron": 32,
+    "fragment_anchor_count": 12,
+    "tag_anchor_count": 6,
     "vector_round_digits": 6,
     "position_round_digits": 4,
     "edge_direction_enabled": True,
+    "max_connection_degree": 0,
+    "min_synapse_weight": 0.0,
     "gc_every_batches": 4,
     "max_neurons_total": 0,
     "max_edges_per_neuron": 0,
     "max_synapses_total": 0,
     "max_pending_dirty_fragments": 0,
     "compact_save_enabled": True,
+    "synapse_spool_enabled": True,
+    "spill_to_disk_enabled": False,
+    "max_hot_neurons": 0,
+    "spill_after_batches": 0,
+    "spill_precision_mode": "adaptive",
+    "spill_high_precision_threshold": 0.68,
+    "spill_medium_precision_threshold": 0.35,
 }
 
 DEFAULT_TIER_POLICY = {
@@ -65,6 +81,14 @@ DEFAULT_TIER_POLICY = {
     "working": {"max_age_hours": 72.0, "target_count": 12000},
     "long": {"max_age_hours": 24.0 * 30.0, "target_count": 40000},
     "cold": {},
+}
+DEFAULT_RETENTION_POLICY = {
+    "protect_cold_importance": 0.72,
+    "compact_low_importance_threshold": 0.18,
+    "compact_low_importance_age_hours": 24.0 * 7.0,
+    "pre_compact_enabled": False,
+    "pre_compact_limit": 24,
+    "pre_compact_min_size_bytes": 65536,
 }
 DEFAULT_BOOT_POLICY = {
     "boot_mode": "full",  # full | fast | auto
@@ -186,6 +210,16 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         max_tags_per_neuron = 32
     max_tags_per_neuron = max(1, max_tags_per_neuron)
     try:
+        fragment_anchor_count = int(policy.get("fragment_anchor_count", 0))
+    except (TypeError, ValueError):
+        fragment_anchor_count = 12
+    fragment_anchor_count = max(0, fragment_anchor_count)
+    try:
+        tag_anchor_count = int(policy.get("tag_anchor_count", 0))
+    except (TypeError, ValueError):
+        tag_anchor_count = 6
+    tag_anchor_count = max(0, tag_anchor_count)
+    try:
         vector_round_digits = int(policy.get("vector_round_digits", 6))
     except (TypeError, ValueError):
         vector_round_digits = 6
@@ -196,6 +230,17 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         position_round_digits = 4
     position_round_digits = max(1, min(position_round_digits, 6))
     edge_direction_enabled = bool(policy.get("edge_direction_enabled", True))
+    try:
+        max_connection_degree = int(policy.get("max_connection_degree", 0))
+    except (TypeError, ValueError):
+        max_connection_degree = 0
+    if max_connection_degree < 0:
+        max_connection_degree = 0
+    try:
+        min_synapse_weight = float(policy.get("min_synapse_weight", 0.0))
+    except (TypeError, ValueError):
+        min_synapse_weight = 0.0
+    min_synapse_weight = _clamp(min_synapse_weight, 0.0, 1.0)
     try:
         gc_every_batches = int(policy.get("gc_every_batches", 4))
     except (TypeError, ValueError):
@@ -227,6 +272,33 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if max_pending_dirty_fragments < 0:
         max_pending_dirty_fragments = 0
     compact_save_enabled = bool(policy.get("compact_save_enabled", True))
+    synapse_spool_enabled = bool(policy.get("synapse_spool_enabled", True))
+    spill_to_disk_enabled = bool(policy.get("spill_to_disk_enabled", False))
+    try:
+        max_hot_neurons = int(policy.get("max_hot_neurons", 0))
+    except (TypeError, ValueError):
+        max_hot_neurons = 0
+    if max_hot_neurons < 0:
+        max_hot_neurons = 0
+    try:
+        spill_after_batches = int(policy.get("spill_after_batches", 0))
+    except (TypeError, ValueError):
+        spill_after_batches = 0
+    if spill_after_batches < 0:
+        spill_after_batches = 0
+    spill_precision_mode = str(policy.get("spill_precision_mode", "adaptive") or "adaptive").strip().lower()
+    if spill_precision_mode not in {"adaptive", "float", "int16", "int8"}:
+        spill_precision_mode = "adaptive"
+    try:
+        spill_high_precision_threshold = float(policy.get("spill_high_precision_threshold", 0.68))
+    except (TypeError, ValueError):
+        spill_high_precision_threshold = 0.68
+    try:
+        spill_medium_precision_threshold = float(policy.get("spill_medium_precision_threshold", 0.35))
+    except (TypeError, ValueError):
+        spill_medium_precision_threshold = 0.35
+    spill_high_precision_threshold = _clamp(spill_high_precision_threshold, 0.0, 1.0)
+    spill_medium_precision_threshold = _clamp(spill_medium_precision_threshold, 0.0, spill_high_precision_threshold)
     return {
         "mode": mode,
         "incremental": incremental,
@@ -245,15 +317,26 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "synapse_refresh_on_idle": synapse_refresh,
         "max_fragments_per_neuron": max_fragments_per_neuron,
         "max_tags_per_neuron": max_tags_per_neuron,
+        "fragment_anchor_count": fragment_anchor_count,
+        "tag_anchor_count": tag_anchor_count,
         "vector_round_digits": vector_round_digits,
         "position_round_digits": position_round_digits,
         "edge_direction_enabled": edge_direction_enabled,
+        "max_connection_degree": max_connection_degree,
+        "min_synapse_weight": min_synapse_weight,
         "gc_every_batches": gc_every_batches,
         "max_neurons_total": max_neurons_total,
         "max_edges_per_neuron": max_edges_per_neuron,
         "max_synapses_total": max_synapses_total,
         "max_pending_dirty_fragments": max_pending_dirty_fragments,
         "compact_save_enabled": compact_save_enabled,
+        "synapse_spool_enabled": synapse_spool_enabled,
+        "spill_to_disk_enabled": spill_to_disk_enabled,
+        "max_hot_neurons": max_hot_neurons,
+        "spill_after_batches": spill_after_batches,
+        "spill_precision_mode": spill_precision_mode,
+        "spill_high_precision_threshold": spill_high_precision_threshold,
+        "spill_medium_precision_threshold": spill_medium_precision_threshold,
     }
 
 
@@ -301,12 +384,15 @@ def _memory_policy():
             return None
         return ivalue if ivalue > 0 else None
 
-    def _coerce_positive_float(value: Any) -> Optional[float]:
+    def _coerce_float(value: Any) -> Optional[float]:
         try:
-            fvalue = float(value)
+            return float(value)
         except (TypeError, ValueError):
             return None
-        return fvalue if fvalue > 0 else None
+
+    def _coerce_positive_float(value: Any) -> Optional[float]:
+        fvalue = _coerce_float(value)
+        return fvalue if fvalue is not None and fvalue > 0 else None
 
     for tier in MEMORY_TIERS:
         tier_defaults = DEFAULT_TIER_POLICY.get(tier, {}).copy()
@@ -319,6 +405,27 @@ def _memory_policy():
             if target_override is not None:
                 tier_defaults["target_count"] = target_override
         policy[tier] = tier_defaults
+
+    retention = DEFAULT_RETENTION_POLICY.copy()
+    raw_retention = user_policy.get("retention", {}) if isinstance(user_policy, dict) else {}
+    if isinstance(raw_retention, dict):
+        protect = _coerce_float(raw_retention.get("protect_cold_importance"))
+        if protect is not None:
+            retention["protect_cold_importance"] = _clamp(protect, 0.0, 1.0)
+        low_importance = _coerce_float(raw_retention.get("compact_low_importance_threshold"))
+        if low_importance is not None:
+            retention["compact_low_importance_threshold"] = _clamp(low_importance, 0.0, 1.0)
+        low_age = _coerce_positive_float(raw_retention.get("compact_low_importance_age_hours"))
+        if low_age is not None:
+            retention["compact_low_importance_age_hours"] = low_age
+        retention["pre_compact_enabled"] = bool(raw_retention.get("pre_compact_enabled", retention["pre_compact_enabled"]))
+        pre_limit = _coerce_positive_int(raw_retention.get("pre_compact_limit"))
+        if pre_limit is not None:
+            retention["pre_compact_limit"] = pre_limit
+        min_size = _coerce_positive_int(raw_retention.get("pre_compact_min_size_bytes"))
+        if min_size is not None:
+            retention["pre_compact_min_size_bytes"] = min_size
+    policy["retention"] = retention
     return policy
 
 
@@ -568,6 +675,105 @@ def _resolve_boot_mode(policy: Dict[str, Any], shutdown: Dict[str, Any]) -> Tupl
     return "fast", "auto_default"
 
 
+def _memory_graph_phase_args(argv: Optional[List[str]] = None):
+    parser = argparse.ArgumentParser(description="Memory graph maintenance phases.")
+    parser.add_argument("--phase", choices=("full", "boot", "neural"), default="full")
+    return parser.parse_args(argv)
+
+
+def _set_memory_graph_deferred_build(child: str, status: str, **extra: Any) -> Dict[str, Any]:
+    state = _load_inastate(child)
+    payload = state.get("memory_graph_deferred_build") if isinstance(state.get("memory_graph_deferred_build"), dict) else {}
+    payload = dict(payload)
+    payload.update(extra)
+    payload["status"] = str(status or "").strip().lower() or "queued"
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if payload["status"] != "running":
+        payload.pop("pid", None)
+    _write_inastate_value(child, "memory_graph_deferred_build", payload)
+    return payload
+
+
+def _run_memory_index_verification(child: str, cfg: Dict[str, Any], mgr: "MemoryManager") -> Dict[str, Any]:
+    boot_policy = _boot_policy(cfg)
+    shutdown_ctx = _shutdown_context(child, boot_policy)
+    boot_mode, reason = _resolve_boot_mode(boot_policy, shutdown_ctx)
+    log_to_statusbox(f"[Memory] Boot mode: {boot_mode} (reason={reason}).")
+
+    if boot_mode == "full":
+        mgr.reindex_all(rebalance=boot_policy.get("rebalance_on_boot", True))
+        if boot_policy.get("prune_missing_on_boot", False):
+            mgr.prune_missing()
+    else:
+        mgr.fast_reindex(
+            rebalance=boot_policy.get("rebalance_on_boot", False),
+            prune_missing=boot_policy.get("prune_missing_on_boot", False),
+        )
+
+    mgr.stats()
+    handle_bundle_prune(child, cfg, mgr)
+    verification = {
+        "boot_mode": boot_mode,
+        "reason": reason,
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+        "fragment_count": len(mgr.memory_map),
+    }
+    _write_inastate_value(child, "memory_graph_last_verification", verification)
+    return verification
+
+
+def _run_memory_neural_phase(child: str, mgr: "MemoryManager", *, launch_source: str = "manual") -> None:
+    launched_at = datetime.now(timezone.utc).isoformat()
+    _set_memory_graph_deferred_build(
+        child,
+        "running",
+        launch_source=launch_source,
+        launched_at=launched_at,
+        pid=os.getpid(),
+    )
+    log_to_statusbox("[Memory] Starting neural graph build phase.")
+    build_summary: Dict[str, Any] = {}
+    experience_summary: Dict[str, Any] = {}
+    try:
+        mgr.fast_reindex(rebalance=False, prune_missing=False)
+        build_summary = build_fractal_memory(child) or {}
+        if build_summary.get("needs_resume"):
+            _set_memory_graph_deferred_build(
+                child,
+                "queued",
+                launch_source=launch_source,
+                queued_at=datetime.now(timezone.utc).isoformat(),
+                fragment_count=len(mgr.memory_map),
+                last_cycle=build_summary,
+                last_error=None,
+            )
+            log_to_statusbox("[Memory] Neural graph burst paused with work remaining; re-queued for the scheduler.")
+            return
+        experience_summary = build_experience_graph(child) or {}
+    except Exception as exc:
+        _set_memory_graph_deferred_build(
+            child,
+            "failed",
+            launch_source=launch_source,
+            failed_at=datetime.now(timezone.utc).isoformat(),
+            last_cycle=build_summary,
+            last_error=str(exc),
+        )
+        raise
+
+    _set_memory_graph_deferred_build(
+        child,
+        "completed",
+        launch_source=launch_source,
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        fragment_count=len(mgr.memory_map),
+        last_cycle=build_summary,
+        experience_cycle=experience_summary,
+        last_error=None,
+    )
+    log_to_statusbox("[Memory] Neural graph build phase completed.")
+
+
 def _selector_state_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "neural_selector_state.json"
 
@@ -798,9 +1004,98 @@ def _is_compacted_fragment(fragment: Dict[str, Any]) -> bool:
     return False
 
 
+_PROTECTED_FRAGMENT_TAGS = {
+    "anchor", "anchors", "core", "identity", "bond", "attachment", "pinned", "protected",
+    "self", "self_model", "relationship", "love", "grief", "family", "memory_anchor",
+}
+
+
+def _record_tags(record: Dict[str, Any]) -> Set[str]:
+    tags = record.get("tags") if isinstance(record.get("tags"), list) else []
+    return {str(tag).lower() for tag in tags if tag}
+
+
+def _is_anchor_fragment_record(record: Dict[str, Any], retention: Optional[Dict[str, Any]] = None) -> bool:
+    retention = retention or DEFAULT_RETENTION_POLICY
+    if _record_tags(record) & _PROTECTED_FRAGMENT_TAGS:
+        return True
+    protect = _clamp(_safe_float(retention.get("protect_cold_importance"), DEFAULT_RETENTION_POLICY["protect_cold_importance"]), 0.0, 1.0)
+    importance = _clamp(_safe_float(record.get("importance"), 0.0), 0.0, 1.0)
+    return importance >= protect
+
+
+def _select_pregraph_compaction_candidates(child: str, index: Any, retention: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any], Path]]:
+    limit = max(0, int(retention.get("pre_compact_limit", 0) or 0))
+    if limit <= 0:
+        return []
+    min_age_hours = max(0.0, _safe_float(retention.get("compact_low_importance_age_hours"), DEFAULT_RETENTION_POLICY["compact_low_importance_age_hours"]))
+    low_importance = _clamp(_safe_float(retention.get("compact_low_importance_threshold"), DEFAULT_RETENTION_POLICY["compact_low_importance_threshold"]), 0.0, 1.0)
+    min_size_bytes = max(0, int(retention.get("pre_compact_min_size_bytes", 0) or 0))
+    now = datetime.now(timezone.utc)
+    heap: List[Tuple[Tuple[int, float, str], str, Dict[str, Any], Path]] = []
+    for frag_id, meta in index.items():
+        if not frag_id or not isinstance(meta, dict):
+            continue
+        if _is_anchor_fragment_record(meta, retention):
+            continue
+        tier = str(meta.get("tier") or "short")
+        if tier not in {"long", "cold"}:
+            continue
+        importance = _clamp(_safe_float(meta.get("importance"), 0.0), 0.0, 1.0)
+        if importance > low_importance:
+            continue
+        ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp"))
+        if ts is None:
+            continue
+        age_hours = (now - datetime.fromtimestamp(ts, timezone.utc)).total_seconds() / 3600.0
+        if age_hours < min_age_hours:
+            continue
+        size_bytes = int(_safe_float(meta.get("size_bytes"), 0.0))
+        if size_bytes < min_size_bytes:
+            continue
+        path = _resolve_index_path(child, frag_id, meta)
+        if path is None:
+            continue
+        score = (size_bytes, age_hours, str(frag_id))
+        entry = (score, str(frag_id), meta, path)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        elif entry[0] > heap[0][0]:
+            heapq.heapreplace(heap, entry)
+    return [(frag_id, meta, path) for _, frag_id, meta, path in sorted(heap, key=lambda item: item[0], reverse=True)]
+
+
+def _pregraph_fragment_compaction_pass(child: str, index: Any, retention: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    retention = retention or DEFAULT_RETENTION_POLICY
+    if not bool(retention.get("pre_compact_enabled", False)):
+        return {"status": "disabled", "candidates": 0, "compacted": 0, "skipped": 0}
+    if compact_fragment_file is None:
+        return {"status": "unavailable", "candidates": 0, "compacted": 0, "skipped": 0}
+    cold_policy = _cold_storage_policy()
+    if not cold_policy.get("enabled", True):
+        return {"status": "disabled", "candidates": 0, "compacted": 0, "skipped": 0}
+    selected = _select_pregraph_compaction_candidates(child, index, retention)
+    compacted = 0
+    skipped = 0
+    for frag_id, meta, path in selected:
+        fragment = _load_fragment_from_path(path)
+        if not fragment or _is_compacted_fragment(fragment) or _is_anchor_fragment_record(fragment, retention):
+            skipped += 1
+            continue
+        try:
+            result = compact_fragment_file(path, child=child, policy=cold_policy)
+        except Exception:
+            result = None
+        if isinstance(result, dict) and result.get("status") in {"compacted", "retained"}:
+            compacted += 1
+        else:
+            skipped += 1
+    return {"status": "ok", "candidates": len(selected), "compacted": compacted, "skipped": skipped}
+
+
 def _candidate_pool_from_index(
     child: str,
-    index: Dict[str, Any],
+    index: Any,
     *,
     pool_max: int,
     blocked_tags: Iterable[str],
@@ -808,6 +1103,8 @@ def _candidate_pool_from_index(
     known_fragments: Optional[Set[str]],
     cost_max_bytes: Optional[int],
 ) -> List[str]:
+    if pool_max <= 0:
+        return []
     blocked = {str(tag).lower() for tag in blocked_tags if tag}
     entries: List[Tuple[float, float, str]] = []
     for frag_id, meta in index.items():
@@ -836,9 +1133,13 @@ def _candidate_pool_from_index(
             except OSError:
                 ts = 0.0
         importance = _safe_float(meta.get("importance"), 0.0)
-        entries.append((ts or 0.0, importance, frag_id))
+        entry = (ts or 0.0, importance, frag_id)
+        if len(entries) < pool_max:
+            heapq.heappush(entries, entry)
+        elif entry > entries[0]:
+            heapq.heapreplace(entries, entry)
     entries.sort(reverse=True)
-    return [entry[2] for entry in entries[:pool_max]]
+    return [entry[2] for entry in entries]
 
 
 def _softmax(scores: List[float], temperature: float) -> List[float]:
@@ -1038,24 +1339,21 @@ def select_fragments_for_neural_map(
     *,
     cfg: Optional[Dict[str, Any]] = None,
     known_fragments: Optional[Set[str]] = None,
+    index: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
     config = _selector_config(cfg)
     if not config.get("enabled", True):
         fragments, total = load_fragments(child, limit=limit)
         return fragments, total, {"mode": "disabled"}
 
-    index_path = Path("AI_Children") / child / "memory" / "memory_map.json"
-    if not index_path.exists():
+    owned_index = None
+    if index is None:
+        owned_index = _load_memory_index(child)
+        index = owned_index
+    if not index:
         fragments, total = load_fragments(child, limit=limit)
-        return fragments, total, {"mode": "fallback"}
-    try:
-        with index_path.open("r", encoding="utf-8") as fh:
-            index = json.load(fh)
-    except Exception:
-        fragments, total = load_fragments(child, limit=limit)
-        return fragments, total, {"mode": "fallback"}
-    if not isinstance(index, dict) or not index:
-        fragments, total = load_fragments(child, limit=limit)
+        if owned_index is not None and hasattr(owned_index, "close"):
+            owned_index.close()
         return fragments, total, {"mode": "fallback"}
 
     inastate = _load_inastate(child)
@@ -1105,7 +1403,7 @@ def select_fragments_for_neural_map(
 
     candidates: List[Dict[str, Any]] = []
     for frag_id in candidate_ids:
-        meta = index.get(frag_id, {}) if isinstance(index, dict) else {}
+        meta = index.get(frag_id, {})
         path = _resolve_index_path(child, frag_id, meta)
         if path is None:
             continue
@@ -1207,6 +1505,8 @@ def select_fragments_for_neural_map(
         if slim:
             slim_fragments.append(slim)
 
+    if owned_index is not None and hasattr(owned_index, "close"):
+        owned_index.close()
     return slim_fragments, len(index), audit
 
 
@@ -1586,6 +1886,206 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
             })
     return clusters
 
+@dataclass(slots=True)
+class _SynapseRecord:
+    source: str
+    target: str
+    weight: float
+    direction: Optional[Tuple[float, float, float]] = None
+    relation: Optional[str] = None
+
+
+def _synapse_get(synapse: Any, key: str, default: Any = None) -> Any:
+    if isinstance(synapse, dict):
+        return synapse.get(key, default)
+    return getattr(synapse, key, default)
+
+
+def _synapse_sort_key(synapse: Any) -> Tuple[float, str, str]:
+    return (
+        _safe_float(_synapse_get(synapse, "weight"), 0.0),
+        str(_synapse_get(synapse, "source") or ""),
+        str(_synapse_get(synapse, "target") or ""),
+    )
+
+
+def _synapse_to_payload(synapse: Any) -> Dict[str, Any]:
+    payload = {
+        "source": _synapse_get(synapse, "source"),
+        "target": _synapse_get(synapse, "target"),
+        "weight": round(_safe_float(_synapse_get(synapse, "weight"), 0.0), 4),
+        "network_type": str(_synapse_get(synapse, "network_type", "memory_graph") or "memory_graph"),
+    }
+    direction = _synapse_get(synapse, "direction")
+    if direction is not None:
+        payload["direction"] = [round(float(value), 5) for value in direction[:3]]
+    relation = _synapse_get(synapse, "relation")
+    if relation:
+        payload["relation"] = str(relation)
+    return payload
+
+
+class _BoundedSynapseCollector:
+    def __init__(self, limit: Optional[int] = None) -> None:
+        self.limit = limit if isinstance(limit, int) and limit > 0 else 0
+        self._items: List[Any] = []
+        self._heap: List[Tuple[Tuple[float, str, str], int, Any]] = []
+        self._seen = 0
+        self._counter = 0
+
+    def add(self, synapse: Any) -> None:
+        if not synapse:
+            return
+        self._seen += 1
+        if self.limit <= 0:
+            self._items.append(synapse)
+            return
+        key = _synapse_sort_key(synapse)
+        entry = (key, self._counter, synapse)
+        self._counter += 1
+        if len(self._heap) < self.limit:
+            heapq.heappush(self._heap, entry)
+            return
+        if entry[0] > self._heap[0][0]:
+            heapq.heapreplace(self._heap, entry)
+
+    def extend(self, synapses: Iterable[Any]) -> None:
+        for synapse in synapses:
+            self.add(synapse)
+
+    @property
+    def pruned_count(self) -> int:
+        return max(0, self._seen - self.count)
+
+    @property
+    def count(self) -> int:
+        return len(self._heap) if self.limit > 0 else len(self._items)
+
+    def finalize(self) -> List[Any]:
+        if self.limit <= 0:
+            return list(self._items)
+        return [entry[2] for entry in sorted(self._heap, key=lambda item: item[0], reverse=True)]
+
+
+class _BoundedSynapseSpool:
+    def __init__(self, path: Path, limit: Optional[int] = None) -> None:
+        self.path = Path(path)
+        self.limit = limit if isinstance(limit, int) and limit > 0 else 0
+        self._heap: List[Tuple[Tuple[float, str, str], int, int]] = []
+        self._seen = 0
+        self._counter = 0
+        self._row_count = 0
+        self.conn: Optional[sqlite3.Connection] = None
+        self._cleanup_files()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path))
+        self.conn.execute("PRAGMA journal_mode=OFF")
+        self.conn.execute("PRAGMA synchronous=OFF")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS synapses ("
+            "row_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "sort_weight REAL NOT NULL, "
+            "sort_source TEXT NOT NULL, "
+            "sort_target TEXT NOT NULL, "
+            "payload TEXT NOT NULL)"
+        )
+
+    def _cleanup_files(self) -> None:
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            target = Path(str(self.path) + suffix)
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                continue
+
+    def _insert(self, synapse: Any, key: Tuple[float, str, str]) -> int:
+        if self.conn is None:
+            return 0
+        payload = json.dumps(_synapse_to_payload(synapse), ensure_ascii=False)
+        cursor = self.conn.execute(
+            "INSERT INTO synapses(sort_weight, sort_source, sort_target, payload) VALUES (?, ?, ?, ?)",
+            (float(key[0]), str(key[1]), str(key[2]), payload),
+        )
+        self._row_count += 1
+        return int(cursor.lastrowid or 0)
+
+    def _delete_row(self, row_id: int) -> None:
+        if self.conn is None or row_id <= 0:
+            return
+        self.conn.execute("DELETE FROM synapses WHERE row_id = ?", (int(row_id),))
+        self._row_count = max(0, self._row_count - 1)
+
+    def add(self, synapse: Any) -> None:
+        if not synapse:
+            return
+        self._seen += 1
+        key = _synapse_sort_key(synapse)
+        if self.limit <= 0:
+            self._insert(synapse, key)
+            return
+        if len(self._heap) < self.limit:
+            row_id = self._insert(synapse, key)
+            heapq.heappush(self._heap, (key, self._counter, row_id))
+            self._counter += 1
+            return
+        if key <= self._heap[0][0]:
+            self._counter += 1
+            return
+        row_id = self._insert(synapse, key)
+        _, _, dropped_row_id = heapq.heapreplace(self._heap, (key, self._counter, row_id))
+        self._counter += 1
+        self._delete_row(dropped_row_id)
+
+    def extend(self, synapses: Iterable[Any]) -> None:
+        for synapse in synapses:
+            self.add(synapse)
+
+    @property
+    def pruned_count(self) -> int:
+        return max(0, self._seen - self.count)
+
+    @property
+    def count(self) -> int:
+        return len(self._heap) if self.limit > 0 else self._row_count
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        return self.iter_sorted()
+
+    def iter_sorted(self) -> Iterable[Dict[str, Any]]:
+        if self.conn is None:
+            return
+        rows = self.conn.execute(
+            "SELECT payload FROM synapses ORDER BY sort_weight DESC, sort_source DESC, sort_target DESC, row_id DESC"
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row[0]) if row and row[0] else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                yield payload
+
+    def finalize(self):
+        if self.conn is not None:
+            self.conn.commit()
+        return self
+
+    def cleanup(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+        self._heap.clear()
+        self._row_count = 0
+        self._cleanup_files()
+
+
 def build_synaptic_links(
     neurons,
     threshold=0.91,
@@ -1594,14 +2094,23 @@ def build_synaptic_links(
     max_pairs: Optional[int] = None,
     max_edges_per_neuron: Optional[int] = None,
     include_direction: bool = True,
+    batch_size: Optional[int] = None,
+    compact_records: bool = False,
+    spool_path: Optional[Path] = None,
     return_stats: bool = False,
 ):
-    synapses = []
     pairs_evaluated = 0
     truncated = False
     edge_cap = max_edges if (isinstance(max_edges, int) and max_edges > 0) else None
     pair_cap = max_pairs if (isinstance(max_pairs, int) and max_pairs > 0) else None
     per_node_cap = max_edges_per_neuron if (isinstance(max_edges_per_neuron, int) and max_edges_per_neuron > 0) else None
+    emit_batch_size = batch_size if (isinstance(batch_size, int) and batch_size > 0) else 256
+    collector: Any
+    if spool_path is not None:
+        collector = _BoundedSynapseSpool(spool_path, edge_cap)
+    else:
+        collector = _BoundedSynapseCollector(edge_cap)
+    edge_batch: List[Any] = []
 
     for i, source in enumerate(neurons):
         source_edges = 0
@@ -1613,40 +2122,55 @@ def build_synaptic_links(
             if pair_cap is not None and pairs_evaluated >= pair_cap:
                 truncated = True
                 break
-            if edge_cap is not None and len(synapses) >= edge_cap:
-                truncated = True
-                break
             pairs_evaluated += 1
             vec_a = source.get("vector")
             vec_b = target.get("vector")
             if vec_a and vec_b:
                 sim = cosine_similarity(vec_a, vec_b)
                 if sim >= threshold:
-                    payload = {
-                        "source": source["id"],
-                        "target": target["id"],
-                        "weight": round(sim, 4),
-                        "network_type": "memory_graph",
-                    }
+                    direction = None
                     if include_direction:
-                        direction = None
                         pos_a = source.get("position")
                         pos_b = target.get("position")
                         if pos_a and pos_b:
                             delta = [pos_b[k] - pos_a[k] for k in range(3)]
                             norm = math.sqrt(sum(d * d for d in delta))
                             if norm > 1e-6:
-                                direction = [round(d / norm, 5) for d in delta]
-                        payload["direction"] = direction
-                    synapses.append(payload)
+                                direction = tuple(round(d / norm, 5) for d in delta)
+                    if compact_records:
+                        payload = _SynapseRecord(
+                            source=str(source["id"]),
+                            target=str(target["id"]),
+                            weight=round(sim, 4),
+                            direction=direction,
+                        )
+                    else:
+                        payload = {
+                            "source": source["id"],
+                            "target": target["id"],
+                            "weight": round(sim, 4),
+                            "network_type": "memory_graph",
+                        }
+                        if include_direction:
+                            payload["direction"] = list(direction) if direction is not None else None
+                    edge_batch.append(payload)
                     source_edges += 1
+                    if len(edge_batch) >= emit_batch_size:
+                        collector.extend(edge_batch)
+                        edge_batch.clear()
         if truncated:
             break
+    if edge_batch:
+        collector.extend(edge_batch)
+    synapses = collector.finalize()
+    if edge_cap is not None and collector.pruned_count > 0:
+        truncated = True
     if return_stats:
         return synapses, {
             "pairs_evaluated": pairs_evaluated,
             "edge_count": len(synapses),
             "truncated": truncated,
+            "budget_pruned": collector.pruned_count,
         }
     return synapses
 
@@ -1677,6 +2201,34 @@ def _save_neural_map(child: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, fh, indent=4)
 
 
+def _atomic_write_json_stream(path: Path, write_fn) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            write_fn(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _write_json_array_stream(handle, items: Iterable[Any]) -> None:
+    handle.write("[")
+    first = True
+    for item in items:
+        if not first:
+            handle.write(",")
+        json.dump(item, handle, ensure_ascii=False)
+        first = False
+    handle.write("]")
+
+
 def _neural_build_state_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "neural" / "neural_build_state.json"
 
@@ -1689,8 +2241,20 @@ def _neural_snapshot_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_snapshot_csr.json"
 
 
+def _neural_spill_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_spill.sqlite"
+
+
+def _neural_synapse_spool_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / "neural_synapse_spool.sqlite"
+
+
 def _custom_transformer_usage_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "neural" / "custom_transformer_usage.json"
+
+
+def _memory_index_db_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "memory_map.sqlite"
 
 
 def _load_json_dict(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
@@ -1711,6 +2275,426 @@ def _save_json_dict(path: Path, payload: Dict[str, Any]) -> None:
             json.dump(payload, fh, indent=2)
     except Exception:
         return
+
+
+def _quantize_sequence(values: Optional[Iterable[Any]], bits: int) -> Optional[Dict[str, Any]]:
+    if values is None:
+        return None
+    raw = []
+    for value in values:
+        try:
+            raw.append(float(value))
+        except (TypeError, ValueError):
+            raw.append(0.0)
+    if not raw:
+        return None
+    qmax = (2 ** (bits - 1)) - 1
+    max_abs = max(abs(value) for value in raw)
+    if max_abs <= 1e-12:
+        return {"bits": bits, "scale": 1.0, "values": [0 for _ in raw]}
+    scale = max_abs / float(qmax)
+    quantized = [int(max(-qmax, min(qmax, round(value / scale)))) for value in raw]
+    return {"bits": bits, "scale": round(scale, 8), "values": quantized}
+
+
+def _dequantize_sequence(payload: Any) -> List[float]:
+    if isinstance(payload, list):
+        return [float(value) for value in payload]
+    if not isinstance(payload, dict):
+        return []
+    values = payload.get("values") if isinstance(payload.get("values"), list) else []
+    scale = _safe_float(payload.get("scale"), 1.0)
+    if abs(scale) <= 1e-12:
+        scale = 1.0
+    return [round(_safe_float(value, 0.0) * scale, 6) for value in values]
+
+
+_SPILL_HIGH_IMPORTANCE_TAGS = {
+    "care", "emotion", "feeling", "heart", "trauma", "shadow", "unresolved", "high_conflict",
+    "bond", "attachment", "love", "grief", "memory", "identity", "core",
+}
+
+
+_SPILL_MEDIUM_IMPORTANCE_TAGS = {
+    "intensity", "stress", "risk", "fear", "hope", "joy", "pain", "voice", "vision", "meaning",
+}
+
+
+def _spill_importance_score(neuron: Dict[str, Any]) -> float:
+    tags = {str(tag).lower() for tag in (neuron.get("tags") or []) if tag}
+    tag_score = 0.0
+    if tags & _SPILL_HIGH_IMPORTANCE_TAGS:
+        tag_score = 1.0
+    elif tags & _SPILL_MEDIUM_IMPORTANCE_TAGS:
+        tag_score = 0.6
+    symbolic_score = _clamp(abs(_safe_float(neuron.get("symbolic_density"), 0.0)), 0.0, 1.0)
+    activation_history = [abs(_safe_float(value, 0.0)) for value in (neuron.get("activation_history") or []) if isinstance(value, (int, float))]
+    activation_score = _clamp(max(activation_history) if activation_history else 0.0, 0.0, 1.0)
+    fragment_score = _clamp(len(neuron.get("fragments", []) or []) / 64.0, 0.0, 1.0)
+    reuse_score = _clamp(_safe_float(neuron.get("spill_reuse_count"), 0.0) / 3.0, 0.0, 1.0)
+    return _clamp(
+        (0.35 * tag_score)
+        + (0.2 * symbolic_score)
+        + (0.15 * activation_score)
+        + (0.15 * fragment_score)
+        + (0.15 * reuse_score),
+        0.0,
+        1.0,
+    )
+
+
+def _spill_precision_level(neuron: Dict[str, Any], policy: Dict[str, Any]) -> str:
+    mode = str(policy.get("spill_precision_mode", "adaptive") or "adaptive").strip().lower()
+    if mode in {"float", "int16", "int8"}:
+        return mode
+    score = _spill_importance_score(neuron)
+    high = _safe_float(policy.get("spill_high_precision_threshold"), 0.68)
+    medium = _safe_float(policy.get("spill_medium_precision_threshold"), 0.35)
+    if score >= high:
+        return "float"
+    if score >= medium:
+        return "int16"
+    return "int8"
+
+
+def _encode_spilled_neuron(neuron: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(neuron)
+    precision = _spill_precision_level(payload, policy)
+    payload["spill_precision"] = precision
+    vector_digits = int(policy.get("vector_round_digits", 6))
+    pos_digits = int(policy.get("position_round_digits", 4))
+    if precision == "float":
+        payload["vector"] = _round_vector(payload.get("vector"), vector_digits)
+        payload["position"] = _round_vector(payload.get("position"), pos_digits)
+    else:
+        bits = 16 if precision == "int16" else 8
+        vector_q = _quantize_sequence(payload.pop("vector", None), bits)
+        position_q = _quantize_sequence(payload.pop("position", None), bits)
+        if vector_q is not None:
+            payload["vector_q"] = vector_q
+        if position_q is not None:
+            payload["position_q"] = position_q
+    return payload
+
+
+def _decode_spilled_neuron(payload: Dict[str, Any]) -> Dict[str, Any]:
+    neuron = dict(payload)
+    neuron.pop("spill_precision", None)
+    vector_q = neuron.pop("vector_q", None)
+    position_q = neuron.pop("position_q", None)
+    if vector_q is not None:
+        neuron["vector"] = _dequantize_sequence(vector_q)
+    if position_q is not None:
+        neuron["position"] = _dequantize_sequence(position_q)
+    return neuron
+
+
+def _lightweight_neuron_view(neuron: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": neuron.get("id"),
+        "vector": list(neuron.get("vector") or []),
+        "position": list(neuron.get("position") or []),
+    }
+
+
+def _dense_float_array(values: Optional[Iterable[Any]]) -> array:
+    dense = array("f")
+    if values is None:
+        return dense
+    for value in values:
+        dense.append(float(_safe_float(value, 0.0)))
+    return dense
+
+
+class _NeuralSpillStore:
+    def __init__(self, child: str, policy: Dict[str, Any]) -> None:
+        self.child = child
+        self.policy = policy if isinstance(policy, dict) else {}
+        self.enabled = bool(self.policy.get("spill_to_disk_enabled", False))
+        self.max_hot_neurons = max(0, int(self.policy.get("max_hot_neurons", 0) or 0))
+        self.spill_after_batches = max(0, int(self.policy.get("spill_after_batches", 0) or 0))
+        self.path = _neural_spill_path(child)
+        self.conn: Optional[sqlite3.Connection] = None
+        self.meta: Dict[str, Dict[str, Any]] = {}
+        if not self.enabled or self.max_hot_neurons <= 0:
+            self.enabled = False
+            return
+        self._cleanup_files()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path))
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS spill_neurons ("
+            "node_id TEXT PRIMARY KEY, "
+            "payload TEXT NOT NULL, "
+            "last_used REAL DEFAULT 0.0, "
+            "fragment_count INTEGER DEFAULT 0)"
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS spill_fragments ("
+            "fragment_id TEXT PRIMARY KEY, "
+            "node_id TEXT NOT NULL)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_spill_fragments_node_id ON spill_fragments(node_id)"
+        )
+        self.conn.commit()
+
+    def _cleanup_files(self) -> None:
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            target = Path(str(self.path) + suffix)
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _chunks(values: Iterable[str], size: int = 250) -> Iterable[List[str]]:
+        batch: List[str] = []
+        for value in values:
+            if not value:
+                continue
+            batch.append(str(value))
+            if len(batch) >= size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    @staticmethod
+    def _spill_sort_key(neuron: Dict[str, Any]) -> Tuple[float, int, str]:
+        last_used_ts = _parse_iso_timestamp(neuron.get("last_used")) or 0.0
+        fragment_count = len(neuron.get("fragments", []) or [])
+        return (last_used_ts, -fragment_count, str(neuron.get("id") or ""))
+
+    @staticmethod
+    def _meta_from_neuron(neuron: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(neuron.get("id") or ""),
+            "vector": _dense_float_array(neuron.get("vector")),
+            "position": _dense_float_array(neuron.get("position")),
+            "tags": tuple(str(tag) for tag in (neuron.get("tags") or []) if tag),
+            "region": str(neuron.get("region") or ""),
+            "last_used_ts": _parse_iso_timestamp(neuron.get("last_used")) or 0.0,
+            "fragment_count": len(neuron.get("fragments", []) or []),
+            "reuse_count": int(_safe_float(neuron.get("spill_reuse_count"), 0.0)),
+        }
+
+    def count(self) -> int:
+        return len(self.meta)
+
+    def has_spills(self) -> bool:
+        return bool(self.meta)
+
+    def node_ids(self) -> List[str]:
+        return list(self.meta.keys())
+
+    def scored_entries(self) -> List[Tuple[str, int, float]]:
+        return [
+            (
+                node_id,
+                int(meta.get("fragment_count", 0) or 0),
+                float(meta.get("last_used_ts", 0.0) or 0.0),
+            )
+            for node_id, meta in self.meta.items()
+        ]
+
+    def _store_neurons(self, neurons: List[Dict[str, Any]]) -> int:
+        if not self.enabled or self.conn is None or not neurons:
+            return 0
+        payload_rows: List[Tuple[str, str, float, int]] = []
+        fragment_rows: List[Tuple[str, str]] = []
+        node_ids: List[str] = []
+        for neuron in neurons:
+            node_id = str(neuron.get("id") or "").strip()
+            if not node_id:
+                continue
+            meta = self._meta_from_neuron(neuron)
+            encoded = _encode_spilled_neuron(neuron, self.policy)
+            payload_rows.append(
+                (
+                    node_id,
+                    json.dumps(encoded, ensure_ascii=False),
+                    float(meta.get("last_used_ts", 0.0) or 0.0),
+                    int(meta.get("fragment_count", 0) or 0),
+                )
+            )
+            node_ids.append(node_id)
+            self.meta[node_id] = meta
+            for fragment_id in neuron.get("fragments", []) or []:
+                if fragment_id:
+                    fragment_rows.append((str(fragment_id), node_id))
+        if not payload_rows:
+            return 0
+        with self.conn:
+            self.conn.executemany("DELETE FROM spill_fragments WHERE node_id = ?", [(node_id,) for node_id in node_ids])
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO spill_neurons(node_id, payload, last_used, fragment_count) VALUES (?, ?, ?, ?)",
+                payload_rows,
+            )
+            if fragment_rows:
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO spill_fragments(fragment_id, node_id) VALUES (?, ?)",
+                    fragment_rows,
+                )
+        return len(payload_rows)
+
+    def spill_overflow(self, neurons: List[Dict[str, Any]]) -> int:
+        if not self.enabled or self.conn is None or self.max_hot_neurons <= 0:
+            return 0
+        if len(neurons) <= self.max_hot_neurons:
+            return 0
+        overflow = len(neurons) - self.max_hot_neurons
+        scored = [
+            (self._spill_sort_key(neuron), idx, neuron)
+            for idx, neuron in enumerate(neurons)
+            if neuron.get("id")
+        ]
+        if not scored:
+            return 0
+        scored.sort(key=lambda item: item[0])
+        selected = scored[:overflow]
+        drop_indices = {idx for _, idx, _ in selected}
+        spill_list = [neuron for _, _, neuron in selected]
+        spilled = self._store_neurons(spill_list)
+        if spilled:
+            neurons[:] = [neuron for idx, neuron in enumerate(neurons) if idx not in drop_indices]
+        return spilled
+
+    def maybe_flush(self, neurons: List[Dict[str, Any]], batches_run: int) -> int:
+        if not self.enabled or self.spill_after_batches <= 0:
+            return 0
+        if batches_run <= 0 or (batches_run % self.spill_after_batches) != 0:
+            return 0
+        return self.spill_overflow(neurons)
+
+    def best_match(self, candidate: Dict[str, Any], tag_weight: float) -> Tuple[Optional[str], float]:
+        if not self.enabled or not self.meta:
+            return None, 0.0
+        best_id: Optional[str] = None
+        best_score = 0.0
+        for node_id, meta in self.meta.items():
+            score = _score_candidate_match(meta, candidate, tag_weight)
+            if score > best_score:
+                best_id = node_id
+                best_score = score
+        return best_id, best_score
+
+    def _remove_node_ids(self, node_ids: List[str]) -> Set[str]:
+        removed_fragments: Set[str] = set()
+        if not self.enabled or self.conn is None or not node_ids:
+            return removed_fragments
+        unique_ids = [node_id for node_id in dict.fromkeys(node_ids) if node_id]
+        if not unique_ids:
+            return removed_fragments
+        for chunk in self._chunks(unique_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT fragment_id FROM spill_fragments WHERE node_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            removed_fragments.update(str(row[0]) for row in rows if row and row[0])
+            with self.conn:
+                self.conn.execute(f"DELETE FROM spill_neurons WHERE node_id IN ({placeholders})", chunk)
+                self.conn.execute(f"DELETE FROM spill_fragments WHERE node_id IN ({placeholders})", chunk)
+        for node_id in unique_ids:
+            self.meta.pop(node_id, None)
+        return removed_fragments
+
+    def drop_nodes(self, node_ids: List[str]) -> Set[str]:
+        return self._remove_node_ids(node_ids)
+
+    def activate_node(self, node_id: str, neurons: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not self.enabled or self.conn is None or not node_id:
+            return None
+        meta = self.meta.get(str(node_id), {})
+        row = self.conn.execute("SELECT payload FROM spill_neurons WHERE node_id = ?", (str(node_id),)).fetchone()
+        if not row or not row[0]:
+            self.meta.pop(str(node_id), None)
+            return None
+        try:
+            payload = json.loads(row[0])
+        except Exception:
+            payload = None
+        self._remove_node_ids([str(node_id)])
+        if isinstance(payload, dict):
+            neuron = _decode_spilled_neuron(payload)
+            neuron["spill_reuse_count"] = int(_safe_float(meta.get("reuse_count"), _safe_float(neuron.get("spill_reuse_count"), 0.0))) + 1
+            neurons.append(neuron)
+            return neuron
+        return None
+
+    def activate_for_fragments(self, fragment_ids: Set[str], neurons: List[Dict[str, Any]]) -> int:
+        if not self.enabled or self.conn is None or not fragment_ids:
+            return 0
+        node_ids: List[str] = []
+        seen: Set[str] = set()
+        for chunk in self._chunks(fragment_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT DISTINCT node_id FROM spill_fragments WHERE fragment_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                node_id = str(row[0]) if row and row[0] else ""
+                if node_id and node_id not in seen:
+                    seen.add(node_id)
+                    node_ids.append(node_id)
+        activated = 0
+        for node_id in node_ids:
+            if self.activate_node(node_id, neurons):
+                activated += 1
+        return activated
+
+    def iter_storage_neurons(self, hot_neurons: List[Dict[str, Any]], policy: Dict[str, Any], *, compact: bool) -> Iterable[Dict[str, Any]]:
+        for neuron in hot_neurons:
+            yield _compact_neuron_for_storage(neuron, policy) if compact else neuron
+        if not self.enabled or self.conn is None or not self.meta:
+            return
+        rows = self.conn.execute("SELECT payload FROM spill_neurons ORDER BY node_id")
+        for row in rows:
+            try:
+                payload = json.loads(row[0]) if row and row[0] else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                neuron = _decode_spilled_neuron(payload)
+                yield _compact_neuron_for_storage(neuron, policy) if compact else neuron
+
+    def iter_link_neurons(self) -> Iterable[Dict[str, Any]]:
+        if not self.enabled or not self.meta:
+            return
+        for node_id in sorted(self.meta.keys()):
+            meta = self.meta.get(node_id) or {}
+            yield {
+                "id": node_id,
+                "vector": meta.get("vector") or array("f"),
+                "position": meta.get("position") or array("f"),
+            }
+
+    def materialize_all(self, neurons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not self.enabled or self.conn is None or not self.meta:
+            return list(neurons)
+        materialized = list(neurons)
+        rows = self.conn.execute("SELECT payload FROM spill_neurons ORDER BY node_id")
+        for row in rows:
+            try:
+                payload = json.loads(row[0]) if row and row[0] else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                materialized.append(_decode_spilled_neuron(payload))
+        return materialized
+
+    def cleanup(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+        self.meta.clear()
+        self._cleanup_files()
 
 
 class _NeuralCustomTransformerRuntime:
@@ -2014,7 +2998,169 @@ def _save_neural_dirty_index(child: str, signatures: Dict[str, str]) -> None:
     _save_json_dict(_neural_dirty_index_path(child), payload)
 
 
-def _load_memory_index(child: str) -> Dict[str, Any]:
+def _persist_memory_index_db(child: str, index_data: Dict[str, Any], *, source_mtime_ns: Optional[int] = None) -> None:
+    db_path = _memory_index_db_path(child)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS fragments (frag_id TEXT PRIMARY KEY, tier TEXT, filename TEXT, last_seen TEXT, timestamp TEXT, importance REAL, mtime_ns INTEGER, size_bytes INTEGER, tags_json TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        rows = []
+        for frag_id, meta in index_data.items():
+            if not frag_id or not isinstance(meta, dict):
+                continue
+            tags = meta.get("tags") if isinstance(meta.get("tags"), list) else []
+            rows.append((
+                str(frag_id),
+                str(meta.get("tier") or ""),
+                str(meta.get("filename") or ""),
+                str(meta.get("last_seen") or ""),
+                str(meta.get("timestamp") or ""),
+                float(_safe_float(meta.get("importance"), 0.0)),
+                int(_safe_float(meta.get("mtime_ns"), 0.0)),
+                int(_safe_float(meta.get("size_bytes"), 0.0)),
+                json.dumps([str(tag) for tag in tags if tag], ensure_ascii=False),
+            ))
+        with conn:
+            conn.execute("DELETE FROM fragments")
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO fragments(frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('source_mtime_ns', ?)", (str(int(source_mtime_ns or 0)),))
+    finally:
+        conn.close()
+
+
+class _MemoryIndexStore:
+    def __init__(self, child: str) -> None:
+        self.child = child
+        self.json_path = Path("AI_Children") / child / "memory" / "memory_map.json"
+        self.db_path = _memory_index_db_path(child)
+        self.conn: Optional[sqlite3.Connection] = None
+        self._count = 0
+        if not self.json_path.exists() and not self.db_path.exists():
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fragments (frag_id TEXT PRIMARY KEY, tier TEXT, filename TEXT, last_seen TEXT, timestamp TEXT, importance REAL, mtime_ns INTEGER, size_bytes INTEGER, tags_json TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        self._ensure_current()
+        row = self.conn.execute("SELECT COUNT(*) FROM fragments").fetchone()
+        self._count = int(row[0] or 0) if row else 0
+
+    def _meta_value(self, key: str) -> Optional[str]:
+        if self.conn is None:
+            return None
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (str(key),)).fetchone()
+        return str(row[0]) if row and row[0] is not None else None
+
+    def _ensure_current(self) -> None:
+        if self.conn is None or not self.json_path.exists():
+            return
+        try:
+            source_mtime_ns = int(self.json_path.stat().st_mtime_ns)
+        except OSError:
+            return
+        current = self._meta_value("source_mtime_ns")
+        row = self.conn.execute("SELECT 1 FROM fragments LIMIT 1").fetchone()
+        if current == str(source_mtime_ns) and row is not None:
+            return
+        try:
+            with self.json_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return
+        if isinstance(payload, dict):
+            _persist_memory_index_db(self.child, payload, source_mtime_ns=source_mtime_ns)
+            self.close()
+            self.conn = sqlite3.connect(str(self.db_path))
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+
+    def __len__(self) -> int:
+        return int(self._count)
+
+    def __bool__(self) -> bool:
+        return self._count > 0
+
+    @staticmethod
+    def _row_to_meta(row: Any) -> Dict[str, Any]:
+        if not row:
+            return {}
+        tags = []
+        try:
+            payload = json.loads(row[8]) if row[8] else []
+            if isinstance(payload, list):
+                tags = [str(tag) for tag in payload if tag]
+        except Exception:
+            tags = []
+        meta = {
+            "tier": str(row[1] or "") or None,
+            "filename": str(row[2] or "") or None,
+            "last_seen": str(row[3] or "") or None,
+            "timestamp": str(row[4] or "") or None,
+            "importance": float(_safe_float(row[5], 0.0)),
+            "mtime_ns": int(_safe_float(row[6], 0.0)),
+            "size_bytes": int(_safe_float(row[7], 0.0)),
+            "tags": tags,
+        }
+        return {key: value for key, value in meta.items() if value not in (None, "", [])}
+
+    def get(self, frag_id: str, default: Any = None) -> Any:
+        if self.conn is None or not frag_id:
+            return default
+        row = self.conn.execute(
+            "SELECT frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json FROM fragments WHERE frag_id = ?",
+            (str(frag_id),),
+        ).fetchone()
+        if not row:
+            return default
+        return self._row_to_meta(row)
+
+    def __contains__(self, frag_id: object) -> bool:
+        if self.conn is None or not frag_id:
+            return False
+        row = self.conn.execute("SELECT 1 FROM fragments WHERE frag_id = ? LIMIT 1", (str(frag_id),)).fetchone()
+        return bool(row)
+
+    def items(self) -> Iterable[Tuple[str, Dict[str, Any]]]:
+        if self.conn is None:
+            return []
+        cursor = self.conn.execute(
+            "SELECT frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json FROM fragments"
+        )
+        for row in cursor:
+            yield str(row[0]), self._row_to_meta(row)
+
+    def keys(self) -> Iterable[str]:
+        if self.conn is None:
+            return []
+        cursor = self.conn.execute("SELECT frag_id FROM fragments")
+        for row in cursor:
+            if row and row[0]:
+                yield str(row[0])
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def _load_memory_index(child: str) -> Any:
+    store = _MemoryIndexStore(child)
+    if store:
+        return store
+    if store.conn is not None:
+        store.close()
     path = Path("AI_Children") / child / "memory" / "memory_map.json"
     if not path.exists():
         return {}
@@ -2046,27 +3192,29 @@ def _fragment_signature(child: str, frag_id: str, meta: Dict[str, Any]) -> Optio
 
 def _collect_dirty_fragment_ids(
     child: str,
-    index: Dict[str, Any],
+    index: Any,
     previous_signatures: Dict[str, str],
 ) -> Tuple[List[str], Dict[str, str], Set[str]]:
     dirty: List[str] = []
-    current: Dict[str, str] = {}
+    changed: Dict[str, str] = {}
+    seen: Set[str] = set()
     for frag_id, meta in index.items():
         if not frag_id or not isinstance(meta, dict):
             continue
+        seen.add(str(frag_id))
         signature = _fragment_signature(child, frag_id, meta)
         if not signature:
             continue
-        current[frag_id] = signature
         if previous_signatures.get(frag_id) != signature:
             dirty.append(frag_id)
-    removed = {fid for fid in previous_signatures.keys() if fid not in current}
-    return dirty, current, removed
+            changed[frag_id] = signature
+    removed = {fid for fid in previous_signatures.keys() if fid not in seen}
+    return dirty, changed, removed
 
 
 def _prune_neurons_to_valid_fragments(
     neurons: List[Dict[str, Any]],
-    valid_ids: Set[str],
+    valid_ids: Any,
 ) -> Tuple[int, int]:
     pruned_refs = 0
     pruned_neurons = 0
@@ -2095,14 +3243,18 @@ def _apply_neuron_caps(neurons: List[Dict[str, Any]], policy: Dict[str, Any]) ->
     changes = 0
     for neuron in neurons:
         original_fragments = list(neuron.get("fragments", []))
-        clipped_fragments = _clip_sequence(original_fragments, frag_limit)
+        clipped_fragments = _clip_sequence_with_anchors(
+            original_fragments,
+            frag_limit,
+            int(policy.get("fragment_anchor_count", 0)),
+        )
         if clipped_fragments != original_fragments:
             neuron["fragments"] = clipped_fragments
             changes += 1
 
         original_tags = [str(tag) for tag in neuron.get("tags", []) if tag]
-        unique_tags = sorted(set(original_tags))
-        clipped_tags = unique_tags[-tag_limit:] if tag_limit > 0 else unique_tags
+        unique_tags = list(dict.fromkeys(original_tags))
+        clipped_tags = _clip_sequence_with_anchors(unique_tags, tag_limit, int(policy.get("tag_anchor_count", 0)))
         if clipped_tags != original_tags:
             neuron["tags"] = clipped_tags
             changes += 1
@@ -2136,16 +3288,56 @@ def _enforce_neuron_budget(neurons: List[Dict[str, Any]], max_neurons_total: int
     return overflow
 
 
-def _enforce_synapse_budget(synapses: List[Dict[str, Any]], max_synapses_total: int) -> int:
+def _enforce_total_neuron_budget(
+    neurons: List[Dict[str, Any]],
+    max_neurons_total: int,
+    spill_store: Optional[_NeuralSpillStore] = None,
+) -> Tuple[int, Set[str]]:
+    if max_neurons_total <= 0:
+        return 0, set()
+    spill_entries = spill_store.scored_entries() if spill_store is not None else []
+    total_neurons = len(neurons) + len(spill_entries)
+    if total_neurons <= max_neurons_total:
+        return 0, set()
+    overflow = total_neurons - max_neurons_total
+    scored: List[Tuple[int, float, str, Any]] = []
+    for idx, neuron in enumerate(neurons):
+        fragment_ids = [str(fid) for fid in (neuron.get("fragments", []) or []) if fid]
+        fragment_count = len(fragment_ids)
+        last_used_ts = _parse_iso_timestamp(neuron.get("last_used")) or 0.0
+        scored.append((fragment_count, last_used_ts, "hot", (idx, fragment_ids)))
+    for node_id, fragment_count, last_used_ts in spill_entries:
+        scored.append((fragment_count, last_used_ts, "spill", str(node_id)))
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    hot_drop_indices: Set[int] = set()
+    spill_drop_ids: List[str] = []
+    removed_fragments: Set[str] = set()
+    for _, _, kind, payload in scored[:overflow]:
+        if kind == "hot":
+            idx, fragment_ids = payload
+            hot_drop_indices.add(idx)
+            removed_fragments.update(fragment_ids)
+        else:
+            spill_drop_ids.append(str(payload))
+    if hot_drop_indices:
+        neurons[:] = [neuron for idx, neuron in enumerate(neurons) if idx not in hot_drop_indices]
+    if spill_drop_ids and spill_store is not None:
+        removed_fragments.update(spill_store.drop_nodes(spill_drop_ids))
+    return overflow, removed_fragments
+
+
+def _enforce_synapse_budget(synapses: Any, max_synapses_total: int) -> int:
     if max_synapses_total <= 0:
+        return 0
+    if isinstance(synapses, _BoundedSynapseSpool):
         return 0
     if len(synapses) <= max_synapses_total:
         return 0
     synapses.sort(
         key=lambda synapse: (
-            _safe_float(synapse.get("weight"), 0.0),
-            str(synapse.get("source") or ""),
-            str(synapse.get("target") or ""),
+            _safe_float(_synapse_get(synapse, "weight"), 0.0),
+            str(_synapse_get(synapse, "source") or ""),
+            str(_synapse_get(synapse, "target") or ""),
         ),
         reverse=True,
     )
@@ -2154,8 +3346,52 @@ def _enforce_synapse_budget(synapses: List[Dict[str, Any]], max_synapses_total: 
     return overflow
 
 
-def _pending_fragment_sort_key(fragment_id: str, index: Dict[str, Any]) -> Tuple[float, float]:
-    meta = index.get(fragment_id, {}) if isinstance(index, dict) else {}
+def _apply_synapse_connection_caps(synapses: Any, policy: Dict[str, Any]) -> Tuple[Any, Dict[str, int]]:
+    max_degree = int(policy.get("max_connection_degree", 0) or 0)
+    min_weight = _safe_float(policy.get("min_synapse_weight"), 0.0)
+    if max_degree <= 0 and min_weight <= 0.0:
+        return synapses, {"weight_pruned": 0, "degree_pruned": 0}
+
+    if isinstance(synapses, _BoundedSynapseSpool):
+        ordered = synapses.iter_sorted()
+    else:
+        synapses.sort(
+            key=lambda synapse: (
+                _safe_float(_synapse_get(synapse, "weight"), 0.0),
+                str(_synapse_get(synapse, "source") or ""),
+                str(_synapse_get(synapse, "target") or ""),
+            ),
+            reverse=True,
+        )
+        ordered = synapses
+
+    kept: List[Any] = []
+    degree: Dict[str, int] = {}
+    weight_pruned = 0
+    degree_pruned = 0
+    for synapse in ordered:
+        source = str(_synapse_get(synapse, "source") or "")
+        target = str(_synapse_get(synapse, "target") or "")
+        if not source or not target:
+            continue
+        weight = _safe_float(_synapse_get(synapse, "weight"), 0.0)
+        if min_weight > 0.0 and weight < min_weight:
+            weight_pruned += 1
+            continue
+        if max_degree > 0 and (degree.get(source, 0) >= max_degree or degree.get(target, 0) >= max_degree):
+            degree_pruned += 1
+            continue
+        kept.append(synapse)
+        degree[source] = degree.get(source, 0) + 1
+        degree[target] = degree.get(target, 0) + 1
+
+    if isinstance(synapses, _BoundedSynapseSpool):
+        synapses.cleanup()
+    return kept, {"weight_pruned": weight_pruned, "degree_pruned": degree_pruned}
+
+
+def _pending_fragment_sort_key(fragment_id: str, index: Any) -> Tuple[float, float]:
+    meta = index.get(fragment_id, {})
     ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp")) or 0.0
     importance = _safe_float(meta.get("importance"), 0.0)
     return ts, importance
@@ -2163,7 +3399,7 @@ def _pending_fragment_sort_key(fragment_id: str, index: Dict[str, Any]) -> Tuple
 
 def _trim_pending_fragment_ids(
     fragment_ids: Iterable[str],
-    index: Dict[str, Any],
+    index: Any,
     max_pending_dirty_fragments: int,
 ) -> Tuple[List[str], int]:
     deduped = [str(fragment_id) for fragment_id in dict.fromkeys(fragment_ids) if fragment_id]
@@ -2209,7 +3445,7 @@ def _detach_neurons_for_dirty_rebuild(
 def _load_fragments_by_id(
     child: str,
     fragment_ids: List[str],
-    index: Dict[str, Any],
+    index: Any,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     loaded: List[Dict[str, Any]] = []
     missing: List[str] = []
@@ -2234,37 +3470,157 @@ def _load_fragments_by_id(
     return loaded, missing
 
 
-def _save_sparse_snapshot(child: str, neurons: List[Dict[str, Any]], synapses: List[Dict[str, Any]]) -> None:
-    node_ids = [str(neuron.get("id")) for neuron in neurons if neuron.get("id")]
+def _snapshot_synapse_sort_key(synapse: Any, node_to_index: Dict[str, int]) -> Tuple[int, int, int]:
+    source = node_to_index.get(str(_synapse_get(synapse, "source")))
+    target = node_to_index.get(str(_synapse_get(synapse, "target")))
+    if source is None or target is None:
+        return (1, 0, 0)
+    return (0, source, target)
+
+
+def _save_sparse_snapshot_by_ids(child: str, node_ids: List[str], synapses: Any) -> None:
+    path = _neural_snapshot_path(child)
     node_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
-    rows: Dict[int, List[Tuple[int, float]]] = {}
-    for synapse in synapses:
-        source = node_to_index.get(str(synapse.get("source")))
-        target = node_to_index.get(str(synapse.get("target")))
-        if source is None or target is None:
-            continue
-        weight = _safe_float(synapse.get("weight"), 0.0)
-        rows.setdefault(source, []).append((target, round(weight, 4)))
-    indptr: List[int] = [0]
-    indices: List[int] = []
-    weights: List[float] = []
-    for row_idx in range(len(node_ids)):
-        edges = rows.get(row_idx, [])
-        edges.sort(key=lambda item: item[0])
-        for target_idx, weight in edges:
-            indices.append(int(target_idx))
-            weights.append(weight)
-        indptr.append(len(indices))
-    payload = {
-        "format": "csr_v1",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "node_ids": node_ids,
-        "indptr": indptr,
-        "indices": indices,
-        "weights": weights,
-        "edge_count": len(indices),
-    }
-    _save_json_dict(_neural_snapshot_path(child), payload)
+    row_counts = [0 for _ in node_ids]
+    edge_count = 0
+
+    snapshot_edges: Optional[List[Tuple[int, int, float]]] = None
+    if isinstance(synapses, _BoundedSynapseSpool):
+        snapshot_edges = []
+        for synapse in synapses.iter_sorted():
+            source = node_to_index.get(str(_synapse_get(synapse, "source")))
+            target = node_to_index.get(str(_synapse_get(synapse, "target")))
+            if source is None or target is None:
+                continue
+            snapshot_edges.append((int(source), int(target), round(_safe_float(_synapse_get(synapse, "weight"), 0.0), 4)))
+        snapshot_edges.sort()
+        edge_count = len(snapshot_edges)
+        for source, _, _ in snapshot_edges:
+            row_counts[source] += 1
+    elif synapses:
+        synapses.sort(key=lambda synapse: _snapshot_synapse_sort_key(synapse, node_to_index))
+        for synapse in synapses:
+            source = node_to_index.get(str(_synapse_get(synapse, "source")))
+            target = node_to_index.get(str(_synapse_get(synapse, "target")))
+            if source is None or target is None:
+                continue
+            row_counts[source] += 1
+            edge_count += 1
+
+    def _iter_indptr() -> Iterable[int]:
+        running = 0
+        yield 0
+        for count in row_counts:
+            running += int(count)
+            yield running
+
+    def _iter_indices() -> Iterable[int]:
+        if snapshot_edges is not None:
+            for _, target, _ in snapshot_edges:
+                yield int(target)
+            return
+        for synapse in synapses:
+            source = node_to_index.get(str(_synapse_get(synapse, "source")))
+            target = node_to_index.get(str(_synapse_get(synapse, "target")))
+            if source is None or target is None:
+                continue
+            yield int(target)
+
+    def _iter_weights() -> Iterable[float]:
+        if snapshot_edges is not None:
+            for _, _, weight in snapshot_edges:
+                yield float(weight)
+            return
+        for synapse in synapses:
+            source = node_to_index.get(str(_synapse_get(synapse, "source")))
+            target = node_to_index.get(str(_synapse_get(synapse, "target")))
+            if source is None or target is None:
+                continue
+            yield round(_safe_float(_synapse_get(synapse, "weight"), 0.0), 4)
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    def _write(handle) -> None:
+        handle.write("{")
+        handle.write(json.dumps("format"))
+        handle.write(":")
+        json.dump("csr_v1", handle, ensure_ascii=False)
+        handle.write(",")
+        handle.write(json.dumps("updated_at"))
+        handle.write(":")
+        json.dump(updated_at, handle, ensure_ascii=False)
+        handle.write(",")
+        handle.write(json.dumps("node_ids"))
+        handle.write(":")
+        _write_json_array_stream(handle, node_ids)
+        handle.write(",")
+        handle.write(json.dumps("indptr"))
+        handle.write(":")
+        _write_json_array_stream(handle, _iter_indptr())
+        handle.write(",")
+        handle.write(json.dumps("indices"))
+        handle.write(":")
+        _write_json_array_stream(handle, _iter_indices())
+        handle.write(",")
+        handle.write(json.dumps("weights"))
+        handle.write(":")
+        _write_json_array_stream(handle, _iter_weights())
+        handle.write(",")
+        handle.write(json.dumps("edge_count"))
+        handle.write(":")
+        json.dump(edge_count, handle, ensure_ascii=False)
+        handle.write("}")
+
+    _atomic_write_json_stream(path, _write)
+
+
+def _save_sparse_snapshot(child: str, neurons: List[Dict[str, Any]], synapses: Any) -> None:
+    node_ids = [str(neuron.get("id")) for neuron in neurons if neuron.get("id")]
+    _save_sparse_snapshot_by_ids(child, node_ids, synapses)
+
+
+def _save_neural_map_streaming(
+    child: str,
+    payload_meta: Dict[str, Any],
+    hot_neurons: List[Dict[str, Any]],
+    synapses: Any,
+    policy: Dict[str, Any],
+    spill_store: Optional[_NeuralSpillStore],
+) -> None:
+    path = _neural_map_path(child)
+    compact = bool(policy.get("compact_save_enabled", True))
+    meta = {key: value for key, value in payload_meta.items() if key not in {"neurons", "synapses"}}
+
+    def _write(handle) -> None:
+        handle.write("{")
+        items = list(meta.items())
+        for idx, (key, value) in enumerate(items):
+            if idx:
+                handle.write(",")
+            handle.write(json.dumps(str(key)))
+            handle.write(":")
+            json.dump(value, handle, ensure_ascii=False)
+        if items:
+            handle.write(",")
+        handle.write(json.dumps("neurons"))
+        handle.write(":")
+        neuron_iter = spill_store.iter_storage_neurons(hot_neurons, policy, compact=compact) if spill_store is not None else (
+            _compact_neuron_for_storage(neuron, policy) if compact else neuron for neuron in hot_neurons if neuron.get("id")
+        )
+        _write_json_array_stream(handle, neuron_iter)
+        handle.write(",")
+        handle.write(json.dumps("synapses"))
+        handle.write(":")
+        source_synapses = synapses.iter_sorted() if isinstance(synapses, _BoundedSynapseSpool) else synapses
+        synapse_iter = (
+            _compact_synapse_for_storage(synapse) if compact else _synapse_to_payload(synapse)
+            for synapse in source_synapses
+            if _synapse_get(synapse, "source") and _synapse_get(synapse, "target")
+        )
+        _write_json_array_stream(handle, synapse_iter)
+        handle.write("}")
+
+    _atomic_write_json_stream(path, _write)
 
 
 def _existing_fragment_ids(neurons: List[Dict[str, Any]]) -> Set[str]:
@@ -2275,7 +3631,7 @@ def _existing_fragment_ids(neurons: List[Dict[str, Any]]) -> Set[str]:
     return known
 
 
-def _node_id_allocator(neurons: List[Dict[str, Any]]):
+def _node_id_allocator(neurons: List[Dict[str, Any]], extra_ids: Optional[Iterable[str]] = None):
     prefix = "node_"
     max_idx = -1
     for neuron in neurons:
@@ -2283,6 +3639,16 @@ def _node_id_allocator(neurons: List[Dict[str, Any]]):
         if node_id.startswith(prefix):
             try:
                 idx = int(node_id[len(prefix):])
+                max_idx = max(max_idx, idx)
+            except ValueError:
+                continue
+    if extra_ids is not None:
+        for node_id in extra_ids:
+            node_text = str(node_id or "")
+            if not node_text.startswith(prefix):
+                continue
+            try:
+                idx = int(node_text[len(prefix):])
                 max_idx = max(max_idx, idx)
             except ValueError:
                 continue
@@ -2324,6 +3690,35 @@ def _clip_sequence(values: Iterable[Any], limit: int) -> List[str]:
     return clipped
 
 
+def _clip_sequence_with_anchors(values: Iterable[Any], limit: int, anchor_count: int = 0) -> List[str]:
+    clipped = [str(value) for value in values if value]
+    if limit <= 0 or len(clipped) <= limit:
+        return clipped
+    anchor_count = max(0, min(int(anchor_count or 0), limit))
+    if anchor_count <= 0:
+        return clipped[-limit:]
+    tail_count = max(0, limit - anchor_count)
+    head = clipped[:anchor_count]
+    tail = clipped[-tail_count:] if tail_count > 0 else []
+    selected: List[str] = []
+    seen = set()
+    for value in head + tail:
+        if value not in seen:
+            selected.append(value)
+            seen.add(value)
+    if len(selected) < limit:
+        extras: List[str] = []
+        for value in reversed(clipped):
+            if value in seen:
+                continue
+            extras.append(value)
+            seen.add(value)
+            if len(selected) + len(extras) >= limit:
+                break
+        selected[anchor_count:anchor_count] = list(reversed(extras))
+    return selected[:limit]
+
+
 def _merge_vectors(
     base: List[float],
     base_count: int,
@@ -2347,11 +3742,19 @@ def _merge_vectors(
 def _compact_neuron_for_storage(neuron: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     compact = {
         "id": neuron.get("id"),
-        "fragments": _clip_sequence(neuron.get("fragments", []), int(policy.get("max_fragments_per_neuron", 128))),
+        "fragments": _clip_sequence_with_anchors(
+            neuron.get("fragments", []),
+            int(policy.get("max_fragments_per_neuron", 128)),
+            int(policy.get("fragment_anchor_count", 0)),
+        ),
         "vector": _round_vector(neuron.get("vector"), int(policy.get("vector_round_digits", 6))),
         "position": _round_vector(neuron.get("position"), int(policy.get("position_round_digits", 4))),
         "region": neuron.get("region"),
-        "tags": _clip_sequence(neuron.get("tags", []), int(policy.get("max_tags_per_neuron", 32))),
+        "tags": _clip_sequence_with_anchors(
+            neuron.get("tags", []),
+            int(policy.get("max_tags_per_neuron", 32)),
+            int(policy.get("tag_anchor_count", 0)),
+        ),
         "last_used": neuron.get("last_used"),
     }
     network_type = str(neuron.get("network_type") or "memory_graph")
@@ -2370,19 +3773,20 @@ def _compact_neuron_for_storage(neuron: Dict[str, Any], policy: Dict[str, Any]) 
     return {key: value for key, value in compact.items() if value not in (None, [], {}, "")}
 
 
-def _compact_synapse_for_storage(synapse: Dict[str, Any]) -> Dict[str, Any]:
+def _compact_synapse_for_storage(synapse: Any) -> Dict[str, Any]:
+    payload = _synapse_to_payload(synapse)
     compact = {
-        "source": synapse.get("source"),
-        "target": synapse.get("target"),
-        "weight": round(_safe_float(synapse.get("weight"), 0.0), 4),
+        "source": payload.get("source"),
+        "target": payload.get("target"),
+        "weight": round(_safe_float(payload.get("weight"), 0.0), 4),
     }
-    direction = synapse.get("direction")
+    direction = payload.get("direction")
     if isinstance(direction, list) and direction:
         compact["direction"] = [round(float(value), 5) for value in direction[:3]]
-    relation = synapse.get("relation")
+    relation = payload.get("relation")
     if relation:
         compact["relation"] = str(relation)
-    network_type = str(synapse.get("network_type") or "memory_graph")
+    network_type = str(payload.get("network_type") or "memory_graph")
     if network_type != "memory_graph":
         compact["network_type"] = network_type
     return {key: value for key, value in compact.items() if value not in (None, [], {}, "")}
@@ -2395,7 +3799,7 @@ def _compact_graph_for_storage(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     return (
         [_compact_neuron_for_storage(neuron, policy) for neuron in neurons if neuron.get("id")],
-        [_compact_synapse_for_storage(synapse) for synapse in synapses if synapse.get("source") and synapse.get("target")],
+        [_compact_synapse_for_storage(synapse) for synapse in synapses if _synapse_get(synapse, "source") and _synapse_get(synapse, "target")],
     )
 
 
@@ -2407,13 +3811,13 @@ def _materialize_candidate(node_id: str, candidate: Dict[str, Any], policy: Dict
     pos_digits = int(policy.get("position_round_digits", 4))
     return {
         "id": node_id,
-        "fragments": _clip_sequence(candidate["fragments"], frag_limit),
+        "fragments": _clip_sequence_with_anchors(candidate["fragments"], frag_limit, int(policy.get("fragment_anchor_count", 0))),
         "vector": _round_vector(candidate.get("vector"), vector_digits),
         "position": _round_vector(candidate.get("position"), pos_digits),
         "region": candidate["region"],
         "network_type": "memory_graph",
         "symbolic_density": 0.0,
-        "tags": _clip_sequence(candidate["tags"], tag_limit),
+        "tags": _clip_sequence_with_anchors(candidate["tags"], tag_limit, int(policy.get("tag_anchor_count", 0))),
         "activation_history": [],
         "last_used": now_iso,
     }
@@ -2426,7 +3830,11 @@ def _update_neuron_from_candidate(neuron: Dict[str, Any], candidate: Dict[str, A
         existing_frags.extend(new_ids)
     max_fragments_per_neuron = int(policy.get("max_fragments_per_neuron", 128))
     if max_fragments_per_neuron > 0 and len(existing_frags) > max_fragments_per_neuron:
-        neuron["fragments"] = _clip_sequence(existing_frags, max_fragments_per_neuron)
+        neuron["fragments"] = _clip_sequence_with_anchors(
+            existing_frags,
+            max_fragments_per_neuron,
+            int(policy.get("fragment_anchor_count", 0)),
+        )
         existing_frags = neuron["fragments"]
     retained_new = len([fid for fid in new_ids if fid in existing_frags])
     base_vec = neuron.get("vector")
@@ -2443,11 +3851,13 @@ def _update_neuron_from_candidate(neuron: Dict[str, Any], candidate: Dict[str, A
     neuron["vector"] = combined_vec
     position = _blend_position(neuron.get("position"), candidate["position"], policy["position_blend"]) or candidate["position"]
     neuron["position"] = _round_vector(position, int(policy.get("position_round_digits", 4)))
-    tag_union = set(neuron.get("tags", []))
-    tag_union.update(candidate["tags"])
-    sorted_tags = sorted(tag_union)
+    tag_list = [str(tag) for tag in (neuron.get("tags", []) or []) if tag]
+    for tag in candidate["tags"]:
+        tag_text = str(tag)
+        if tag_text and tag_text not in tag_list:
+            tag_list.append(tag_text)
     tag_limit = int(policy.get("max_tags_per_neuron", 32))
-    neuron["tags"] = sorted_tags[-tag_limit:] if tag_limit > 0 else sorted_tags
+    neuron["tags"] = _clip_sequence_with_anchors(tag_list, tag_limit, int(policy.get("tag_anchor_count", 0)))
     if not neuron.get("region"):
         neuron["region"] = candidate["region"]
     neuron["last_used"] = datetime.now(timezone.utc).isoformat()
@@ -2501,6 +3911,7 @@ def _merge_candidates_into_neurons(
     cluster_threshold: float,
     tag_weight: float,
     policy: Dict[str, Any],
+    spill_store: Optional[_NeuralSpillStore] = None,
 ) -> Tuple[int, int, int]:
     if not candidates:
         return 0, 0, 0
@@ -2508,7 +3919,7 @@ def _merge_candidates_into_neurons(
     merged = 0
     created = 0
     skipped = 0
-    id_allocator = _node_id_allocator(neurons)
+    id_allocator = _node_id_allocator(neurons, spill_store.node_ids() if spill_store is not None else None)
     for candidate in candidates:
         best = None
         best_score = 0.0
@@ -2517,6 +3928,13 @@ def _merge_candidates_into_neurons(
             if score > best_score:
                 best_score = score
                 best = neuron
+        if spill_store is not None and spill_store.has_spills():
+            spill_id, spill_score = spill_store.best_match(candidate, tag_weight)
+            if spill_id and spill_score > best_score:
+                activated = spill_store.activate_node(spill_id, neurons)
+                if activated is not None:
+                    best = activated
+                    best_score = spill_score
         if best and best_score >= merge_threshold:
             _update_neuron_from_candidate(best, candidate, policy)
             merged += 1
@@ -2541,6 +3959,7 @@ def _integrate_fragment_batch(
     policy: Dict[str, Any],
     anchors: Dict[str, Dict[str, float]],
     fallback_anchor: Dict[str, Any],
+    spill_store: Optional[_NeuralSpillStore] = None,
 ) -> Dict[str, int]:
     if not fragments:
         return {"input": 0, "encoded": 0, "clusters": 0, "merged": 0, "created": 0, "skipped": 0}
@@ -2572,12 +3991,13 @@ def _integrate_fragment_batch(
             cluster_threshold,
             tag_weight,
             policy,
+            spill_store=spill_store,
         )
     else:
         merged = 0
         created = 0
         skipped = 0
-        id_allocator = _node_id_allocator(neurons)
+        id_allocator = _node_id_allocator(neurons, spill_store.node_ids() if spill_store is not None else None)
         for candidate in candidates:
             neurons.append(_materialize_candidate(next(id_allocator), candidate, policy))
             created += 1
@@ -2600,7 +4020,10 @@ def build_fractal_memory(child):
     cluster_threshold, synapse_threshold, tag_weight = _neural_settings()
     cfg = _load_config()
     policy = _neural_policy(cfg)
+    spill_store = _NeuralSpillStore(child, policy)
     custom_runtime = _NeuralCustomTransformerRuntime(child, cfg)
+    spill_flushes = 0
+    spilled_neurons = 0
     burst_limit = policy.get("fragment_batch")
     if burst_limit is None:
         burst_limit = cfg.get("neural_map_burst")
@@ -2620,11 +4043,21 @@ def build_fractal_memory(child):
     if not isinstance(neurons, list):
         neurons = []
     neuron_cap_changes = _apply_neuron_caps(neurons, policy) if incremental else 0
-    neuron_budget_pruned = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0))) if incremental else 0
+    neuron_budget_pruned, _ = _enforce_total_neuron_budget(
+        neurons,
+        int(policy.get("max_neurons_total", 0)),
+        spill_store=spill_store if incremental else None,
+    ) if incremental else (0, set())
     known_fragments = _existing_fragment_ids(neurons) if incremental else set()
 
     index = _load_memory_index(child)
-    valid_ids = set(index.keys()) if isinstance(index, dict) else set()
+    valid_ids = index
+    retention_policy = _memory_policy().get("retention", DEFAULT_RETENTION_POLICY)
+    prep_stats = _pregraph_fragment_compaction_pass(child, index, retention_policy)
+    if prep_stats.get("status") == "ok" and prep_stats.get("compacted"):
+        log_to_statusbox(
+            f"[NeuralMap] Pre-graph compaction compacted {prep_stats['compacted']} fragment(s) and skipped {prep_stats['skipped']} candidate(s)."
+        )
 
     pruned_refs = 0
     pruned_neurons = 0
@@ -2638,6 +4071,14 @@ def build_fractal_memory(child):
     elif neuron_cap_changes or neuron_budget_pruned:
         log_to_statusbox(
             f"[NeuralMap] Applied payload caps ({neuron_cap_changes} updates) and budget-pruned {neuron_budget_pruned} neuron(s)."
+        )
+
+    initial_spilled = spill_store.spill_overflow(neurons)
+    if initial_spilled:
+        spilled_neurons += initial_spilled
+        spill_flushes += 1
+        log_to_statusbox(
+            f"[NeuralMap] Spilled {initial_spilled} cold neuron(s) to the temporary disk store to cap hot RAM."
         )
 
     anchors = _load_body_anchors()
@@ -2668,6 +4109,11 @@ def build_fractal_memory(child):
         if dirty_set:
             known_dirty = dirty_set & known_fragments
             if known_dirty:
+                reactivated = spill_store.activate_for_fragments(known_dirty, neurons)
+                if reactivated:
+                    log_to_statusbox(
+                        f"[NeuralMap] Reloaded {reactivated} spilled neuron(s) touched by the dirty set."
+                    )
                 local_rebuild_ids, detached_neurons, detached_overflow = _detach_neurons_for_dirty_rebuild(
                     neurons,
                     known_dirty,
@@ -2679,7 +4125,7 @@ def build_fractal_memory(child):
                     )
                 else:
                     dirty_set.update(local_rebuild_ids)
-                    known_fragments = _existing_fragment_ids(neurons)
+                    known_fragments.difference_update(local_rebuild_ids)
             pending_set = set(pending_ids)
             for frag_id in dirty_set:
                 if frag_id in valid_ids and frag_id not in pending_set:
@@ -2701,6 +4147,7 @@ def build_fractal_memory(child):
             burst_limit,
             cfg=cfg,
             known_fragments=known_fragments if incremental else None,
+            index=index,
         )
         selector_loaded = len(fragments)
         if selector_total > selector_loaded:
@@ -2746,21 +4193,31 @@ def build_fractal_memory(child):
                 policy=policy,
                 anchors=anchors,
                 fallback_anchor=fallback_anchor,
+                spill_store=spill_store,
             )
             for key in totals:
                 totals[key] += stats.get(key, 0)
             batch_processed_ids = [str(frag.get("id")) for frag in batch_fragments if frag.get("id")]
             processed_count += len(batch_processed_ids)
+            known_fragments.update(batch_processed_ids)
             for frag_id in batch_processed_ids:
                 sig = current_signatures.get(frag_id)
                 if sig:
                     dirty_signatures[frag_id] = sig
             custom_runtime.observe(batch_fragments)
-            dropped = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0)))
+            dropped, removed_fragments = _enforce_total_neuron_budget(
+                neurons,
+                int(policy.get("max_neurons_total", 0)),
+                spill_store=spill_store,
+            )
             if dropped:
                 neuron_budget_pruned += dropped
-                known_fragments = _existing_fragment_ids(neurons)
+                known_fragments.difference_update(removed_fragments)
             batches_run += 1
+            spilled_now = spill_store.maybe_flush(neurons, batches_run)
+            if spilled_now:
+                spilled_neurons += spilled_now
+                spill_flushes += 1
             gc_every_batches = int(policy.get("gc_every_batches", 0))
             if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
                 gc.collect()
@@ -2788,19 +4245,31 @@ def build_fractal_memory(child):
                 policy=policy,
                 anchors=anchors,
                 fallback_anchor=fallback_anchor,
+                spill_store=spill_store,
             )
             for key in totals:
                 totals[key] += stats.get(key, 0)
+            batch_processed_ids = [str(frag.get("id")) for frag in batch_fragments if frag.get("id")]
+            known_fragments.update(batch_processed_ids)
             custom_runtime.observe(batch_fragments)
-            dropped = _enforce_neuron_budget(neurons, int(policy.get("max_neurons_total", 0)))
+            dropped, removed_fragments = _enforce_total_neuron_budget(
+                neurons,
+                int(policy.get("max_neurons_total", 0)),
+                spill_store=spill_store,
+            )
             if dropped:
                 neuron_budget_pruned += dropped
-                known_fragments = _existing_fragment_ids(neurons)
+                known_fragments.difference_update(removed_fragments)
             batches_run += 1
+            spilled_now = spill_store.maybe_flush(neurons, batches_run)
+            if spilled_now:
+                spilled_neurons += spilled_now
+                spill_flushes += 1
             gc_every_batches = int(policy.get("gc_every_batches", 0))
             if gc_every_batches > 0 and (batches_run % gc_every_batches) == 0:
                 gc.collect()
             del batch_fragments
+            del batch_processed_ids
         selector_targets = list(selector_queue)
 
     custom_usage = custom_runtime.run()
@@ -2840,6 +4309,8 @@ def build_fractal_memory(child):
     if not isinstance(prior_synapses, list):
         prior_synapses = []
     synapses = prior_synapses
+    total_neuron_count = len(neurons) + spill_store.count()
+
     max_synapses_total = int(policy.get("max_synapses_total", 0) or 0)
     synapse_budget_pruned = 0
     synapse_stats = {"pairs_evaluated": 0, "edge_count": len(synapses), "truncated": False}
@@ -2847,13 +4318,21 @@ def build_fractal_memory(child):
         max_edges_updated = int(policy.get("max_edges_updated", 0) or 0)
         if max_synapses_total > 0 and (max_edges_updated <= 0 or max_synapses_total < max_edges_updated):
             max_edges_updated = max_synapses_total
+        link_neurons = [_lightweight_neuron_view(neuron) for neuron in neurons]
+        if spill_store.has_spills():
+            link_neurons.extend(spill_store.iter_link_neurons())
+        synapse_spool_path = None
+        if policy.get("synapse_spool_enabled", True) and max_edges_updated > 0 and int(policy.get("max_connection_degree", 0) or 0) <= 0:
+            synapse_spool_path = _neural_synapse_spool_path(child)
         synapses, synapse_stats = build_synaptic_links(
-            neurons,
+            link_neurons,
             threshold=synapse_threshold,
             max_edges=max_edges_updated,
             max_pairs=int(policy.get("max_synapse_pairs", 0) or 0),
             max_edges_per_neuron=int(policy.get("max_edges_per_neuron", 0) or 0),
             include_direction=bool(policy.get("edge_direction_enabled", True)),
+            compact_records=True,
+            spool_path=synapse_spool_path,
             return_stats=True,
         )
         if synapse_stats.get("truncated"):
@@ -2863,23 +4342,33 @@ def build_fractal_memory(child):
     synapse_budget_pruned = _enforce_synapse_budget(synapses, max_synapses_total)
     if synapse_budget_pruned:
         log_to_statusbox(f"[NeuralMap] Applied hard synapse cap; pruned {synapse_budget_pruned} edge(s).")
+    synapses, connection_cap_stats = _apply_synapse_connection_caps(synapses, policy)
+    if connection_cap_stats.get("weight_pruned"):
+        log_to_statusbox(f"[NeuralMap] Dropped {connection_cap_stats['weight_pruned']} weak connection(s) below the persistence threshold.")
+    if connection_cap_stats.get("degree_pruned"):
+        log_to_statusbox(f"[NeuralMap] Applied per-neuron connection cap; pruned {connection_cap_stats['degree_pruned']} edge(s).")
 
-    should_save_map = bool(not incremental or map_changed or needs_synapse_refresh or synapse_budget_pruned)
+    should_save_map = bool(
+        not incremental
+        or map_changed
+        or needs_synapse_refresh
+        or synapse_budget_pruned
+        or connection_cap_stats.get("weight_pruned")
+        or connection_cap_stats.get("degree_pruned")
+    )
     if should_save_map:
-        storage_neurons = neurons
-        storage_synapses = synapses
-        if policy.get("compact_save_enabled", True):
-            storage_neurons, storage_synapses = _compact_graph_for_storage(neurons, synapses, policy)
         result = existing_map if incremental else {}
         result.update({
-            "neurons": storage_neurons,
-            "synapses": storage_synapses,
             "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
-        _save_neural_map(child, result)
+        active_spill_store = spill_store if spill_store.has_spills() else None
+        _save_neural_map_streaming(child, result, neurons, synapses, policy, active_spill_store)
         if policy.get("emit_sparse_snapshot", True):
-            _save_sparse_snapshot(child, storage_neurons, storage_synapses)
+            node_ids = [str(neuron.get("id")) for neuron in neurons if neuron.get("id")]
+            if active_spill_store is not None:
+                node_ids.extend(str(node.get("id")) for node in active_spill_store.iter_link_neurons() if node.get("id"))
+            _save_sparse_snapshot_by_ids(child, node_ids, synapses)
 
     if source == "selector" and selector_loaded and selector_target_count == 0 and incremental:
         log_to_statusbox("[NeuralMap] No new fragments detected after selector filtering.")
@@ -2901,6 +4390,10 @@ def build_fractal_memory(child):
         log_to_statusbox(
             f"[NeuralMap] Enforced global neuron budget; pruned {neuron_budget_pruned} node(s) this cycle."
         )
+    if spilled_neurons:
+        log_to_statusbox(
+            f"[NeuralMap] Spilled {spilled_neurons} cold neuron(s) across {spill_flushes} flush(es) to bound RAM during the build."
+        )
     if custom_usage.get("status") == "cooldown":
         log_to_statusbox(
             f"[NeuralMap] Custom transformer runtime cooling down ({custom_usage.get('seconds_remaining')}s remaining)."
@@ -2912,22 +4405,64 @@ def build_fractal_memory(child):
             log_to_statusbox("[NeuralMap] No fragments available for neural map build.")
 
     duration = datetime.now() - start_time
+    final_neuron_count = total_neuron_count
     log_to_statusbox(
-        f"[NeuralMap] {len(neurons)} neurons | {len(synapses)} synapses | "
+        f"[NeuralMap] {final_neuron_count} neurons | {len(synapses)} synapses | "
         f"Policy={policy.get('mode')} | Source={source} | Batches={batches_run}."
     )
     log_to_statusbox(f"[NeuralMap] Mapping time: {duration}.")
+    selector_remaining = len(selector_targets) if isinstance(selector_targets, list) else 0
+    if source == "dirty_index":
+        needs_resume = bool(queue_remaining or budget_hit)
+    else:
+        needs_resume = bool((selector_total > selector_loaded) or selector_remaining or budget_hit)
+
+    summary = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "input_processed": totals["input"],
+        "encoded": totals["encoded"],
+        "clusters": totals["clusters"],
+        "merged": totals["merged"],
+        "created": totals["created"],
+        "skipped": totals["skipped"],
+        "batches_run": batches_run,
+        "budget_hit": bool(budget_hit),
+        "queue_remaining": queue_remaining,
+        "selector_total": selector_total,
+        "selector_loaded": selector_loaded,
+        "selector_remaining": selector_remaining,
+        "map_changed": bool(map_changed),
+        "needs_resume": bool(needs_resume),
+        "neurons": final_neuron_count,
+        "synapses": len(synapses),
+    }
+
+    if isinstance(synapses, _BoundedSynapseSpool):
+        synapses.cleanup()
+    if hasattr(index, "close"):
+        index.close()
+    spill_store.cleanup()
+    return summary
 
 # === MemoryManager Class ===
 class MemoryManager:
-    def __init__(self, child="Inazuma_Yagami", tier_policy: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        child="Inazuma_Yagami",
+        tier_policy: Optional[Dict[str, Any]] = None,
+        *,
+        autoload: bool = True,
+    ):
         self.child = child
         self.base_path = Path("AI_Children") / child / "memory" / "fragments"
         self.index_path = Path("AI_Children") / child / "memory" / "memory_map.json"
         self.memory_map = {}
+        self._map_loaded = False
         self.policy = tier_policy or _memory_policy()
         self.cold_storage_policy = _cold_storage_policy()
-        self.load_map()
+        if autoload:
+            self.load_map()
 
     @staticmethod
     def _stat_payload(path: Path) -> Dict[str, Any]:
@@ -2966,7 +4501,9 @@ class MemoryManager:
             except Exception:
                 continue
 
-    def load_map(self):
+    def load_map(self, force: bool = False):
+        if self._map_loaded and not force:
+            return
         if self.index_path.exists():
             try:
                 with open(self.index_path, "r") as f:
@@ -2975,10 +4512,24 @@ class MemoryManager:
                 self.memory_map = {}
         else:
             self.memory_map = {}
+        self._map_loaded = True
 
     def save_map(self):
         with open(self.index_path, "w") as f:
             json.dump(self.memory_map, f, indent=2)
+        self._map_loaded = True
+        try:
+            source_mtime_ns = int(self.index_path.stat().st_mtime_ns)
+        except OSError:
+            source_mtime_ns = None
+        try:
+            _persist_memory_index_db(self.child, self.memory_map, source_mtime_ns=source_mtime_ns)
+        except Exception:
+            pass
+
+    def unload_map(self):
+        self.memory_map = {}
+        self._map_loaded = False
 
     def _resolve_fragment_path(self, frag_id: str, meta: Dict[str, Any]) -> Optional[Path]:
         """
@@ -3068,6 +4619,18 @@ class MemoryManager:
         if long_cap is not None and age_hours <= long_cap:
             return "long"
         return "cold"
+
+    @staticmethod
+    def _retention_adjusted_tier(target_tier: str, importance: float, age_hours: Optional[float], retention: Optional[Dict[str, Any]] = None) -> str:
+        retention = retention or DEFAULT_RETENTION_POLICY
+        protect = _clamp(_safe_float(retention.get("protect_cold_importance"), DEFAULT_RETENTION_POLICY["protect_cold_importance"]), 0.0, 1.0)
+        low_importance = _clamp(_safe_float(retention.get("compact_low_importance_threshold"), DEFAULT_RETENTION_POLICY["compact_low_importance_threshold"]), 0.0, 1.0)
+        low_age = max(0.0, _safe_float(retention.get("compact_low_importance_age_hours"), DEFAULT_RETENTION_POLICY["compact_low_importance_age_hours"]))
+        if target_tier == "cold" and importance >= protect:
+            return "long"
+        if target_tier in {"long", "cold"} and age_hours is not None and age_hours >= low_age and importance <= low_importance:
+            return "cold"
+        return target_tier
 
     @staticmethod
     def _timestamp_sort_key(ts: Optional[datetime]) -> datetime:
@@ -3332,9 +4895,13 @@ class MemoryManager:
         transitions: Dict[str, int] = {}
         missing = 0
 
+        retention = self.policy.get("retention", DEFAULT_RETENTION_POLICY)
         for frag_id, meta in self.memory_map.items():
             ts = self._parse_timestamp(meta.get("last_seen")) or self._parse_timestamp(meta.get("timestamp"))
+            age_hours = (now - ts).total_seconds() / 3600.0 if ts else None
+            importance = _clamp(_safe_float(meta.get("importance"), 0.0), 0.0, 1.0)
             target_tier = self._tier_for_age(ts, now)
+            target_tier = self._retention_adjusted_tier(target_tier, importance, age_hours, retention)
             buckets[target_tier].append(
                 {
                     "id": frag_id,
@@ -3673,27 +5240,39 @@ def handle_bundle_prune(child: str, cfg: Optional[Dict[str, Any]], manager: Memo
         f"[BundlePrune] {report['status']} {report['pruned']} of {report['candidates']} candidate fragment(s)."
     )
 
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _memory_graph_phase_args(argv)
     cfg = _load_config()
     child = cfg.get("current_child", "Inazuma_Yagami")
     mgr = MemoryManager(child)
 
-    boot_policy = _boot_policy(cfg)
-    shutdown_ctx = _shutdown_context(child, boot_policy)
-    boot_mode, reason = _resolve_boot_mode(boot_policy, shutdown_ctx)
-    log_to_statusbox(f"[Memory] Boot mode: {boot_mode} (reason={reason}).")
-
-    if boot_mode == "full":
-        mgr.reindex_all(rebalance=boot_policy.get("rebalance_on_boot", True))
-        if boot_policy.get("prune_missing_on_boot", False):
-            mgr.prune_missing()
-    else:
-        mgr.fast_reindex(
-            rebalance=boot_policy.get("rebalance_on_boot", False),
-            prune_missing=boot_policy.get("prune_missing_on_boot", False),
+    if args.phase == "boot":
+        verification = _run_memory_index_verification(child, cfg, mgr)
+        _set_memory_graph_deferred_build(
+            child,
+            "queued",
+            requested_at=datetime.now(timezone.utc).isoformat(),
+            requested_by="boot",
+            boot_verification=verification,
         )
+        log_to_statusbox("[Memory] Boot verification complete. Deferred neural build queued.")
+        return 0
 
-    mgr.stats()
-    handle_bundle_prune(child, cfg, mgr)
-    build_fractal_memory(child)
-    build_experience_graph(child)
+    if args.phase == "neural":
+        _run_memory_neural_phase(child, mgr, launch_source="deferred")
+        return 0
+
+    verification = _run_memory_index_verification(child, cfg, mgr)
+    _set_memory_graph_deferred_build(
+        child,
+        "queued",
+        requested_by="full",
+        requested_at=datetime.now(timezone.utc).isoformat(),
+        boot_verification=verification,
+    )
+    _run_memory_neural_phase(child, mgr, launch_source="full")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

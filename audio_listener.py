@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from gui_hook import log_to_statusbox
-from model_manager import load_config, get_sweet_spots
+from model_manager import load_config, get_sweet_spots, get_inastate
 from audio_digest import analyze_audio_clip, generate_fragment
 from fragmentation_engine import fragment_device_log
 from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -210,7 +210,16 @@ def run_audio_loop():
         fallback = f"plughw:{idx},0" if idx is not None else "default"
         devices[label] = resolve_plughw_device(name_hint, fallback=fallback)
 
+    last_mode = None
     while True:
+        mode = str(get_inastate("audio_mode") or "default").strip().lower()
+        if mode != last_mode:
+            log_to_statusbox(f"[Audio] Mode -> {mode}")
+            last_mode = mode
+        if mode in {"suppressed", "off", "world"}:
+            time.sleep(2)
+            continue
+
         now = time.time()
         for label in LABELS:
             if now - last_flush[label] >= FLUSH_INTERVAL:

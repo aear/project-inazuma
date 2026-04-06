@@ -2,8 +2,6 @@
 # === meditation_state.py (Full Rewrite) ===
 # Reflection mode — builds maps, performs symbolic introspection, exits on emotional drift
 
-import subprocess
-from safe_popen import safe_popen
 import time
 import json
 import os
@@ -11,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import (
     mark_module_running, clear_module_running, update_inastate, get_inastate,
-    get_sweet_spots, seed_self_question, load_config
+    get_sweet_spots, seed_self_question, load_config, request_scheduler_task
 )
 from gui_hook import log_to_statusbox
 
@@ -63,16 +61,16 @@ def meditate_loop():
         loop_count += 1
         log_to_statusbox(f"[Meditation] Reflective cycle {loop_count}/{max_loops}")
         try:
-            subprocess.run(["python", "emotion_engine.py"], check=False)
-            subprocess.run(["python", "who_am_i.py"], check=False)
-            subprocess.run(["python", "memory_graph.py"], check=False)
-            subprocess.run(["python", "meaning_map.py"], check=False)
-            subprocess.run(["python", "logic_map_builder.py"], check=False)
-            subprocess.run(["python", "emotion_map.py"], check=False)
-            subprocess.run(["python", "predictive_layer.py"], check=False)
-            log_to_statusbox("[Meditation] Ran core reflection modules.")
+            request_scheduler_task("emotion_engine_run", reason="meditation_cycle", priority=74)
+            request_scheduler_task("who_am_i_run", reason="meditation_cycle", priority=70)
+            request_scheduler_task("memory_graph_neural", reason="meditation_cycle", priority=88)
+            request_scheduler_task("meaning_map_refresh", reason="meditation_cycle", priority=78)
+            request_scheduler_task("logic_map_refresh", reason="meditation_cycle", priority=76)
+            request_scheduler_task("emotion_map_refresh", reason="meditation_cycle", priority=74)
+            request_scheduler_task("predictive_layer_run", reason="meditation_cycle", priority=76)
+            log_to_statusbox("[Meditation] Queued core reflection modules.")
         except Exception as e:
-            log_to_statusbox(f"[Meditation] Subprocess error: {e}")
+            log_to_statusbox(f"[Meditation] Scheduler request error: {e}")
 
         emo = get_inastate("current_emotions") or {}
         log_to_statusbox(f"[Meditation] Emotional snapshot: {json.dumps(emo, indent=2)}")
@@ -94,7 +92,7 @@ def meditate_loop():
             return
         if fuzz > 0.7 and stress > 0.5:
             exit_meditation("transition to dream")
-            safe_popen(["python", "dreamstate.py"])
+            request_scheduler_task("dreamstate_run", reason="meditation_transition", priority=84)
             return
 
         save_log({

@@ -190,14 +190,27 @@ def vision_loop():
             f" (source={obs_bridge.source or 'program scene'})"
         )
 
-    prev_webcam = capture_webcam_frame()
-    prev_screen = capture_display_frame()
+    mode = str(get_inastate("vision_mode") or "default").strip().lower()
+    prev_webcam = None if mode in {"suppressed", "off"} else capture_webcam_frame()
+    prev_screen = None if mode in {"suppressed", "off"} else capture_display_frame()
 
     if optic_nerve:
         optic_nerve.ensure_episode()
 
+    last_mode = None
     try:
         while True:
+            mode = str(get_inastate("vision_mode") or "default").strip().lower()
+            if mode != last_mode:
+                log_to_statusbox(f"[Vision] Mode -> {mode}")
+                last_mode = mode
+            if mode in {"suppressed", "off"}:
+                prev_webcam = None
+                prev_screen = None
+                webcam_buffer.clear()
+                time.sleep(FRAME_INTERVAL)
+                continue
+
             time.sleep(FRAME_INTERVAL)
 
             curr_webcam = capture_webcam_frame()

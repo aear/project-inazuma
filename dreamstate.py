@@ -2,13 +2,12 @@
 # === dreamstate.py (Full Rewrite) ===
 # Ina's dream engine: soft looping, hallucination, energy recovery, and symbolic insight
 
-import subprocess
 import time
 import json
 import random
 from pathlib import Path
 from datetime import datetime, timezone
-from model_manager import get_inastate, update_inastate, mark_module_running, clear_module_running
+from model_manager import get_inastate, update_inastate, mark_module_running, clear_module_running, request_scheduler_task
 from emotion_engine import tag_fragment_emotions
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
@@ -42,13 +41,10 @@ def hallucinate_symbolic_fragment():
     return synthetic
 
 def soft_build_maps():
-    subprocess.call(["python", "memory_graph.py"])
-    time.sleep(1)
-    subprocess.call(["python", "meaning_map.py"])
-    time.sleep(1)
-    subprocess.call(["python", "logic_map_builder.py"])
-    time.sleep(1)
-    subprocess.call(["python", "emotion_map.py"])
+    request_scheduler_task("memory_graph_neural", reason="dreamstate_soft_build", priority=88)
+    request_scheduler_task("meaning_map_refresh", reason="dreamstate_soft_build", priority=76)
+    request_scheduler_task("logic_map_refresh", reason="dreamstate_soft_build", priority=74)
+    request_scheduler_task("emotion_map_refresh", reason="dreamstate_soft_build", priority=72)
 
 def log_dream_fragment(child, fragment):
     path = Path("AI_Children") / child / "memory" / "dream_log.json"
@@ -70,7 +66,7 @@ def maybe_trigger_instincts():
     if state.get("stress", 0) > 0.6:
         log_to_statusbox("[Dreamstate] Interrupted by instinct — stress response triggered.")
 
-        subprocess.call(["python", "instinct_engine.py"])
+        request_scheduler_task("instinct_engine_run", reason="dreamstate_stress", priority=82)
         return True
     return False
 
@@ -119,7 +115,7 @@ def enter_dreamstate():
 
         # Soft background cognitive maintenance
         soft_build_maps()
-        log_to_statusbox("[Dreamstate] Rebuilding soft maps: memory_graph, meaning_map, logic_map, emotion_map")
+        log_to_statusbox("[Dreamstate] Queued soft map maintenance: memory_graph, meaning_map, logic_map, emotion_map")
 
 
         # Simulate dream silence

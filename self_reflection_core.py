@@ -102,6 +102,10 @@ class SelfReflectionCore:
                 ids = list(memory_graph.keys())
             elif hasattr(memory_graph, "memory_map"):
                 ids = list(getattr(memory_graph, "memory_map", {}).keys())
+            elif hasattr(memory_graph, "keys"):
+                ids = list(memory_graph.keys())
+            elif isinstance(memory_graph, Iterable) and not isinstance(memory_graph, (str, bytes)):
+                ids = [str(item) for item in memory_graph if item]
             else:
                 ids = []
             sample = random.sample(ids, min(3, len(ids)))

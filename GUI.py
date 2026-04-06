@@ -484,6 +484,87 @@ def _format_module_usage(modules):
     return '\n'.join(lines)
 
 
+def _format_process_usage(process_rows):
+    if not process_rows:
+        return 'Per-process view: none detected.'
+    header = f"{'PID':>7} {'Module':<24} {'RAM':>10} {'CPU':>7} {'Thr':>5}"
+    lines = [header, '-' * len(header)]
+    visible = list(process_rows[:24])
+    for item in visible:
+        lines.append(
+            f"{int(item['pid']):>7} {item['name'][:24]:<24} {_format_ram_value(item['mem_bytes']):>10} {item['cpu']:>6.1f}% {item['threads']:>5}"
+        )
+    if len(process_rows) > len(visible):
+        lines.append(f"...and {len(process_rows) - len(visible)} more process(es)")
+    return '\n'.join(lines)
+
+
+def _scheduler_snapshot():
+    raw = get_inastate('process_scheduler') or {}
+    if not isinstance(raw, dict):
+        return {'available': False, 'summary': 'Scheduler data is not available yet.', 'learning_hint': '', 'running': [], 'next_slots': [], 'last_decisions': []}
+    planner = raw.get('planner') if isinstance(raw.get('planner'), dict) else {}
+    slot_summary = raw.get('slot_summary') if isinstance(raw.get('slot_summary'), dict) else {}
+    return {
+        'available': bool(raw),
+        'summary': str(planner.get('summary') or 'Scheduler idle.').strip(),
+        'learning_hint': str(planner.get('learning_hint') or '').strip(),
+        'running': [item for item in (planner.get('running') or [])[:4] if isinstance(item, dict)],
+        'next_slots': [item for item in (planner.get('next_slots') or [])[:10] if isinstance(item, dict)],
+        'last_decisions': [item for item in (planner.get('last_decisions') or [])[-4:] if isinstance(item, dict)],
+        'queue_depth': int(planner.get('queue_depth') or slot_summary.get('queued_slots') or 0),
+        'running_count': int(planner.get('running_count') or slot_summary.get('running_slots') or 0),
+        'blocked_count': int(planner.get('blocked_count') or 0),
+        'memory_guard_level': str(planner.get('memory_guard_level') or 'unknown').strip().lower() or 'unknown',
+        'cpu_percent': round(float(planner.get('cpu_percent') or 0.0), 1),
+        'gpu_utilization_percent': round(float(planner.get('gpu_utilization_percent') or 0.0), 1),
+        'gpu_available': bool(planner.get('gpu_available', False)),
+        'max_parallel_tasks': int(slot_summary.get('max_parallel_tasks') or 0),
+        'max_queue_slots': int(slot_summary.get('max_queue_slots') or 0),
+    }
+
+
+def _summarize_scheduler_state(scheduler):
+    if not scheduler.get('available'):
+        return 'Scheduler data is not available yet.'
+    summary = str(scheduler.get('summary') or 'Scheduler idle.').strip()
+    hint = str(scheduler.get('learning_hint') or '').strip()
+    if hint:
+        return f'{summary} {hint}'
+    return summary
+
+
+def _format_scheduler_slots(scheduler):
+    if not scheduler.get('available'):
+        return 'Scheduler queue: no data yet.'
+    lines = [
+        f"Running {int(scheduler.get('running_count') or 0)}/{int(scheduler.get('max_parallel_tasks') or 0)}  |  Queue {int(scheduler.get('queue_depth') or 0)}/{int(scheduler.get('max_queue_slots') or 0)}  |  Guard {scheduler.get('memory_guard_level')}",
+        f"CPU {float(scheduler.get('cpu_percent') or 0.0):.1f}%" + (f"  |  GPU {float(scheduler.get('gpu_utilization_percent') or 0.0):.1f}%" if scheduler.get('gpu_available') else ''),
+    ]
+    running = scheduler.get('running') or []
+    queued = scheduler.get('next_slots') or []
+    if running:
+        lines.append('Running now:')
+        for item in running[:4]:
+            pid = item.get('pid')
+            pid_text = f" pid={int(pid)}" if pid else ''
+            lines.append(f"- {item.get('label') or item.get('task_key')} (p{int(item.get('priority') or 0)}){pid_text}")
+    else:
+        lines.append('Running now: idle')
+    if queued:
+        lines.append('Next slots:')
+        for index, item in enumerate(queued[:10], 1):
+            lines.append(f"{index:>2}. {item.get('label') or item.get('task_key')} (p{int(item.get('priority') or 0)})")
+    else:
+        lines.append('Next slots: empty')
+    decisions = scheduler.get('last_decisions') or []
+    blocked = [item for item in decisions if str(item.get('decision') or '').strip().lower() == 'blocked']
+    if blocked:
+        last = blocked[-1]
+        lines.append(f"Last block: {last.get('label') or last.get('task_key')} ({str(last.get('reason') or '').replace('_', ' ')})")
+    return '\n'.join(lines)
+
+
 def _resource_pressure_level(stats):
     system_mem = float(stats.get('system_mem') or 0.0)
     if system_mem >= 92.0:
@@ -593,9 +674,11 @@ def _publish_resource_snapshot(stats):
             'cpu_percent': round(float(item['cpu']), 1),
             'threads': int(item['threads']),
             'processes': int(item['processes']),
+            'pids': [int(pid) for pid in (item.get('pids') or [])[:8]],
         })
     timestamp = datetime.now(timezone.utc).isoformat()
     summary = _summarize_resource_usage(stats)
+    scheduler = _scheduler_snapshot()
     optimization_hint = (
         f"Start optimisation with {top_modules[0]['name']} because it currently holds the most RAM."
         if top_modules else
@@ -605,6 +688,10 @@ def _publish_resource_snapshot(stats):
         round(float(stats.get('mem_bytes') or 0) / (1024.0 ** 3), 2),
         round(float(stats.get('system_mem') or 0.0), 1),
         tuple((item['name'], item['ram_human']) for item in top_modules[:3]),
+        int(scheduler.get('queue_depth') or 0),
+        int(scheduler.get('running_count') or 0),
+        tuple(item.get('task_key') for item in (scheduler.get('running') or [])[:3]),
+        tuple(item.get('task_key') for item in (scheduler.get('next_slots') or [])[:3]),
     )
     if _last_resource_publish_key == key and _last_resource_publish_ts and (now - _last_resource_publish_ts) < RESOURCE_PUBLISH_INTERVAL_SEC:
         return
@@ -636,6 +723,21 @@ def _publish_resource_snapshot(stats):
         'summary': summary,
         'optimization_hint': optimization_hint,
         'trend': trends,
+        'process_scheduler': {
+            'available': bool(scheduler.get('available')),
+            'summary': scheduler.get('summary'),
+            'learning_hint': scheduler.get('learning_hint'),
+            'running': scheduler.get('running'),
+            'next_slots': scheduler.get('next_slots'),
+            'last_decisions': scheduler.get('last_decisions'),
+            'queue_depth': int(scheduler.get('queue_depth') or 0),
+            'running_count': int(scheduler.get('running_count') or 0),
+            'blocked_count': int(scheduler.get('blocked_count') or 0),
+            'memory_guard_level': scheduler.get('memory_guard_level'),
+            'cpu_percent': round(float(scheduler.get('cpu_percent') or 0.0), 1),
+            'gpu_utilization_percent': round(float(scheduler.get('gpu_utilization_percent') or 0.0), 1),
+            'gpu_available': bool(scheduler.get('gpu_available')),
+        },
     })
     _last_resource_publish_ts = now
     _last_resource_publish_key = key
@@ -650,8 +752,10 @@ def _collect_usage_snapshot():
         'system_cpu': 0.0,
         'system_mem': 0.0,
         'modules': [],
+        'process_rows': [],
     }
     modules = {}
+    process_rows = []
 
     for proc in _ina_processes():
         try:
@@ -665,11 +769,14 @@ def _collect_usage_snapshot():
         stats['threads'] += threads
         stats['processes'] += 1
         name = _module_process_name(proc)
-        bucket = modules.setdefault(name, {'name': name, 'cpu': 0.0, 'mem_bytes': 0, 'threads': 0, 'processes': 0})
+        pid = int(proc.pid)
+        process_rows.append({'pid': pid, 'name': name, 'cpu': cpu, 'mem_bytes': mem_bytes, 'threads': threads})
+        bucket = modules.setdefault(name, {'name': name, 'cpu': 0.0, 'mem_bytes': 0, 'threads': 0, 'processes': 0, 'pids': []})
         bucket['cpu'] += cpu
         bucket['mem_bytes'] += mem_bytes
         bucket['threads'] += threads
         bucket['processes'] += 1
+        bucket['pids'].append(pid)
 
     try:
         stats['system_cpu'] = psutil.cpu_percent(interval=None)
@@ -681,9 +788,16 @@ def _collect_usage_snapshot():
     except Exception:
         stats['system_mem'] = 0.0
 
+    for item in modules.values():
+        item['pids'] = sorted(dict.fromkeys(item.get('pids') or []))
     stats['modules'] = sorted(
         modules.values(),
         key=lambda item: (item['mem_bytes'], item['cpu'], item['name']),
+        reverse=True,
+    )
+    stats['process_rows'] = sorted(
+        process_rows,
+        key=lambda item: (item['mem_bytes'], item['cpu'], item['name'], item['pid']),
         reverse=True,
     )
     return stats
@@ -834,12 +948,17 @@ def _update_usage_labels():
         _usage_labels['sys_mem'].config(text=f"System RAM: {stats['system_mem']:.1f}%")
     history = get_inastate('resource_vitals_history') or []
     trends = _compute_resource_trends(history if isinstance(history, list) else [])
+    scheduler = _scheduler_snapshot()
     if _usage_labels.get('resource_note'):
         _usage_labels['resource_note'].config(text=summary)
     if _usage_labels.get('resource_trend'):
         _usage_labels['resource_trend'].config(text=trends.get('summary', 'No resource trend data yet.'))
     if _usage_labels.get('module_mem'):
-        _usage_labels['module_mem'].config(text=_format_module_usage(stats.get('modules', [])))
+        _usage_labels['module_mem'].config(text=_format_process_usage(stats.get('process_rows', [])))
+    if _usage_labels.get('scheduler_note'):
+        _usage_labels['scheduler_note'].config(text=_summarize_scheduler_state(scheduler))
+    if _usage_labels.get('scheduler_slots'):
+        _usage_labels['scheduler_slots'].config(text=_format_scheduler_slots(scheduler))
 
     _publish_resource_snapshot(stats)
     _refresh_energy_label()
@@ -912,6 +1031,20 @@ def open_vitals_window():
             anchor='w',
             font='TkFixedFont',
         ),
+        'scheduler_note': tk.Label(
+            usage_frame,
+            text='Scheduler summary: gathering…',
+            justify=tk.LEFT,
+            anchor='w',
+            wraplength=680,
+        ),
+        'scheduler_slots': tk.Label(
+            usage_frame,
+            text='Scheduler queue: gathering…',
+            justify=tk.LEFT,
+            anchor='w',
+            font='TkFixedFont',
+        ),
     }
 
     _usage_labels['ina_cpu'].pack(anchor='w')
@@ -923,8 +1056,11 @@ def open_vitals_window():
     _usage_labels['resource_note'].pack(anchor='w', fill=tk.X, pady=(2, 0))
     tk.Label(usage_frame, text='Trend summary for Ina').pack(anchor='w', pady=(8, 0))
     _usage_labels['resource_trend'].pack(anchor='w', fill=tk.X, pady=(2, 0))
-    tk.Label(usage_frame, text='Per-process module RAM / CPU').pack(anchor='w', pady=(8, 0))
+    tk.Label(usage_frame, text='Per-process RAM / CPU (PID shown)').pack(anchor='w', pady=(8, 0))
     _usage_labels['module_mem'].pack(anchor='w', fill=tk.X, pady=(2, 0))
+    tk.Label(usage_frame, text='Process scheduler for Ina').pack(anchor='w', pady=(8, 0))
+    _usage_labels['scheduler_note'].pack(anchor='w', fill=tk.X, pady=(2, 0))
+    _usage_labels['scheduler_slots'].pack(anchor='w', fill=tk.X, pady=(2, 0))
 
     energy_frame = tk.LabelFrame(content, text='Energy')
     energy_frame.pack(fill=tk.X, padx=10, pady=(6, 6))

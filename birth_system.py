@@ -5,7 +5,6 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from memory_graph import build_fractal_memory
 from model_manager import update_inastate, load_config, get_inastate
 from gui_hook import log_to_statusbox
 from safe_popen import safe_popen
@@ -141,6 +140,9 @@ def launch_symbolic_startup(child):
         script_path = Path(script_name)
         if not script_path.exists():
             log_to_statusbox(f"[Birth] Skipping missing module: {script_name}")
+            return
+        if script_name == "memory_graph.py":
+            subprocess.call(["python", str(script_path), "--phase", "boot"])
             return
         subprocess.call(["python", str(script_path)])
 
