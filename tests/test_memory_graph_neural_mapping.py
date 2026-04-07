@@ -4,6 +4,7 @@ import sys
 import tempfile
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -898,6 +899,130 @@ def test_select_pregraph_compaction_candidates_skips_anchors():
                 parent.rmdir()
             except OSError:
                 pass
+
+
+def test_human_memory_prune_limit_scales_for_large_index():
+    retention = mg.DEFAULT_RETENTION_POLICY.copy()
+
+    normal = mg._human_memory_prune_settings(retention, index_count=42)
+    large = mg._human_memory_prune_settings(
+        retention,
+        index_count=retention["human_prune_large_index_threshold"],
+    )
+
+    assert normal["limit"] == retention["human_prune_limit"]
+    assert large["limit"] == retention["human_prune_large_index_limit"]
+
+
+def test_select_human_memory_prune_candidates_uses_indexed_human_bias():
+    child = "TestHumanMemoryPruneCandidates"
+    root = Path("AI_Children") / child / "memory"
+    fragment_root = root / "fragments"
+    base = fragment_root / "cold"
+    shutil.rmtree(Path("AI_Children") / child, ignore_errors=True)
+    base.mkdir(parents=True, exist_ok=True)
+    store = None
+    try:
+        old_ts = "2026-03-01T00:00:00+00:00"
+        recent_ts = "2026-04-01T12:00:00+00:00"
+        entries = {
+            "anchor": {"tier": "cold", "filename": "frag_anchor.json", "importance": 0.05, "tags": ["identity"], "last_seen": old_ts, "size_bytes": 4096},
+            "ordinary": {"tier": "cold", "filename": "frag_ordinary.json", "importance": 0.05, "tags": ["ordinary"], "last_seen": old_ts, "size_bytes": 4096},
+            "legacy": {"tier": "short", "filename": "frag_legacy.json", "importance": 0.04, "tags": ["ordinary"], "last_seen": old_ts, "size_bytes": 8192},
+            "important": {"tier": "cold", "filename": "frag_important.json", "importance": 0.9, "tags": ["ordinary"], "last_seen": old_ts, "size_bytes": 4096},
+            "recent": {"tier": "cold", "filename": "frag_recent.json", "importance": 0.05, "tags": ["ordinary"], "last_seen": recent_ts, "size_bytes": 4096},
+        }
+        for frag_id, meta in entries.items():
+            payload = {"id": frag_id, "tags": meta["tags"], "importance": meta["importance"], "timestamp": meta["last_seen"], "summary": "memory"}
+            target_dir = base if meta["tier"] == "cold" else fragment_root
+            (target_dir / meta["filename"]).write_text(json.dumps(payload))
+        (root / "memory_map.json").write_text(json.dumps(entries))
+        store = mg._MemoryIndexStore(child)
+        retention = mg.DEFAULT_RETENTION_POLICY.copy()
+        retention.update({
+            "human_prune_limit": 8,
+            "human_prune_min_age_hours": 24.0 * 7.0,
+            "human_prune_max_importance": 0.18,
+            "human_prune_min_size_bytes": 1,
+        })
+
+        selected = mg._select_human_memory_prune_candidates(
+            child,
+            store,
+            retention,
+            index_count=len(store),
+            now=datetime(2026, 4, 2, tzinfo=timezone.utc),
+        )
+
+        assert [frag_id for frag_id, _, _ in selected] == ["legacy", "ordinary"]
+    finally:
+        if store is not None:
+            store.close()
+        shutil.rmtree(Path("AI_Children") / child, ignore_errors=True)
+
+
+def test_human_memory_prune_pass_compacts_low_value_cold_fragment():
+    child = "TestHumanMemoryPrunePass"
+    root = Path("AI_Children") / child / "memory"
+    fragment_root = root / "fragments"
+    cold_dir = fragment_root / "cold"
+    shutil.rmtree(Path("AI_Children") / child, ignore_errors=True)
+    fragment_root.mkdir(parents=True, exist_ok=True)
+    try:
+        old_ts = "2026-03-01T00:00:00+00:00"
+        path_obj = fragment_root / "frag_low.json"
+        payload = {
+            "id": "low",
+            "tags": ["ordinary"],
+            "importance": 0.05,
+            "timestamp": old_ts,
+            "summary": "low value detail " * 128,
+            "emotions": {"intensity": 0.1, "trust": 0.2},
+        }
+        path_obj.write_text(json.dumps(payload))
+        st = path_obj.stat()
+        retention = mg.DEFAULT_RETENTION_POLICY.copy()
+        retention.update({
+            "human_prune_limit": 4,
+            "human_prune_min_age_hours": 24.0,
+            "human_prune_max_importance": 0.18,
+            "human_prune_min_size_bytes": 1,
+            "human_prune_cooldown_seconds": 0.0,
+        })
+        manager = mg.MemoryManager(child=child, tier_policy={"retention": retention}, autoload=False)
+        manager.memory_map = {
+            "low": {
+                "tier": "short",
+                "filename": path_obj.name,
+                "importance": 0.05,
+                "tags": ["ordinary"],
+                "last_seen": old_ts,
+                "mtime_ns": int(st.st_mtime_ns),
+                "size_bytes": int(st.st_size),
+            }
+        }
+        manager._map_loaded = True
+        manager.cold_storage_policy.update({
+            "enabled": True,
+            "auto_compact": True,
+            "quarantine_days": 1,
+            "purge_pending_delete": True,
+            "retain_full_fragment": False,
+        })
+        manager.save_map()
+
+        stats = manager.human_memory_prune_pass(force=True, now=datetime(2026, 4, 2, tzinfo=timezone.utc))
+        stub_path = cold_dir / path_obj.name
+        stub = json.loads(stub_path.read_text())
+        pending_path = root / "fragments" / "pending_delete" / "cold" / path_obj.name
+
+        assert stats["compacted"] == 1
+        assert stats["moved_to_cold"] == 1
+        assert isinstance(stub.get("cold_core"), dict)
+        assert not path_obj.exists()
+        assert pending_path.exists()
+    finally:
+        shutil.rmtree(Path("AI_Children") / child, ignore_errors=True)
 
 
 def test_build_synaptic_links_spooled_stream_through_save_and_snapshot():

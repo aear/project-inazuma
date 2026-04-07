@@ -1,11 +1,12 @@
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import colorchooser, messagebox, simpledialog
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
 from gui_hook import log_to_statusbox
 from model_manager import (
@@ -18,8 +19,15 @@ from model_manager import (
 
 CANVAS_WIDTH = 900
 CANVAS_HEIGHT = 600
-DEFAULT_BG = "#ffffff"
+DEFAULT_BG = "#dfe3ea"
+EMPTY_IMAGE_BG = (255, 255, 255, 0)
 DEFAULT_COLOR = "#1b1b1b"
+PAINT_API_QUEUE_KEY = "paint_command_queue"
+PAINT_API_STATUS_KEY = "paint_api_status"
+PAINT_API_LAST_RESULT_KEY = "paint_api_last_result"
+PAINT_API_POLL_MS = 250
+PAINT_API_MAX_COMMANDS_PER_TICK = 12
+PAINT_API_PATTERNS = ["circle", "spiral", "wave", "star", "burst"]
 PALETTE = [
     "#1b1b1b",
     "#c0392b",
@@ -30,6 +38,251 @@ PALETTE = [
     "#8e44ad",
     "#ecf0f1",
 ]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"1", "true", "yes", "on"}:
+            return True
+        if cleaned in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _coerce_float(value, default: float, low: float | None = None, high: float | None = None) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        number = float(default)
+    if low is not None:
+        number = max(float(low), number)
+    if high is not None:
+        number = min(float(high), number)
+    return number
+
+
+def _coerce_int(value, default: int, low: int | None = None, high: int | None = None) -> int:
+    number = int(round(_coerce_float(value, default)))
+    if low is not None:
+        number = max(int(low), number)
+    if high is not None:
+        number = min(int(high), number)
+    return number
+
+
+def _coerce_brush_size(value, default: int) -> int:
+    return _coerce_int(value, default, low=1, high=72)
+
+
+def _normalise_color(value, default: str = DEFAULT_COLOR) -> str:
+    if not isinstance(value, str) or not value.strip():
+        value = default
+    try:
+        rgb = ImageColor.getrgb(value.strip())
+    except Exception:
+        rgb = ImageColor.getrgb(default)
+    return "#{:02x}{:02x}{:02x}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+def _paint_command_uses_normalized_space(command: dict) -> bool:
+    space = str(command.get("space") or command.get("units") or "").strip().lower()
+    if space in {"pixel", "pixels", "px", "absolute"}:
+        return False
+    if space in {"normalized", "normalised", "relative", "unit", "0..1", "0-1"}:
+        return True
+    if "normalized" in command:
+        return _coerce_bool(command.get("normalized"), True)
+    if "normalised" in command:
+        return _coerce_bool(command.get("normalised"), True)
+    return True
+
+
+def normalise_paint_point(
+    raw_point,
+    *,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+    normalized: bool = True,
+) -> tuple[float, float]:
+    if isinstance(raw_point, dict):
+        x_raw = raw_point.get("x")
+        y_raw = raw_point.get("y")
+    elif isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
+        x_raw = raw_point[0]
+        y_raw = raw_point[1]
+    else:
+        raise ValueError("point must be [x, y] or {'x': x, 'y': y}")
+    try:
+        x = float(x_raw)
+        y = float(y_raw)
+    except Exception as exc:
+        raise ValueError("point coordinates must be numeric") from exc
+    if normalized:
+        x *= width
+        y *= height
+    return (_clamp(x, 0.0, float(width)), _clamp(y, 0.0, float(height)))
+
+
+def normalise_paint_points(
+    raw_points,
+    *,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+    normalized: bool = True,
+) -> list[tuple[float, float]]:
+    if not isinstance(raw_points, list):
+        raise ValueError("points must be a list")
+
+    points = [
+        normalise_paint_point(item, width=width, height=height, normalized=normalized)
+        for item in raw_points
+    ]
+    if not points:
+        raise ValueError("points cannot be empty")
+    return points
+
+
+def _paint_distance(value, *, normalized: bool, width: int = CANVAS_WIDTH, height: int = CANVAS_HEIGHT, default: float = 0.2) -> float:
+    number = _coerce_float(value, default, low=0.0)
+    if normalized:
+        number *= min(width, height)
+    return number
+
+
+def _build_circle_pattern(
+    command: dict,
+    *,
+    normalized: bool,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> list[list[tuple[float, float]]]:
+    center = normalise_paint_point(command.get("center", [0.5, 0.5]), width=width, height=height, normalized=normalized)
+    radius = _paint_distance(command.get("radius", 0.22), normalized=normalized, width=width, height=height, default=0.22)
+    steps = _coerce_int(command.get("steps", 96), 96, low=12, high=360)
+    points = []
+    for idx in range(steps + 1):
+        angle = (2.0 * math.pi * idx) / steps
+        points.append((center[0] + math.cos(angle) * radius, center[1] + math.sin(angle) * radius))
+    return [points]
+
+
+def _build_spiral_pattern(
+    command: dict,
+    *,
+    normalized: bool,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> list[list[tuple[float, float]]]:
+    center = normalise_paint_point(command.get("center", [0.5, 0.5]), width=width, height=height, normalized=normalized)
+    radius = _paint_distance(command.get("radius", 0.32), normalized=normalized, width=width, height=height, default=0.32)
+    turns = _coerce_float(command.get("turns", 3.0), 3.0, low=0.25, high=12.0)
+    steps = _coerce_int(command.get("steps", 120), 120, low=12, high=720)
+    points = []
+    for idx in range(steps + 1):
+        progress = idx / steps
+        angle = 2.0 * math.pi * turns * progress
+        r = radius * progress
+        points.append((center[0] + math.cos(angle) * r, center[1] + math.sin(angle) * r))
+    return [points]
+
+
+def _build_wave_pattern(
+    command: dict,
+    *,
+    normalized: bool,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> list[list[tuple[float, float]]]:
+    start = normalise_paint_point(command.get("start", [0.12, 0.5]), width=width, height=height, normalized=normalized)
+    end = normalise_paint_point(command.get("end", [0.88, 0.5]), width=width, height=height, normalized=normalized)
+    amplitude = _paint_distance(command.get("amplitude", 0.08), normalized=normalized, width=width, height=height, default=0.08)
+    cycles = _coerce_float(command.get("cycles", 2.0), 2.0, low=0.25, high=16.0)
+    steps = _coerce_int(command.get("steps", 120), 120, low=8, high=720)
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy) or 1.0
+    nx = -dy / length
+    ny = dx / length
+    points = []
+    for idx in range(steps + 1):
+        progress = idx / steps
+        offset = math.sin(progress * cycles * 2.0 * math.pi) * amplitude
+        points.append((start[0] + dx * progress + nx * offset, start[1] + dy * progress + ny * offset))
+    return [points]
+
+
+def _build_star_pattern(
+    command: dict,
+    *,
+    normalized: bool,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> list[list[tuple[float, float]]]:
+    center = normalise_paint_point(command.get("center", [0.5, 0.5]), width=width, height=height, normalized=normalized)
+    points_count = _coerce_int(command.get("points_count", command.get("points", 5)), 5, low=3, high=16)
+    outer = _paint_distance(command.get("radius", 0.28), normalized=normalized, width=width, height=height, default=0.28)
+    inner = _paint_distance(command.get("inner_radius", 0.12), normalized=normalized, width=width, height=height, default=0.12)
+    vertices = []
+    total = points_count * 2
+    for idx in range(total + 1):
+        radius = outer if idx % 2 == 0 else inner
+        angle = (-math.pi / 2.0) + (2.0 * math.pi * idx / total)
+        vertices.append((center[0] + math.cos(angle) * radius, center[1] + math.sin(angle) * radius))
+    return [vertices]
+
+
+def _build_burst_pattern(
+    command: dict,
+    *,
+    normalized: bool,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> list[list[tuple[float, float]]]:
+    center = normalise_paint_point(command.get("center", [0.5, 0.5]), width=width, height=height, normalized=normalized)
+    radius = _paint_distance(command.get("radius", 0.3), normalized=normalized, width=width, height=height, default=0.3)
+    inner = _paint_distance(command.get("inner_radius", 0.0), normalized=normalized, width=width, height=height, default=0.0)
+    rays = _coerce_int(command.get("rays", 12), 12, low=2, high=96)
+    strokes = []
+    for idx in range(rays):
+        angle = (2.0 * math.pi * idx) / rays
+        start = (center[0] + math.cos(angle) * inner, center[1] + math.sin(angle) * inner)
+        end = (center[0] + math.cos(angle) * radius, center[1] + math.sin(angle) * radius)
+        strokes.append([start, end])
+    return strokes
+
+
+def build_paint_pattern_strokes(command: dict, *, width: int = CANVAS_WIDTH, height: int = CANVAS_HEIGHT) -> list[list[tuple[float, float]]]:
+    normalized = _paint_command_uses_normalized_space(command)
+    pattern = str(command.get("pattern") or command.get("name") or command.get("action") or "").strip().lower()
+    builders = {
+        "circle": _build_circle_pattern,
+        "spiral": _build_spiral_pattern,
+        "wave": _build_wave_pattern,
+        "star": _build_star_pattern,
+        "burst": _build_burst_pattern,
+    }
+    builder = builders.get(pattern)
+    if builder is None:
+        raise ValueError(f"unknown pattern: {pattern or 'missing'}")
+    strokes = builder(command, normalized=normalized, width=width, height=height)
+    return [
+        [(_clamp(x, 0.0, float(width)), _clamp(y, 0.0, float(height))) for x, y in stroke]
+        for stroke in strokes
+        if stroke
+    ]
 
 
 class PaintWindow:
@@ -70,19 +323,22 @@ class PaintWindow:
         self.last_y = None
         self.dirty = False
         self.last_saved_path = None
+        self._api_poll_active = True
 
         self._build_toolbar()
         self._bind_canvas()
         self._set_window_state(True)
+        self._schedule_api_poll()
 
     def _set_window_state(self, is_open: bool) -> None:
         try:
             update_inastate("paint_window_open", is_open)
+            self._publish_api_status("ready" if is_open else "closed")
         except Exception:
             pass
 
     def _init_image(self) -> None:
-        self.image = Image.new("RGB", (CANVAS_WIDTH, CANVAS_HEIGHT), DEFAULT_BG)
+        self.image = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), EMPTY_IMAGE_BG)
         self.draw = ImageDraw.Draw(self.image)
 
     def _build_toolbar(self) -> None:
@@ -132,6 +388,9 @@ class PaintWindow:
     def _current_color(self) -> str:
         return DEFAULT_BG if self.is_eraser.get() else self.active_color
 
+    def _current_image_color(self):
+        return EMPTY_IMAGE_BG if self.is_eraser.get() else self.active_color
+
     def _start_draw(self, event) -> None:
         self.last_x = event.x
         self.last_y = event.y
@@ -141,40 +400,66 @@ class PaintWindow:
             self.last_x = event.x
             self.last_y = event.y
             return
-        color = self._current_color()
-        width = self.brush_size.get()
-        self.canvas.create_line(
+        self._draw_segment(
             self.last_x,
             self.last_y,
             event.x,
             event.y,
+            color=self._current_color(),
+            width=self.brush_size.get(),
+            image_color=self._current_image_color(),
+        )
+        self.last_x = event.x
+        self.last_y = event.y
+
+    def _end_draw(self, _event) -> None:
+        self.last_x = None
+        self.last_y = None
+
+    def _draw_segment(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        *,
+        color: str,
+        width: int,
+        image_color=None,
+    ) -> None:
+        self.canvas.create_line(
+            x1,
+            y1,
+            x2,
+            y2,
             fill=color,
             width=width,
             capstyle=tk.ROUND,
             smooth=True,
             splinesteps=36,
         )
-        self.draw.line(
-            [self.last_x, self.last_y, event.x, event.y],
-            fill=color,
-            width=width,
-        )
-        self.last_x = event.x
-        self.last_y = event.y
+        self.draw.line([x1, y1, x2, y2], fill=image_color if image_color is not None else color, width=width)
         self.dirty = True
 
-    def _end_draw(self, _event) -> None:
-        self.last_x = None
-        self.last_y = None
+    def _draw_dot(self, x: float, y: float, *, color: str, width: int, image_color=None) -> None:
+        radius = max(1.0, width / 2.0)
+        bounds = (x - radius, y - radius, x + radius, y + radius)
+        self.canvas.create_oval(*bounds, fill=color, outline=color)
+        image_fill = image_color if image_color is not None else color
+        self.draw.ellipse(bounds, fill=image_fill, outline=image_fill)
+        self.dirty = True
 
-    def _clear_canvas(self) -> None:
-        if not messagebox.askyesno("Clear", "Clear the canvas?"):
-            return
+    def _reset_canvas(self) -> None:
         self.canvas.delete("all")
         self._init_image()
         self.dirty = True
 
-    def _save_image(self) -> str | None:
+    def _clear_canvas(self) -> None:
+        if not messagebox.askyesno("Clear", "Clear the canvas?"):
+            return
+        self._reset_canvas()
+
+    def _save_image(self, *, show_errors: bool = True) -> str | None:
         timestamp = datetime.now(timezone.utc).isoformat().replace(":", "-")
         filename = f"ina_paint_{timestamp}.png"
         path = self.session_dir / filename
@@ -187,8 +472,207 @@ class PaintWindow:
             log_to_statusbox(f"[Paint] Saved {path.name}")
             return str(path)
         except Exception as exc:
-            messagebox.showerror("Save failed", f"Could not save image: {exc}")
+            if show_errors:
+                messagebox.showerror("Save failed", f"Could not save image: {exc}")
+            else:
+                log_to_statusbox(f"[Paint] API save failed: {exc}")
             return None
+
+    def _publish_api_status(self, status: str, **extra) -> None:
+        payload = {
+            "timestamp": _utc_now(),
+            "window_open": bool(status != "closed"),
+            "status": status,
+            "queue_key": PAINT_API_QUEUE_KEY,
+            "result_key": PAINT_API_LAST_RESULT_KEY,
+            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "close"],
+            "patterns": PAINT_API_PATTERNS,
+            "coordinate_space": "normalized 0..1 by default; use space='pixels' for canvas pixels",
+            "workspace_background": DEFAULT_BG,
+            "image_background": "transparent",
+            "example": {
+                "id": "sketch_001",
+                "action": "pattern",
+                "pattern": "spiral",
+                "center": [0.5, 0.5],
+                "radius": 0.32,
+                "turns": 3,
+                "color": "#d35400",
+                "brush_size": 8,
+            },
+        }
+        payload.update(extra)
+        try:
+            update_inastate(PAINT_API_STATUS_KEY, payload)
+        except Exception:
+            pass
+
+    def _schedule_api_poll(self) -> None:
+        if not self._api_poll_active:
+            return
+        try:
+            self.root.after(PAINT_API_POLL_MS, self._poll_api_commands)
+        except Exception:
+            pass
+
+    def _poll_api_commands(self) -> None:
+        try:
+            self._process_api_queue()
+        finally:
+            self._schedule_api_poll()
+
+    def _process_api_queue(self) -> None:
+        raw_queue = get_inastate(PAINT_API_QUEUE_KEY)
+        if raw_queue in (None, [], ""):
+            return
+        if isinstance(raw_queue, dict):
+            queue = [raw_queue]
+        elif isinstance(raw_queue, list):
+            queue = raw_queue
+        else:
+            result = {
+                "timestamp": _utc_now(),
+                "status": "error",
+                "error": "paint_command_queue must be a command object or list of command objects",
+            }
+            update_inastate(PAINT_API_QUEUE_KEY, [])
+            update_inastate(PAINT_API_LAST_RESULT_KEY, result)
+            self._publish_api_status("error", last_error=result["error"])
+            return
+
+        batch = queue[:PAINT_API_MAX_COMMANDS_PER_TICK]
+        remaining = queue[PAINT_API_MAX_COMMANDS_PER_TICK:]
+        results = [self._process_api_command(command) for command in batch]
+        payload = {
+            "timestamp": _utc_now(),
+            "processed": len(results),
+            "remaining": len(remaining),
+            "results": results,
+        }
+        update_inastate(PAINT_API_QUEUE_KEY, remaining)
+        update_inastate(PAINT_API_LAST_RESULT_KEY, payload)
+        self._publish_api_status("processed", processed=len(results), remaining=len(remaining))
+
+    def _process_api_command(self, command) -> dict:
+        if not isinstance(command, dict):
+            return {"status": "error", "error": "command must be an object"}
+        action = str(command.get("action") or command.get("type") or "").strip().lower()
+        command_id = str(command.get("id") or f"paint_cmd_{int(time.time() * 1000)}")
+        try:
+            if action in {"stroke", "draw", "line"}:
+                result = self._api_stroke(command)
+            elif action in {"pattern", "shape", *PAINT_API_PATTERNS}:
+                result = self._api_pattern(command, action=action)
+            elif action == "set_brush":
+                result = self._api_set_brush(command)
+            elif action == "clear":
+                self._reset_canvas()
+                result = {"status": "ok", "cleared": True}
+            elif action == "save":
+                path = self._save_image(show_errors=False)
+                result = {"status": "ok" if path else "error", "path": path}
+                if not path:
+                    result["error"] = "save failed"
+            elif action in {"close", "finish", "done"}:
+                result = self._api_close(command)
+            else:
+                result = {"status": "error", "error": f"unknown action: {action or 'missing'}"}
+        except Exception as exc:
+            result = {"status": "error", "error": str(exc)}
+        result["id"] = command_id
+        result["action"] = action or None
+        result["timestamp"] = _utc_now()
+        return result
+
+    def _api_set_brush(self, command: dict) -> dict:
+        if "brush_size" in command:
+            self.brush_size.set(_coerce_brush_size(command.get("brush_size"), self.brush_size.get()))
+        if "color" in command:
+            self._set_color(_normalise_color(command.get("color"), self.active_color))
+        if "eraser" in command:
+            self.is_eraser.set(_coerce_bool(command.get("eraser"), self.is_eraser.get()))
+        return {
+            "status": "ok",
+            "brush_size": self.brush_size.get(),
+            "color": self.active_color,
+            "eraser": self.is_eraser.get(),
+        }
+
+    def _api_stroke_style(self, command: dict):
+        width = _coerce_brush_size(command.get("brush_size"), self.brush_size.get())
+        eraser = _coerce_bool(command.get("eraser"), self.is_eraser.get())
+        if eraser:
+            return width, DEFAULT_BG, EMPTY_IMAGE_BG, eraser
+        color = _normalise_color(command.get("color", self.active_color), self.active_color)
+        return width, color, color, eraser
+
+    def _render_api_points(
+        self,
+        points: list[tuple[float, float]],
+        *,
+        color: str,
+        width: int,
+        image_color=None,
+    ) -> None:
+        if len(points) == 1:
+            self._draw_dot(points[0][0], points[0][1], color=color, width=width, image_color=image_color)
+        else:
+            for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                self._draw_segment(x1, y1, x2, y2, color=color, width=width, image_color=image_color)
+
+    def _api_stroke(self, command: dict) -> dict:
+        width, color, image_color, eraser = self._api_stroke_style(command)
+        points = normalise_paint_points(
+            command.get("points"),
+            width=CANVAS_WIDTH,
+            height=CANVAS_HEIGHT,
+            normalized=_paint_command_uses_normalized_space(command),
+        )
+        self._render_api_points(points, color=color, width=width, image_color=image_color)
+
+        return {
+            "status": "ok",
+            "points": len(points),
+            "brush_size": width,
+            "color": color,
+            "eraser": eraser,
+            "dirty": self.dirty,
+        }
+
+    def _api_pattern(self, command: dict, *, action: str) -> dict:
+        if not command.get("pattern") and action in PAINT_API_PATTERNS:
+            command = dict(command)
+            command["pattern"] = action
+        width, color, image_color, eraser = self._api_stroke_style(command)
+        strokes = build_paint_pattern_strokes(command)
+        for stroke in strokes:
+            self._render_api_points(stroke, color=color, width=width, image_color=image_color)
+        return {
+            "status": "ok",
+            "pattern": str(command.get("pattern") or action),
+            "strokes": len(strokes),
+            "points": sum(len(stroke) for stroke in strokes),
+            "brush_size": width,
+            "color": color,
+            "eraser": eraser,
+            "dirty": self.dirty,
+        }
+
+    def _api_close(self, command: dict) -> dict:
+        save_before_close = _coerce_bool(command.get("save"), True)
+        saved_path = self._save_image(show_errors=False) if save_before_close and self.dirty else None
+        self._api_poll_active = False
+        self._set_window_state(False)
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "closed": True,
+            "saved": bool(saved_path),
+            "path": saved_path,
+        }
 
     def _share_image(self) -> None:
         path = self._save_image() if self.dirty or self.last_saved_path is None else str(self.last_saved_path)
@@ -272,6 +756,7 @@ class PaintWindow:
         if self.dirty:
             if messagebox.askyesno("Save", "Save before closing?"):
                 self._save_image()
+        self._api_poll_active = False
         self._set_window_state(False)
         self.root.destroy()
 

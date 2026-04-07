@@ -571,10 +571,17 @@ def _iter_word_candidates(value: Any) -> Iterable[Dict[str, Any]]:
         yield {"word": str(value)}
 
 
+def _candidate_matches_symbol_token(candidate: Any, symbol: str) -> bool:
+    if symbol in _candidate_symbols(candidate):
+        return True
+    native_word = _candidate_native_word(candidate)
+    return bool(native_word and native_word == symbol)
+
+
 def _iter_text_vocab_link_candidates(links_payload: Any, symbol: str) -> Iterable[Dict[str, Any]]:
     if isinstance(links_payload, list):
         for entry in links_payload:
-            if symbol in _candidate_symbols(entry):
+            if _candidate_matches_symbol_token(entry, symbol):
                 yield entry
         return
 
@@ -585,7 +592,7 @@ def _iter_text_vocab_link_candidates(links_payload: Any, symbol: str) -> Iterabl
         entries = links_payload.get(key)
         if isinstance(entries, list):
             for entry in entries:
-                if symbol in _candidate_symbols(entry):
+                if _candidate_matches_symbol_token(entry, symbol):
                     yield entry
 
     symbol_map = links_payload.get("symbols")
@@ -598,7 +605,7 @@ def _iter_text_vocab_link_candidates(links_payload: Any, symbol: str) -> Iterabl
     vocab = links_payload.get("vocab")
     if isinstance(vocab, dict):
         for word, entry in vocab.items():
-            if symbol not in _candidate_symbols(entry):
+            if not _candidate_matches_symbol_token(entry, symbol):
                 continue
             candidate = dict(entry) if isinstance(entry, dict) else {}
             candidate.setdefault("word", word)
@@ -766,8 +773,9 @@ def build_dual_symbolic_message(
     context: Optional[Dict[str, Any]] = None,
     fallback_to_symbol_to_token: bool = True,
     native_style: str = "symbols",
-    native_label: str = "Ina native",
+    native_label: str = "Native",
     human_label: str = "Human guess",
+    symbol_to_token_vocab: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     if isinstance(symbols, str):
         normalized = [symbols.strip()] if symbols.strip() else []
@@ -783,6 +791,7 @@ def build_dual_symbolic_message(
     native_sources: Dict[str, str] = {}
     gloss_sources: Dict[str, str] = {}
     use_glyphs = _use_native_glyphs(native_style)
+    native_unresolved_indexes: List[tuple] = []
 
     links_payload = load_text_vocab_links(child, base_path=base_path) if (use_glyphs or not explicit_human_text) else {}
     for idx, sym in enumerate(normalized):
@@ -792,6 +801,8 @@ def build_dual_symbolic_message(
             if native_word:
                 native_tokens[idx] = native_word
                 native_sources[sym] = "text_vocab_links"
+        if use_glyphs and native_tokens[idx] == sym:
+            native_unresolved_indexes.append((idx, sym))
 
         if explicit_human_text:
             continue
@@ -801,8 +812,25 @@ def build_dual_symbolic_message(
         else:
             unresolved_indexes.append((idx, sym))
 
+    vocab: Optional[Dict[str, Any]] = symbol_to_token_vocab if isinstance(symbol_to_token_vocab, dict) else None
+    if use_glyphs and native_unresolved_indexes:
+        if vocab is None and fallback_to_symbol_to_token:
+            vocab = load_symbol_to_token(child, base_path=base_path)
+        if isinstance(vocab, dict):
+            still_native_unresolved: List[tuple] = []
+            for idx, sym in native_unresolved_indexes:
+                entry = vocab.get(sym)
+                native_word = str(entry.get("word") or "").strip() if isinstance(entry, dict) else ""
+                if native_word:
+                    native_tokens[idx] = native_word
+                    native_sources[sym] = "symbol_to_token"
+                else:
+                    still_native_unresolved.append((idx, sym))
+            native_unresolved_indexes = still_native_unresolved
+
     if not explicit_human_text and unresolved_indexes and fallback_to_symbol_to_token:
-        vocab = load_symbol_to_token(child, base_path=base_path)
+        if vocab is None:
+            vocab = load_symbol_to_token(child, base_path=base_path)
         still_unresolved: List[tuple] = []
         for idx, sym in unresolved_indexes:
             entry = vocab.get(sym) if isinstance(vocab, dict) else {}
@@ -817,6 +845,11 @@ def build_dual_symbolic_message(
                 still_unresolved.append((idx, sym))
         unresolved_indexes = still_unresolved
 
+    if not explicit_human_text and use_glyphs:
+        for idx, sym in unresolved_indexes:
+            if native_tokens[idx] != sym:
+                guessed_words[idx] = native_tokens[idx]
+
     unresolved_symbols: List[str] = [sym for _, sym in unresolved_indexes]
     native_text = " ".join(native_tokens)
     fallback_text = str(fallback_human_text or "").strip()
@@ -826,10 +859,7 @@ def build_dual_symbolic_message(
     if not gloss_text:
         gloss_text = native_text
 
-    if gloss_text == native_text:
-        combined = native_text
-    else:
-        combined = f"{native_label}: {native_text}\n{human_label}: {gloss_text}"
+    combined = f"{native_label}: {native_text}\n{human_label}: {gloss_text}"
 
     return {
         "text": combined,
@@ -1600,6 +1630,7 @@ def generate_symbolic_reply_from_text(
         context=reply_context,
         fallback_to_symbol_to_token=False,
         native_style="glyphs",
+        symbol_to_token_vocab=vocab if vocab_loaded else None,
     )
     fallback_text = " ".join(symbols_to_speak)
     transformer_insights = _build_reply_transformer_insights(symbols_to_speak, vocab, unknown)

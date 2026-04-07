@@ -89,6 +89,14 @@ DEFAULT_RETENTION_POLICY = {
     "pre_compact_enabled": False,
     "pre_compact_limit": 24,
     "pre_compact_min_size_bytes": 65536,
+    "human_prune_limit": 750,
+    "human_prune_large_index_threshold": 1_000_000,
+    "human_prune_large_index_limit": 5_000,
+    "human_prune_candidate_multiplier": 6,
+    "human_prune_min_age_hours": 24.0 * 7.0,
+    "human_prune_max_importance": 0.18,
+    "human_prune_min_size_bytes": 2048,
+    "human_prune_cooldown_seconds": 3600.0,
 }
 DEFAULT_BOOT_POLICY = {
     "boot_mode": "full",  # full | fast | auto
@@ -425,6 +433,30 @@ def _memory_policy():
         min_size = _coerce_positive_int(raw_retention.get("pre_compact_min_size_bytes"))
         if min_size is not None:
             retention["pre_compact_min_size_bytes"] = min_size
+        human_limit = _coerce_positive_int(raw_retention.get("human_prune_limit"))
+        if human_limit is not None:
+            retention["human_prune_limit"] = human_limit
+        large_threshold = _coerce_positive_int(raw_retention.get("human_prune_large_index_threshold"))
+        if large_threshold is not None:
+            retention["human_prune_large_index_threshold"] = large_threshold
+        large_limit = _coerce_positive_int(raw_retention.get("human_prune_large_index_limit"))
+        if large_limit is not None:
+            retention["human_prune_large_index_limit"] = large_limit
+        candidate_multiplier = _coerce_positive_int(raw_retention.get("human_prune_candidate_multiplier"))
+        if candidate_multiplier is not None:
+            retention["human_prune_candidate_multiplier"] = candidate_multiplier
+        human_age = _coerce_positive_float(raw_retention.get("human_prune_min_age_hours"))
+        if human_age is not None:
+            retention["human_prune_min_age_hours"] = human_age
+        human_importance = _coerce_float(raw_retention.get("human_prune_max_importance"))
+        if human_importance is not None:
+            retention["human_prune_max_importance"] = _clamp(human_importance, 0.0, 1.0)
+        human_min_size = _coerce_positive_int(raw_retention.get("human_prune_min_size_bytes"))
+        if human_min_size is not None:
+            retention["human_prune_min_size_bytes"] = human_min_size
+        human_cooldown = _coerce_positive_float(raw_retention.get("human_prune_cooldown_seconds"))
+        if human_cooldown is not None:
+            retention["human_prune_cooldown_seconds"] = human_cooldown
     policy["retention"] = retention
     return policy
 
@@ -711,6 +743,8 @@ def _run_memory_index_verification(child: str, cfg: Dict[str, Any], mgr: "Memory
         )
 
     mgr.stats()
+    if hasattr(mgr, "human_memory_prune_pass"):
+        mgr.human_memory_prune_pass(force=True)
     handle_bundle_prune(child, cfg, mgr)
     verification = {
         "boot_mode": boot_mode,
@@ -736,6 +770,8 @@ def _run_memory_neural_phase(child: str, mgr: "MemoryManager", *, launch_source:
     experience_summary: Dict[str, Any] = {}
     try:
         mgr.fast_reindex(rebalance=False, prune_missing=False)
+        if hasattr(mgr, "human_memory_prune_pass"):
+            mgr.human_memory_prune_pass()
         build_summary = build_fractal_memory(child) or {}
         if build_summary.get("needs_resume"):
             _set_memory_graph_deferred_build(
@@ -1058,6 +1094,127 @@ def _select_pregraph_compaction_candidates(child: str, index: Any, retention: Di
             continue
         score = (size_bytes, age_hours, str(frag_id))
         entry = (score, str(frag_id), meta, path)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        elif entry[0] > heap[0][0]:
+            heapq.heapreplace(heap, entry)
+    return [(frag_id, meta, path) for _, frag_id, meta, path in sorted(heap, key=lambda item: item[0], reverse=True)]
+
+
+def _human_memory_prune_settings(retention: Optional[Dict[str, Any]], index_count: int = 0) -> Dict[str, Any]:
+    retention = retention or DEFAULT_RETENTION_POLICY
+    base_limit = max(1, int(_safe_float(retention.get("human_prune_limit"), DEFAULT_RETENTION_POLICY["human_prune_limit"])))
+    large_threshold = max(1, int(_safe_float(
+        retention.get("human_prune_large_index_threshold"),
+        DEFAULT_RETENTION_POLICY["human_prune_large_index_threshold"],
+    )))
+    large_limit = max(base_limit, int(_safe_float(
+        retention.get("human_prune_large_index_limit"),
+        DEFAULT_RETENTION_POLICY["human_prune_large_index_limit"],
+    )))
+    limit = large_limit if index_count >= large_threshold else base_limit
+    min_age_default = _safe_float(
+        retention.get("compact_low_importance_age_hours"),
+        DEFAULT_RETENTION_POLICY["compact_low_importance_age_hours"],
+    )
+    max_importance_default = _safe_float(
+        retention.get("compact_low_importance_threshold"),
+        DEFAULT_RETENTION_POLICY["compact_low_importance_threshold"],
+    )
+    return {
+        "limit": limit,
+        "candidate_multiplier": max(1, int(_safe_float(
+            retention.get("human_prune_candidate_multiplier"),
+            DEFAULT_RETENTION_POLICY["human_prune_candidate_multiplier"],
+        ))),
+        "min_age_hours": max(0.0, _safe_float(
+            retention.get("human_prune_min_age_hours"),
+            min_age_default,
+        )),
+        "max_importance": _clamp(_safe_float(
+            retention.get("human_prune_max_importance"),
+            max_importance_default,
+        ), 0.0, 1.0),
+        "min_size_bytes": max(0, int(_safe_float(
+            retention.get("human_prune_min_size_bytes"),
+            DEFAULT_RETENTION_POLICY["human_prune_min_size_bytes"],
+        ))),
+        "cooldown_seconds": max(0.0, _safe_float(
+            retention.get("human_prune_cooldown_seconds"),
+            DEFAULT_RETENTION_POLICY["human_prune_cooldown_seconds"],
+        )),
+    }
+
+
+def _human_prune_candidate_from_meta(
+    child: str,
+    frag_id: str,
+    meta: Dict[str, Any],
+    retention: Dict[str, Any],
+    settings: Dict[str, Any],
+    now_ts: float,
+) -> Optional[Tuple[str, Dict[str, Any], Path, Tuple[int, float, float, str]]]:
+    if not frag_id or not isinstance(meta, dict):
+        return None
+    if _is_anchor_fragment_record(meta, retention):
+        return None
+    tier = str(meta.get("tier") or "short")
+    if tier == "working":
+        return None
+    if tier not in set(MEMORY_TIERS):
+        tier = "short"
+    importance = _clamp(_safe_float(meta.get("importance"), 0.0), 0.0, 1.0)
+    if importance > settings["max_importance"]:
+        return None
+    ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp"))
+    if ts is None:
+        return None
+    age_hours = max(0.0, (now_ts - ts) / 3600.0)
+    if age_hours < settings["min_age_hours"]:
+        return None
+    path = _resolve_index_path(child, frag_id, meta)
+    if path is None:
+        return None
+    size_bytes = int(_safe_float(meta.get("size_bytes"), 0.0))
+    if size_bytes <= 0:
+        try:
+            size_bytes = int(path.stat().st_size)
+        except OSError:
+            return None
+    if size_bytes < settings["min_size_bytes"]:
+        return None
+    score = (size_bytes, age_hours, -importance, str(frag_id))
+    return str(frag_id), meta, path, score
+
+
+def _select_human_memory_prune_candidates(
+    child: str,
+    index: Any,
+    retention: Optional[Dict[str, Any]],
+    *,
+    index_count: int = 0,
+    now: Optional[datetime] = None,
+) -> List[Tuple[str, Dict[str, Any], Path]]:
+    retention = retention or DEFAULT_RETENTION_POLICY
+    settings = _human_memory_prune_settings(retention, index_count=index_count)
+    limit = int(settings["limit"])
+    if limit <= 0 or not index:
+        return []
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    now_ts = now_dt.timestamp()
+
+    if hasattr(index, "iter_human_prune_candidates"):
+        return list(index.iter_human_prune_candidates(retention, settings, now_ts))[:limit]
+
+    heap: List[Tuple[Tuple[int, float, float, str], str, Dict[str, Any], Path]] = []
+    for frag_id, meta in index.items():
+        candidate = _human_prune_candidate_from_meta(child, str(frag_id), meta, retention, settings, now_ts)
+        if candidate is None:
+            continue
+        candidate_id, candidate_meta, candidate_path, score = candidate
+        entry = (score, candidate_id, candidate_meta, candidate_path)
         if len(heap) < limit:
             heapq.heappush(heap, entry)
         elif entry[0] > heap[0][0]:
@@ -3146,6 +3303,57 @@ class _MemoryIndexStore:
             if row and row[0]:
                 yield str(row[0])
 
+    def iter_human_prune_candidates(
+        self,
+        retention: Dict[str, Any],
+        settings: Dict[str, Any],
+        now_ts: float,
+    ) -> Iterable[Tuple[str, Dict[str, Any], Path]]:
+        if self.conn is None:
+            return []
+        limit = int(settings.get("limit") or 0)
+        if limit <= 0:
+            return []
+        fetch_limit = max(limit, limit * int(settings.get("candidate_multiplier") or 1))
+        cutoff_iso = datetime.fromtimestamp(
+            now_ts - (float(settings.get("min_age_hours") or 0.0) * 3600.0),
+            timezone.utc,
+        ).isoformat()
+        cursor = self.conn.execute(
+            """
+            SELECT frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json
+            FROM fragments
+            WHERE (tier IS NULL OR tier = '' OR tier IN ('short', 'long', 'cold'))
+              AND importance <= ?
+              AND size_bytes >= ?
+              AND (
+                    (last_seen IS NOT NULL AND last_seen != '' AND last_seen <= ?)
+                 OR (timestamp IS NOT NULL AND timestamp != '' AND timestamp <= ?)
+              )
+            ORDER BY size_bytes DESC, importance ASC, COALESCE(NULLIF(last_seen, ''), NULLIF(timestamp, ''), '') ASC
+            LIMIT ?
+            """,
+            (
+                float(settings.get("max_importance") or 0.0),
+                int(settings.get("min_size_bytes") or 0),
+                cutoff_iso,
+                cutoff_iso,
+                fetch_limit,
+            ),
+        )
+        selected: List[Tuple[str, Dict[str, Any], Path]] = []
+        for row in cursor:
+            frag_id = str(row[0])
+            meta = self._row_to_meta(row)
+            candidate = _human_prune_candidate_from_meta(self.child, frag_id, meta, retention, settings, now_ts)
+            if candidate is None:
+                continue
+            candidate_id, candidate_meta, candidate_path, _ = candidate
+            selected.append((candidate_id, candidate_meta, candidate_path))
+            if len(selected) >= limit:
+                break
+        return selected
+
     def close(self) -> None:
         if self.conn is not None:
             try:
@@ -4870,6 +5078,180 @@ class MemoryManager:
                 f"[Memory] Pruned {len(removed)} missing fragment entries from index."
             )
         return len(removed)
+
+    def human_memory_prune_pass(self, *, force: bool = False, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Mandatory forgetting pass: preserve the gist of old cold memories while
+        shedding low-importance detail payloads that human memory would blur.
+        """
+        if not self._map_loaded:
+            self.load_map()
+        retention = (self.policy or {}).get("retention", DEFAULT_RETENTION_POLICY)
+        index_count = len(self.memory_map)
+        settings = _human_memory_prune_settings(retention, index_count=index_count)
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+
+        if not force:
+            state = _load_inastate(self.child)
+            last_run = state.get("human_memory_prune_last_run") if isinstance(state, dict) else None
+            last_ts = None
+            if isinstance(last_run, dict):
+                last_ts = _parse_iso_timestamp(last_run.get("timestamp"))
+            cooldown = float(settings.get("cooldown_seconds") or 0.0)
+            if last_ts is not None and cooldown > 0 and (now_dt.timestamp() - last_ts) < cooldown:
+                return {
+                    "status": "cooldown",
+                    "limit": settings["limit"],
+                    "index_count": index_count,
+                    "timestamp": now_dt.isoformat(),
+                }
+
+        if compact_fragment_file is None:
+            stats = {
+                "status": "unavailable",
+                "reason": "cold_storage_unavailable",
+                "limit": settings["limit"],
+                "index_count": index_count,
+                "timestamp": now_dt.isoformat(),
+            }
+            _write_inastate_value(self.child, "human_memory_prune_last_run", stats)
+            return stats
+
+        cold_policy = dict(self.cold_storage_policy or _cold_storage_policy())
+        cold_policy["enabled"] = True
+        cold_policy["auto_compact"] = True
+        cold_policy["retain_full_fragment"] = False
+        cold_policy["purge_pending_delete"] = True
+
+        index = _load_memory_index(self.child)
+        selected: List[Tuple[str, Dict[str, Any], Path]] = []
+        try:
+            try:
+                index_count = len(index)
+            except Exception:
+                index_count = len(self.memory_map)
+            selected = _select_human_memory_prune_candidates(
+                self.child,
+                index,
+                retention,
+                index_count=index_count,
+                now=now_dt,
+            )
+        finally:
+            if hasattr(index, "close"):
+                index.close()
+
+        compacted = 0
+        retained = 0
+        already_compacted = 0
+        moved_to_cold = 0
+        protected = 0
+        failed = 0
+        missing = 0
+        skipped = 0
+        changed = False
+
+        for frag_id, meta, path in selected:
+            live_meta = self.memory_map.get(frag_id)
+            if not isinstance(live_meta, dict):
+                skipped += 1
+                continue
+            path = self._resolve_fragment_path(frag_id, live_meta) or path
+            if path is None or not path.exists():
+                missing += 1
+                continue
+            if _is_anchor_fragment_record(live_meta, retention):
+                protected += 1
+                continue
+            fragment = _load_fragment_from_path(path)
+            if not fragment:
+                skipped += 1
+                continue
+            if _is_anchor_fragment_record(fragment, retention):
+                protected += 1
+                continue
+            if _is_compacted_fragment(fragment):
+                already_compacted += 1
+                live_meta.update(self._stat_payload(path))
+                self.memory_map[frag_id] = live_meta
+                changed = True
+                continue
+
+            cold_dir = self.base_path / "cold"
+            if path.parent != cold_dir:
+                cold_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = cold_dir / path.name
+                if dest_path.exists() and dest_path != path:
+                    skipped += 1
+                    continue
+                try:
+                    path.rename(dest_path)
+                except OSError:
+                    skipped += 1
+                    continue
+                path = dest_path
+                live_meta["tier"] = "cold"
+                live_meta["filename"] = path.name
+                self.memory_map[frag_id] = live_meta
+                moved_to_cold += 1
+                changed = True
+
+            result = self._compact_cold_fragment(frag_id, live_meta, path, cold_policy)
+            status = result.get("status") if isinstance(result, dict) else None
+            if status in {"compacted", "retained"}:
+                if status == "compacted":
+                    compacted += 1
+                else:
+                    retained += 1
+                live_meta["tier"] = "cold"
+                live_meta["filename"] = path.name
+                live_meta.update(self._stat_payload(path))
+                if not live_meta.get("last_seen"):
+                    live_meta["last_seen"] = fragment.get("timestamp", now_dt.isoformat())
+                self.memory_map[frag_id] = live_meta
+                changed = True
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+
+        if changed:
+            self.save_map()
+
+        purge_stats = {"deleted": 0, "kept": 0}
+        try:
+            import cold_storage  # type: ignore
+
+            purge_stats = cold_storage.purge_pending_delete(self.child, cold_policy)
+        except Exception:
+            pass
+
+        stats = {
+            "status": "ok",
+            "selected": len(selected),
+            "compacted": compacted,
+            "retained": retained,
+            "already_compacted": already_compacted,
+            "moved_to_cold": moved_to_cold,
+            "protected": protected,
+            "failed": failed,
+            "missing": missing,
+            "skipped": skipped,
+            "purged_pending": int(purge_stats.get("deleted", 0) or 0),
+            "pending_kept": int(purge_stats.get("kept", 0) or 0),
+            "limit": settings["limit"],
+            "index_count": index_count,
+            "timestamp": now_dt.isoformat(),
+        }
+        _write_inastate_value(self.child, "human_memory_prune_last_run", stats)
+        if compacted or stats["purged_pending"] or failed:
+            log_to_statusbox(
+                f"[Memory] Human-memory prune: compacted {compacted}, moved {moved_to_cold}, purged {stats['purged_pending']}, "
+                f"skipped {skipped + protected + already_compacted}, failed {failed}."
+            )
+        return stats
 
     def rebalance_tiers(self, now: Optional[datetime] = None):
         """

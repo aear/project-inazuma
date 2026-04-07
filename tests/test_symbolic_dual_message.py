@@ -22,7 +22,7 @@ def test_build_dual_symbolic_message_combines_native_and_guess(monkeypatch):
     assert payload is not None
     assert payload["native_text"] == "sym_hello sym_calm"
     assert payload["gloss_text"] == "hello calm"
-    assert payload["text"] == "Ina native: sym_hello sym_calm\nHuman guess: hello calm"
+    assert payload["text"] == "Native: sym_hello sym_calm\nHuman guess: hello calm"
 
 
 
@@ -42,7 +42,7 @@ def test_build_dual_symbolic_message_prefers_supplied_human_text(monkeypatch):
     assert payload is not None
     assert payload["native_text"] == "sym_wave"
     assert payload["gloss_text"] == "hello there"
-    assert payload["text"] == "Ina native: sym_wave\nHuman guess: hello there"
+    assert payload["text"] == "Native: sym_wave\nHuman guess: hello there"
 
 
 def test_build_dual_symbolic_message_uses_contextual_text_vocab_links(tmp_path, monkeypatch):
@@ -76,6 +76,55 @@ def test_build_dual_symbolic_message_uses_contextual_text_vocab_links(tmp_path, 
         "sym_ambiguous": "text_vocab_links",
         "sym_ina": "text_vocab_links",
     }
+
+
+
+def test_build_dual_symbolic_message_resolves_raw_symbol_words_from_text_vocab_links(tmp_path, monkeypatch):
+    monkeypatch.setattr(lp, "load_symbol_to_token", lambda child, base_path=None: {})
+    memory_root = tmp_path / "TestChild" / "memory"
+    memory_root.mkdir(parents=True)
+    (memory_root / "text_vocab_links.json").write_text(
+        "{\"links\": [{\"word\": \"heart\", \"symbol\": \"sym_heart\", \"symbol_word\": \"glyph_heart\", \"count\": 4}]}",
+        encoding="utf-8",
+    )
+
+    payload = lp.build_dual_symbolic_message(
+        ["glyph_heart", "glyph_unmapped"],
+        child="TestChild",
+        base_path=tmp_path,
+        context={"tokens": ["heart"], "tags": ["discord"]},
+        fallback_to_symbol_to_token=False,
+        native_style="glyphs",
+    )
+
+    assert payload is not None
+    assert payload["native_text"] == "glyph_heart glyph_unmapped"
+    assert payload["gloss_text"] == "heart glyph_unmapped"
+    assert payload["text"] == "Native: glyph_heart glyph_unmapped\nHuman guess: heart glyph_unmapped"
+    assert payload["unresolved_symbols"] == ["glyph_unmapped"]
+
+
+
+def test_build_dual_symbolic_message_preserves_native_vocab_as_unresolved_guess(monkeypatch):
+    def fail_load_symbol_to_token(child, base_path=None):
+        raise AssertionError("symbol_to_token fallback should stay lazy when a vocab is supplied")
+
+    monkeypatch.setattr(lp, "load_text_vocab_links", lambda child, base_path=None: {})
+    monkeypatch.setattr(lp, "load_symbol_to_token", fail_load_symbol_to_token)
+
+    payload = lp.build_dual_symbolic_message(
+        ["sym_private"],
+        child="TestChild",
+        fallback_to_symbol_to_token=False,
+        native_style="glyphs",
+        symbol_to_token_vocab={"sym_private": {"word": "glyph_private"}},
+    )
+
+    assert payload is not None
+    assert payload["native_text"] == "glyph_private"
+    assert payload["gloss_text"] == "glyph_private"
+    assert payload["text"] == "Native: glyph_private\nHuman guess: glyph_private"
+    assert payload["unresolved_symbols"] == ["sym_private"]
 
 
 def test_build_dual_symbolic_message_can_skip_symbol_to_token_fallback(tmp_path, monkeypatch):

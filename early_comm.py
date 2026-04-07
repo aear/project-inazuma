@@ -1637,6 +1637,7 @@ def early_communicate():
             context=dual_context,
             fallback_to_symbol_to_token=False,
             native_style="glyphs",
+            symbol_to_token_vocab=vocab_map,
         )
         if dual_symbol_message and dual_symbol_message.get("text"):
             fallback_text = str(dual_symbol_message.get("text"))
