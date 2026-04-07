@@ -61,3 +61,5 @@ You are free to interpret them symbolically, scientifically, or aesthetically.
 This rider carries no legal force.  
 It is an ethical and philosophical invitation:
 if you borrow from this work, carry the spirit that shaped it.
+
+These principles are optional. They are offered as heuristics that may support more stable and interpretable behaviour, though further exploration and replication are needed.

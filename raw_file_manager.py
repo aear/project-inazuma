@@ -1427,6 +1427,7 @@ def self_read_and_train():
                     elif report.get("duplicate_within_cooldown"):
                         note += " Existing cooldown report reused."
                     log_to_statusbox(note)
+                    continue
                 log_to_statusbox(f"[SelfRead] ERROR processing {path.name}: {e}")
 
             if count >= FRAG_LIMIT:
