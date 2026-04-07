@@ -1593,11 +1593,25 @@ def early_communicate():
     fallback_text = vocab_word or word_id or symbol_text
     dual_symbol_message = None
     if speech_symbols:
+        frag_tags = frag.get("tags", []) if isinstance(frag, dict) else []
+        dual_context = {
+            "source": "early_comm",
+            "source_text": expression,
+            "tokens": spoken_words or [],
+            "tags": [
+                *(str(tag) for tag in frag_tags if tag),
+                "typed_contact",
+                expression_strategy,
+            ],
+        }
         dual_symbol_message = build_dual_symbolic_message(
             speech_symbols[:3],
             child=child,
             base_path=Path("AI_Children"),
-            human_text=fallback_text,
+            fallback_human_text=fallback_text,
+            context=dual_context,
+            fallback_to_symbol_to_token=False,
+            native_style="glyphs",
         )
         if dual_symbol_message and dual_symbol_message.get("text"):
             fallback_text = str(dual_symbol_message.get("text"))
@@ -1710,6 +1724,8 @@ def early_communicate():
                     "urge_to_voice": voice_urge_level,
                     "symbolic_native_text": dual_symbol_message.get("native_text") if dual_symbol_message else None,
                     "symbolic_gloss_text": dual_symbol_message.get("gloss_text") if dual_symbol_message else None,
+                    "symbolic_native_sources": dual_symbol_message.get("native_sources") if dual_symbol_message else None,
+                    "symbolic_gloss_sources": dual_symbol_message.get("gloss_sources") if dual_symbol_message else None,
                 },
                 allow_empty=payload_allow_empty,
                 attachment_path=str(audio_clip_path) if audio_clip_path else None,

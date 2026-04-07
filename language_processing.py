@@ -510,12 +510,262 @@ def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
         _atomic_write_json(path, data, indent=4, ensure_ascii=True)
 
 
+def load_text_vocab_links(child, base_path: Optional[Path] = None):
+    path = _memory_root(child, base_path) / "text_vocab_links.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            return loaded if isinstance(loaded, (dict, list)) else {}
+    except Exception:
+        return {}
+
+
+def _candidate_word(candidate: Any) -> str:
+    if isinstance(candidate, (str, int, float)):
+        return str(candidate).strip()
+    if not isinstance(candidate, dict):
+        return ""
+    for key in ("word", "token", "text", "vocab_word", "label", "value"):
+        value = candidate.get(key)
+        if isinstance(value, (str, int, float)):
+            word = str(value).strip()
+            if word:
+                return word
+    return ""
+
+
+def _candidate_symbols(candidate: Any) -> List[str]:
+    if not isinstance(candidate, dict):
+        return []
+    symbols: List[str] = []
+    for key in ("symbol", "symbol_id", "sid", "native", "symbol_word_id"):
+        value = candidate.get(key)
+        if isinstance(value, (str, int, float)):
+            symbols.append(str(value).strip())
+    raw_symbols = candidate.get("symbols")
+    if isinstance(raw_symbols, dict):
+        symbols.extend(str(sym).strip() for sym in raw_symbols.keys())
+    elif isinstance(raw_symbols, (list, tuple, set)):
+        symbols.extend(str(sym).strip() for sym in raw_symbols)
+    return [sym for sym in symbols if sym]
+
+
+def _iter_word_candidates(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_word_candidates(item)
+    elif isinstance(value, dict):
+        if _candidate_word(value):
+            yield value
+            return
+        for word, item in value.items():
+            if isinstance(item, dict):
+                candidate = dict(item)
+                candidate.setdefault("word", word)
+                yield candidate
+            elif isinstance(item, (str, int, float)):
+                yield {"word": word, "score": item}
+    elif isinstance(value, (str, int, float)):
+        yield {"word": str(value)}
+
+
+def _iter_text_vocab_link_candidates(links_payload: Any, symbol: str) -> Iterable[Dict[str, Any]]:
+    if isinstance(links_payload, list):
+        for entry in links_payload:
+            if symbol in _candidate_symbols(entry):
+                yield entry
+        return
+
+    if not isinstance(links_payload, dict):
+        return
+
+    for key in ("links", "items", "candidates"):
+        entries = links_payload.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                if symbol in _candidate_symbols(entry):
+                    yield entry
+
+    symbol_map = links_payload.get("symbols")
+    if isinstance(symbol_map, dict) and symbol in symbol_map:
+        yield from _iter_word_candidates(symbol_map.get(symbol))
+
+    if symbol in links_payload:
+        yield from _iter_word_candidates(links_payload.get(symbol))
+
+    vocab = links_payload.get("vocab")
+    if isinstance(vocab, dict):
+        for word, entry in vocab.items():
+            if symbol not in _candidate_symbols(entry):
+                continue
+            candidate = dict(entry) if isinstance(entry, dict) else {}
+            candidate.setdefault("word", word)
+            yield candidate
+
+
+def _words_from_value(value: Any) -> List[str]:
+    words: List[str] = []
+    if isinstance(value, str):
+        words.extend(tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", value))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            words.extend(_words_from_value(item))
+    return [word for word in words if word]
+
+
+def _symbol_lookup_context(context: Optional[Dict[str, Any]]) -> Dict[str, set]:
+    words = set()
+    tags = set()
+    if isinstance(context, dict):
+        for key in ("tokens", "words", "input_tokens", "source_tokens"):
+            words.update(_words_from_value(context.get(key)))
+        for key in ("text", "source_text", "prompt", "utterance", "user_text"):
+            words.update(_words_from_value(context.get(key)))
+        for key in ("tags", "source", "channel", "adapter"):
+            tags.update(_words_from_value(context.get(key)))
+    elif context:
+        words.update(_words_from_value(context))
+    return {"words": words, "tags": tags}
+
+
+def _candidate_tags(candidate: Dict[str, Any]) -> set:
+    tags = set()
+    for key in ("tags", "sources", "contexts", "source", "channel", "adapter"):
+        tags.update(_words_from_value(candidate.get(key)))
+    return tags
+
+
+def _numeric_candidate_value(candidate: Dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        try:
+            return float(candidate.get(key))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _score_text_vocab_candidate(candidate: Dict[str, Any], lookup_context: Dict[str, set]) -> float:
+    word = _candidate_word(candidate).lower()
+    score = 0.0
+    if word and word in lookup_context["words"]:
+        score += 100.0
+
+    tag_overlap = _candidate_tags(candidate) & lookup_context["tags"]
+    score += len(tag_overlap) * 20.0
+
+    score += _numeric_candidate_value(candidate, "similarity", "score") * 10.0
+    score += _numeric_candidate_value(candidate, "symbol_confidence", "confidence") * 5.0
+
+    count = _numeric_candidate_value(candidate, "count", "uses", "use_count")
+    if count > 0:
+        score += math.log10(count + 1.0)
+    return score
+
+
+def _candidate_native_word(candidate: Any) -> str:
+    if not isinstance(candidate, dict):
+        return ""
+    for key in ("symbol_word", "glyph", "native_word", "native_text"):
+        value = candidate.get(key)
+        if isinstance(value, (str, int, float)):
+            word = str(value).strip()
+            if word:
+                return word
+    return ""
+
+
+def _use_native_glyphs(native_style: str) -> bool:
+    return str(native_style or "symbols").strip().lower() in {
+        "glyph",
+        "glyphs",
+        "symbol_word",
+        "native_glyphs",
+    }
+
+
+def _lookup_text_vocab_word(
+    symbol: str,
+    links_payload: Any,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    lookup_context = _symbol_lookup_context(context)
+    best: Optional[Dict[str, Any]] = None
+    best_score = float("-inf")
+    for candidate in _iter_text_vocab_link_candidates(links_payload, symbol):
+        if not isinstance(candidate, dict):
+            continue
+        word = _candidate_word(candidate)
+        if not word:
+            continue
+        score = _score_text_vocab_candidate(candidate, lookup_context)
+        if score > best_score:
+            best = {**candidate, "word": word, "score": round(score, 4)}
+            best_score = score
+    return best
+
+
+def _build_text_vocab_word_symbol_index(links_payload: Any) -> Dict[str, str]:
+    index: Dict[str, str] = {}
+    scores: Dict[str, float] = {}
+    context = {"words": set(), "tags": set()}
+
+    def consider(candidate: Any):
+        if not isinstance(candidate, dict):
+            return
+        word = _candidate_word(candidate).lower()
+        symbols = _candidate_symbols(candidate)
+        if not word or not symbols:
+            return
+        score = _score_text_vocab_candidate(candidate, context)
+        if score > scores.get(word, float("-inf")):
+            index[word] = symbols[0]
+            scores[word] = score
+
+    if isinstance(links_payload, list):
+        for entry in links_payload:
+            consider(entry)
+    elif isinstance(links_payload, dict):
+        for key in ("links", "items", "candidates"):
+            entries = links_payload.get(key)
+            if isinstance(entries, list):
+                for entry in entries:
+                    consider(entry)
+        symbol_map = links_payload.get("symbols")
+        if isinstance(symbol_map, dict):
+            for symbol, value in symbol_map.items():
+                for candidate in _iter_word_candidates(value):
+                    candidate = dict(candidate)
+                    candidate.setdefault("symbol", symbol)
+                    consider(candidate)
+        for symbol, value in links_payload.items():
+            if not str(symbol).startswith("sym_"):
+                continue
+            for candidate in _iter_word_candidates(value):
+                candidate = dict(candidate)
+                candidate.setdefault("symbol", symbol)
+                consider(candidate)
+        vocab = links_payload.get("vocab")
+        if isinstance(vocab, dict):
+            for word, entry in vocab.items():
+                candidate = dict(entry) if isinstance(entry, dict) else {}
+                candidate.setdefault("word", word)
+                consider(candidate)
+    return index
+
+
 def build_dual_symbolic_message(
     symbols,
     *,
     child: str = "Inazuma_Yagami",
     base_path: Optional[Path] = None,
     human_text: Optional[str] = None,
+    fallback_human_text: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    fallback_to_symbol_to_token: bool = True,
+    native_style: str = "symbols",
     native_label: str = "Ina native",
     human_label: str = "Human guess",
 ) -> Optional[Dict[str, Any]]:
@@ -526,20 +776,53 @@ def build_dual_symbolic_message(
     if not normalized:
         return None
 
-    vocab = load_symbol_to_token(child, base_path=base_path)
-    guessed_words: List[str] = []
-    unresolved_symbols: List[str] = []
-    for sym in normalized:
-        entry = vocab.get(sym) if isinstance(vocab, dict) else {}
-        word = str(entry.get("word") or "").strip() if isinstance(entry, dict) else ""
-        if word:
-            guessed_words.append(word)
-        else:
-            guessed_words.append(sym)
-            unresolved_symbols.append(sym)
+    explicit_human_text = str(human_text or "").strip()
+    native_tokens: List[str] = list(normalized)
+    guessed_words: List[str] = list(normalized)
+    unresolved_indexes: List[tuple] = []
+    native_sources: Dict[str, str] = {}
+    gloss_sources: Dict[str, str] = {}
+    use_glyphs = _use_native_glyphs(native_style)
 
-    native_text = " ".join(normalized)
-    gloss_text = str(human_text or "").strip() or " ".join(guessed_words)
+    links_payload = load_text_vocab_links(child, base_path=base_path) if (use_glyphs or not explicit_human_text) else {}
+    for idx, sym in enumerate(normalized):
+        link = _lookup_text_vocab_word(sym, links_payload, context=context) if links_payload else None
+        if link and use_glyphs:
+            native_word = _candidate_native_word(link)
+            if native_word:
+                native_tokens[idx] = native_word
+                native_sources[sym] = "text_vocab_links"
+
+        if explicit_human_text:
+            continue
+        if link:
+            guessed_words[idx] = str(link.get("word") or sym)
+            gloss_sources[sym] = "text_vocab_links"
+        else:
+            unresolved_indexes.append((idx, sym))
+
+    if not explicit_human_text and unresolved_indexes and fallback_to_symbol_to_token:
+        vocab = load_symbol_to_token(child, base_path=base_path)
+        still_unresolved: List[tuple] = []
+        for idx, sym in unresolved_indexes:
+            entry = vocab.get(sym) if isinstance(vocab, dict) else {}
+            word = str(entry.get("word") or "").strip() if isinstance(entry, dict) else ""
+            if word:
+                guessed_words[idx] = word
+                gloss_sources[sym] = "symbol_to_token"
+                if use_glyphs and native_tokens[idx] == sym:
+                    native_tokens[idx] = word
+                    native_sources[sym] = "symbol_to_token"
+            else:
+                still_unresolved.append((idx, sym))
+        unresolved_indexes = still_unresolved
+
+    unresolved_symbols: List[str] = [sym for _, sym in unresolved_indexes]
+    native_text = " ".join(native_tokens)
+    fallback_text = str(fallback_human_text or "").strip()
+    gloss_text = explicit_human_text or " ".join(guessed_words)
+    if fallback_text and gloss_text == native_text:
+        gloss_text = fallback_text
     if not gloss_text:
         gloss_text = native_text
 
@@ -553,6 +836,8 @@ def build_dual_symbolic_message(
         "native_text": native_text,
         "gloss_text": gloss_text,
         "unresolved_symbols": unresolved_symbols,
+        "native_sources": native_sources,
+        "gloss_sources": gloss_sources,
     }
 
 
@@ -1208,6 +1493,7 @@ def generate_symbolic_reply_from_text(
     child: str = "Inazuma_Yagami",
     base_path: Optional[Path] = None,
     max_symbols: int = 4,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Try to reply to a text prompt using Ina's known symbol vocabulary.
@@ -1217,52 +1503,72 @@ def generate_symbolic_reply_from_text(
     if not tokens:
         return None
 
-    vocab = load_symbol_to_token(child, base_path=base_path)
+    links_payload = load_text_vocab_links(child, base_path=base_path)
+    linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
     lang_hint = guess_language_code(text)
-    if _ensure_vocab_embeddings(vocab, language_hint=lang_hint):
-        save_symbol_to_token(child, vocab, base_path)
-
-    word_to_symbol = {
-        (entry.get("word") or "").lower(): symbol
-        for symbol, entry in vocab.items()
-        if entry.get("word")
-    }
-
+    vocab: Dict[str, Any] = {}
+    word_to_symbol: Dict[str, str] = {}
     embedding_index = []
-    for sym, entry in vocab.items():
-        if not isinstance(entry, dict):
-            continue
-        emb = entry.get("embedding")
-        if isinstance(emb, list) and emb:
-            embedding_index.append((sym, emb, entry.get("language")))
+    vocab_loaded = False
+
+    def ensure_vocab_loaded():
+        nonlocal vocab, word_to_symbol, embedding_index, vocab_loaded
+        if vocab_loaded:
+            return
+        vocab = load_symbol_to_token(child, base_path=base_path)
+        if _ensure_vocab_embeddings(vocab, language_hint=lang_hint):
+            save_symbol_to_token(child, vocab, base_path)
+        word_to_symbol = {
+            (entry.get("word") or "").lower(): symbol
+            for symbol, entry in vocab.items()
+            if isinstance(entry, dict) and entry.get("word")
+        }
+        embedding_index = []
+        for sym, entry in vocab.items():
+            if not isinstance(entry, dict):
+                continue
+            emb = entry.get("embedding")
+            if isinstance(emb, list) and emb:
+                embedding_index.append((sym, emb, entry.get("language")))
+        vocab_loaded = True
 
     matched: List[str] = []
     unknown: List[str] = []
     seen = set()
 
     for tok in tokens:
+        sym = linked_word_to_symbol.get(tok)
+        if sym:
+            if sym not in seen:
+                matched.append(sym)
+                seen.add(sym)
+            continue
+
+        ensure_vocab_loaded()
         sym = word_to_symbol.get(tok)
-        if sym and sym not in seen:
-            matched.append(sym)
-            seen.add(sym)
-        else:
-            tok_emb = _EMBEDDER.embed_text(tok, language=lang_hint)
-            best_sym = None
-            best_sim = 0.0
-            for sym_id, emb, lang in embedding_index:
-                if sym_id in seen:
-                    continue
-                if lang_hint != "und" and lang and lang != lang_hint:
-                    continue
-                sim = _EMBEDDER.cosine(tok_emb, emb)
-                if sim > 0.42 and sim > best_sim:
-                    best_sim = sim
-                    best_sym = sym_id
-            if best_sym:
-                matched.append(best_sym)
-                seen.add(best_sym)
-            elif tok not in unknown:
-                unknown.append(tok)
+        if sym:
+            if sym not in seen:
+                matched.append(sym)
+                seen.add(sym)
+            continue
+
+        tok_emb = _EMBEDDER.embed_text(tok, language=lang_hint)
+        best_sym = None
+        best_sim = 0.0
+        for sym_id, emb, lang in embedding_index:
+            if sym_id in seen:
+                continue
+            if lang_hint != "und" and lang and lang != lang_hint:
+                continue
+            sim = _EMBEDDER.cosine(tok_emb, emb)
+            if sim > 0.42 and sim > best_sim:
+                best_sim = sim
+                best_sym = sym_id
+        if best_sym:
+            matched.append(best_sym)
+            seen.add(best_sym)
+        elif tok not in unknown:
+            unknown.append(tok)
 
     if unknown:
         seed_self_question(
@@ -1278,21 +1584,34 @@ def generate_symbolic_reply_from_text(
     except Exception:
         pass
 
-    labels = [(vocab.get(sym, {}) or {}).get("word") or sym for sym in symbols_to_speak]
+    reply_context: Dict[str, Any] = dict(context) if isinstance(context, dict) else {}
+    reply_context.setdefault("source_text", text)
+    reply_context.setdefault("tokens", tokens)
+    reply_tags = ["symbolic_reply"]
+    for tag in _words_from_value(reply_context.get("tags")):
+        if tag not in reply_tags:
+            reply_tags.append(tag)
+    reply_context["tags"] = reply_tags
+
     dual_message = build_dual_symbolic_message(
         symbols_to_speak,
         child=child,
         base_path=base_path,
-        human_text=" ".join(labels),
+        context=reply_context,
+        fallback_to_symbol_to_token=False,
+        native_style="glyphs",
     )
+    fallback_text = " ".join(symbols_to_speak)
     transformer_insights = _build_reply_transformer_insights(symbols_to_speak, vocab, unknown)
     return {
-        "text": (dual_message or {}).get("text") or " ".join(labels),
+        "text": (dual_message or {}).get("text") or fallback_text,
         "symbols": symbols_to_speak,
         "unknown": unknown,
         "native_text": (dual_message or {}).get("native_text"),
         "gloss_text": (dual_message or {}).get("gloss_text"),
         "unresolved_symbols": (dual_message or {}).get("unresolved_symbols") or [],
+        "native_sources": (dual_message or {}).get("native_sources") or {},
+        "gloss_sources": (dual_message or {}).get("gloss_sources") or {},
         "transformer_insights": transformer_insights,
     }
 

@@ -6,6 +6,8 @@ import json
 import wave
 import contextlib
 import sys
+import atexit
+import signal
 import itertools
 import io
 import zipfile
@@ -48,6 +50,11 @@ try:
 except Exception as e:  # pragma: no cover - optional dependency
     fitz = None
     _PDF_IMPORT_ERROR = e
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX environments
+    fcntl = None
 
 
 FRAG_LIMIT = 1000
@@ -406,6 +413,160 @@ def get_child():
 child = get_child()
 
 log_to_statusbox(f"[RawFileManager] Final child: {child}")
+
+_SELF_READ_LOCK_HANDLE = None
+_SELF_READ_LOCK_HELD = False
+_SELF_READ_FINALIZED = False
+
+
+def _memory_root(child_name=None):
+    return Path("AI_Children") / (child_name or child) / "memory"
+
+
+def _runtime_lock_path(child_name=None):
+    return _memory_root(child_name) / "raw_file_manager.lock"
+
+
+def _runtime_state_path(child_name=None):
+    return _memory_root(child_name) / "raw_file_manager_state.json"
+
+
+def _atomic_write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _read_runtime_state(child_name=None):
+    path = _runtime_state_path(child_name)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_alive(pid):
+    try:
+        pid_int = int(pid or 0)
+    except Exception:
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        os.kill(pid_int, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _write_runtime_state(status, *, source=None, error=None, **extra):
+    state = _read_runtime_state()
+    state.update(
+        {
+            "status": str(status or "unknown"),
+            "pid": os.getpid(),
+            "source": source or state.get("source") or os.getenv(SELF_READ_SOURCE_ENV) or "all",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if status == "running":
+        state.setdefault("started_at", state["updated_at"])
+    if status in {"completed", "failed", "cancelled", "exited"}:
+        state["finished_at"] = state["updated_at"]
+    if error:
+        state["error"] = str(error)[:500]
+    for key, value in extra.items():
+        state[key] = value
+    _atomic_write_json(_runtime_state_path(), state)
+
+
+def _acquire_runtime_lock():
+    global _SELF_READ_LOCK_HANDLE, _SELF_READ_LOCK_HELD
+    lock_path = _runtime_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+
+    if fcntl is not None:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            state = _read_runtime_state()
+            detail = f"pid {state.get('pid')}" if state.get("pid") else "another process"
+            log_to_statusbox(f"[SelfRead] Raw file manager already running ({detail}); exiting duplicate.")
+            lock_handle.close()
+            return False
+    else:
+        state = _read_runtime_state()
+        if str(state.get("status") or "").lower() == "running" and _pid_alive(state.get("pid")):
+            log_to_statusbox(f"[SelfRead] Raw file manager already running (pid {state.get('pid')}); exiting duplicate.")
+            lock_handle.close()
+            return False
+
+    source = os.getenv(SELF_READ_SOURCE_ENV) or "all"
+    payload = {
+        "pid": os.getpid(),
+        "source": source,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(json.dumps(payload, ensure_ascii=True))
+    lock_handle.flush()
+    try:
+        os.fsync(lock_handle.fileno())
+    except Exception:
+        pass
+
+    _SELF_READ_LOCK_HANDLE = lock_handle
+    _SELF_READ_LOCK_HELD = True
+    _write_runtime_state("running", source=source)
+    atexit.register(_release_runtime_lock)
+    return True
+
+
+def _release_runtime_lock(status="exited", *, error=None):
+    global _SELF_READ_LOCK_HANDLE, _SELF_READ_LOCK_HELD, _SELF_READ_FINALIZED
+    if not _SELF_READ_LOCK_HELD or _SELF_READ_FINALIZED:
+        return
+    _SELF_READ_FINALIZED = True
+    try:
+        _write_runtime_state(status, error=error)
+    except Exception:
+        pass
+    lock_handle = _SELF_READ_LOCK_HANDLE
+    _SELF_READ_LOCK_HANDLE = None
+    _SELF_READ_LOCK_HELD = False
+    if lock_handle is not None:
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock_handle.close()
+        except Exception:
+            pass
+    try:
+        _runtime_lock_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _handle_runtime_signal(signum, frame):
+    signal_name = getattr(signal.Signals(signum), "name", str(signum))
+    _release_runtime_lock("cancelled", error=signal_name)
+    raise SystemExit(128 + int(signum))
+
+
+def _install_runtime_signal_handlers():
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            signal.signal(sig, _handle_runtime_signal)
 
 
 def classify_suffixes(suffixes):
@@ -1059,6 +1220,8 @@ def self_read_and_train():
     if source_override and not source_choices.get(source_override, False):
         log_to_statusbox(f"[SelfRead] Source override '{source_override}' ignored by preference.")
         source_override = None
+    if _SELF_READ_LOCK_HELD:
+        _write_runtime_state("running", source=source_override or "all", phase="collect_roots")
 
     raw_history = load_history(child)
     history = {entry for entry in raw_history if "/" in entry}
@@ -1275,6 +1438,13 @@ def self_read_and_train():
 
     combined_history = list(history.union(legacy_history))
     save_history(child, combined_history)
+    if _SELF_READ_LOCK_HELD:
+        _write_runtime_state(
+            "running",
+            source=source_override or "all",
+            phase="training" if count > 0 else "complete",
+            fragments_saved=count,
+        )
     log_to_statusbox(f"[SelfRead] Done. {count} new fragments saved.")
 
     if count > 0:
@@ -1318,4 +1488,13 @@ def pretrain_audio_digest(paths, child):
 
 
 if __name__ == "__main__":
-    self_read_and_train()
+    if not _acquire_runtime_lock():
+        sys.exit(0)
+    _install_runtime_signal_handlers()
+    try:
+        self_read_and_train()
+    except Exception as exc:
+        _release_runtime_lock("failed", error=exc)
+        raise
+    else:
+        _release_runtime_lock("completed")

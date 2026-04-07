@@ -52,6 +52,7 @@ config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")
 MEMORY_PATH = Path("AI_Children") / CHILD / "memory"
 SELF_READ_PREF_PATH = MEMORY_PATH / "self_read_preferences.json"
+RAW_FILE_MANAGER_STATE_PATH = MEMORY_PATH / "raw_file_manager_state.json"
 _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.json"
 RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
@@ -2423,6 +2424,8 @@ _last_self_read_launch = 0.0
 _SELF_READ_COOLDOWN = 300  # seconds
 _last_self_read_hold_log = 0.0
 _SELF_READ_HOLD_LOG_COOLDOWN = 120.0
+_EXPLORATION_NUDGE_WINDOW_SEC = 6 * 3600.0
+_EXPLORATION_NUDGE_HISTORY_LIMIT = 32
 _last_voice_urge_log = 0.0
 _last_typing_urge_log = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
@@ -5257,6 +5260,7 @@ def paint_check():
         update_inastate("paint_request", False)
         _last_paint_launch = now
         request_scheduler_task("paint_window_open", reason="paint_request")
+        _record_exploration_nudge("creative", "drawing", now=now)
         update_inastate(
             "last_paint_trigger",
             {
@@ -5303,6 +5307,7 @@ def paint_check():
             "boredom": round(boredom, 3),
         },
     )
+    _record_exploration_nudge("creative", "drawing", now=now)
     update_inastate(
         "last_paint_trigger",
         {
@@ -5320,6 +5325,239 @@ def paint_check():
     log_to_statusbox(
         "[Manager] Creative urge triggered paint "
         f"(curiosity={curiosity:.2f}, joy={joy:.2f}, play={playfulness:.2f}, stress={stress:.2f})."
+    )
+
+
+def _load_raw_file_manager_state() -> Dict[str, Any]:
+    if not RAW_FILE_MANAGER_STATE_PATH.exists():
+        return {}
+    try:
+        with RAW_FILE_MANAGER_STATE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_raw_file_manager_state(state: Dict[str, Any]) -> None:
+    try:
+        atomic_write_json(RAW_FILE_MANAGER_STATE_PATH, state, indent=2)
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to write raw file manager state: {exc}")
+
+
+def _raw_file_manager_processes() -> List[Dict[str, Any]]:
+    processes: List[Dict[str, Any]] = []
+    current_pid = os.getpid()
+    if psutil is not None:
+        for proc in psutil.process_iter(["pid", "cmdline", "status"]):
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid <= 0 or pid == current_pid:
+                    continue
+                cmdline = [str(part) for part in (proc.info.get("cmdline") or [])]
+                if not any("raw_file_manager.py" in part for part in cmdline):
+                    continue
+                status = str(proc.info.get("status") or "").lower()
+                if status == getattr(psutil, "STATUS_ZOMBIE", "zombie"):
+                    continue
+                processes.append({"pid": pid, "cmdline": cmdline, "status": status or "unknown"})
+            except Exception:
+                continue
+        return processes
+
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "raw_file_manager.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode not in {0, 1}:
+        return []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_text, cmdline_text = line.split(maxsplit=1)
+            pid = int(pid_text)
+        except Exception:
+            continue
+        if pid <= 0 or pid == current_pid:
+            continue
+        if "pgrep" in cmdline_text:
+            continue
+        processes.append({"pid": pid, "cmdline": cmdline_text.split(), "status": "unknown"})
+    return processes
+
+
+def _raw_file_manager_active() -> Tuple[bool, Dict[str, Any]]:
+    state = _load_raw_file_manager_state()
+    pid = _coerce_int(state.get("pid"), 0)
+    if pid > 0:
+        alive, metrics = _scheduler_pid_metrics(pid)
+        if alive:
+            active = dict(state)
+            active.update(metrics)
+            active["pid"] = pid
+            return True, active
+
+    live = _raw_file_manager_processes()
+    if live:
+        active = dict(state)
+        active.update(
+            {
+                "status": "running",
+                "pid": live[0].get("pid"),
+                "extra_pids": [item.get("pid") for item in live[1:] if item.get("pid")],
+                "process_count": len(live),
+                "detected_by": "process_scan",
+            }
+        )
+        return True, active
+    return False, state
+
+
+def _record_raw_file_manager_launch(process, *, source: Optional[str], reason: str, now: float) -> None:
+    payload = {
+        "status": "running",
+        "pid": int(process.pid),
+        "source": source or "all",
+        "reason": reason,
+        "started_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+    }
+    _write_raw_file_manager_state(payload)
+    update_inastate("raw_file_manager_state", payload)
+
+
+def _wait_for_raw_file_manager(process, *, source: Optional[str], reason: str) -> None:
+    try:
+        returncode = process.wait()
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Raw file manager wait failed: {exc}")
+        return
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    state = _load_raw_file_manager_state()
+    if _coerce_int(state.get("pid"), 0) == int(getattr(process, "pid", 0) or 0):
+        state.update(
+            {
+                "status": "completed" if returncode == 0 else "failed",
+                "returncode": int(returncode),
+                "source": state.get("source") or source or "all",
+                "reason": state.get("reason") or reason,
+                "finished_at": finished_at,
+                "updated_at": finished_at,
+            }
+        )
+        _write_raw_file_manager_state(state)
+        update_inastate("raw_file_manager_state", state)
+    update_inastate(
+        "last_raw_file_manager_exit",
+        {
+            "timestamp": finished_at,
+            "pid": int(getattr(process, "pid", 0) or 0),
+            "returncode": int(returncode),
+            "source": source or state.get("source") or "all",
+        },
+    )
+
+
+def _merge_quantum_emotion_bias(delta: Dict[str, float]) -> Dict[str, float]:
+    current = get_inastate("quantum_emotion_bias")
+    bias = dict(current) if isinstance(current, dict) else {}
+    for key, value in delta.items():
+        try:
+            next_value = float(bias.get(key, 0.0) or 0.0) + float(value or 0.0)
+        except Exception:
+            continue
+        if abs(next_value) < 0.005:
+            bias.pop(key, None)
+        else:
+            bias[key] = round(max(-0.3, min(0.3, next_value)), 4)
+    update_inastate("quantum_emotion_bias", bias)
+    return bias
+
+
+def _record_exploration_nudge(kind: str, target: str, *, now: Optional[float] = None) -> Dict[str, Any]:
+    now = time.time() if now is None else float(now)
+    target = str(target or "unknown").strip().lower() or "unknown"
+    kind = str(kind or "exploration").strip().lower() or "exploration"
+    state = get_inastate("exploration_nudge_state")
+    state = state if isinstance(state, dict) else {}
+    raw_history = state.get("history") if isinstance(state.get("history"), list) else []
+    cutoff = now - _EXPLORATION_NUDGE_WINDOW_SEC
+    history = [item for item in raw_history if isinstance(item, dict) and _coerce_float(item.get("ts"), 0.0) >= cutoff]
+
+    repeat_count = sum(
+        1
+        for item in history
+        if str(item.get("kind") or "").lower() == kind and str(item.get("target") or "").lower() == target
+    )
+    boredom_delta = min(0.035, 0.012 * repeat_count) if repeat_count else 0.0
+    novelty_targets = {"music", "drawing", "paint"}
+    novelty_delta = 0.025 if target in novelty_targets and repeat_count == 0 else 0.0
+
+    if boredom_delta:
+        try:
+            boredom = _clamp01(float(get_inastate("emotion_boredom") or 0.0) + boredom_delta)
+            update_inastate("emotion_boredom", round(boredom, 4))
+        except Exception:
+            pass
+    if novelty_delta:
+        _merge_quantum_emotion_bias(
+            {
+                "novelty": novelty_delta,
+                "interest": novelty_delta * 0.7,
+                "curiosity": novelty_delta * 0.4,
+            }
+        )
+
+    event = {
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "ts": now,
+        "kind": kind,
+        "target": target,
+        "repeat_count": repeat_count,
+        "boredom_delta": round(boredom_delta, 4),
+        "novelty_delta": round(novelty_delta, 4),
+    }
+    history.append(event)
+    state.update(
+        {
+            "updated_at": event["timestamp"],
+            "last": event,
+            "history": history[-_EXPLORATION_NUDGE_HISTORY_LIMIT:],
+        }
+    )
+    update_inastate("exploration_nudge_state", state)
+    update_inastate("last_exploration_nudge", event)
+    return event
+
+
+def _defer_self_read_for_active_process(reason: str, active_state: Dict[str, Any], now: float) -> None:
+    global _last_self_read_hold_log
+    if (now - _last_self_read_hold_log) >= _SELF_READ_HOLD_LOG_COOLDOWN:
+        pid = active_state.get("pid")
+        count = int(active_state.get("process_count") or 1)
+        extra = f" plus {count - 1} duplicate(s)" if count > 1 else ""
+        log_to_statusbox(f"[Manager] Self-read held; raw_file_manager.py is already running (pid {pid}{extra}).")
+        _last_self_read_hold_log = now
+    update_inastate(
+        "last_self_read_deferral",
+        {
+            "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "reason": reason,
+            "deferred_by": "raw_file_manager_already_running",
+            "active_pid": active_state.get("pid"),
+            "active_source": active_state.get("source"),
+            "active_process_count": active_state.get("process_count", 1),
+            "extra_pids": active_state.get("extra_pids"),
+        },
     )
 
 
@@ -5465,6 +5703,12 @@ def _maybe_self_read():
         )
         return
 
+    raw_active, raw_state = _raw_file_manager_active()
+    if raw_active:
+        _last_self_read_launch = now
+        _defer_self_read_for_active_process(reason, raw_state, now)
+        return
+
     _last_self_read_launch = now
     trigger = {
         "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
@@ -5507,7 +5751,20 @@ def _maybe_self_read():
         log_to_statusbox(f"[Manager] Self-read source pick: {source_pick}.")
     update_inastate("last_self_read_trigger", trigger)
     log_to_statusbox(f"[Manager] Self-read triggered ({reason}).")
-    safe_popen(["python", "raw_file_manager.py"], **popen_kwargs)
+    process = safe_popen(["python", "raw_file_manager.py"], **popen_kwargs)
+    if process is None:
+        trigger["launch_failed"] = True
+        update_inastate("last_self_read_trigger", trigger)
+        return
+
+    _record_raw_file_manager_launch(process, source=source_pick, reason=reason, now=now)
+    _record_exploration_nudge("self_read", source_pick or "all", now=now)
+    threading.Thread(
+        target=_wait_for_raw_file_manager,
+        kwargs={"process": process, "source": source_pick, "reason": reason},
+        name="raw_file_manager_wait",
+        daemon=True,
+    ).start()
 
 def _update_contact_urges():
     """

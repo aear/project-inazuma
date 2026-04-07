@@ -493,3 +493,77 @@ def test_build_process_scheduler_summary_includes_recent_module_history():
     assert memory_graph["started_count"] == 1
     assert memory_graph["cancelled_count"] == 1
     assert "cancelled" in memory_graph["status_spectrum"]
+
+
+def test_raw_file_manager_active_uses_state_pid(tmp_path):
+    original_path = mm.RAW_FILE_MANAGER_STATE_PATH
+    original_metrics = mm._scheduler_pid_metrics
+    original_processes = mm._raw_file_manager_processes
+    try:
+        mm.RAW_FILE_MANAGER_STATE_PATH = tmp_path / "raw_file_manager_state.json"
+        mm.RAW_FILE_MANAGER_STATE_PATH.write_text(
+            '{"status": "running", "pid": 123, "source": "music"}',
+            encoding="utf-8",
+        )
+        mm._scheduler_pid_metrics = lambda pid: (pid == 123, {"rss_gb": 0.25})
+        mm._raw_file_manager_processes = lambda: []
+
+        active, state = mm._raw_file_manager_active()
+
+        assert active is True
+        assert state["pid"] == 123
+        assert state["source"] == "music"
+        assert state["rss_gb"] == 0.25
+    finally:
+        mm.RAW_FILE_MANAGER_STATE_PATH = original_path
+        mm._scheduler_pid_metrics = original_metrics
+        mm._raw_file_manager_processes = original_processes
+
+
+def test_exploration_nudge_rewards_new_music_and_penalizes_repeat():
+    original_get = mm.get_inastate
+    original_update = mm.update_inastate
+    store = {"emotion_boredom": 0.1}
+
+    def fake_get(key, default=None):
+        return store.get(key, default)
+
+    def fake_update(key, value):
+        store[key] = value
+
+    try:
+        mm.get_inastate = fake_get
+        mm.update_inastate = fake_update
+
+        first = mm._record_exploration_nudge("self_read", "music", now=1000.0)
+        second = mm._record_exploration_nudge("self_read", "music", now=1010.0)
+
+        assert first["novelty_delta"] == 0.025
+        assert first["boredom_delta"] == 0.0
+        assert second["repeat_count"] == 1
+        assert second["boredom_delta"] == 0.012
+        assert store["emotion_boredom"] == 0.112
+        assert store["quantum_emotion_bias"]["novelty"] == 0.025
+    finally:
+        mm.get_inastate = original_get
+        mm.update_inastate = original_update
+
+
+def test_raw_file_manager_process_scan_falls_back_to_pgrep():
+    original_psutil = mm.psutil
+    original_run = mm.subprocess.run
+
+    class Result:
+        returncode = 0
+        stdout = "123 python raw_file_manager.py\n456 pgrep -af raw_file_manager.py\n"
+
+    try:
+        mm.psutil = None
+        mm.subprocess.run = lambda *args, **kwargs: Result()
+
+        rows = mm._raw_file_manager_processes()
+
+        assert rows == [{"pid": 123, "cmdline": ["python", "raw_file_manager.py"], "status": "unknown"}]
+    finally:
+        mm.psutil = original_psutil
+        mm.subprocess.run = original_run

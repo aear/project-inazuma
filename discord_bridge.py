@@ -597,11 +597,23 @@ def process_inbound_message(msg) -> CommsResponse:
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
 
     tokens = _extract_tokens(user_text)
+    symbolic_context = {
+        "source": "discord",
+        "source_text": user_text,
+        "tokens": tokens,
+        "tags": [
+            "discord",
+            "text",
+            "dm" if (msg.metadata or {}).get("is_dm") else "guild",
+        ],
+        "channel": msg.channel.name,
+    }
     symbolic = generate_symbolic_reply_from_text(
         user_text,
         child=child,
         base_path=Path("AI_Children"),
         max_symbols=4,
+        context=symbolic_context,
     )
     symbolic_unknown: list[str] = symbolic.get("unknown") if symbolic else []
     symbolic_text = symbolic.get("text") if symbolic else None
@@ -615,6 +627,8 @@ def process_inbound_message(msg) -> CommsResponse:
                 "unknown_words": symbolic.get("unknown"),
                 "symbolic_native_text": symbolic_native_text,
                 "symbolic_gloss_text": symbolic_gloss_text,
+                "symbolic_native_sources": symbolic.get("native_sources"),
+                "symbolic_gloss_sources": symbolic.get("gloss_sources"),
             }
         )
         if not symbolic_unknown and not attachments:
