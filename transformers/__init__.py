@@ -1,62 +1,34 @@
-try:  # pragma: no cover - optional dependency
-    from .soul_drift import DriftConfig, DriftState, SoulDriftTransformer
-except Exception:
-    DriftConfig = DriftState = SoulDriftTransformer = None
+import importlib
 
-try:
-    from .mycelial_transformer import MycelialTransformer
-except Exception:
-    MycelialTransformer = None
+_EXPORTS = {
+    "DriftConfig": ("transformers.soul_drift", "DriftConfig"),
+    "DriftState": ("transformers.soul_drift", "DriftState"),
+    "SoulDriftTransformer": ("transformers.soul_drift", "SoulDriftTransformer"),
+    "MycelialTransformer": ("transformers.mycelial_transformer", "MycelialTransformer"),
+    "HeuristicMirrorTransformer": ("transformers.heuristic_mirror_transformer", "HeuristicMirrorTransformer"),
+    "FractalTransformer": ("transformers.fractal_multidimensional_transformers", "FractalTransformer"),
+    "load_precision_profile": ("transformers.fractal_multidimensional_transformers", "load_precision_profile"),
+    "SeedlingTransformer": ("transformers.seedling_transformer", "SeedlingTransformer"),
+    "QTransformer": ("transformers.QTransformer", "QTransformer"),
+    "HindsightTransformer": ("transformers.hindsight_transformer", "HindsightTransformer"),
+    "ShadowTransformer": ("transformers.shadow_transformer", "ShadowTransformer"),
+    "BridgeTransformer": ("transformers.bridge_transformer", "BridgeTransformer"),
+}
 
-try:
-    from .heuristic_mirror_transformer import HeuristicMirrorTransformer
-except Exception:
-    HeuristicMirrorTransformer = None
+__all__ = list(_EXPORTS)
 
-try:
-    from .fractal_multidimensional_transformers import (
-        FractalTransformer,
-        load_precision_profile,
-    )
-except Exception:
-    FractalTransformer = load_precision_profile = None
 
-try:
-    from .seedling_transformer import SeedlingTransformer
-except Exception:
-    SeedlingTransformer = None
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _EXPORTS[name]
+    try:
+        value = getattr(importlib.import_module(module_name), attr_name)
+    except Exception:
+        value = None
+    globals()[name] = value
+    return value
 
-try:  # pragma: no cover - optional dependency
-    from .QTransformer import QTransformer
-except Exception:  # pragma: no cover
-    QTransformer = None
 
-try:
-    from .hindsight_transformer import HindsightTransformer
-except Exception:
-    HindsightTransformer = None
-
-try:
-    from .shadow_transformer import ShadowTransformer
-except Exception:
-    ShadowTransformer = None
-
-try:
-    from .bridge_transformer import BridgeTransformer
-except Exception:
-    BridgeTransformer = None
-
-__all__ = [
-    "DriftConfig",
-    "DriftState",
-    "SoulDriftTransformer",
-    "MycelialTransformer",
-    "HeuristicMirrorTransformer",
-    "FractalTransformer",
-    "load_precision_profile",
-    "SeedlingTransformer",
-    "QTransformer",
-    "HindsightTransformer",
-    "ShadowTransformer",
-    "BridgeTransformer",
-]
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

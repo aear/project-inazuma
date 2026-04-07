@@ -3,6 +3,7 @@
 # Symbol-aware communication, language adaptation, and device reasoning based on config.json
 
 import json
+import heapq
 import math
 import time
 import subprocess
@@ -24,7 +25,7 @@ from language_processing import (
     save_symbol_to_token,
     speak_symbolically,
 )
-from model_manager import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
+from runtime_state import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
 from social_map import get_high_trust_contacts, get_owner_user_id
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
@@ -35,6 +36,7 @@ WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
 TYPE_CONTACT_COOLDOWN = 180  # seconds between proactive typed contacts
 PATTERN_PROMOTION_COOLDOWN = 300  # seconds between repeated-tone promotion scans
 PATTERN_FRAGMENT_SCAN_LIMIT = 192  # cap pattern mining to recent expression fragments
+RECENT_EVENT_SCAN_LIMIT = 96  # cap recent speech grounding to newest experience event files
 EMBEDDER = MultimodalEmbedder(dim=128)
 
 
@@ -42,6 +44,24 @@ def _normalize_symbol_map(raw):
     if isinstance(raw, dict) and "symbols" in raw:
         return raw.get("symbols", {})
     return raw if isinstance(raw, dict) else {}
+
+
+def _newest_matching_paths(directory: Path, pattern: str, limit: int) -> List[Path]:
+    try:
+        bounded_limit = max(0, int(limit))
+    except Exception:
+        bounded_limit = 0
+    if bounded_limit <= 0 or not directory.exists():
+        return []
+
+    def candidates():
+        for path in directory.glob(pattern):
+            try:
+                yield path.stat().st_mtime, path
+            except OSError:
+                continue
+
+    return [path for _mtime, path in heapq.nlargest(bounded_limit, candidates(), key=lambda item: item[0])]
 
 
 def _proto_confidence(uses: int, base: float = 0.2) -> float:
@@ -333,7 +353,12 @@ def _update_tone_diversity_metrics(
     update_inastate("tone_voice_metrics", metrics)
 
 
-def load_recent_heard_words(child: str, limit: int = 12) -> List[Dict[str, str]]:
+def load_recent_heard_words(
+    child: str,
+    limit: int = 12,
+    *,
+    event_scan_limit: int = RECENT_EVENT_SCAN_LIMIT,
+) -> List[Dict[str, str]]:
     """
     Pull the most recent heard words from grounded experience events so babbles
     can mimic real speech instead of abstract symbols.
@@ -342,7 +367,11 @@ def load_recent_heard_words(child: str, limit: int = 12) -> List[Dict[str, str]]
     if not events_dir.exists():
         return []
 
-    paths = sorted(events_dir.glob("evt_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    try:
+        scan_limit = max(1, int(event_scan_limit))
+    except Exception:
+        scan_limit = RECENT_EVENT_SCAN_LIMIT
+    paths = _newest_matching_paths(events_dir, "evt_*.json", scan_limit)
     heard: List[Dict[str, str]] = []
 
     for path in paths:
@@ -666,11 +695,7 @@ def _load_recent_expression_fragments(child: str, limit: int = PATTERN_FRAGMENT_
         return []
 
     try:
-        paths = sorted(
-            frag_dir.glob("frag_expression_*.json"),
-            key=lambda frag_path: frag_path.stat().st_mtime,
-            reverse=True,
-        )
+        paths = _newest_matching_paths(frag_dir, "frag_expression_*.json", limit)
     except Exception:
         paths = []
 
@@ -1824,7 +1849,8 @@ def early_communicate():
         update_inastate("last_babble_strategy", expression_strategy)
         update_inastate("currently_speaking", False)
 
-    _update_tone_diversity_metrics(child, symbol_seq_for_embed)
+    tone_metric_symbols = speech_symbols or ([symbol_id] if symbol_id else [])
+    _update_tone_diversity_metrics(child, tone_metric_symbols)
 
 
 if __name__ == "__main__":

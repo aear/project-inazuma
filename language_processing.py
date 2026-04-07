@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from embedding_stack import MultimodalEmbedder, guess_language_code
-from model_manager import load_config, seed_self_question
+from runtime_state import load_config, seed_self_question
 from experience_logger import ExperienceLogger
 from symbol_generator import (
     ACCENT_GLYPHS,

@@ -108,6 +108,50 @@ def get_github_submission_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     return policy
 
 
+def _configured_token_from_section(section: Any) -> str:
+    if not isinstance(section, dict):
+        return ""
+    for key in ("token", "access_token", "github_token", "pat"):
+        value = str(section.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("token_file", "token_path"):
+        path_text = str(section.get(key) or "").strip()
+        if not path_text:
+            continue
+        try:
+            token = Path(path_text).expanduser().read_text(encoding="utf-8").strip()
+        except Exception:
+            token = ""
+        if token:
+            return token
+    return ""
+
+
+def resolve_github_token(cfg: Optional[Dict[str, Any]] = None, policy: Optional[Dict[str, Any]] = None) -> str:
+    payload = cfg if isinstance(cfg, dict) else load_config()
+    active_policy = policy if isinstance(policy, dict) else get_github_submission_config(payload)
+    token_env = str(active_policy.get("token_env") or "").strip()
+    if token_env:
+        token = os.environ.get(token_env, "").strip()
+        if token:
+            return token
+
+    raw_submission = payload.get("github_submission") if isinstance(payload, dict) else None
+    token = _configured_token_from_section(raw_submission)
+    if token:
+        return token
+
+    raw_github = payload.get("github") if isinstance(payload, dict) else None
+    token = _configured_token_from_section(raw_github)
+    if token:
+        return token
+
+    raise RuntimeError(
+        f"GitHub token not found; set {token_env or 'GITHUB_TOKEN'} or configure github_submission.token/token_file"
+    )
+
+
 def github_outbox_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "github_outbox.jsonl"
 
@@ -498,10 +542,7 @@ def submit_issue(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) ->
     repo_full_name = str(policy.get("repo_full_name") or "").strip()
     if not repo_full_name:
         raise RuntimeError("repo_full_name is not configured")
-    token_env = str(policy.get("token_env") or "").strip()
-    token = os.environ.get(token_env, "") if token_env else ""
-    if not token:
-        raise RuntimeError(f"GitHub token not found in environment variable {token_env or '<unset>'}")
+    token = resolve_github_token(cfg, policy)
 
     url = f"{policy['api_base']}/repos/{repo_full_name}/issues"
     payload = {
@@ -560,6 +601,7 @@ __all__ = [
     "log_history",
     "maybe_queue_submission_discord_notice",
     "read_pending_entries",
+    "resolve_github_token",
     "submit_issue",
     "typed_outbox_path",
 ]

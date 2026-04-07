@@ -11,6 +11,7 @@ try:
 except ImportError:  # pragma: no cover - platform dependent
     fcntl = None
 
+from github_feedback import get_github_feedback_config, sync_issue_feedback
 from github_submission import (
     archive_entry,
     get_current_child,
@@ -22,11 +23,13 @@ from github_submission import (
     log_history,
     maybe_queue_submission_discord_notice,
     read_pending_entries,
+    resolve_github_token,
     submit_issue,
 )
 
 logger = logging.getLogger("github_bridge")
 _LOCK_HANDLE = None
+_LAST_FEEDBACK_CHECK = 0.0
 
 
 def _acquire_single_instance_lock(child: str) -> bool:
@@ -51,6 +54,33 @@ def _acquire_single_instance_lock(child: str) -> bool:
     return True
 
 
+def maybe_check_issue_feedback(*, force: bool = False) -> Optional[dict]:
+    cfg = load_config()
+    policy = get_github_feedback_config(cfg)
+    if not policy.get("enabled", False):
+        return None
+
+    global _LAST_FEEDBACK_CHECK
+    now = time.time()
+    interval = float(policy.get("poll_interval_sec") or 900.0)
+    if not force and _LAST_FEEDBACK_CHECK and (now - _LAST_FEEDBACK_CHECK) < interval:
+        return None
+    _LAST_FEEDBACK_CHECK = now
+
+    result = sync_issue_feedback(cfg)
+    if result.get("checked"):
+        logger.info(
+            "GitHub feedback check: %s issue(s), %s new comment(s).",
+            result.get("checked_issues", 0),
+            result.get("new_comments", 0),
+        )
+    elif result.get("reason") == "missing_token":
+        logger.warning("GitHub feedback check skipped: token unavailable.")
+    else:
+        logger.info("GitHub feedback check skipped: %s", result.get("reason"))
+    return result
+
+
 def process_once() -> int:
     cfg = load_config()
     child = get_current_child(cfg)
@@ -60,6 +90,12 @@ def process_once() -> int:
         return 0
     if policy.get("delivery_mode") != "issues":
         logger.info("GitHub delivery mode is %s; queue will not be delivered.", policy.get("delivery_mode"))
+        return 0
+
+    try:
+        resolve_github_token(cfg, policy)
+    except Exception as exc:
+        logger.warning("GitHub submission skipped: token unavailable: %s", exc)
         return 0
 
     daily_cap = int(policy.get("daily_issue_cap", 4) or 4)
@@ -117,6 +153,7 @@ def process_once() -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Deliver Ina's queued GitHub optimisation proposals.")
     parser.add_argument("--once", action="store_true", help="Process the queue once and exit.")
+    parser.add_argument("--check-feedback", action="store_true", help="Check submitted GitHub issues for new comments and exit.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -126,13 +163,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error("github_bridge already running; exiting duplicate instance.")
         return 1
 
+    if args.check_feedback:
+        maybe_check_issue_feedback(force=True)
+        return 0
+
     if args.once:
         process_once()
+        maybe_check_issue_feedback(force=True)
         return 0
 
     while True:
         try:
             process_once()
+            maybe_check_issue_feedback()
         except Exception:
             logger.exception("GitHub bridge loop failed.")
         cfg = load_config()
