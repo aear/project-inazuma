@@ -18,7 +18,44 @@ def load_self_reflection(child):
     except:
         return {}
 
+def _journal_self_question_prompts(child, limit=8):
+    try:
+        from reflection_journal import get_recent_entries
+
+        entries = get_recent_entries(
+            limit,
+            entry_types=("note", "reflection", "journal"),
+            child=child,
+        )
+    except Exception:
+        return []
+
+    if not entries:
+        return []
+
+    tags = {str(tag) for entry in entries for tag in entry.get("tags", [])}
+    prompts = []
+    if "high_regret" in tags:
+        prompts.append("Why did high-regret precision events repeat?")
+    if "emotion_spike" in tags:
+        prompts.append("What preceded the recent emotion spike?")
+    if "contradiction" in tags or "notable_contradiction" in tags:
+        prompts.append("Which journal contradiction needs checking?")
+    if any(entry.get("type") == "journal" for entry in entries):
+        prompts.append("What pattern is present in the latest journal entry?")
+    if any(entry.get("type") == "reflection" for entry in entries):
+        prompts.append("What changed across recent reflections?")
+
+    deduped = []
+    for prompt in prompts:
+        if prompt not in deduped:
+            deduped.append(prompt)
+    return deduped[:3]
+
+
 def generate_self_question_prompts():
+    config = load_config()
+    child = config.get("current_child", "default_child")
     energy = get_inastate("current_energy") or 0.5
     transformer = FractalTransformer()
     transformer.load_precision_profile()
@@ -39,8 +76,13 @@ def generate_self_question_prompts():
     if vision == "too bright": prompts.append("Why is it so bright?")
     if precision < 32: prompts.append("Should I be thinking more precisely?")
     if precision > 48: prompts.append("Would lowering precision help me think more clearly?")
+    prompts.extend(_journal_self_question_prompts(child))
 
-    return prompts
+    deduped = []
+    for prompt in prompts:
+        if prompt not in deduped:
+            deduped.append(prompt)
+    return deduped
 
 def run_reflection():
     config = load_config()

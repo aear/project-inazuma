@@ -19,6 +19,10 @@ DEFAULT_CHILD = "Inazuma_Yagami"
 LOG_FILENAME = "precision_memory_map.jsonl"
 OUTCOME_STATUSES = {"stable", "overload", "efficient", "stalled"}
 SUCCESS_STATUSES = {"stable", "efficient"}
+REFLECTION_NOTE_REGRET_THRESHOLD = 5.0
+REFLECTION_NOTE_LOW_COMPLETION_THRESHOLD = 0.35
+REFLECTION_NOTE_CPU_THRESHOLD = 85.0
+REFLECTION_NOTE_RAM_THRESHOLD_GB = 8.0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -182,6 +186,82 @@ def _normalize_outcome(outcome: Dict[str, Any], cost: Dict[str, Any]) -> Dict[st
     return normalized
 
 
+def _nested_numeric_values(value: Any) -> List[float]:
+    if isinstance(value, dict):
+        numbers: List[float] = []
+        for item in value.values():
+            numbers.extend(_nested_numeric_values(item))
+        return numbers
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
+        numbers = []
+        for item in value:
+            numbers.extend(_nested_numeric_values(item))
+        return numbers
+    number = _optional_float(value)
+    return [number] if number is not None else []
+
+
+def _max_nested_numeric(value: Any) -> float:
+    numbers = _nested_numeric_values(value)
+    return max(numbers) if numbers else 0.0
+
+
+def _reflection_note_reasons(entry: Dict[str, Any]) -> List[str]:
+    outcome = entry.get("outcome") if isinstance(entry.get("outcome"), dict) else {}
+    cost = entry.get("cost") if isinstance(entry.get("cost"), dict) else {}
+    status = str(outcome.get("status") or "").strip().lower()
+    regret = _safe_float(outcome.get("regret"), 0.0)
+    completion = _safe_float(outcome.get("completion"), 0.0)
+    cpu_max = _max_nested_numeric(cost.get("cpu"))
+    ram_max = _max_nested_numeric(cost.get("ram"))
+
+    reasons: List[str] = []
+    if regret >= REFLECTION_NOTE_REGRET_THRESHOLD:
+        reasons.append("high_regret")
+    if completion <= REFLECTION_NOTE_LOW_COMPLETION_THRESHOLD:
+        reasons.append("low_completion")
+    if status in {"overload", "stalled"}:
+        reasons.append(f"status:{status}")
+    if cpu_max >= REFLECTION_NOTE_CPU_THRESHOLD:
+        reasons.append("high_cpu")
+    if ram_max >= REFLECTION_NOTE_RAM_THRESHOLD_GB:
+        reasons.append("high_ram")
+    return reasons
+
+
+def _reflection_note_content(entry: Dict[str, Any], reasons: List[str]) -> str:
+    context = entry.get("context") if isinstance(entry.get("context"), dict) else {}
+    outcome = entry.get("outcome") if isinstance(entry.get("outcome"), dict) else {}
+    modules = _coerce_module_list(context.get("active_modules", []))
+    module_text = ",".join(modules[:4]) if modules else "none"
+    return (
+        "precision decision note; "
+        f"event={entry.get('id')}; status={outcome.get('status')}; "
+        f"regret={_safe_float(outcome.get('regret'), 0.0):.3g}; "
+        f"completion={_safe_float(outcome.get('completion'), 0.0):.3g}; "
+        f"modules={module_text}; triggers={','.join(reasons)}"
+    )
+
+
+def _maybe_write_reflection_note(entry: Dict[str, Any], *, child: Optional[str], base_path: Optional[Path]) -> None:
+    reasons = _reflection_note_reasons(entry)
+    if not reasons:
+        return
+    try:
+        from reflection_journal import write_note
+
+        write_note(
+            _reflection_note_content(entry, reasons),
+            context=entry.get("context") if isinstance(entry.get("context"), dict) else None,
+            tags=["precision_memory", "precision_event_note", *reasons],
+            linked_events=[str(entry.get("id"))] if entry.get("id") else [],
+            child=child,
+            base_path=base_path,
+        )
+    except Exception:
+        pass
+
+
 def log_event(
     context: Dict[str, Any],
     cost: Dict[str, Any],
@@ -194,8 +274,10 @@ def log_event(
     """Append a precision decision event to memory and return the entry."""
 
     normalized_cost = _normalize_cost(cost)
+    timestamp = time.time()
     entry = {
-        "timestamp": time.time(),
+        "id": f"precision_{int(timestamp * 1000000)}",
+        "timestamp": timestamp,
         "context": _normalize_context(context),
         "cost": normalized_cost,
         "precision": _normalize_precision(precision),
@@ -205,6 +287,7 @@ def log_event(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _maybe_write_reflection_note(entry, child=child, base_path=base_path)
     return entry
 
 

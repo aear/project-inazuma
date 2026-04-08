@@ -149,6 +149,8 @@ _last_memory_queue_event_ts = 0.0
 _last_memory_queue_process_ts = 0.0
 _RUNTIME_HEARTBEAT_INTERVAL = 30.0
 _last_runtime_heartbeat = 0.0
+_REFLECTION_JOURNAL_INTERVAL_SECONDS = 24 * 60 * 60
+_REFLECTION_JOURNAL_STATE_KEY = "reflection_journal_state"
 _PROCESS_SCHEDULER_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
 _PROCESS_SCHEDULER_TICK_INTERVAL = 5.0
 _last_process_scheduler_tick = 0.0
@@ -5012,6 +5014,51 @@ def _run_passive_reflection():
         log_to_statusbox(f"[Manager] Passive reflection failed: {exc}")
 
 
+def _journal_timestamp_to_seconds(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if math.isfinite(number) and number > 0.0:
+        return number
+    if not isinstance(value, str) or not value.strip():
+        return 0.0
+    try:
+        stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except Exception:
+        return 0.0
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def _maybe_generate_reflection_journal() -> None:
+    now = time.time()
+    state = get_inastate(_REFLECTION_JOURNAL_STATE_KEY) or {}
+    if not isinstance(state, dict):
+        state = {}
+    last_ts = _journal_timestamp_to_seconds(state.get("last_daily_ts") or state.get("last_daily"))
+    if last_ts and (now - last_ts) < _REFLECTION_JOURNAL_INTERVAL_SECONDS:
+        return
+
+    try:
+        from reflection_journal import generate_journal
+
+        content = generate_journal(period="daily", child=CHILD)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        update_inastate(
+            _REFLECTION_JOURNAL_STATE_KEY,
+            {
+                "last_daily_ts": now,
+                "last_daily": timestamp,
+                "last_period": "daily",
+                "last_content_preview": content[:240],
+            },
+        )
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to generate reflection journal: {exc}")
+
+
 def _check_self_adjustment():
     """
     Surface optional introspection opportunities and prompts to inastate.
@@ -8596,6 +8643,7 @@ def run_internal_loop():
         defer_optional=defer_optional,
         defer_spawns=defer_spawns,
     )
+    _maybe_generate_reflection_journal()
 
 def schedule_runtime():
     log_to_statusbox("[Manager] Starting main runtime loop...")

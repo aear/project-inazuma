@@ -114,6 +114,7 @@ DEFAULT_BASELINE: Dict[str, float] = {
 
 AI_CHILDREN_ROOT = Path("AI_Children")
 BODY_INTENSITY_THRESHOLD = 0.6
+REFLECTION_INTENSITY_THRESHOLD = 0.75
 _PLAYFULNESS_STATE_KEY = "emotion_playfulness_state"
 _PLAYFULNESS_LEVEL_KEY = "emotion_playfulness_level"
 _PLAYFULNESS_HALF_LIFE_SECONDS = 240.0
@@ -624,6 +625,37 @@ def tag_fragment_emotions(
     )
 
 
+def _maybe_record_emotion_reflection(
+    child: str,
+    snapshot: EmotionSnapshot,
+    context_tags: Optional[List[str]],
+) -> None:
+    try:
+        intensity = abs(float(snapshot.values.get("intensity", 0.0) or 0.0))
+    except Exception:
+        intensity = 0.0
+    if intensity <= REFLECTION_INTENSITY_THRESHOLD:
+        return
+
+    try:
+        from reflection_journal import reflect_on_emotion_snapshot
+
+        reflect_on_emotion_snapshot(
+            snapshot.to_dict(),
+            context={
+                "active_modules": ["emotion_engine"],
+                "emotion_state": snapshot.values,
+                "energy": get_inastate("current_energy") or 0.0,
+                "mode": snapshot.mode,
+            },
+            tags=context_tags or [],
+            threshold=REFLECTION_INTENSITY_THRESHOLD,
+            child=child,
+        )
+    except Exception as exc:
+        _log(f"Failed to record emotion reflection: {exc}")
+
+
 def tag_fragment(
     fragment: Dict[str, Any],
     snapshot: EmotionSnapshot,
@@ -770,6 +802,7 @@ def run_emotion_engine(context_tags: Optional[List[str]] = None) -> None:
     # Persist
     log_emotion_snapshot(child, snapshot)
     save_baseline(child, snapshot.values)
+    _maybe_record_emotion_reflection(child, snapshot, tags)
 
     # Tag fragments (can be disabled later or made more selective)
     tag_all_fragments(child, snapshot, body_state=body_state_snapshot)
