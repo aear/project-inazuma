@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import random
@@ -11,7 +12,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph.opengl as gl
 
 from gui_hook import log_to_statusbox
-from body_schema import get_region_anchors
 from model_manager import (
     get_inastate,
     get_running_modules,
@@ -28,9 +28,9 @@ SHIFT_STEP = 0.25
 ROT_STEP_DEG = 2.0
 
 DETAIL_LEVELS = {
-    "Low": {"max_nodes": 4000, "max_edges": 25000, "show_edges": False},
-    "Medium": {"max_nodes": 8000, "max_edges": 50000, "show_edges": True},
-    "High": {"max_nodes": 12000, "max_edges": 100000, "show_edges": True},
+    "Low": {"max_nodes": 4000, "max_edges": 8000, "show_edges": True},
+    "Medium": {"max_nodes": 12000, "max_edges": 50000, "show_edges": True},
+    "High": {"max_nodes": 20000, "max_edges": 100000, "show_edges": True},
 }
 
 NETWORK_COLORS: Dict[str, Tuple[float, float, float]] = {
@@ -113,6 +113,8 @@ class BrainDataLoader:
         self.child = child
         self.memory_root = Path("AI_Children") / child / "memory"
         self.neural_root = self.memory_root / "neural"
+        self._json_cache: Dict[Path, Tuple[int, int, Any]] = {}
+        self._source_cache: Dict[Tuple[Path, str], Tuple[int, int, Tuple[float, ...], Any]] = {}
         schema = _load_json(Path("body_schema.json")) or {}
         bounds = schema.get("body_bounds") if isinstance(schema, dict) else None
         center = bounds.get("center") if isinstance(bounds, dict) else None
@@ -122,6 +124,48 @@ class BrainDataLoader:
             self.origin_offset = np.zeros(3, dtype=float)
         self.manual_offset = np.zeros(3, dtype=float)
         self.manual_rotation = np.zeros(3, dtype=float)  # yaw, pitch, roll in radians
+
+    def _load_json_cached(self, path: Path) -> Any:
+        try:
+            stat = path.stat()
+        except OSError:
+            self._json_cache.pop(path, None)
+            return None
+
+        cached = self._json_cache.get(path)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+
+        data = _load_json(path)
+        if data is None and cached:
+            return cached[2]
+        self._json_cache[path] = (stat.st_mtime_ns, stat.st_size, data)
+        return data
+
+    def _transform_cache_key(self) -> Tuple[float, ...]:
+        values = list(self.manual_offset) + list(self.manual_rotation)
+        return tuple(round(float(value), 6) for value in values)
+
+    def _source_cache_get(self, path: Path, source_key: str) -> Any:
+        try:
+            stat = path.stat()
+        except OSError:
+            self._source_cache.pop((path, source_key), None)
+            return None
+
+        cached = self._source_cache.get((path, source_key))
+        transform_key = self._transform_cache_key()
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size and cached[2] == transform_key:
+            return cached[3]
+        return None
+
+    def _source_cache_set(self, path: Path, source_key: str, value: Any) -> Any:
+        try:
+            stat = path.stat()
+        except OSError:
+            return value
+        self._source_cache[(path, source_key)] = (stat.st_mtime_ns, stat.st_size, self._transform_cache_key(), value)
+        return value
 
     def load(self) -> Dict[str, Any]:
         neurons: List[Dict[str, Any]] = []
@@ -161,7 +205,12 @@ class BrainDataLoader:
         return snapshot
 
     def _load_neural_map(self, path: Path, fallback_network: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        data = _load_json(path) or {}
+        source_key = f"neural:{fallback_network}"
+        cached = self._source_cache_get(path, source_key)
+        if cached is not None:
+            return cached
+
+        data = self._load_json_cached(path) or {}
         raw_nodes = data.get("neurons", [])
         raw_edges = data.get("synapses", [])
         neurons: List[Dict[str, Any]] = []
@@ -177,10 +226,15 @@ class BrainDataLoader:
             if edge:
                 synapses.append(edge)
 
-        return neurons, synapses
+        return self._source_cache_set(path, source_key, (neurons, synapses))
 
     def _load_typed_graph(self, path: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        data = _load_json(path) or {}
+        source_key = "typed_neural_graph"
+        cached = self._source_cache_get(path, source_key)
+        if cached is not None:
+            return cached
+
+        data = self._load_json_cached(path) or {}
         nodes_raw = data.get("nodes", {})
         edges_raw = data.get("edges", {})
         nodes: List[Dict[str, Any]] = []
@@ -223,7 +277,7 @@ class BrainDataLoader:
             if edge:
                 edges.append(edge)
 
-        return nodes, edges
+        return self._source_cache_set(path, source_key, (nodes, edges))
 
     def _coerce_neuron(self, entry: Dict[str, Any], default_network: str, seed_hint: str) -> Optional[Dict[str, Any]]:
         neuron_id = entry.get("id") or entry.get("neuron_id")
@@ -231,9 +285,10 @@ class BrainDataLoader:
             return None
 
         network_type = entry.get("network_type") or default_network
-        pos = self._position_from_entry(entry, seed_hint=seed_hint + neuron_id)
+        pos = self._position_from_entry(entry, seed_hint=seed_hint + str(neuron_id))
         activation = self._activation_from_entry(entry)
-        last_used = _parse_timestamp(entry.get("last_used"))
+        timestamp = entry.get("last_used") or entry.get("last_seen") or entry.get("timestamp") or entry.get("updated_at")
+        last_used = _parse_timestamp(timestamp)
         label = entry.get("symbol") or entry.get("label") or entry.get("description") or ""
         return {
             "id": neuron_id,
@@ -268,6 +323,8 @@ class BrainDataLoader:
             "network_type": entry.get("network_type") or default_network,
             "direction": dir_vec,
             "relation": entry.get("relation") or entry.get("type") or "",
+            "evidence": entry.get("evidence", 0.0),
+            "last_seen": _parse_timestamp(entry.get("last_seen") or entry.get("timestamp") or entry.get("updated_at")) or 0.0,
         }
 
     def _activation_from_entry(self, entry: Dict[str, Any]) -> float:
@@ -283,7 +340,7 @@ class BrainDataLoader:
                     return clamp(sum(values[-10:]) / max(1, len(values[-10:])))
             except Exception:
                 pass
-        ts = _parse_timestamp(entry.get("last_used"))
+        ts = _parse_timestamp(entry.get("last_used") or entry.get("last_seen") or entry.get("timestamp"))
         if ts:
             age = max(1.0, time.time() - ts)
             return clamp(math.exp(-age / 3600.0))
@@ -301,7 +358,8 @@ class BrainDataLoader:
             coords = [float(x) for x in vec[:3]]
             return self._fit_to_brain(coords)
 
-        rng = random.Random(hash(seed_hint) & 0xFFFFFFFF)
+        seed = int.from_bytes(hashlib.blake2s(seed_hint.encode("utf-8"), digest_size=8).digest(), "big")
+        rng = random.Random(seed)
         theta = rng.uniform(0, 2 * math.pi)
         phi = rng.uniform(0, math.pi)
         r = rng.uniform(0.35, 1.0)
@@ -442,7 +500,7 @@ class EEGWindow(QtWidgets.QWidget):
         )
         overlay_layout.addWidget(self.info_label, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         overlay_layout.addStretch()
-        self._add_body_wireframe(overlay_layout)
+        self._build_filter_buttons(overlay_layout)
 
         stack.addWidget(overlay)
         layout.addWidget(container)
@@ -495,58 +553,6 @@ class EEGWindow(QtWidgets.QWidget):
             self._persist_alignment()
             return
         super().keyPressEvent(event)
-
-    def _add_body_wireframe(self, overlay_layout: QtWidgets.QVBoxLayout) -> None:
-        anchors = get_region_anchors()
-        offset = getattr(self.loader, "origin_offset", np.zeros(3, dtype=float)) + getattr(
-            self.loader, "manual_offset", np.zeros(3, dtype=float)
-        )
-        schema = _load_json(Path("body_schema.json")) or {}
-        regions = schema.get("body_regions", []) if isinstance(schema, dict) else []
-        centers: Dict[str, List[float]] = {}
-        for region in regions:
-            rid = region.get("id")
-            anchor = anchors.get(rid, {"center": [0.0, 0.0, 0.0]})
-            base_center = np.array(anchor.get("center", [0.0, 0.0, 0.0]), dtype=float)
-            center = self.loader._apply_rotation(base_center) + offset
-            centers[rid] = center.tolist()
-
-        segments = []
-        colors = []
-        for region in regions:
-            rid = region.get("id")
-            parent = region.get("parent")
-            if parent and parent != "root" and parent in centers and rid in centers:
-                segments.extend([centers[parent], centers[rid]])
-                colors.extend(
-                    [
-                        (0.25, 0.32, 0.38, 0.4),
-                        (0.25, 0.32, 0.38, 0.75),
-                    ]
-                )
-
-        if segments:
-            body_lines = gl.GLLinePlotItem(
-                pos=np.array(segments),
-                color=np.array(colors),
-                width=2.0,
-                mode="lines",
-                antialias=True,
-            )
-            body_lines.setDepthValue(5)
-            self.view.addItem(body_lines)
-
-        if centers:
-            pts = gl.GLScatterPlotItem(
-                pos=np.array(list(centers.values())),
-                size=np.array([0.6] * len(centers)),
-                color=np.array([(0.7, 0.86, 1.0, 0.9)] * len(centers)),
-                pxMode=False,
-            )
-            pts.setDepthValue(6)
-            self.view.addItem(pts)
-
-        self._build_filter_buttons(overlay_layout)
 
     def _build_filter_buttons(self, overlay_layout: QtWidgets.QVBoxLayout) -> None:
         def make_chip(title: str, color: Tuple[float, float, float]) -> QtWidgets.QPushButton:
@@ -686,29 +692,82 @@ class EEGWindow(QtWidgets.QWidget):
             return
 
         settings = DETAIL_LEVELS.get(self.detail_level, DETAIL_LEVELS["Medium"])
+        loaded_neuron_count = len(neurons)
+        loaded_edge_count = len(edges)
         neurons = self._apply_filters(neurons)
-        sampled_neurons = self._sample_neurons(neurons, settings["max_nodes"])
+        if not neurons:
+            self._clear_scene()
+            self.info_label.setText("<b>No neurons match the active EEG filters.</b>")
+            self.legend_label.setText("")
+            self.status_label.setText("Filtered")
+            return
+
+        visible_node_ids = {n["id"] for n in neurons}
+        edges = self._apply_edge_filters(edges, visible_node_ids)
+        edge_node_scores = self._edge_node_scores(edges)
+        sampled_neurons = self._sample_neurons(neurons, settings["max_nodes"], edge_node_scores)
         sampled_edges = self._sample_edges(edges, settings["max_edges"], sampled_neurons, settings["show_edges"])
 
         pos_map = {n["id"]: n["pos"] for n in sampled_neurons}
 
         self._draw_nodes(sampled_neurons, state)
         self._draw_edges(sampled_edges, pos_map)
-        self._update_overlay(sampled_neurons, neurons, sampled_edges, edges, state)
-
-    def _sample_neurons(self, neurons: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        ranked = sorted(
+        self._update_overlay(
+            sampled_neurons,
             neurons,
-            key=lambda n: (
-                n.get("activation", 0.0),
-                n.get("last_used", 0.0),
-                n.get("strength", 0.0),
-            ),
-            reverse=True,
+            sampled_edges,
+            edges,
+            state,
+            loaded_neuron_count,
+            loaded_edge_count,
         )
+
+    def _sample_neurons(
+        self,
+        neurons: List[Dict[str, Any]],
+        limit: int,
+        edge_node_scores: Optional[Dict[Any, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        edge_node_scores = edge_node_scores or {}
+
+        def rank_key(node: Dict[str, Any]) -> Tuple[float, float, float, float]:
+            synapse_score = clamp(math.log1p(max(0.0, edge_node_scores.get(node.get("id"), 0.0))) / 4.0)
+            activation = clamp(self._safe_float(node.get("activation"), 0.0))
+            return (
+                activation + 0.65 * synapse_score,
+                synapse_score,
+                self._safe_float(node.get("last_used"), 0.0),
+                self._safe_float(node.get("strength"), 0.0),
+            )
+
+        ranked = sorted(neurons, key=rank_key, reverse=True)
         if len(ranked) <= limit:
             return ranked
         return ranked[:limit]
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _edge_score_key(self, edge: Dict[str, Any]) -> Tuple[float, float, float]:
+        weight = self._safe_float(edge.get("weight"), 0.0)
+        evidence = max(0.0, self._safe_float(edge.get("evidence"), 0.0))
+        last_seen = self._safe_float(edge.get("last_seen"), 0.0)
+        return (weight, math.log1p(evidence), last_seen)
+
+    def _edge_node_scores(self, edges: List[Dict[str, Any]]) -> Dict[Any, float]:
+        scores: Dict[Any, float] = {}
+        for edge in edges:
+            weight, evidence_score, _ = self._edge_score_key(edge)
+            score = max(0.0, weight) + min(2.0, evidence_score / 8.0)
+            for key in (edge.get("source"), edge.get("target")):
+                if key is not None:
+                    scores[key] = scores.get(key, 0.0) + score
+        return scores
 
     def _sample_edges(
         self,
@@ -721,8 +780,40 @@ class EEGWindow(QtWidgets.QWidget):
             return []
         ids = {n["id"] for n in neurons}
         filtered = [e for e in edges if e.get("source") in ids and e.get("target") in ids]
-        ranked = sorted(filtered, key=lambda e: e.get("weight", 0.0), reverse=True)
-        return ranked[:limit] if len(ranked) > limit else ranked
+        if len(filtered) <= limit:
+            return filtered
+
+        by_network: Dict[str, List[Dict[str, Any]]] = {}
+        for edge in filtered:
+            network = str(edge.get("network_type") or "memory_graph")
+            by_network.setdefault(network, []).append(edge)
+
+        network_quota = max(1, limit // max(1, len(by_network)))
+        selected: List[Dict[str, Any]] = []
+        overflow: List[Dict[str, Any]] = []
+        for network in sorted(by_network.keys()):
+            ranked = sorted(by_network[network], key=self._edge_score_key, reverse=True)
+            take = min(len(ranked), network_quota)
+            selected.extend(ranked[:take])
+            overflow.extend(ranked[take:])
+
+        if len(selected) < limit and overflow:
+            selected.extend(sorted(overflow, key=self._edge_score_key, reverse=True)[: limit - len(selected)])
+        if len(selected) > limit:
+            selected = sorted(selected, key=self._edge_score_key, reverse=True)[:limit]
+        return selected
+
+    def _apply_edge_filters(self, edges: List[Dict[str, Any]], visible_node_ids: set) -> List[Dict[str, Any]]:
+        enabled_networks = {k for k, b in self.network_buttons.items() if b.isChecked()}
+        filtered: List[Dict[str, Any]] = []
+        for edge in edges:
+            if edge.get("source") not in visible_node_ids or edge.get("target") not in visible_node_ids:
+                continue
+            network = edge.get("network_type", "memory_graph")
+            if enabled_networks and network not in enabled_networks:
+                continue
+            filtered.append(edge)
+        return filtered
 
     def _apply_filters(self, neurons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         enabled_types = {k for k, b in self.type_buttons.items() if b.isChecked()}
@@ -838,6 +929,11 @@ class EEGWindow(QtWidgets.QWidget):
         )
         self.view.addItem(self.edge_item)
 
+    def _format_visible_count(self, rendered: int, visible: int, loaded: int) -> str:
+        if visible == loaded:
+            return f"{rendered} of {loaded}"
+        return f"{rendered} of {visible} visible ({loaded} loaded)"
+
     def _update_overlay(
         self,
         sampled_neurons: List[Dict[str, Any]],
@@ -845,25 +941,30 @@ class EEGWindow(QtWidgets.QWidget):
         sampled_edges: List[Dict[str, Any]],
         all_edges: List[Dict[str, Any]],
         state: Dict[str, Any],
+        loaded_neuron_count: int,
+        loaded_edge_count: int,
     ) -> None:
         mode = state.get("mode", "unknown")
         dreaming = state.get("dreaming", False)
+        neuron_count = self._format_visible_count(len(sampled_neurons), len(all_neurons), loaded_neuron_count)
+        edge_count = self._format_visible_count(len(sampled_edges), len(all_edges), loaded_edge_count)
         status_parts = [
             f"Mode: {mode}" + (" (dreaming)" if dreaming else ""),
             f"Detail: {self.detail_level}",
-            f"Rendering {len(sampled_neurons)}/{len(all_neurons)} neurons",
+            f"Rendering {neuron_count} neurons",
+            f"{edge_count} synapses",
         ]
-        if self.detail_level != "Low":
-            status_parts.append(f"{len(sampled_edges)}/{len(all_edges)} synapses")
 
         self.status_label.setText(" | ".join(status_parts))
 
         info_lines = [
             f"<b>Mode:</b> {mode}{' (dream)' if dreaming else ''}",
             f"<b>Detail:</b> {self.detail_level}",
-            f"<b>Neurons:</b> {len(sampled_neurons)} of {len(all_neurons)}",
-            f"<b>Synapses:</b> {len(sampled_edges)} of {len(all_edges)}",
+            f"<b>Neurons:</b> {neuron_count}",
+            f"<b>Synapses:</b> {edge_count}",
         ]
+        if len(sampled_edges) < len(all_edges):
+            info_lines.append("<b>Synapse sample:</b> network-balanced by weight and evidence")
 
         # Alignment readout
         offset = getattr(self.loader, "manual_offset", np.zeros(3, dtype=float))
