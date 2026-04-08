@@ -151,6 +151,7 @@ _last_runtime_heartbeat = 0.0
 _PROCESS_SCHEDULER_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
 _PROCESS_SCHEDULER_TICK_INTERVAL = 5.0
 _last_process_scheduler_tick = 0.0
+_scheduler_process_cpu_samples = {}
 _PROCESS_SCHEDULER_DEFAULTS = {
     "enabled": True,
     "max_queue_slots": 10,
@@ -969,6 +970,7 @@ def _scheduler_brief_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     memory_estimate = max(0.0, _coerce_float(resource_profile.get("memory_estimate_gb"), 0.0))
     memory_limit = max(0.0, _coerce_float(resource_profile.get("memory_limit_gb"), 0.0))
     status = str(entry.get("status") or ("running" if pid > 0 else "queued")).strip().lower()
+    cpu_value = entry.get("cpu_percent")
     return {
         "task_key": task_key,
         "label": _scheduler_task_label(task_key),
@@ -983,6 +985,7 @@ def _scheduler_brief_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         "cpu_class": str(profile.get("cpu_class") or resource_profile.get("cpu_class") or "").strip().lower() or "unknown",
         "gpu_class": str(profile.get("gpu_class") or resource_profile.get("gpu_class") or "").strip().lower() or "none",
         "rss_gb": round(rss_gb, 3) if rss_gb > 0.0 else None,
+        "cpu_percent": round(_coerce_float(cpu_value, 0.0), 1) if cpu_value is not None else None,
         "memory_estimate_gb": round(memory_estimate, 3) if memory_estimate > 0.0 else None,
         "memory_limit_gb": round(memory_limit, 3) if memory_limit > 0.0 else None,
         "stop_reason": str(entry.get("stop_reason") or "").strip().lower() or None,
@@ -1666,6 +1669,41 @@ def _scheduler_can_start_task(entry: Dict[str, Any], state: Dict[str, Any], reso
     return True, "ok"
 
 
+def _scheduler_process_cpu_sample_key(proc: Any) -> Tuple[int, Optional[float]]:
+    try:
+        created = round(float(proc.create_time()), 3)
+    except Exception:
+        created = None
+    return int(proc.pid), created
+
+
+def _scheduler_sample_process_cpu_percent(proc: Any, now: Optional[float] = None) -> float:
+    sample_now = time.monotonic() if now is None else float(now)
+    key = _scheduler_process_cpu_sample_key(proc)
+    try:
+        times = proc.cpu_times()
+        total_cpu_time = float(getattr(times, "user", 0.0)) + float(getattr(times, "system", 0.0))
+    except Exception:
+        return 0.0
+    previous = _scheduler_process_cpu_samples.get(key)
+    _scheduler_process_cpu_samples[key] = (sample_now, total_cpu_time)
+    if not previous:
+        return 0.0
+    elapsed = sample_now - float(previous[0])
+    cpu_delta = total_cpu_time - float(previous[1])
+    if elapsed <= 0.0 or cpu_delta < 0.0:
+        return 0.0
+    return max(0.0, (cpu_delta / elapsed) * 100.0)
+
+
+def _scheduler_prune_process_cpu_samples(live_keys: set, now: Optional[float] = None) -> None:
+    sample_now = time.monotonic() if now is None else float(now)
+    cutoff = sample_now - 120.0
+    for key, sample in list(_scheduler_process_cpu_samples.items()):
+        if key not in live_keys and float(sample[0]) < cutoff:
+            _scheduler_process_cpu_samples.pop(key, None)
+
+
 def _scheduler_pid_metrics(pid: int) -> Tuple[bool, Dict[str, Any]]:
     if pid <= 0:
         return False, {}
@@ -1677,15 +1715,21 @@ def _scheduler_pid_metrics(pid: int) -> Tuple[bool, Dict[str, Any]]:
             status = proc.status()
             if status == getattr(psutil, "STATUS_ZOMBIE", "zombie"):
                 return False, {}
+            sample_now = time.monotonic()
+            live_keys = {_scheduler_process_cpu_sample_key(proc)}
             rss_bytes = float(proc.memory_info().rss)
+            cpu_percent = _scheduler_sample_process_cpu_percent(proc, now=sample_now)
             for child in proc.children(recursive=True):
                 try:
+                    live_keys.add(_scheduler_process_cpu_sample_key(child))
                     rss_bytes += float(child.memory_info().rss)
+                    cpu_percent += _scheduler_sample_process_cpu_percent(child, now=sample_now)
                 except Exception:
                     continue
+            _scheduler_prune_process_cpu_samples(live_keys, now=sample_now)
             return True, {
                 "rss_gb": round(rss_bytes / (1024.0 ** 3), 3),
-                "cpu_percent": round(float(proc.cpu_percent(interval=None)), 1),
+                "cpu_percent": round(cpu_percent, 1),
                 "process_status": status,
             }
         except Exception:
@@ -3551,6 +3595,8 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
     long = trend.get("long") if isinstance(trend.get("long"), dict) else {}
     top_modules = payload.get("top_modules") if isinstance(payload.get("top_modules"), list) else []
     top_modules = [item for item in top_modules[:3] if isinstance(item, dict)]
+    top_cpu_modules = payload.get("top_cpu_modules") if isinstance(payload.get("top_cpu_modules"), list) else []
+    top_cpu_modules = [item for item in top_cpu_modules[:3] if isinstance(item, dict)]
     scheduler = payload.get("process_scheduler") if isinstance(payload.get("process_scheduler"), dict) else {}
     if not scheduler:
         scheduler_state = get_inastate("process_scheduler") or {}
@@ -3589,6 +3635,7 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
     )
 
     largest = top_modules[0] if top_modules else {}
+    hottest = top_cpu_modules[0] if top_cpu_modules else {}
     trend_summary = str(trend.get("summary") or "").strip()
     summary = str(payload.get("summary") or "").strip()
     optimization_hint = str(payload.get("optimization_hint") or "").strip()
@@ -3617,8 +3664,11 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
         "trend_summary": trend_summary,
         "optimization_hint": optimization_hint,
         "top_modules": top_modules,
+        "top_cpu_modules": top_cpu_modules,
         "largest_module": str(largest.get("name") or ""),
         "largest_module_ram": str(largest.get("ram_human") or ""),
+        "hottest_module": str(hottest.get("name") or ""),
+        "hottest_module_cpu_percent": round(_coerce_float(hottest.get("cpu_percent"), 0.0), 1) if hottest else 0.0,
         "samples": int(_coerce_float(trend.get("samples"), 0.0)),
         "scheduler_available": bool(scheduler),
         "scheduler_summary": scheduler_summary,
@@ -6440,6 +6490,7 @@ def _update_meta_arbitration_signal(memory_guard: Optional[Dict[str, Any]] = Non
             "trend_summary": resource_trend_summary,
             "optimization_hint": resource_context.get("optimization_hint"),
             "top_modules": resource_context.get("top_modules"),
+            "top_cpu_modules": resource_context.get("top_cpu_modules"),
         },
     }
 
@@ -8056,7 +8107,7 @@ def _update_machine_semantics():
                 "direction": "risk" if resource_trend_pressure >= 0.55 else "watch",
                 "reason": resource_context.get("trend_summary") or resource_context.get("summary") or "resource telemetry available",
                 "hint": resource_context.get("optimization_hint"),
-                "focus_module": resource_context.get("largest_module"),
+                "focus_module": resource_context.get("hottest_module") or resource_context.get("largest_module"),
             }
         )
 
@@ -8083,7 +8134,7 @@ def _update_machine_semantics():
                     "direction": "risk" if scheduler_pressure >= 0.55 else "watch",
                     "reason": resource_context.get("scheduler_summary") or "scheduler telemetry available",
                     "hint": resource_context.get("scheduler_learning_hint"),
-                    "focus_module": resource_context.get("largest_module"),
+                    "focus_module": resource_context.get("hottest_module") or resource_context.get("largest_module"),
                 }
             )
 
@@ -8101,6 +8152,7 @@ def _update_machine_semantics():
             "trend_summary": resource_context.get("trend_summary"),
             "optimization_hint": resource_context.get("optimization_hint"),
             "top_modules": resource_context.get("top_modules"),
+            "top_cpu_modules": resource_context.get("top_cpu_modules"),
             "process_scheduler": {
                 "available": resource_context.get("scheduler_available", False),
                 "summary": resource_context.get("scheduler_summary"),

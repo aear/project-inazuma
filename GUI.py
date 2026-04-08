@@ -167,6 +167,7 @@ offer_status_var = None
 offer_note_var = None
 _last_resource_publish_ts = 0.0
 _last_resource_publish_key = None
+_process_cpu_samples = {}
 RESOURCE_PUBLISH_INTERVAL_SEC = float(os.environ.get("INA_RESOURCE_PUBLISH_INTERVAL_SEC", "15"))
 RESOURCE_HISTORY_MAX_SAMPLES = max(12, int(float(os.environ.get("INA_RESOURCE_HISTORY_MAX_SAMPLES", "240"))))
 RESOURCE_TREND_SHORT_SAMPLES = max(4, int(float(os.environ.get("INA_RESOURCE_TREND_SHORT_SAMPLES", "8"))))
@@ -428,16 +429,51 @@ def _ina_processes():
         children = []
     return [root_proc] + children
 
+def _process_cpu_sample_key(proc):
+    try:
+        created = round(float(proc.create_time()), 3)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        created = None
+    return (int(proc.pid), created)
+
+
+def _sample_process_cpu_percent(proc, now=None):
+    now = time.monotonic() if now is None else float(now)
+    key = _process_cpu_sample_key(proc)
+    try:
+        times = proc.cpu_times()
+        total_cpu_time = float(getattr(times, 'user', 0.0)) + float(getattr(times, 'system', 0.0))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        return 0.0
+    previous = _process_cpu_samples.get(key)
+    _process_cpu_samples[key] = (now, total_cpu_time)
+    if not previous:
+        return 0.0
+    elapsed = now - float(previous[0])
+    cpu_delta = total_cpu_time - float(previous[1])
+    if elapsed <= 0.0 or cpu_delta < 0.0:
+        return 0.0
+    return max(0.0, (cpu_delta / elapsed) * 100.0)
+
+
+def _prune_process_cpu_samples(live_keys):
+    for key in list(_process_cpu_samples):
+        if key not in live_keys:
+            _process_cpu_samples.pop(key, None)
+
+
 def _prime_usage_counters():
     try:
         psutil.cpu_percent(interval=None)
     except Exception:
         pass
+    now = time.monotonic()
+    live_keys = set()
     for proc in _ina_processes():
-        try:
-            proc.cpu_percent(interval=None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+        key = _process_cpu_sample_key(proc)
+        live_keys.add(key)
+        _sample_process_cpu_percent(proc, now=now)
+    _prune_process_cpu_samples(live_keys)
 
 
 def _module_process_name(proc):
@@ -487,8 +523,14 @@ def _format_module_usage(modules):
 def _format_process_usage(process_rows):
     if not process_rows:
         return 'Per-process view: none detected.'
+    top_cpu = max(process_rows, key=lambda item: (float(item.get('cpu') or 0.0), int(item.get('mem_bytes') or 0), str(item.get('name') or '')))
+    top_cpu_value = float(top_cpu.get('cpu') or 0.0)
+    if top_cpu_value > 0.0:
+        top_line = f"Top CPU: {top_cpu['name']} pid={int(top_cpu['pid'])} CPU {top_cpu_value:.1f}% RAM {_format_ram_value(int(top_cpu.get('mem_bytes') or 0))}"
+    else:
+        top_line = 'Top CPU: waiting for the next CPU sample.'
     header = f"{'PID':>7} {'Module':<24} {'RAM':>10} {'CPU':>7} {'Thr':>5}"
-    lines = [header, '-' * len(header)]
+    lines = [top_line, header, '-' * len(header)]
     visible = list(process_rows[:24])
     for item in visible:
         lines.append(
@@ -552,7 +594,9 @@ def _format_scheduler_slots(scheduler):
         for item in running[:4]:
             pid = item.get('pid')
             pid_text = f" pid={int(pid)}" if pid else ''
-            lines.append(f"- {item.get('label') or item.get('task_key')} (p{int(item.get('priority') or 0)}){pid_text}")
+            cpu = item.get('cpu_percent')
+            cpu_text = f" cpu={float(cpu):.1f}%" if cpu is not None else ''
+            lines.append(f"- {item.get('label') or item.get('task_key')} (p{int(item.get('priority') or 0)}){pid_text}{cpu_text}")
     else:
         lines.append('Running now: idle')
     if queued:
@@ -677,6 +721,11 @@ def _summarize_resource_usage(stats):
         f"{item['name']} {_format_ram_value(item['mem_bytes'])}"
         for item in top_modules
     ) if top_modules else 'no child modules detected'
+    cpu_modules = [item for item in (stats.get('cpu_modules') or [])[:3] if float(item.get('cpu') or 0.0) > 0.0]
+    cpu_text = ', '.join(
+        f"{item['name']} {float(item.get('cpu') or 0.0):.1f}%"
+        for item in cpu_modules
+    ) if cpu_modules else 'waiting for the next CPU sample'
     if level == 'hard':
         note = 'Pressure is high. Large RAM holders should shed memory before new work starts.'
     elif level == 'soft':
@@ -686,7 +735,7 @@ def _summarize_resource_usage(stats):
     return (
         f"Total Ina RAM is {_format_ram_value(int(stats.get('mem_bytes') or 0))} across {int(stats.get('processes') or 0)} process(es). "
         f"System RAM is at {float(stats.get('system_mem') or 0.0):.1f}%. "
-        f"Top modules: {top_text}. {note}"
+        f"Top RAM: {top_text}. Top CPU: {cpu_text}. {note}"
     )
 
 
@@ -704,18 +753,46 @@ def _publish_resource_snapshot(stats):
             'processes': int(item['processes']),
             'pids': [int(pid) for pid in (item.get('pids') or [])[:8]],
         })
+    top_cpu_modules = []
+    for item in (stats.get('cpu_modules') or [])[:6]:
+        top_cpu_modules.append({
+            'name': item['name'],
+            'ram_bytes': int(item['mem_bytes']),
+            'ram_human': _format_ram_value(item['mem_bytes']),
+            'cpu_percent': round(float(item['cpu']), 1),
+            'threads': int(item['threads']),
+            'processes': int(item['processes']),
+            'pids': [int(pid) for pid in (item.get('pids') or [])[:8]],
+        })
+    top_cpu_processes = []
+    for item in (stats.get('process_rows') or [])[:6]:
+        top_cpu_processes.append({
+            'pid': int(item['pid']),
+            'name': item['name'],
+            'ram_bytes': int(item['mem_bytes']),
+            'ram_human': _format_ram_value(item['mem_bytes']),
+            'cpu_percent': round(float(item['cpu']), 1),
+            'threads': int(item['threads']),
+        })
     timestamp = datetime.now(timezone.utc).isoformat()
     summary = _summarize_resource_usage(stats)
     scheduler = _scheduler_snapshot()
-    optimization_hint = (
-        f"Start optimisation with {top_modules[0]['name']} because it currently holds the most RAM."
-        if top_modules else
-        'No active child modules detected; measure the largest live process before optimising.'
-    )
+    if top_cpu_modules and float(top_cpu_modules[0].get('cpu_percent') or 0.0) > 0.0:
+        top_cpu = top_cpu_modules[0]
+        optimization_hint = (
+            f"Start CPU optimisation with {top_cpu['name']} because it is currently the hottest process group "
+            f"at {float(top_cpu.get('cpu_percent') or 0.0):.1f}% CPU."
+        )
+    elif top_modules:
+        optimization_hint = f"Start optimisation with {top_modules[0]['name']} because it currently holds the most RAM."
+    else:
+        optimization_hint = 'No active child modules detected; measure the largest live process before optimising.'
     key = (
+        round(float(stats.get('cpu') or 0.0) / 5.0) * 5,
         round(float(stats.get('mem_bytes') or 0) / (1024.0 ** 3), 2),
         round(float(stats.get('system_mem') or 0.0), 1),
         tuple((item['name'], item['ram_human']) for item in top_modules[:3]),
+        tuple((item['name'], round(float(item['cpu_percent'] or 0.0) / 5.0) * 5) for item in top_cpu_modules[:3]),
         int(scheduler.get('queue_depth') or 0),
         int(scheduler.get('running_count') or 0),
         tuple(item.get('task_key') for item in (scheduler.get('running') or [])[:3]),
@@ -732,6 +809,7 @@ def _publish_resource_snapshot(stats):
         'ina_ram_bytes': int(stats.get('mem_bytes') or 0),
         'system_ram_percent': round(float(stats.get('system_mem') or 0.0), 1),
         'top_modules': top_modules[:3],
+        'top_cpu_modules': top_cpu_modules[:3],
     })
     history = history[-RESOURCE_HISTORY_MAX_SAMPLES:]
     trends = _compute_resource_trends(history)
@@ -748,6 +826,8 @@ def _publish_resource_snapshot(stats):
         'process_count': int(stats.get('processes') or 0),
         'thread_count': int(stats.get('threads') or 0),
         'top_modules': top_modules,
+        'top_cpu_modules': top_cpu_modules,
+        'top_cpu_processes': top_cpu_processes,
         'summary': summary,
         'optimization_hint': optimization_hint,
         'trend': trends,
@@ -784,14 +864,19 @@ def _collect_usage_snapshot():
         'system_cpu': 0.0,
         'system_mem': 0.0,
         'modules': [],
+        'cpu_modules': [],
         'process_rows': [],
     }
     modules = {}
     process_rows = []
+    live_keys = set()
+    now = time.monotonic()
 
     for proc in _ina_processes():
         try:
-            cpu = proc.cpu_percent(interval=None)
+            key = _process_cpu_sample_key(proc)
+            live_keys.add(key)
+            cpu = _sample_process_cpu_percent(proc, now=now)
             mem_bytes = int(proc.memory_info().rss)
             threads = proc.num_threads()
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -827,12 +912,19 @@ def _collect_usage_snapshot():
         key=lambda item: (item['mem_bytes'], item['cpu'], item['name']),
         reverse=True,
     )
-    stats['process_rows'] = sorted(
-        process_rows,
-        key=lambda item: (item['mem_bytes'], item['cpu'], item['name'], item['pid']),
+    stats['cpu_modules'] = sorted(
+        modules.values(),
+        key=lambda item: (item['cpu'], item['mem_bytes'], item['name']),
         reverse=True,
     )
+    stats['process_rows'] = sorted(
+        process_rows,
+        key=lambda item: (item['cpu'], item['mem_bytes'], item['name'], item['pid']),
+        reverse=True,
+    )
+    _prune_process_cpu_samples(live_keys)
     return stats
+
 
 def _refresh_energy_label():
     if energy_status_var is None:

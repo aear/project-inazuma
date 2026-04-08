@@ -25,8 +25,15 @@ DEFAULT_COLOR = "#1b1b1b"
 PAINT_API_QUEUE_KEY = "paint_command_queue"
 PAINT_API_STATUS_KEY = "paint_api_status"
 PAINT_API_LAST_RESULT_KEY = "paint_api_last_result"
+PAINT_CANVAS_STATE_KEY = "paint_canvas_state"
 PAINT_API_POLL_MS = 250
 PAINT_API_MAX_COMMANDS_PER_TICK = 12
+PAINT_CANVAS_RECENT_MARKS = 40
+PAINT_CANVAS_HISTORY_LIMIT = 240
+PAINT_SPATIAL_COLUMNS = 6
+PAINT_SPATIAL_ROWS = 4
+PAINT_REGION_COLUMNS = 3
+PAINT_REGION_ROWS = 3
 PAINT_API_PATTERNS = ["circle", "spiral", "wave", "star", "burst"]
 PALETTE = [
     "#1b1b1b",
@@ -153,6 +160,149 @@ def normalise_paint_points(
     if not points:
         raise ValueError("points cannot be empty")
     return points
+
+
+def _serialise_paint_point(point) -> list[float]:
+    return [round(float(point[0]), 2), round(float(point[1]), 2)]
+
+
+def _paint_points_preview(points, *, limit: int = 8) -> list[list[float]]:
+    return [_serialise_paint_point(point) for point in list(points)[:limit]]
+
+
+def _paint_bounds(points) -> dict | None:
+    points = list(points)
+    if not points:
+        return None
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    return {
+        "x1": round(min(xs), 2),
+        "y1": round(min(ys), 2),
+        "x2": round(max(xs), 2),
+        "y2": round(max(ys), 2),
+    }
+
+
+def _paint_cell_for_point(
+    point,
+    *,
+    columns: int,
+    rows: int,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> tuple[int, int]:
+    x = _clamp(float(point[0]), 0.0, float(width - 1))
+    y = _clamp(float(point[1]), 0.0, float(height - 1))
+    column = min(columns - 1, max(0, int((x / width) * columns)))
+    row = min(rows - 1, max(0, int((y / height) * rows)))
+    return row, column
+
+
+def _paint_cells_for_stroke(
+    stroke,
+    *,
+    columns: int,
+    rows: int,
+    width: int = CANVAS_WIDTH,
+    height: int = CANVAS_HEIGHT,
+) -> set[tuple[int, int]]:
+    points = list(stroke)
+    if not points:
+        return set()
+    if len(points) == 1:
+        return {_paint_cell_for_point(points[0], columns=columns, rows=rows, width=width, height=height)}
+
+    cell_width = width / columns
+    cell_height = height / rows
+    occupied = set()
+    for start, end in zip(points, points[1:]):
+        dx = float(end[0]) - float(start[0])
+        dy = float(end[1]) - float(start[1])
+        steps = max(1, int(math.ceil(max(abs(dx) / cell_width, abs(dy) / cell_height) * 2)))
+        for idx in range(steps + 1):
+            progress = idx / steps
+            point = (float(start[0]) + dx * progress, float(start[1]) + dy * progress)
+            occupied.add(_paint_cell_for_point(point, columns=columns, rows=rows, width=width, height=height))
+    return occupied
+
+
+def _serialise_canvas_mark(mark: dict) -> dict:
+    return {key: value for key, value in mark.items() if not key.startswith("_")}
+
+
+def _paint_region_name(row: int, column: int) -> str:
+    vertical = ["top", "middle", "bottom"][min(PAINT_REGION_ROWS - 1, row)]
+    horizontal = ["left", "center", "right"][min(PAINT_REGION_COLUMNS - 1, column)]
+    if vertical == "middle" and horizontal == "center":
+        return "center"
+    if vertical == "middle":
+        return horizontal
+    if horizontal == "center":
+        return vertical
+    return f"{vertical}_{horizontal}"
+
+
+def _paint_spatial_summary(marks: list[dict]) -> dict:
+    points = []
+    grid_cells = set()
+    region_cells = set()
+    for mark in marks:
+        mark_grid_cells = set()
+        mark_region_cells = set()
+        mark_points = []
+        for stroke in mark.get("_strokes", []):
+            mark_points.extend(stroke)
+            mark_grid_cells.update(
+                _paint_cells_for_stroke(
+                    stroke,
+                    columns=PAINT_SPATIAL_COLUMNS,
+                    rows=PAINT_SPATIAL_ROWS,
+                )
+            )
+            mark_region_cells.update(
+                _paint_cells_for_stroke(
+                    stroke,
+                    columns=PAINT_REGION_COLUMNS,
+                    rows=PAINT_REGION_ROWS,
+                )
+            )
+        if mark.get("eraser"):
+            grid_cells.difference_update(mark_grid_cells)
+            region_cells.difference_update(mark_region_cells)
+        else:
+            grid_cells.update(mark_grid_cells)
+            region_cells.update(mark_region_cells)
+            points.extend(mark_points)
+
+    total_cells = PAINT_SPATIAL_COLUMNS * PAINT_SPATIAL_ROWS
+    filled_ratio = round(len(grid_cells) / total_cells, 4) if total_cells else 0.0
+    region_names = [
+        _paint_region_name(row, column)
+        for row in range(PAINT_REGION_ROWS)
+        for column in range(PAINT_REGION_COLUMNS)
+    ]
+    regions = {name: 0 for name in region_names}
+    for row, column in region_cells:
+        regions[_paint_region_name(row, column)] += 1
+
+    return {
+        "method": "geometry_grid",
+        "fill_ratio": filled_ratio,
+        "empty_ratio": round(1.0 - filled_ratio, 4),
+        "bounds": _paint_bounds(points),
+        "grid": {
+            "columns": PAINT_SPATIAL_COLUMNS,
+            "rows": PAINT_SPATIAL_ROWS,
+            "occupied_count": len(grid_cells),
+            "total_cells": total_cells,
+            "occupied_cells": [
+                {"row": row, "column": column}
+                for row, column in sorted(grid_cells)
+            ],
+        },
+        "regions": regions,
+    }
 
 
 def _paint_distance(value, *, normalized: bool, width: int = CANVAS_WIDTH, height: int = CANVAS_HEIGHT, default: float = 0.2) -> float:
@@ -323,6 +473,10 @@ class PaintWindow:
         self.last_y = None
         self.dirty = False
         self.last_saved_path = None
+        self.canvas_revision = 0
+        self.last_inspect_revision = 0
+        self.next_mark_id = 1
+        self.canvas_marks = []
         self._api_poll_active = True
 
         self._build_toolbar()
@@ -334,6 +488,7 @@ class PaintWindow:
         try:
             update_inastate("paint_window_open", is_open)
             self._publish_api_status("ready" if is_open else "closed")
+            self._publish_canvas_state("window_open" if is_open else "window_closed", window_open=is_open)
         except Exception:
             pass
 
@@ -400,14 +555,33 @@ class PaintWindow:
             self.last_x = event.x
             self.last_y = event.y
             return
+        start = (self.last_x, self.last_y)
+        end = (event.x, event.y)
+        color = self._current_color()
+        image_color = self._current_image_color()
+        width = self.brush_size.get()
         self._draw_segment(
-            self.last_x,
-            self.last_y,
-            event.x,
-            event.y,
-            color=self._current_color(),
-            width=self.brush_size.get(),
-            image_color=self._current_image_color(),
+            start[0],
+            start[1],
+            end[0],
+            end[1],
+            color=color,
+            width=width,
+            image_color=image_color,
+        )
+        self._record_canvas_mark(
+            {
+                "kind": "manual_stroke",
+                "source": "manual",
+                "points": 2,
+                "_strokes": [[start, end]],
+                "_image_color": image_color,
+                "preview": [_serialise_paint_point(start), _serialise_paint_point(end)],
+                "bounds": _paint_bounds([start, end]),
+                "brush_size": width,
+                "color": color,
+                "eraser": self.is_eraser.get(),
+            }
         )
         self.last_x = event.x
         self.last_y = event.y
@@ -438,7 +612,8 @@ class PaintWindow:
             smooth=True,
             splinesteps=36,
         )
-        self.draw.line([x1, y1, x2, y2], fill=image_color if image_color is not None else color, width=width)
+        image_fill = image_color if image_color is not None else color
+        self.draw.line([x1, y1, x2, y2], fill=image_fill, width=width)
         self.dirty = True
 
     def _draw_dot(self, x: float, y: float, *, color: str, width: int, image_color=None) -> None:
@@ -453,6 +628,9 @@ class PaintWindow:
         self.canvas.delete("all")
         self._init_image()
         self.dirty = True
+        self.canvas_revision += 1
+        self.canvas_marks = []
+        self._publish_canvas_state("cleared")
 
     def _clear_canvas(self) -> None:
         if not messagebox.askyesno("Clear", "Clear the canvas?"):
@@ -470,6 +648,7 @@ class PaintWindow:
             self._append_log_entry(path, timestamp)
             self._save_fragment(path, timestamp)
             log_to_statusbox(f"[Paint] Saved {path.name}")
+            self._publish_canvas_state("saved")
             return str(path)
         except Exception as exc:
             if show_errors:
@@ -485,11 +664,13 @@ class PaintWindow:
             "status": status,
             "queue_key": PAINT_API_QUEUE_KEY,
             "result_key": PAINT_API_LAST_RESULT_KEY,
-            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "close"],
+            "canvas_state_key": PAINT_CANVAS_STATE_KEY,
+            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "close", "inspect", "undo"],
             "patterns": PAINT_API_PATTERNS,
             "coordinate_space": "normalized 0..1 by default; use space='pixels' for canvas pixels",
             "workspace_background": DEFAULT_BG,
             "image_background": "transparent",
+            "undo_example": {"id": "undo_001", "action": "undo", "count": 1},
             "example": {
                 "id": "sketch_001",
                 "action": "pattern",
@@ -506,6 +687,152 @@ class PaintWindow:
             update_inastate(PAINT_API_STATUS_KEY, payload)
         except Exception:
             pass
+
+    def _brush_state(self) -> dict:
+        return {
+            "size": self.brush_size.get(),
+            "color": self.active_color,
+            "eraser": self.is_eraser.get(),
+        }
+
+    def _canvas_state_payload(self, event: str, **extra) -> dict:
+        since_revision = _coerce_int(
+            extra.pop("since_revision", self.last_inspect_revision),
+            self.last_inspect_revision,
+            low=0,
+        )
+        spatial = _paint_spatial_summary(self.canvas_marks)
+        recent_marks = [
+            _serialise_canvas_mark(mark)
+            for mark in self.canvas_marks[-PAINT_CANVAS_RECENT_MARKS:]
+        ]
+        delta_marks = [
+            _serialise_canvas_mark(mark)
+            for mark in self.canvas_marks
+            if int(mark.get("revision", 0)) > since_revision
+        ]
+        payload = {
+            "timestamp": _utc_now(),
+            "event": event,
+            "window_open": bool(extra.pop("window_open", self._api_poll_active)),
+            "canvas": {
+                "width": CANVAS_WIDTH,
+                "height": CANVAS_HEIGHT,
+                "workspace_background": DEFAULT_BG,
+                "image_background": "transparent",
+                "image_mode": getattr(self.image, "mode", None),
+            },
+            "dirty": self.dirty,
+            "last_saved_path": str(self.last_saved_path) if self.last_saved_path else None,
+            "revision": self.canvas_revision,
+            "revision_delta": {
+                "from": since_revision,
+                "to": self.canvas_revision,
+                "count": max(0, self.canvas_revision - since_revision),
+                "mark_ids": [mark.get("mark_id") for mark in delta_marks],
+                "marks": delta_marks,
+            },
+            "mark_count": len(self.canvas_marks),
+            "recent_marks": recent_marks,
+            "fill_ratio": spatial["fill_ratio"],
+            "empty_ratio": spatial["empty_ratio"],
+            "spatial": spatial,
+            "brush": self._brush_state(),
+        }
+        payload.update(extra)
+        return payload
+
+    def _publish_canvas_state(self, event: str = "state", **extra) -> dict:
+        payload = self._canvas_state_payload(event, **extra)
+        try:
+            update_inastate(PAINT_CANVAS_STATE_KEY, payload)
+        except Exception:
+            pass
+        return payload
+
+    def _record_canvas_mark(self, mark: dict) -> dict:
+        self.canvas_revision += 1
+        mark_id = str(mark.get("mark_id") or f"paint_mark_{self.next_mark_id:04d}")
+        self.next_mark_id += 1
+        entry = dict(mark)
+        entry["mark_id"] = mark_id
+        if entry.get("kind") in {"stroke", "manual_stroke"}:
+            entry.setdefault("stroke_id", mark_id)
+        elif entry.get("kind") == "pattern":
+            entry.setdefault(
+                "stroke_ids",
+                [f"{mark_id}_stroke_{idx + 1:02d}" for idx, _stroke in enumerate(entry.get("_strokes", []))],
+            )
+        entry["revision"] = self.canvas_revision
+        entry.setdefault("timestamp", _utc_now())
+        self.canvas_marks.append(entry)
+        self.canvas_marks = self.canvas_marks[-PAINT_CANVAS_HISTORY_LIMIT:]
+        return self._publish_canvas_state(entry.get("kind", "mark"))
+
+    def _redraw_canvas_from_marks(self) -> None:
+        self.canvas.delete("all")
+        self._init_image()
+        for mark in self.canvas_marks:
+            for stroke in mark.get("_strokes", []):
+                self._render_api_points(
+                    stroke,
+                    color=mark.get("color", DEFAULT_COLOR),
+                    width=mark.get("brush_size", self.brush_size.get()),
+                    image_color=mark.get("_image_color"),
+                )
+        self.dirty = True
+
+    def _api_inspect(self, command: dict) -> dict:
+        since_revision = _coerce_int(
+            command.get("since_revision", self.last_inspect_revision),
+            self.last_inspect_revision,
+            low=0,
+        )
+        canvas = self._publish_canvas_state("inspect", since_revision=since_revision)
+        self.last_inspect_revision = self.canvas_revision
+        return {"status": "ok", "canvas": canvas}
+
+    def _api_undo(self, command: dict) -> dict:
+        if not self.canvas_marks:
+            canvas = self._publish_canvas_state("undo", undone_count=0, undone_marks=[])
+            return {"status": "ok", "undone": 0, "undone_marks": [], "canvas": canvas}
+
+        mark_id = str(command.get("mark_id") or command.get("stroke_id") or "").strip()
+        undone = []
+        if mark_id:
+            index = next(
+                (
+                    idx for idx, mark in enumerate(self.canvas_marks)
+                    if mark.get("mark_id") == mark_id
+                    or mark.get("stroke_id") == mark_id
+                    or mark_id in mark.get("stroke_ids", [])
+                ),
+                None,
+            )
+            if index is None:
+                return {"status": "error", "error": f"mark not found: {mark_id}"}
+            undone.append(self.canvas_marks.pop(index))
+        else:
+            count = _coerce_int(command.get("count", 1), 1, low=1, high=20)
+            for _idx in range(min(count, len(self.canvas_marks))):
+                undone.append(self.canvas_marks.pop())
+            undone.reverse()
+
+        self._redraw_canvas_from_marks()
+        self.canvas_revision += 1
+        undone_marks = [_serialise_canvas_mark(mark) for mark in undone]
+        canvas = self._publish_canvas_state(
+            "undo",
+            undone_count=len(undone_marks),
+            undone_marks=undone_marks,
+        )
+        return {
+            "status": "ok",
+            "undone": len(undone_marks),
+            "undone_marks": undone_marks,
+            "revision": self.canvas_revision,
+            "canvas": canvas,
+        }
 
     def _schedule_api_poll(self) -> None:
         if not self._api_poll_active:
@@ -573,6 +900,10 @@ class PaintWindow:
                 result = {"status": "ok" if path else "error", "path": path}
                 if not path:
                     result["error"] = "save failed"
+            elif action in {"inspect", "state", "snapshot"}:
+                result = self._api_inspect(command)
+            elif action == "undo":
+                result = self._api_undo(command)
             elif action in {"close", "finish", "done"}:
                 result = self._api_close(command)
             else:
@@ -591,6 +922,7 @@ class PaintWindow:
             self._set_color(_normalise_color(command.get("color"), self.active_color))
         if "eraser" in command:
             self.is_eraser.set(_coerce_bool(command.get("eraser"), self.is_eraser.get()))
+        self._publish_canvas_state("brush")
         return {
             "status": "ok",
             "brush_size": self.brush_size.get(),
@@ -629,6 +961,21 @@ class PaintWindow:
             normalized=_paint_command_uses_normalized_space(command),
         )
         self._render_api_points(points, color=color, width=width, image_color=image_color)
+        self._record_canvas_mark(
+            {
+                "kind": "stroke",
+                "source": "api",
+                "command_id": command.get("id"),
+                "points": len(points),
+                "_strokes": [points],
+                "_image_color": image_color,
+                "preview": _paint_points_preview(points),
+                "bounds": _paint_bounds(points),
+                "brush_size": width,
+                "color": color,
+                "eraser": eraser,
+            }
+        )
 
         return {
             "status": "ok",
@@ -647,6 +994,24 @@ class PaintWindow:
         strokes = build_paint_pattern_strokes(command)
         for stroke in strokes:
             self._render_api_points(stroke, color=color, width=width, image_color=image_color)
+        all_points = [point for stroke in strokes for point in stroke]
+        self._record_canvas_mark(
+            {
+                "kind": "pattern",
+                "source": "api",
+                "command_id": command.get("id"),
+                "pattern": str(command.get("pattern") or action),
+                "strokes": len(strokes),
+                "points": len(all_points),
+                "_strokes": strokes,
+                "_image_color": image_color,
+                "preview": _paint_points_preview(all_points),
+                "bounds": _paint_bounds(all_points),
+                "brush_size": width,
+                "color": color,
+                "eraser": eraser,
+            }
+        )
         return {
             "status": "ok",
             "pattern": str(command.get("pattern") or action),

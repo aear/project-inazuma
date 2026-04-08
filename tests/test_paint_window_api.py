@@ -174,6 +174,9 @@ class FakeCanvas:
 
     def delete(self, *args):
         self.deleted.append(args)
+        if args == ("all",):
+            self.lines = []
+            self.ovals = []
 
 
 class FakeRoot:
@@ -194,11 +197,24 @@ def _window_stub():
     window.is_eraser = FakeVar(False)
     window.active_color = pw.DEFAULT_COLOR
     window.dirty = False
+    window.last_saved_path = None
+    window.canvas_revision = 0
+    window.last_inspect_revision = 0
+    window.next_mark_id = 1
+    window.canvas_marks = []
     window._api_poll_active = True
     return window
 
 
 class PaintWindowApiTests(unittest.TestCase):
+    def setUp(self):
+        self.store = {}
+        self.original_update_inastate = pw.update_inastate
+        pw.update_inastate = lambda key, value: self.store.__setitem__(key, value)
+
+    def tearDown(self):
+        pw.update_inastate = self.original_update_inastate
+
     def test_normalise_paint_points_defaults_to_normalized_and_clamps(self):
         points = pw.normalise_paint_points(
             [[0.0, 0.0], {"x": 1.0, "y": 0.5}, [2.0, -1.0]],
@@ -307,9 +323,95 @@ class PaintWindowApiTests(unittest.TestCase):
             ["brush", "dot"],
         )
         self.assertEqual(store[pw.PAINT_API_STATUS_KEY]["status"], "processed")
+        self.assertEqual(store[pw.PAINT_API_STATUS_KEY]["canvas_state_key"], pw.PAINT_CANVAS_STATE_KEY)
         self.assertEqual(window.brush_size.get(), 14)
         self.assertEqual(window.active_color, "#ff0000")
         self.assertTrue(window.canvas.ovals)
+
+    def test_canvas_state_tracks_recent_api_marks_and_inspect_command(self):
+        window = _window_stub()
+
+        stroke = window._process_api_command(
+            {
+                "id": "state_stroke",
+                "action": "stroke",
+                "points": [[0.25, 0.25], [0.75, 0.5]],
+                "color": "#ffffff",
+                "brush_size": 11,
+            }
+        )
+
+        self.assertEqual(stroke["status"], "ok")
+        state = self.store[pw.PAINT_CANVAS_STATE_KEY]
+        self.assertEqual(state["revision"], 1)
+        self.assertEqual(state["revision_delta"]["count"], 1)
+        self.assertEqual(state["mark_count"], 1)
+        self.assertEqual(state["brush"]["size"], 6)
+        self.assertEqual(state["canvas"]["image_background"], "transparent")
+        self.assertGreater(state["fill_ratio"], 0.0)
+        self.assertLess(state["empty_ratio"], 1.0)
+        self.assertGreater(state["spatial"]["grid"]["occupied_count"], 0)
+        self.assertEqual(state["recent_marks"][-1]["kind"], "stroke")
+        self.assertEqual(state["recent_marks"][-1]["mark_id"], "paint_mark_0001")
+        self.assertEqual(state["recent_marks"][-1]["stroke_id"], "paint_mark_0001")
+        self.assertEqual(state["recent_marks"][-1]["command_id"], "state_stroke")
+        self.assertEqual(state["recent_marks"][-1]["points"], 2)
+        self.assertEqual(state["recent_marks"][-1]["color"], "#ffffff")
+
+        inspect = window._process_api_command({"id": "look", "action": "inspect"})
+
+        self.assertEqual(inspect["status"], "ok")
+        self.assertEqual(inspect["canvas"]["revision"], 1)
+        self.assertEqual(inspect["canvas"]["revision_delta"]["mark_ids"], ["paint_mark_0001"])
+        self.assertEqual(inspect["canvas"]["recent_marks"][-1]["command_id"], "state_stroke")
+
+        second = window._process_api_command(
+            {
+                "id": "after_inspect",
+                "action": "stroke",
+                "points": [[0.1, 0.1], [0.2, 0.1]],
+            }
+        )
+
+        self.assertEqual(second["status"], "ok")
+        state = self.store[pw.PAINT_CANVAS_STATE_KEY]
+        self.assertEqual(state["revision"], 2)
+        self.assertEqual(state["revision_delta"]["from"], 1)
+        self.assertEqual(state["revision_delta"]["mark_ids"], ["paint_mark_0002"])
+
+    def test_api_undo_removes_stroke_by_identity_and_rebuilds_canvas(self):
+        window = _window_stub()
+
+        window._process_api_command(
+            {
+                "id": "first",
+                "action": "stroke",
+                "points": [[0.1, 0.1], [0.2, 0.2]],
+                "color": "#d35400",
+            }
+        )
+        window._process_api_command(
+            {
+                "id": "second",
+                "action": "stroke",
+                "points": [[0.8, 0.8], [0.9, 0.9]],
+                "color": "#ffffff",
+            }
+        )
+        first_id = self.store[pw.PAINT_CANVAS_STATE_KEY]["recent_marks"][0]["stroke_id"]
+
+        undo = window._process_api_command({"id": "undo_first", "action": "undo", "stroke_id": first_id})
+
+        self.assertEqual(undo["status"], "ok")
+        self.assertEqual(undo["undone"], 1)
+        self.assertEqual(undo["undone_marks"][0]["stroke_id"], first_id)
+        state = self.store[pw.PAINT_CANVAS_STATE_KEY]
+        self.assertEqual(state["event"], "undo")
+        self.assertEqual(state["revision"], 3)
+        self.assertEqual(state["mark_count"], 1)
+        self.assertEqual(state["recent_marks"][0]["command_id"], "second")
+        self.assertEqual(len(window.canvas.lines), 1)
+        self.assertEqual(window.canvas.lines[0]["kwargs"]["fill"], "#ffffff")
 
     def test_api_pattern_draws_generated_spiral_points(self):
         window = _window_stub()

@@ -105,11 +105,53 @@ def test_build_process_scheduler_summary_reports_learning_hint_for_exclusive_mem
     assert "memory graph neural" in summary["summary"]
 
 
+def test_scheduler_sample_process_cpu_percent_uses_cached_cpu_times():
+    original_samples = mm._scheduler_process_cpu_samples
+
+    class Times:
+        def __init__(self, user, system):
+            self.user = user
+            self.system = system
+
+    class Proc:
+        pid = 12345
+
+        def __init__(self):
+            self.user = 1.0
+            self.system = 0.0
+
+        def create_time(self):
+            return 42.0
+
+        def cpu_times(self):
+            return Times(self.user, self.system)
+
+    try:
+        mm._scheduler_process_cpu_samples = {}
+        proc = Proc()
+
+        assert mm._scheduler_sample_process_cpu_percent(proc, now=100.0) == 0.0
+
+        proc.user = 1.25
+        proc.system = 0.25
+        assert mm._scheduler_sample_process_cpu_percent(proc, now=101.0) == 50.0
+    finally:
+        mm._scheduler_process_cpu_samples = original_samples
+
+
+def test_scheduler_brief_entry_includes_cpu_percent():
+    brief = mm._scheduler_brief_entry({"task_key": "memory_graph_neural", "pid": 12345, "cpu_percent": 37.26, "rss_gb": 2.0})
+
+    assert brief["cpu_percent"] == 37.3
+    assert brief["pid"] == 12345
+
+
 def test_extract_resource_context_includes_scheduler_payload():
     payload = {
         "pressure_level": "soft",
         "summary": "RAM is rising.",
         "optimization_hint": "Start with memory_graph.py.",
+        "top_cpu_modules": [{"name": "memory_graph.py", "cpu_percent": 72.5, "ram_human": "1.7 GB"}],
         "trend": {
             "samples": 4,
             "summary": "RAM trend is rising.",
@@ -131,6 +173,8 @@ def test_extract_resource_context_includes_scheduler_payload():
 
     resource_context = mm._extract_resource_context(payload)
 
+    assert resource_context["hottest_module"] == "memory_graph.py"
+    assert resource_context["hottest_module_cpu_percent"] == 72.5
     assert resource_context["scheduler_available"] is True
     assert resource_context["scheduler_queue_depth"] == 1
     assert resource_context["scheduler_blocked_count"] == 1
