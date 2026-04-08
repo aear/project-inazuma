@@ -13,6 +13,7 @@ import signal
 import gc
 import traceback
 import math
+import precision_memory_map
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3450,6 +3451,203 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
         log_to_statusbox(f"[Manager] Failed to append JSONL at {path}: {exc}")
         return False
 
+
+
+def _precision_memory_read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _precision_memory_clamp01(value: Any, default: float = 0.0) -> float:
+    number = _coerce_float(value, default)
+    return max(0.0, min(1.0, number))
+
+
+def _precision_memory_emotion_state() -> Dict[str, float]:
+    raw = get_inastate("emotion_snapshot") or get_inastate("current_emotions") or {}
+    if isinstance(raw, dict) and isinstance(raw.get("values"), dict):
+        raw = raw.get("values")
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _precision_memory_queue_pressure(scheduler_state: Dict[str, Any]) -> float:
+    planner = scheduler_state.get("planner") if isinstance(scheduler_state.get("planner"), dict) else {}
+    slot_summary = scheduler_state.get("slot_summary") if isinstance(scheduler_state.get("slot_summary"), dict) else {}
+    queue = scheduler_state.get("queue") if isinstance(scheduler_state.get("queue"), list) else []
+    queue_depth = _coerce_float(planner.get("queue_depth"), float(len(queue)))
+    max_queue = max(1.0, _coerce_float(slot_summary.get("max_queue_slots"), max(queue_depth, 1.0)))
+    return _precision_memory_clamp01(queue_depth / max_queue, 0.0)
+
+
+def _precision_memory_active_modules(scheduler_state: Dict[str, Any]) -> List[str]:
+    modules = set(str(name) for name in get_running_modules() if str(name))
+    resources = scheduler_state.get("resources") if isinstance(scheduler_state.get("resources"), dict) else {}
+    for name in resources.get("running_modules") or []:
+        if str(name):
+            modules.add(str(name))
+    planner = scheduler_state.get("planner") if isinstance(scheduler_state.get("planner"), dict) else {}
+    running = planner.get("running") if isinstance(planner.get("running"), list) else []
+    for entry in running:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("module") or entry.get("task_key") or entry.get("label")
+        if str(name or "").strip():
+            modules.add(str(name).strip())
+    return sorted(modules)
+
+
+def _precision_memory_context(scheduler_state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "active_modules": _precision_memory_active_modules(scheduler_state),
+        "queue_pressure": _precision_memory_queue_pressure(scheduler_state),
+        "emotion_state": _precision_memory_emotion_state(),
+        "energy": _coerce_float(get_inastate("current_energy"), 0.5),
+    }
+
+
+def _precision_memory_cost(scheduler_state: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    planner = scheduler_state.get("planner") if isinstance(scheduler_state.get("planner"), dict) else {}
+    running = planner.get("running") if isinstance(planner.get("running"), list) else []
+    if not running:
+        running = scheduler_state.get("running") if isinstance(scheduler_state.get("running"), list) else []
+
+    cpu: Dict[str, float] = {}
+    ram: Dict[str, float] = {}
+    for entry in running:
+        if not isinstance(entry, dict):
+            continue
+        module = str(entry.get("module") or entry.get("task_key") or entry.get("label") or "module").strip()
+        if not module:
+            module = "module"
+        if entry.get("cpu_percent") is not None:
+            cpu[module] = max(0.0, _coerce_float(entry.get("cpu_percent"), 0.0))
+        if entry.get("rss_gb") is not None:
+            ram[module] = max(0.0, _coerce_float(entry.get("rss_gb"), 0.0))
+
+    resources = scheduler_state.get("resources") if isinstance(scheduler_state.get("resources"), dict) else {}
+    if not cpu and resources.get("cpu_percent") is not None:
+        cpu["system"] = max(0.0, _coerce_float(resources.get("cpu_percent"), 0.0))
+    if not ram and resources.get("ina_rss_gb") is not None:
+        ram["ina"] = max(0.0, _coerce_float(resources.get("ina_rss_gb"), 0.0))
+    return {"cpu": cpu, "ram": ram}
+
+
+def _precision_memory_current_precision() -> Dict[str, Any]:
+    runtime = _precision_memory_read_json(MEMORY_PATH / "precision_runtime.json")
+    profile = _precision_memory_read_json(MEMORY_PATH / "precision_profile.json")
+    root_config = _precision_memory_read_json(Path("precision_config.json"))
+
+    global_precision = None
+    for source, key in (
+        (runtime, "last_effective_precision"),
+        ({"current_precision": get_inastate("current_precision")}, "current_precision"),
+        (profile, "max_precision"),
+        (root_config, "max_precision"),
+    ):
+        if key not in source:
+            continue
+        try:
+            global_precision = float(source.get(key))
+            break
+        except (TypeError, ValueError):
+            continue
+    if global_precision is None:
+        global_precision = 64.0
+
+    per_module: Dict[str, float] = {}
+    for source in (profile, root_config):
+        raw = source.get("per_module") or source.get("module_precision")
+        if not isinstance(raw, dict):
+            continue
+        for module, value in raw.items():
+            try:
+                per_module[str(module)] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return {"global": global_precision, "per_module": per_module}
+
+
+def _precision_memory_cycle_outcome(
+    cycle_started_ts: float,
+    memory_guard: Dict[str, Any],
+    scheduler_state: Dict[str, Any],
+    *,
+    defer_optional: bool,
+    defer_spawns: bool,
+) -> Dict[str, Any]:
+    planner = scheduler_state.get("planner") if isinstance(scheduler_state.get("planner"), dict) else {}
+    queue_depth = _coerce_float(planner.get("queue_depth"), 0.0)
+    blocked_count = _coerce_float(planner.get("blocked_count"), 0.0)
+    memory_level = str(memory_guard.get("level") or "unknown").strip().lower()
+
+    status = "stable"
+    completion = 0.8
+    if memory_level == "hard" or defer_spawns:
+        status = "overload"
+        completion = 0.25
+    elif blocked_count > 0 and queue_depth > 0:
+        status = "stalled"
+        completion = 0.45
+    elif queue_depth <= 0 and not defer_optional:
+        status = "efficient"
+        completion = 0.95
+    elif defer_optional:
+        completion = 0.65
+
+    return {
+        "status": status,
+        "duration": max(0.0, time.time() - cycle_started_ts),
+        "completion": completion,
+    }
+
+
+def _record_precision_memory_event(
+    cycle_started_ts: float,
+    memory_guard: Dict[str, Any],
+    scheduler_state: Dict[str, Any],
+    *,
+    defer_optional: bool,
+    defer_spawns: bool,
+) -> None:
+    try:
+        context = _precision_memory_context(scheduler_state)
+        cost = _precision_memory_cost(scheduler_state)
+        precision = _precision_memory_current_precision()
+        outcome = _precision_memory_cycle_outcome(
+            cycle_started_ts,
+            memory_guard,
+            scheduler_state,
+            defer_optional=defer_optional,
+            defer_spawns=defer_spawns,
+        )
+        outcome["regret"] = precision_memory_map.calculate_regret(cost, outcome)
+        precision_memory_map.log_event(context, cost, precision, outcome, child=CHILD)
+        suggestion = precision_memory_map.suggest_precision(context, child=CHILD)
+        update_inastate(
+            "precision_memory_suggestion",
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "suggestion": suggestion,
+                "context": context,
+                "outcome_status": outcome.get("status"),
+            },
+        )
+    except Exception as exc:
+        log_to_statusbox(f"[Manager] Failed to record precision memory event: {exc}")
 
 def _sanitize_need_alias(value: Any, *, prefix: str = "sym_need_") -> str:
     raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -8298,6 +8496,7 @@ def _maybe_run_deferred_memory_graph_build(memory_guard: Optional[Dict[str, Any]
 
 
 def run_internal_loop():
+    cycle_started_ts = time.time()
     _maybe_update_runtime_heartbeat()
     _ensure_continuity_thread()
     _maybe_ensure_ina_client()
@@ -8381,7 +8580,7 @@ def run_internal_loop():
     _update_humor_bridge()
     _maybe_run_trauma_processor()
     _run_passive_reflection()
-    _process_scheduler_tick(memory_guard=memory_guard)
+    scheduler_state = _process_scheduler_tick(memory_guard=memory_guard)
     _update_machine_semantics()
     if not defer_optional:
         _scan_fragment_health()
@@ -8390,6 +8589,13 @@ def run_internal_loop():
         _maybe_bundle_memory(defer_optional)
     # Periodically evaluate alignment metrics and surface warnings if needed
     evaluate_alignment()
+    _record_precision_memory_event(
+        cycle_started_ts,
+        memory_guard,
+        scheduler_state,
+        defer_optional=defer_optional,
+        defer_spawns=defer_spawns,
+    )
 
 def schedule_runtime():
     log_to_statusbox("[Manager] Starting main runtime loop...")

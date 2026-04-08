@@ -3,6 +3,7 @@
 import json
 import os
 import random
+import precision_memory_map
 from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import get_inastate, get_sweet_spots
@@ -43,6 +44,93 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {}
+
+
+def _coerce_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _emotion_values(raw):
+    if isinstance(raw, dict) and isinstance(raw.get("values"), dict):
+        raw = raw.get("values")
+    if not isinstance(raw, dict):
+        return {}
+    values = {}
+    for key, value in raw.items():
+        try:
+            values[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _precision_memory_context(child):
+    scheduler = get_inastate("process_scheduler") or {}
+    scheduler = scheduler if isinstance(scheduler, dict) else {}
+    planner = scheduler.get("planner") if isinstance(scheduler.get("planner"), dict) else {}
+    slot_summary = scheduler.get("slot_summary") if isinstance(scheduler.get("slot_summary"), dict) else {}
+    queue = scheduler.get("queue") if isinstance(scheduler.get("queue"), list) else []
+    queue_depth = _coerce_float(planner.get("queue_depth"), float(len(queue)))
+    max_queue = max(1.0, _coerce_float(slot_summary.get("max_queue_slots"), max(queue_depth, 1.0)))
+
+    active_modules = get_inastate("running_modules") or []
+    if isinstance(active_modules, str):
+        active_modules = [active_modules]
+    if not isinstance(active_modules, list):
+        active_modules = []
+    for entry in planner.get("running") or []:
+        if not isinstance(entry, dict):
+            continue
+        module = entry.get("module") or entry.get("task_key") or entry.get("label")
+        if module:
+            active_modules.append(str(module))
+
+    return {
+        "active_modules": sorted(set(str(name) for name in active_modules if str(name))),
+        "queue_pressure": max(0.0, min(1.0, queue_depth / max_queue)),
+        "emotion_state": _emotion_values(get_inastate("emotion_snapshot") or get_inastate("current_emotions") or {}),
+        "energy": _coerce_float(get_inastate("current_energy"), 0.5),
+    }
+
+
+def _precision_hint_candidates(child):
+    return [
+        Path("precision_hint.json"),
+        Path("AI_Children") / child / "precision_hint.json",
+        Path("AI_Children") / child / "memory" / "precision_hint.json",
+    ]
+
+
+def _load_precision_hint_for_child(child):
+    for path in _precision_hint_candidates(child):
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload, path
+        except Exception:
+            continue
+    return {}, None
+
+
+def _write_precision_memory_suggestion(child, context, suggestion):
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "precision_memory_map",
+        "advisory": True,
+        "context": context,
+        "suggestion": suggestion,
+    }
+    path = Path("AI_Children") / child / "memory" / "precision_memory_suggestion.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
 
 def evaluate_efficiency():
     config = load_config()
@@ -175,52 +263,53 @@ def run_precision_test():
 
 
 def apply_precision_strategy():
-    current = load_precision_profile()
+    config = load_config()
+    child = config.get("current_child", CHILD)
+    current = load_precision_profile(child)
     current_precision = current.get("max_precision", 64)
-    emotion = get_inastate("current_emotions") or {}
-    spots = get_sweet_spots()
-
-    min_prec = spots.get("prediction_precision", {}).get("min", 32)
-    max_prec = spots.get("prediction_precision", {}).get("max", 48)
     updated = False
+    suggestion_recorded = False
+    suggestion = {}
+    context = {}
     reason = "stable baseline"
 
-    # === Apply hint
-    if HINT_PATH.exists():
+    # === Extreme-state hints remain explicit overrides.
+    hint, hint_path = _load_precision_hint_for_child(child)
+    if hint:
         try:
-            with open(HINT_PATH, "r") as f:
-                hint = json.load(f)
-            suggested = hint.get("suggested_max_precision")
-            if suggested and 16 <= suggested <= 64:
-                current["max_precision"] = suggested
+            suggested = hint.get("suggested_max_precision", hint.get("override_precision"))
+            if suggested is not None:
+                current["max_precision"] = float(suggested)
                 reason = hint.get("reason", "instinct hint")
                 updated = True
-            os.remove(HINT_PATH)
+            if hint_path is not None:
+                os.remove(hint_path)
         except Exception as e:
             print(f"[Precision] Failed to apply hint: {e}")
 
-    # === Emotion fallback
+    # === Memory-map path: advisory only, no direct precision override.
     if not updated:
-        intensity = emotion.get("intensity", 0.0)
-        stress = emotion.get("stress", 0.0)
-        avg_overload = (intensity + stress) / 2
-        if avg_overload > 0.6 and current_precision > min_prec:
-            current["max_precision"] = max(min_prec, current_precision - 8)
-            reason = "emotional overload fallback"
-            updated = True
+        try:
+            context = _precision_memory_context(child)
+            suggestion = precision_memory_map.suggest_precision(context, child=child)
+            if suggestion.get("global") is not None:
+                _write_precision_memory_suggestion(child, context, suggestion)
+                reason = "precision memory map suggestion"
+                suggestion_recorded = True
+        except Exception as e:
+            print(f"[Precision] Failed to read precision memory map: {e}")
 
-    # === Sweet spot check
-    if not updated:
-        if current_precision > max_prec:
-            current["max_precision"] = max_prec
-            reason = "above sweet spot"
-            updated = True
-        elif current_precision < min_prec:
-            current["max_precision"] = min_prec
-            reason = "below sweet spot"
-            updated = True
+    try:
+        if LOG_JSON.exists():
+            with open(LOG_JSON, "r") as f:
+                logs = json.load(f)
+                if not isinstance(logs, list):
+                    logs = []
+        else:
+            logs = []
+    except Exception:
+        logs = []
 
-    # === Save updated config and log
     if updated:
         try:
             with open(CONFIG_PATH, "w") as f:
@@ -229,29 +318,34 @@ def apply_precision_strategy():
         except Exception as e:
             print(f"[Precision] Failed to write config: {e}")
 
-        try:
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "precision": current["max_precision"],
-                "reason": reason
-            }
-            if LOG_JSON.exists():
-                with open(LOG_JSON, "r") as f:
-                    logs = json.load(f)
-                    if not isinstance(logs, list):
-                        logs = []
-            else:
-                logs = []
-
-            logs.append(entry)
-            logs = logs[-200:]  # Keep last 200 entries
-
-            with open(LOG_JSON, "w") as f:
-                json.dump(logs, f, indent=2)
-        except Exception as e:
-            print(f"[Precision] Failed to update JSON log: {e}")
+        logs.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "precision": current["max_precision"],
+            "reason": reason,
+            "source": "precision_hint",
+        })
+    elif suggestion_recorded:
+        logs.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "precision_suggestion": suggestion,
+            "context": context,
+            "reason": reason,
+            "advisory": True,
+        })
+        print(
+            f"[Precision] Memory suggestion recorded: precision={suggestion.get('global')} "
+            f"confidence={suggestion.get('confidence')} | advisory only"
+        )
     else:
-        print(f"[Precision] No update needed. Current precision: {current_precision}")
+        print(f"[Precision] No memory suggestion available. Current precision: {current_precision}")
+
+    try:
+        LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
+        logs = logs[-200:]
+        with open(LOG_JSON, "w") as f:
+            json.dump(logs, f, indent=2)
+    except Exception as e:
+        print(f"[Precision] Failed to update JSON log: {e}")
 
 
 if __name__ == "__main__":
