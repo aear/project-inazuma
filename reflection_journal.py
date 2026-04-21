@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 DEFAULT_CHILD = "Inazuma_Yagami"
 JOURNAL_FILENAME = "reflection_journal.jsonl"
+PUBLIC_REPORT_FILENAME = "reflection_public_report.jsonl"
 PRECISION_MEMORY_FILENAME = "precision_memory_map.jsonl"
 EMOTION_LOG_FILENAME = "emotion_log.jsonl"
 
@@ -87,6 +88,16 @@ def reflection_journal_path(
     """Return the durable JSONL journal path for a child."""
 
     return _memory_root(child, base_path=base_path) / JOURNAL_FILENAME
+
+
+def reflection_public_report_path(
+    child: Optional[str] = None,
+    *,
+    base_path: Optional[Path] = None,
+) -> Path:
+    """Return the JSONL path for human-readable public reports."""
+
+    return _memory_root(child, base_path=base_path) / PUBLIC_REPORT_FILENAME
 
 
 def _precision_memory_path(child: Optional[str] = None, *, base_path: Optional[Path] = None) -> Path:
@@ -657,6 +668,27 @@ def _emotion_pattern_line(samples: List[Dict[str, float]]) -> str:
     return "emotional patterns: " + "; ".join(fragments)
 
 
+def _emotion_report_fragments(samples: List[Dict[str, float]], limit: int = 3) -> List[str]:
+    if not samples:
+        return []
+
+    aggregate: Dict[str, List[float]] = {}
+    for sample in samples:
+        for key, value in sample.items():
+            aggregate.setdefault(key, []).append(value)
+
+    ranked = []
+    for key, values in aggregate.items():
+        avg = sum(values) / len(values)
+        max_abs = max(abs(value) for value in values)
+        ranked.append((max(abs(avg), max_abs), key, avg, max_abs))
+    ranked.sort(reverse=True)
+    return [
+        f"{key} averaged {avg:.2f}, with a peak magnitude of {max_abs:.2f}"
+        for _score, key, avg, max_abs in ranked[:limit]
+    ]
+
+
 def _precision_event_cost_line(event: Dict[str, Any]) -> str:
     context = event.get("context") if isinstance(event.get("context"), dict) else {}
     cost = event.get("cost") if isinstance(event.get("cost"), dict) else {}
@@ -806,14 +838,105 @@ def generate_journal(
     return content
 
 
+def generate_public_report(
+    period: Union[str, int, float] = "daily",
+    *,
+    child: Optional[str] = None,
+    base_path: Optional[Path] = None,
+    persist: bool = True,
+) -> str:
+    """Generate a best-effort human-readable report without changing the private journal."""
+
+    period_label, seconds = _period_window(period)
+    since_ts = time.time() - seconds
+
+    journal_entries = _recent_by_period(load_entries(child, base_path=base_path), since_ts)
+    precision_events = _recent_by_period(_load_precision_events(child, base_path=base_path), since_ts)
+    emotion_snapshots = _load_recent_emotion_snapshots(child, base_path, since_ts)
+
+    contexts: List[Dict[str, Any]] = []
+    contexts.extend(entry.get("context") for entry in journal_entries if isinstance(entry.get("context"), dict))
+    contexts.extend(event.get("context") for event in precision_events if isinstance(event.get("context"), dict))
+
+    module_counts = _collect_modules_from_contexts(contexts)
+    emotion_samples = _collect_emotion_samples(contexts)
+    for snapshot in emotion_snapshots:
+        values = snapshot.get("values") if isinstance(snapshot.get("values"), dict) else snapshot
+        sample = _numeric_dict(values)
+        if sample:
+            emotion_samples.append(sample)
+
+    high_cost = _high_cost_precision_events(precision_events)
+    contradictions = _contradiction_lines(journal_entries, precision_events)
+
+    lines = [
+        f"Public reflection report for period: {period_label}.",
+        (
+            f"Available signals: {len(journal_entries)} journal entries, "
+            f"{len(precision_events)} precision events, and "
+            f"{len(emotion_snapshots)} emotion snapshots."
+        ),
+    ]
+
+    if module_counts:
+        dominant = ", ".join(f"{module} ({count})" for module, count in module_counts.most_common(5))
+        lines.append(f"Dominant activity: {dominant}.")
+    else:
+        lines.append("Dominant activity: no module pattern was visible in the available context.")
+
+    emotion_fragments = _emotion_report_fragments(emotion_samples)
+    if emotion_fragments:
+        lines.append("Emotional pattern: " + "; ".join(emotion_fragments) + ".")
+    else:
+        lines.append("Emotional pattern: no recent emotional sample was available.")
+
+    if high_cost:
+        lines.append("High-cost decisions noticed:")
+        for event in high_cost[:3]:
+            lines.append("- " + _precision_event_cost_line(event))
+    else:
+        lines.append("High-cost decisions noticed: none in the available precision memory.")
+
+    if contradictions:
+        lines.append("Contradictions or tensions to review:")
+        for item in contradictions:
+            lines.append("- " + item)
+    else:
+        lines.append("Contradictions or tensions to review: no clear signal surfaced.")
+
+    if not journal_entries and not precision_events and not emotion_snapshots:
+        lines.append("Confidence is low because the activity signal is sparse.")
+
+    content = "\n".join(lines)
+    if persist:
+        linked_events = [_event_identifier(event) for event in high_cost[:5] if _event_identifier(event)]
+        entry = _entry_payload(
+            "journal",
+            content,
+            context=_current_context(child, base_path=base_path),
+            tags=["public_report", f"period:{period_label}"],
+            linked_events=linked_events,
+            child=child,
+            base_path=base_path,
+            extra={"period": period_label, "visibility": "public"},
+        )
+        path = reflection_public_report_path(child, base_path=base_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return content
+
+
 __all__ = [
     "generate_journal",
+    "generate_public_report",
     "get_recent_entries",
     "get_recent_notes",
     "load_entries",
     "reflect_on_emotion_snapshot",
     "reflect_on_event",
     "reflection_journal_path",
+    "reflection_public_report_path",
     "write_note",
     "write_reflection",
 ]

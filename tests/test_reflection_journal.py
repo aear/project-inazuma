@@ -114,6 +114,39 @@ class ReflectionJournalTests(unittest.TestCase):
             self.assertEqual(journals[0]["content"], content)
             self.assertEqual(journals[0]["linked_events"], [event["id"]])
 
+    def test_generate_public_report_persists_separate_readable_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = Path(temp_dir)
+            event = pmm.log_event(
+                _context(module="memory_graph", intensity=0.7),
+                {"cpu": {"memory_graph": 86.0}, "ram": {"memory_graph": 2.0}},
+                {"global": 40.0, "per_module": {"memory_graph": 40.0}},
+                {"status": "stalled", "duration": 5.0, "completion": 0.2, "regret": 8.0},
+                child=CHILD,
+                base_path=base_path,
+            )
+
+            report = rj.generate_public_report("daily", child=CHILD, base_path=base_path)
+            self.assertIn("Public reflection report", report)
+            self.assertIn("Available signals:", report)
+            self.assertIn("Dominant activity: memory_graph", report)
+            self.assertIn(event["id"], report)
+
+            public_path = rj.reflection_public_report_path(CHILD, base_path=base_path)
+            public_entries = [json.loads(line) for line in public_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(public_entries), 1)
+            self.assertEqual(public_entries[0]["content"], report)
+            self.assertEqual(public_entries[0]["visibility"], "public")
+            self.assertEqual(public_entries[0]["linked_events"], [event["id"]])
+
+            private_journals = rj.get_recent_entries(
+                entry_types="journal",
+                child=CHILD,
+                base_path=base_path,
+            )
+            self.assertEqual(private_journals, [])
+
+
     def test_emotion_snapshot_reflection_threshold(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base_path = Path(temp_dir)
