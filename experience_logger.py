@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 import json
 
+from experience_storage import newest_event_paths, resolve_event_path
+
 
 def _now_iso() -> str:
     """Return the current UTC timestamp in ISO 8601 format."""
@@ -169,7 +171,7 @@ class ExperienceLogger:
     def list_recent_events(self, limit: int = 5) -> List[EventRecord]:
         """Return the most recent *limit* events for quick inspection."""
 
-        files = sorted(self._events_dir.glob("evt_*.json"), reverse=True)[:limit]
+        files = newest_event_paths(self._events_dir, limit)
         return [self._load_event_from_path(path) for path in files]
 
     # ------------------------------------------------------------------
@@ -417,13 +419,14 @@ class ExperienceLogger:
     # Persistence helpers
     # ------------------------------------------------------------------
     def _event_path(self, event_id: str) -> Path:
-        return self._events_dir / f"{event_id}.json"
+        return resolve_event_path(self._events_dir, event_id)
 
     def _episode_path(self, episode_id: str) -> Path:
         return self._episodes_dir / f"{episode_id}.json"
 
     def _save_event(self, record: EventRecord) -> None:
         path = self._event_path(record.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(record.to_dict(), fh, indent=2)
 

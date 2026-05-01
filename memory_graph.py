@@ -8,6 +8,7 @@ import random
 import heapq
 import time
 import tempfile
+import shutil
 from array import array
 from collections import deque
 import hashlib
@@ -21,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
+from experience_storage import iter_event_paths
 from io_utils import atomic_write_json, file_lock, load_json_dict
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -97,6 +99,15 @@ DEFAULT_RETENTION_POLICY = {
     "human_prune_max_importance": 0.18,
     "human_prune_min_size_bytes": 2048,
     "human_prune_cooldown_seconds": 3600.0,
+    "human_prune_review_required": False,
+    "human_prune_report_dir": "prune_reports",
+    "human_prune_experience_enabled": True,
+    "human_prune_experience_limit": 250,
+    "human_prune_experience_min_age_hours": 24.0 * 30.0,
+    "human_prune_experience_max_importance": 0.18,
+    "human_prune_experience_min_size_bytes": 2048,
+    "human_prune_experience_cold_root": None,
+    "human_prune_experience_retain_local_stub": True,
 }
 DEFAULT_BOOT_POLICY = {
     "boot_mode": "full",  # full | fast | auto
@@ -457,6 +468,37 @@ def _memory_policy():
         human_cooldown = _coerce_positive_float(raw_retention.get("human_prune_cooldown_seconds"))
         if human_cooldown is not None:
             retention["human_prune_cooldown_seconds"] = human_cooldown
+        if "human_prune_review_required" in raw_retention:
+            retention["human_prune_review_required"] = bool(raw_retention.get("human_prune_review_required"))
+        report_dir = raw_retention.get("human_prune_report_dir")
+        if isinstance(report_dir, str) and report_dir.strip():
+            retention["human_prune_report_dir"] = report_dir.strip()
+        if "human_prune_experience_enabled" in raw_retention:
+            retention["human_prune_experience_enabled"] = bool(raw_retention.get("human_prune_experience_enabled"))
+        experience_limit = _coerce_positive_int(raw_retention.get("human_prune_experience_limit"))
+        if experience_limit is not None:
+            retention["human_prune_experience_limit"] = experience_limit
+        experience_age = _coerce_positive_float(raw_retention.get("human_prune_experience_min_age_hours"))
+        if experience_age is not None:
+            retention["human_prune_experience_min_age_hours"] = experience_age
+        experience_importance = _coerce_float(raw_retention.get("human_prune_experience_max_importance"))
+        if experience_importance is not None:
+            retention["human_prune_experience_max_importance"] = _clamp(experience_importance, 0.0, 1.0)
+        experience_min_size = _coerce_positive_int(raw_retention.get("human_prune_experience_min_size_bytes"))
+        if experience_min_size is not None:
+            retention["human_prune_experience_min_size_bytes"] = experience_min_size
+        experience_root = raw_retention.get("human_prune_experience_cold_root")
+        if isinstance(experience_root, str) and experience_root.strip():
+            retention["human_prune_experience_cold_root"] = experience_root.strip()
+        if "human_prune_experience_retain_local_stub" in raw_retention:
+            retention["human_prune_experience_retain_local_stub"] = bool(
+                raw_retention.get("human_prune_experience_retain_local_stub")
+            )
+    layout = cfg.get("storage_layout") if isinstance(cfg, dict) else {}
+    if isinstance(layout, dict) and not retention.get("human_prune_experience_cold_root"):
+        cold_experience_root = layout.get("cold_experience_root")
+        if isinstance(cold_experience_root, str) and cold_experience_root.strip():
+            retention["human_prune_experience_cold_root"] = cold_experience_root.strip()
     policy["retention"] = retention
     return policy
 
@@ -1222,6 +1264,459 @@ def _select_human_memory_prune_candidates(
     return [(frag_id, meta, path) for _, frag_id, meta, path in sorted(heap, key=lambda item: item[0], reverse=True)]
 
 
+def _format_child_path(value: str, child: str) -> str:
+    return value.replace("{child}", child)
+
+
+def _memory_root(child: str) -> Path:
+    return Path("AI_Children") / child / "memory"
+
+
+def _human_prune_report_dir(child: str, retention: Dict[str, Any]) -> Path:
+    raw = retention.get("human_prune_report_dir") or DEFAULT_RETENTION_POLICY["human_prune_report_dir"]
+    report_dir = Path(_format_child_path(str(raw), child)).expanduser()
+    if not report_dir.is_absolute():
+        report_dir = _memory_root(child) / report_dir
+    return report_dir
+
+
+def _experience_cold_root(child: str, retention: Dict[str, Any]) -> Path:
+    raw = retention.get("human_prune_experience_cold_root")
+    if isinstance(raw, str) and raw.strip():
+        return Path(_format_child_path(raw.strip(), child)).expanduser()
+    return _memory_root(child) / "cold_storage" / "experiences"
+
+
+def _safe_load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _experience_tags(payload: Dict[str, Any]) -> Set[str]:
+    tags: Set[str] = set()
+    for key in ("tags", "situation_tags"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            tags.update(str(tag).lower() for tag in value if tag)
+    for key in ("outcome", "result", "internal_state"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            nested = value.get("tags") or value.get("flags")
+            if isinstance(nested, list):
+                tags.update(str(tag).lower() for tag in nested if tag)
+    return tags
+
+
+def _experience_importance(payload: Dict[str, Any]) -> float:
+    scores: List[float] = []
+    for key in ("importance", "salience", "priority", "novelty"):
+        if key in payload:
+            scores.append(abs(_safe_float(payload.get(key), 0.0)))
+    for container_key in ("internal_state", "outcome", "result"):
+        container = payload.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key in ("importance", "salience", "priority", "novelty", "risk", "stress"):
+            if key in container:
+                scores.append(abs(_safe_float(container.get(key), 0.0)))
+        emotions = container.get("emotions")
+        if isinstance(emotions, dict):
+            for key in ("intensity", "risk", "stress", "care", "trust", "novelty"):
+                if key in emotions:
+                    scores.append(abs(_safe_float(emotions.get(key), 0.0)))
+    if payload.get("word_usage") or payload.get("feedback_hooks"):
+        scores.append(0.5)
+    return _clamp(max(scores) if scores else 0.0, 0.0, 1.0)
+
+
+def _experience_timestamp(payload: Dict[str, Any], path: Path) -> Optional[float]:
+    for key in ("timestamp", "start_time", "end_time", "created_at"):
+        ts = _parse_iso_timestamp(payload.get(key))
+        if ts is not None:
+            return ts
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _is_protected_experience(payload: Dict[str, Any], retention: Dict[str, Any]) -> bool:
+    if _experience_tags(payload) & _PROTECTED_FRAGMENT_TAGS:
+        return True
+    if payload.get("word_usage") or payload.get("feedback_hooks"):
+        return True
+    protect = _clamp(
+        _safe_float(retention.get("protect_cold_importance"), DEFAULT_RETENTION_POLICY["protect_cold_importance"]),
+        0.0,
+        1.0,
+    )
+    return _experience_importance(payload) >= protect
+
+
+def _experience_summary(payload: Dict[str, Any]) -> str:
+    for key in ("summary", "narrative", "intent"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:280]
+    tags = sorted(_experience_tags(payload))
+    if tags:
+        return "Experience tagged " + ", ".join(tags[:8])
+    return "Low-signal experience record with no short narrative."
+
+
+def _candidate_reason(
+    *,
+    kind: str,
+    age_hours: float,
+    importance: float,
+    size_bytes: int,
+    tags: Iterable[str],
+    action: str,
+) -> str:
+    age_days = age_hours / 24.0
+    tag_text = ", ".join(sorted(str(tag) for tag in tags if tag)[:6]) or "no protected tags"
+    size_kib = size_bytes / 1024.0
+    return (
+        f"{kind} is about {age_days:.1f} days old, uses {size_kib:.1f} KiB, "
+        f"has importance {importance:.2f}, and has {tag_text}. Recommended action: {action}."
+    )
+
+
+def _experience_candidate_from_path(
+    child: str,
+    kind: str,
+    path: Path,
+    retention: Dict[str, Any],
+    settings: Dict[str, Any],
+    now_ts: float,
+) -> Optional[Tuple[Dict[str, Any], Tuple[int, float, float, str]]]:
+    payload = _safe_load_json_file(path)
+    if not payload:
+        return None
+    if payload.get("cold_experience") or payload.get("experience_compacted_at"):
+        return None
+    if _is_protected_experience(payload, retention):
+        return None
+    try:
+        size_bytes = int(path.stat().st_size)
+    except OSError:
+        return None
+    if size_bytes < int(settings.get("min_size_bytes") or 0):
+        return None
+    ts = _experience_timestamp(payload, path)
+    if ts is None:
+        return None
+    age_hours = max(0.0, (now_ts - ts) / 3600.0)
+    if age_hours < float(settings.get("min_age_hours") or 0.0):
+        return None
+    importance = _experience_importance(payload)
+    if importance > float(settings.get("max_importance") or 0.0):
+        return None
+    tags = sorted(_experience_tags(payload))
+    action = "copy full record to HDD cold storage and leave a local recall stub"
+    item = {
+        "kind": kind,
+        "id": str(payload.get("id") or path.stem),
+        "path": str(path),
+        "size_bytes": size_bytes,
+        "age_hours": round(age_hours, 3),
+        "importance": round(importance, 4),
+        "tags": tags,
+        "summary": _experience_summary(payload),
+        "recommended_action": "compact_experience_to_cold_stub",
+        "reason": _candidate_reason(
+            kind=kind,
+            age_hours=age_hours,
+            importance=importance,
+            size_bytes=size_bytes,
+            tags=tags,
+            action=action,
+        ),
+    }
+    score = (size_bytes, age_hours, -importance, str(path))
+    return item, score
+
+
+def _select_experience_prune_candidates(
+    child: str,
+    retention: Optional[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    retention = retention or DEFAULT_RETENTION_POLICY
+    if not bool(retention.get("human_prune_experience_enabled", True)):
+        return []
+    limit = max(0, int(_safe_float(
+        retention.get("human_prune_experience_limit"),
+        DEFAULT_RETENTION_POLICY["human_prune_experience_limit"],
+    )))
+    if limit <= 0:
+        return []
+    settings = {
+        "min_age_hours": max(0.0, _safe_float(
+            retention.get("human_prune_experience_min_age_hours"),
+            DEFAULT_RETENTION_POLICY["human_prune_experience_min_age_hours"],
+        )),
+        "max_importance": _clamp(_safe_float(
+            retention.get("human_prune_experience_max_importance"),
+            DEFAULT_RETENTION_POLICY["human_prune_experience_max_importance"],
+        ), 0.0, 1.0),
+        "min_size_bytes": max(0, int(_safe_float(
+            retention.get("human_prune_experience_min_size_bytes"),
+            DEFAULT_RETENTION_POLICY["human_prune_experience_min_size_bytes"],
+        ))),
+    }
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    now_ts = now_dt.timestamp()
+    base = _memory_root(child) / "experiences"
+    paths = [
+        ("experience_event", base / "events"),
+        ("experience_episode", base / "episodes"),
+    ]
+    heap: List[Tuple[Tuple[int, float, float, str], Dict[str, Any]]] = []
+    for kind, root in paths:
+        if not root.exists():
+            continue
+        path_iter = iter_event_paths(root) if kind == "experience_event" else root.glob("*.json")
+        for path in path_iter:
+            if not path.is_file():
+                continue
+            candidate = _experience_candidate_from_path(child, kind, path, retention, settings, now_ts)
+            if candidate is None:
+                continue
+            item, score = candidate
+            entry = (score, item)
+            if len(heap) < limit:
+                heapq.heappush(heap, entry)
+            elif entry[0] > heap[0][0]:
+                heapq.heapreplace(heap, entry)
+    return [item for _, item in sorted(heap, key=lambda entry: entry[0], reverse=True)]
+
+
+def _fragment_prune_report_items(
+    candidates: List[Tuple[str, Dict[str, Any], Path]],
+    now_dt: datetime,
+) -> List[Dict[str, Any]]:
+    now_ts = now_dt.timestamp()
+    items: List[Dict[str, Any]] = []
+    for frag_id, meta, path in candidates:
+        ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp"))
+        age_hours = max(0.0, (now_ts - ts) / 3600.0) if ts is not None else 0.0
+        size_bytes = int(_safe_float(meta.get("size_bytes"), 0.0))
+        if size_bytes <= 0:
+            try:
+                size_bytes = int(path.stat().st_size)
+            except OSError:
+                size_bytes = 0
+        importance = _clamp(_safe_float(meta.get("importance"), 0.0), 0.0, 1.0)
+        tags = [str(tag).lower() for tag in meta.get("tags", []) if tag] if isinstance(meta.get("tags"), list) else []
+        action = "move to cold tier, compact to anchors/shards, and quarantine the full detail before purge"
+        items.append({
+            "kind": "fragment",
+            "id": str(frag_id),
+            "path": str(path),
+            "tier": str(meta.get("tier") or "short"),
+            "filename": str(meta.get("filename") or path.name),
+            "size_bytes": size_bytes,
+            "age_hours": round(age_hours, 3),
+            "importance": round(importance, 4),
+            "tags": tags,
+            "recommended_action": "compact_fragment_to_cold_stub",
+            "reason": _candidate_reason(
+                kind="fragment",
+                age_hours=age_hours,
+                importance=importance,
+                size_bytes=size_bytes,
+                tags=tags,
+                action=action,
+            ),
+        })
+    return items
+
+
+def _write_human_prune_review_report(
+    child: str,
+    retention: Dict[str, Any],
+    fragment_items: List[Dict[str, Any]],
+    experience_items: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+    now_dt: datetime,
+) -> Dict[str, Any]:
+    report_id = f"prune_{now_dt.strftime('%Y%m%dT%H%M%SZ')}"
+    report_dir = _human_prune_report_dir(child, retention)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    json_path = report_dir / f"{report_id}.json"
+    md_path = report_dir / f"{report_id}.md"
+    candidates = fragment_items + experience_items
+    total_bytes = sum(int(item.get("size_bytes") or 0) for item in candidates)
+    report = {
+        "report_id": report_id,
+        "child": child,
+        "status": "review_required",
+        "timestamp": now_dt.isoformat(),
+        "summary": {
+            "fragments": len(fragment_items),
+            "experiences": len(experience_items),
+            "candidates": len(candidates),
+            "candidate_bytes": total_bytes,
+        },
+        "settings": settings,
+        "approval": {
+            "inastate_key": "human_memory_prune_apply_report",
+            "inastate_value": report_id,
+            "note": "Set this only after reviewing the report. The next prune pass will apply this exact report and clear the key.",
+        },
+        "candidates": candidates,
+    }
+    try:
+        from exchange_review import evaluate_prune_report_payload
+
+        report["exchange_review"] = evaluate_prune_report_payload(report)
+    except Exception:
+        report["exchange_review"] = {
+            "status": "unavailable",
+            "reason": "exchange_review_failed",
+        }
+    report["paths"] = {"json": str(json_path), "markdown": str(md_path)}
+    atomic_write_json(json_path, report, indent=2, ensure_ascii=True)
+
+    exchange = report.get("exchange_review") if isinstance(report.get("exchange_review"), dict) else {}
+    lines = [
+        f"# Memory prune report: {report_id}",
+        "",
+        f"Child: {child}",
+        f"Generated: {now_dt.isoformat()}",
+        "",
+        "## Summary",
+        "",
+        f"- Fragment candidates: {len(fragment_items)}",
+        f"- Experience candidates: {len(experience_items)}",
+        f"- Candidate bytes: {total_bytes}",
+        "",
+        "## Law of Exchange",
+        "",
+        f"- Recommendation: {exchange.get('recommendation', 'unavailable')}",
+        f"- Balance: {exchange.get('law_of_exchange', {}).get('plain_english', 'Exchange review unavailable.') if isinstance(exchange.get('law_of_exchange'), dict) else 'Exchange review unavailable.'}",
+        "",
+        "## Approval",
+        "",
+        "Review this report before applying. To approve the exact report, set ",
+        "`human_memory_prune_apply_report` in inastate to this report id.",
+        "",
+        "## Reasons",
+        "",
+    ]
+    preview = candidates[:120]
+    for item in preview:
+        lines.append(
+            f"- {item.get('kind')} `{item.get('id')}`: {item.get('reason')} Path: `{item.get('path')}`"
+        )
+    if len(candidates) > len(preview):
+        lines.append("")
+        lines.append(f"JSON report contains {len(candidates) - len(preview)} additional candidate(s).")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+def _load_human_prune_report(child: str, retention: Dict[str, Any], report_id: str) -> Optional[Dict[str, Any]]:
+    raw = str(report_id or "").strip()
+    if not raw:
+        return None
+    candidate = Path(_format_child_path(raw, child)).expanduser()
+    if not candidate.is_absolute():
+        if candidate.suffix != ".json":
+            candidate = _human_prune_report_dir(child, retention) / f"{raw}.json"
+        else:
+            candidate = _human_prune_report_dir(child, retention) / candidate
+    return _safe_load_json_file(candidate)
+
+
+def _compact_experience_file(
+    child: str,
+    item: Dict[str, Any],
+    retention: Dict[str, Any],
+    now_dt: datetime,
+) -> Dict[str, Any]:
+    path = Path(str(item.get("path") or ""))
+    if not path.exists() or not path.is_file():
+        return {"status": "missing", "path": str(path)}
+    payload = _safe_load_json_file(path)
+    if not payload:
+        return {"status": "unreadable", "path": str(path)}
+    if payload.get("cold_experience") or payload.get("experience_compacted_at"):
+        return {"status": "already_compacted", "path": str(path)}
+
+    kind = str(item.get("kind") or "experience")
+    cold_root = _experience_cold_root(child, retention)
+    full_dir = cold_root / "full" / kind
+    summary_dir = cold_root / "summaries" / kind
+    full_path = full_dir / path.name
+    summary_path = summary_dir / path.name
+    source_hash = _hash_file(path)
+    if not source_hash:
+        return {"status": "unreadable", "path": str(path)}
+
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    if full_path.exists():
+        full_path = full_path.with_name(f"{full_path.stem}__{now_dt.strftime('%Y%m%dT%H%M%SZ')}{full_path.suffix}")
+    try:
+        shutil.copy2(path, full_path)
+    except Exception as exc:
+        return {"status": "failed", "reason": f"copy_failed: {exc}", "path": str(path)}
+    if _hash_file(full_path) != source_hash:
+        try:
+            full_path.unlink()
+        except OSError:
+            pass
+        return {"status": "failed", "reason": "copy_verification_failed", "path": str(path)}
+
+    summary = {
+        "version": 1,
+        "id": payload.get("id") or path.stem,
+        "kind": kind,
+        "timestamp": payload.get("timestamp") or payload.get("start_time") or payload.get("end_time"),
+        "summary": _experience_summary(payload),
+        "tags": sorted(_experience_tags(payload)),
+        "importance": _experience_importance(payload),
+        "source_path": str(path),
+        "cold_full_path": str(full_path),
+        "source_sha256": source_hash,
+        "compacted_at": now_dt.isoformat(),
+        "reason": item.get("reason"),
+    }
+    atomic_write_json(summary_path, summary, indent=2, ensure_ascii=True)
+
+    if bool(retention.get("human_prune_experience_retain_local_stub", True)):
+        stub = {
+            "id": summary["id"],
+            "type": payload.get("type") or kind,
+            "timestamp": summary["timestamp"],
+            "summary": summary["summary"],
+            "tags": summary["tags"],
+            "importance": summary["importance"],
+            "cold_experience": {
+                "full_path": str(full_path),
+                "summary_path": str(summary_path),
+                "source_sha256": source_hash,
+            },
+            "experience_compacted_at": now_dt.isoformat(),
+            "reconstructed": False,
+        }
+        atomic_write_json(path, stub, indent=2, ensure_ascii=True)
+
+    return {
+        "status": "compacted",
+        "path": str(path),
+        "cold_full_path": str(full_path),
+        "summary_path": str(summary_path),
+    }
+
+
 def _pregraph_fragment_compaction_pass(child: str, index: Any, retention: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     retention = retention or DEFAULT_RETENTION_POLICY
     if not bool(retention.get("pre_compact_enabled", False)):
@@ -1762,7 +2257,7 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
 
     if limit_val > 0:
         heap: List[tuple] = []
-        for path in sorted(events_dir.glob("evt_*.json")):
+        for path in iter_event_paths(events_dir):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
@@ -1771,7 +2266,7 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
             if "id" not in data:
                 continue
             total += 1
-            entry = (_ts_value(data, path), path.name, data)
+            entry = (_ts_value(data, path), str(path), data)
             if len(heap) < limit_val:
                 heapq.heappush(heap, entry)
             else:
@@ -1780,7 +2275,7 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
         heap.sort()
         events = [item[2] for item in heap]
     else:
-        for path in sorted(events_dir.glob("evt_*.json")):
+        for path in sorted(iter_event_paths(events_dir)):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
@@ -5093,8 +5588,26 @@ class MemoryManager:
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=timezone.utc)
 
-        if not force:
-            state = _load_inastate(self.child)
+        review_required = bool(retention.get("human_prune_review_required", False))
+        state = _load_inastate(self.child)
+        apply_report_id = None
+        apply_report = None
+        if review_required and isinstance(state, dict):
+            raw_apply = state.get("human_memory_prune_apply_report")
+            if isinstance(raw_apply, str) and raw_apply.strip():
+                apply_report_id = raw_apply.strip()
+                apply_report = _load_human_prune_report(self.child, retention, apply_report_id)
+                if not apply_report:
+                    stats = {
+                        "status": "failed",
+                        "reason": "approved_report_not_found",
+                        "approved_report": apply_report_id,
+                        "timestamp": now_dt.isoformat(),
+                    }
+                    _write_inastate_value(self.child, "human_memory_prune_last_run", stats)
+                    return stats
+
+        if not force and not apply_report:
             last_run = state.get("human_memory_prune_last_run") if isinstance(state, dict) else None
             last_ts = None
             if isinstance(last_run, dict):
@@ -5108,7 +5621,85 @@ class MemoryManager:
                     "timestamp": now_dt.isoformat(),
                 }
 
-        if compact_fragment_file is None:
+        selected: List[Tuple[str, Dict[str, Any], Path]] = []
+        experience_items: List[Dict[str, Any]] = []
+
+        if apply_report:
+            report_candidates = apply_report.get("candidates") if isinstance(apply_report, dict) else []
+            if isinstance(report_candidates, list):
+                for item in report_candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    kind = str(item.get("kind") or "")
+                    if kind == "fragment":
+                        frag_id = str(item.get("id") or "")
+                        live_meta = self.memory_map.get(frag_id)
+                        if not frag_id or not isinstance(live_meta, dict):
+                            continue
+                        report_path = Path(str(item.get("path") or ""))
+                        path = self._resolve_fragment_path(frag_id, live_meta) or report_path
+                        selected.append((frag_id, live_meta, path))
+                    elif kind.startswith("experience_"):
+                        experience_items.append(item)
+        else:
+            index = _load_memory_index(self.child)
+            try:
+                try:
+                    index_count = len(index)
+                except Exception:
+                    index_count = len(self.memory_map)
+                selected = _select_human_memory_prune_candidates(
+                    self.child,
+                    index,
+                    retention,
+                    index_count=index_count,
+                    now=now_dt,
+                )
+            finally:
+                if hasattr(index, "close"):
+                    index.close()
+            experience_items = _select_experience_prune_candidates(self.child, retention, now=now_dt)
+
+        if review_required and not apply_report:
+            fragment_items = _fragment_prune_report_items(selected, now_dt)
+            report = _write_human_prune_review_report(
+                self.child,
+                retention,
+                fragment_items,
+                experience_items,
+                settings,
+                now_dt,
+            )
+            stats = {
+                "status": "review_required",
+                "selected": len(fragment_items),
+                "experience_selected": len(experience_items),
+                "report_id": report.get("report_id"),
+                "report_paths": report.get("paths", {}),
+                "limit": settings["limit"],
+                "index_count": index_count,
+                "timestamp": now_dt.isoformat(),
+            }
+            _write_inastate_value(self.child, "human_memory_prune_last_run", stats)
+            _write_inastate_value(
+                self.child,
+                "human_memory_prune_report",
+                {
+                    "report_id": report.get("report_id"),
+                    "status": report.get("status"),
+                    "timestamp": report.get("timestamp"),
+                    "summary": report.get("summary", {}),
+                    "paths": report.get("paths", {}),
+                    "approval": report.get("approval", {}),
+                },
+            )
+            log_to_statusbox(
+                f"[Memory] Human-memory prune report ready: {len(fragment_items)} fragment(s), "
+                f"{len(experience_items)} experience(s)."
+            )
+            return stats
+
+        if compact_fragment_file is None and selected:
             stats = {
                 "status": "unavailable",
                 "reason": "cold_storage_unavailable",
@@ -5125,24 +5716,6 @@ class MemoryManager:
         cold_policy["retain_full_fragment"] = False
         cold_policy["purge_pending_delete"] = True
 
-        index = _load_memory_index(self.child)
-        selected: List[Tuple[str, Dict[str, Any], Path]] = []
-        try:
-            try:
-                index_count = len(index)
-            except Exception:
-                index_count = len(self.memory_map)
-            selected = _select_human_memory_prune_candidates(
-                self.child,
-                index,
-                retention,
-                index_count=index_count,
-                now=now_dt,
-            )
-        finally:
-            if hasattr(index, "close"):
-                index.close()
-
         compacted = 0
         retained = 0
         already_compacted = 0
@@ -5151,6 +5724,9 @@ class MemoryManager:
         failed = 0
         missing = 0
         skipped = 0
+        experience_compacted = 0
+        experience_failed = 0
+        experience_skipped = 0
         changed = False
 
         for frag_id, meta, path in selected:
@@ -5217,6 +5793,16 @@ class MemoryManager:
             else:
                 failed += 1
 
+        for item in experience_items:
+            result = _compact_experience_file(self.child, item, retention, now_dt)
+            status = result.get("status") if isinstance(result, dict) else None
+            if status == "compacted":
+                experience_compacted += 1
+            elif status in {"already_compacted", "missing"}:
+                experience_skipped += 1
+            else:
+                experience_failed += 1
+
         if changed:
             self.save_map()
 
@@ -5239,17 +5825,27 @@ class MemoryManager:
             "failed": failed,
             "missing": missing,
             "skipped": skipped,
+            "experience_selected": len(experience_items),
+            "experience_compacted": experience_compacted,
+            "experience_skipped": experience_skipped,
+            "experience_failed": experience_failed,
             "purged_pending": int(purge_stats.get("deleted", 0) or 0),
             "pending_kept": int(purge_stats.get("kept", 0) or 0),
             "limit": settings["limit"],
             "index_count": index_count,
             "timestamp": now_dt.isoformat(),
         }
+        if apply_report_id:
+            stats["applied_report"] = apply_report_id
         _write_inastate_value(self.child, "human_memory_prune_last_run", stats)
-        if compacted or stats["purged_pending"] or failed:
+        if apply_report_id:
+            _write_inastate_value(self.child, "human_memory_prune_apply_report", None)
+            _write_inastate_value(self.child, "human_memory_prune_last_applied_report", stats)
+        if compacted or stats["purged_pending"] or failed or experience_compacted or experience_failed:
             log_to_statusbox(
                 f"[Memory] Human-memory prune: compacted {compacted}, moved {moved_to_cold}, purged {stats['purged_pending']}, "
-                f"skipped {skipped + protected + already_compacted}, failed {failed}."
+                f"experiences {experience_compacted}, skipped {skipped + protected + already_compacted + experience_skipped}, "
+                f"failed {failed + experience_failed}."
             )
         return stats
 

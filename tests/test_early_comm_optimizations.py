@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import early_comm as ec
+from experience_storage import sharded_event_path
 
 
 def _write_json(path, payload, mtime):
@@ -55,6 +56,24 @@ def test_load_recent_heard_words_uses_bounded_recent_event_window(tmp_path, monk
     heard = ec.load_recent_heard_words("Ina", limit=4, event_scan_limit=2)
 
     assert [item["word"] for item in heard] == ["newword", "midword"]
+
+
+def test_load_recent_heard_words_reads_sharded_events(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    events_dir = tmp_path / "AI_Children" / "Ina" / "memory" / "experiences" / "events"
+    event_path = sharded_event_path(events_dir, "evt_20260106T010203000000Z")
+    _write_json(
+        event_path,
+        {
+            "timestamp": "new",
+            "word_usage": [{"speaker": "Sakura", "words": ["shardword"], "utterance": "shardword"}],
+        },
+        400,
+    )
+
+    heard = ec.load_recent_heard_words("Ina", limit=2, event_scan_limit=5)
+
+    assert [item["word"] for item in heard] == ["shardword"]
 
 
 def test_early_comm_import_does_not_load_model_manager():

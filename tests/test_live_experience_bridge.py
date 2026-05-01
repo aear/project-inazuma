@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experience_logger import ExperienceLogger
+from experience_storage import resolve_event_path, sharded_event_path
 from live_experience_bridge import LiveExperienceBridge
 
 
@@ -28,7 +29,8 @@ def test_log_conversation_turn_creates_event_with_word_usage(bridge):
 
     # Event file should exist and include attached word usage
     events_dir = base / child / "memory" / "experiences" / "events"
-    event_file = events_dir / f"{event_id}.json"
+    event_file = resolve_event_path(events_dir, event_id)
+    assert event_file == sharded_event_path(events_dir, event_id)
     assert event_file.exists()
     event_data = json.loads(event_file.read_text(encoding="utf-8"))
     assert event_data["word_usage"], "word usage annotations should be recorded"

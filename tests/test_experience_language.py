@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import language_processing
+from experience_storage import resolve_event_path
 from experience_logger import ExperienceLogger
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
@@ -105,11 +106,11 @@ def test_experience_logging_and_grounding(temp_child, monkeypatch):
     assert any(hook["event_id"] == screen_event for hook in episode_payload["feedback_hooks"])
 
     events_dir = base / child / "memory" / "experiences" / "events"
-    with open(events_dir / f"{conversation_event}.json", "r", encoding="utf-8") as fh:
+    with open(resolve_event_path(events_dir, conversation_event), "r", encoding="utf-8") as fh:
         conversation_payload = json.load(fh)
     assert conversation_payload["internal_state"]["audio_features"] == audio_features
 
-    with open(events_dir / f"{motor_event}.json", "r", encoding="utf-8") as fh:
+    with open(resolve_event_path(events_dir, motor_event), "r", encoding="utf-8") as fh:
         motor_payload = json.load(fh)
     assert motor_payload["internal_state"]["motor_feedback"] == {"pressure": 0.82}
 

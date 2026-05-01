@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
+from experience_storage import newest_event_paths
 from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json
 from language_processing import (
@@ -371,7 +372,7 @@ def load_recent_heard_words(
         scan_limit = max(1, int(event_scan_limit))
     except Exception:
         scan_limit = RECENT_EVENT_SCAN_LIMIT
-    paths = _newest_matching_paths(events_dir, "evt_*.json", scan_limit)
+    paths = newest_event_paths(events_dir, scan_limit)
     heard: List[Dict[str, str]] = []
 
     for path in paths:
