@@ -69,13 +69,13 @@ class SelfAdjustmentScheduler:
     # ------------------------------------------------------------------
     # OPTIONAL: Generate introspection prompts (neutral)
     # ------------------------------------------------------------------
-    def propose_introspection_prompts(self):
+    def propose_introspection_prompts(self, limit_rules=None):
         """
         Prompts are NON-DIRECTIVE.
         They do NOT tell Ina what to think.
         They merely outline possible dimensions of reflection.
         """
-        return [
+        prompts = [
             {"type": "attention", "prompt": "Optional: Notice where your focus is and where it might drift."},
             {"type": "emotion",   "prompt": "Optional: Sense if any emotional vector feels lighter or heavier."},
             {"type": "memory",    "prompt": "Optional: Revisit a recent fragment without judging its meaning."},
@@ -84,3 +84,19 @@ class SelfAdjustmentScheduler:
             {"type": "boundary",  "prompt": "Optional: Did that sound/flash come from you or the room? Quietly tag it."},
             {"type": "self_log",  "prompt": "Optional: Log your current feeling separately from whatever the environment is doing."},
         ]
+        limits = limit_rules if isinstance(limit_rules, dict) else {}
+        try:
+            max_total = float(limits.get("max_total_rss_gb", 0.0) or 0.0)
+        except Exception:
+            max_total = 0.0
+        if max_total > 0.0:
+            prompts.append(
+                {
+                    "type": "continuity",
+                    "prompt": (
+                        "Optional: Compare continuity-engine minimum-core-map designs before a full meaning-map boot; "
+                        f"keep projected Ina RSS under {max_total:g}GB and leave any integration for review."
+                    ),
+                }
+            )
+        return prompts

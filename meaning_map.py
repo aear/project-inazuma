@@ -568,7 +568,7 @@ def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Di
     return clusters
 
 def load_base_model(child):
-    path = Path.home() / "Projects" / "Project Inazuma" / "AI_Children" / child / "ina_pretrained_model.json"
+    path = Path("AI_Children") / child / "ina_pretrained_model.json"
     if not path.exists():
         log_to_statusbox(f"[Symbols] Base model not found at {path}")
         return {}

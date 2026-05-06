@@ -96,7 +96,11 @@ def register_discord_backend(
                     return
 
             try:
-                await channel.send(msg.text)
+                sender = getattr(client, "send_discord_message", None)
+                if sender:
+                    await sender(channel, msg.text, reason=f"comms:{msg.id}")
+                else:
+                    await channel.send(msg.text)
             except Exception:
                 logger.exception(
                     "Failed to send message %s to Discord channel %s",

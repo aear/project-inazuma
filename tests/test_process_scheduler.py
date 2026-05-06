@@ -387,6 +387,59 @@ def test_scheduler_blocks_task_when_total_rss_budget_would_be_exceeded():
     assert reason == "scheduler_total_rss_limit"
 
 
+def test_scheduler_resource_snapshot_uses_fresh_resource_vitals_rss_when_higher():
+    original_get = mm.get_inastate
+    original_tree_rss = mm._ina_process_tree_rss_gb
+    original_gpu = mm._scheduler_gpu_snapshot
+    try:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ina_ram_bytes": int(140 * (1024 ** 3)),
+            "top_modules": [{"name": "meaning_map.py", "ram_bytes": int(140 * (1024 ** 3))}],
+        }
+        mm.get_inastate = lambda key, default=None: payload if key == "resource_vitals" else default
+        mm._ina_process_tree_rss_gb = lambda: 12.0
+        mm._scheduler_gpu_snapshot = lambda track_gpu=True: {
+            "available": False,
+            "utilization_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_used_mb": 0.0,
+        }
+
+        resources = mm._scheduler_resource_snapshot(
+            memory_guard={"level": "normal", "ram_available_gb": 64.0},
+            limits=mm._process_scheduler_limits({"process_scheduler": {"track_gpu": False}}),
+        )
+
+        assert resources["ina_rss_gb"] == 140.0
+        assert resources["ina_rss_source"] == "resource_vitals"
+        assert "meaning_map.py" in resources["running_modules"]
+    finally:
+        mm.get_inastate = original_get
+        mm._ina_process_tree_rss_gb = original_tree_rss
+        mm._scheduler_gpu_snapshot = original_gpu
+
+
+def test_extract_resource_context_marks_meaning_map_over_scheduler_limit():
+    payload = {
+        "pressure_level": "hard",
+        "ina_ram_bytes": int(140 * (1024 ** 3)),
+        "top_modules": [{"name": "meaning_map.py", "ram_bytes": int(140 * (1024 ** 3)), "ram_human": "140.00 GB"}],
+        "process_scheduler": {
+            "max_total_rss_gb": 96.0,
+            "summary": "Ina RSS 140.0/96.0GB via vitals.",
+        },
+    }
+
+    context = mm._extract_resource_context(payload)
+
+    assert context["largest_module"] == "meaning_map.py"
+    assert context["largest_module_ram_gb"] == 140.0
+    assert context["ina_rss_gb"] == 140.0
+    assert context["over_scheduler_total_rss_limit"] is True
+    assert mm._should_request_continuity_core_map_proposal(context) is True
+
+
 def test_scheduler_blocks_task_when_managed_budget_would_be_exceeded():
     limits = mm._process_scheduler_limits({
         "process_scheduler": {

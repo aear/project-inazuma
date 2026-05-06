@@ -30,6 +30,13 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
+from storage_layout import fast_runtime_path
+from storage_vitals import sample_storage_vitals
+from operator_permissions import (
+    FAST_RUNTIME_PERMISSION_TYPE,
+    OPERATOR_PERMISSION_KEY,
+    attach_storage_permission_requests,
+)
 from github_submission import append_github_issue_entry, get_github_submission_config, labels_for_kind
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
@@ -149,10 +156,13 @@ _last_memory_queue_event_ts = 0.0
 _last_memory_queue_process_ts = 0.0
 _RUNTIME_HEARTBEAT_INTERVAL = 30.0
 _last_runtime_heartbeat = 0.0
+_STORAGE_VITALS_INTERVAL = 60.0
+_last_storage_vitals = 0.0
 _REFLECTION_JOURNAL_INTERVAL_SECONDS = 24 * 60 * 60
 _REFLECTION_JOURNAL_STATE_KEY = "reflection_journal_state"
 _PROCESS_SCHEDULER_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
 _PROCESS_SCHEDULER_TICK_INTERVAL = 5.0
+_RESOURCE_VITALS_STALE_SEC = 180.0
 _last_process_scheduler_tick = 0.0
 _scheduler_process_cpu_samples = {}
 _PROCESS_SCHEDULER_DEFAULTS = {
@@ -440,6 +450,52 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _parse_utc_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _resource_vitals_ram_gb(payload: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    bytes_value = max(0.0, _coerce_float(payload.get("ina_ram_bytes"), 0.0))
+    if bytes_value <= 0.0:
+        return 0.0
+    return round(bytes_value / (1024.0 ** 3), 3)
+
+
+def _resource_module_ram_gb(entry: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(entry, dict):
+        return 0.0
+    bytes_value = max(0.0, _coerce_float(entry.get("ram_bytes"), 0.0))
+    if bytes_value <= 0.0:
+        return 0.0
+    return round(bytes_value / (1024.0 ** 3), 3)
+
+
+def _fresh_resource_vitals(max_age_sec: float = _RESOURCE_VITALS_STALE_SEC) -> Dict[str, Any]:
+    payload = get_inastate("resource_vitals") or {}
+    if not isinstance(payload, dict):
+        return {}
+    timestamp = _parse_utc_datetime(payload.get("timestamp") or payload.get("updated_at"))
+    if timestamp is None:
+        return {}
+    age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    if age < 0:
+        age = 0.0
+    if max_age_sec > 0 and age > max_age_sec:
+        return {}
+    return payload
 
 
 def _ina_process_tree_rss_gb() -> float:
@@ -876,7 +932,7 @@ def _scheduler_entry_memory_usage_gb(entry: Dict[str, Any], limits: Optional[Dic
     return _scheduler_memory_estimate_gb(profile, limits)
 
 
-def _scheduler_memory_overview(state: Dict[str, Any], resources: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+def _scheduler_memory_overview(state: Dict[str, Any], resources: Dict[str, Any], limits: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     limits = limits or _process_scheduler_limits()
     running = state.get("running") if isinstance(state.get("running"), list) else []
     managed_running_rss_gb = round(
@@ -890,6 +946,9 @@ def _scheduler_memory_overview(state: Dict[str, Any], resources: Dict[str, Any],
         "max_total_rss_gb": round(max(0.0, _coerce_float(limits.get("max_total_rss_gb"), 0.0)), 3),
         "max_managed_rss_gb": round(max(0.0, _coerce_float(limits.get("max_managed_rss_gb"), 0.0)), 3),
         "min_available_gb": round(max(0.0, _coerce_float(limits.get("min_available_gb"), 0.0)), 3),
+        "ina_rss_source": str(resources.get("ina_rss_source") or "process_tree").strip() or "process_tree",
+        "ina_process_tree_rss_gb": round(max(0.0, _coerce_float(resources.get("ina_process_tree_rss_gb"), 0.0)), 3),
+        "resource_vitals_rss_gb": round(max(0.0, _coerce_float(resources.get("resource_vitals_rss_gb"), 0.0)), 3),
     }
 
 
@@ -1068,10 +1127,12 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
     max_total = memory.get("max_total_rss_gb", 0.0)
     managed_rss = memory.get("managed_running_rss_gb", 0.0)
     max_managed = memory.get("max_managed_rss_gb", 0.0)
+    rss_source = str(memory.get("ina_rss_source") or "process_tree").strip().lower() or "process_tree"
+    rss_suffix = " via vitals" if rss_source == "resource_vitals" else ""
     if max_total > 0:
-        summary_parts.append(f"Ina RSS {total_rss:.1f}/{max_total:.1f}GB")
+        summary_parts.append(f"Ina RSS {total_rss:.1f}/{max_total:.1f}GB{rss_suffix}")
     else:
-        summary_parts.append(f"Ina RSS {total_rss:.1f}GB")
+        summary_parts.append(f"Ina RSS {total_rss:.1f}GB{rss_suffix}")
     if max_managed > 0:
         summary_parts.append(f"managed {managed_rss:.1f}/{max_managed:.1f}GB")
     available_gb = memory.get("ram_available_gb", 0.0)
@@ -1115,6 +1176,9 @@ def _build_process_scheduler_summary(state: Dict[str, Any], limits: Optional[Dic
         "recent_activity": recent_activity[:12],
         "module_history": module_history[:8],
         "ina_rss_gb": round(total_rss, 3),
+        "ina_rss_source": rss_source,
+        "ina_process_tree_rss_gb": round(_coerce_float(memory.get("ina_process_tree_rss_gb"), 0.0), 3),
+        "resource_vitals_rss_gb": round(_coerce_float(memory.get("resource_vitals_rss_gb"), 0.0), 3),
         "managed_running_rss_gb": round(managed_rss, 3),
         "max_total_rss_gb": round(max_total, 3),
         "max_managed_rss_gb": round(max_managed, 3),
@@ -1148,6 +1212,10 @@ def _save_process_scheduler_state(state: Dict[str, Any], limits: Optional[Dict[s
         "max_cpu_heavy_tasks": int(limits.get("max_cpu_heavy_tasks", 2)),
         "max_gpu_tasks": int(limits.get("max_gpu_tasks", 1)),
         "memory_budget_enabled": bool(limits.get("memory_budget_enabled", True)),
+        "total_rss_gb": memory.get("total_rss_gb"),
+        "ina_rss_source": memory.get("ina_rss_source"),
+        "ina_process_tree_rss_gb": memory.get("ina_process_tree_rss_gb"),
+        "resource_vitals_rss_gb": memory.get("resource_vitals_rss_gb"),
         "max_total_rss_gb": memory.get("max_total_rss_gb"),
         "max_managed_rss_gb": memory.get("max_managed_rss_gb"),
         "managed_running_rss_gb": memory.get("managed_running_rss_gb"),
@@ -1234,10 +1302,26 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
         except Exception:
             cpu_percent = 0.0
     gpu = _scheduler_gpu_snapshot(track_gpu=bool(limits.get("track_gpu", True)))
+    tree_rss_gb = round(_ina_process_tree_rss_gb(), 3)
+    vitals = _fresh_resource_vitals()
+    vitals_rss_gb = _resource_vitals_ram_gb(vitals)
+    if vitals_rss_gb > tree_rss_gb:
+        ina_rss_gb = vitals_rss_gb
+        ina_rss_source = "resource_vitals"
+    else:
+        ina_rss_gb = tree_rss_gb
+        ina_rss_source = "process_tree"
+    running_modules = set(get_running_modules())
+    for item in (vitals.get("top_modules") if isinstance(vitals.get("top_modules"), list) else [])[:8]:
+        if isinstance(item, dict) and str(item.get("name") or "").strip():
+            running_modules.add(str(item.get("name")).strip())
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "memory_guard_level": str(guard_state.get("level") or "unknown").strip().lower() or "unknown",
-        "ina_rss_gb": round(_ina_process_tree_rss_gb(), 3),
+        "ina_rss_gb": round(ina_rss_gb, 3),
+        "ina_rss_source": ina_rss_source,
+        "ina_process_tree_rss_gb": tree_rss_gb,
+        "resource_vitals_rss_gb": round(vitals_rss_gb, 3),
         "ram_available_gb": round(max(0.0, _coerce_float(guard_state.get("ram_available_gb"), 0.0)), 3),
         "ram_used_gb": round(max(0.0, _coerce_float(guard_state.get("ram_used_gb"), 0.0)), 3),
         "ram_percent": round(max(0.0, _coerce_float(guard_state.get("ram_percent"), 0.0)), 1),
@@ -1247,7 +1331,12 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
         "gpu_utilization_percent": round(float(gpu.get("utilization_percent", 0.0) or 0.0), 1),
         "gpu_memory_percent": round(float(gpu.get("memory_percent", 0.0) or 0.0), 1),
         "gpu_memory_used_mb": round(float(gpu.get("memory_used_mb", 0.0) or 0.0), 1),
-        "running_modules": get_running_modules(),
+        "running_modules": sorted(running_modules),
+        "resource_vitals_timestamp": vitals.get("timestamp") or vitals.get("updated_at"),
+        "resource_vitals_top_modules": [
+            item for item in (vitals.get("top_modules") if isinstance(vitals.get("top_modules"), list) else [])[:6]
+            if isinstance(item, dict)
+        ],
     }
 
 
@@ -2994,6 +3083,82 @@ def _maybe_update_runtime_heartbeat() -> None:
         return
     update_inastate("runtime_heartbeat", datetime.now(timezone.utc).isoformat())
     _last_runtime_heartbeat = now
+    _maybe_update_storage_vitals(now=now)
+
+
+_OPERATOR_PERMISSION_RESPONSE_STATUSES = {
+    "approved_pending_manual_execution",
+    "denied_by_operator",
+}
+
+
+def _merge_operator_permission_response(permission_request: Dict[str, Any]) -> Dict[str, Any]:
+    existing = get_inastate(OPERATOR_PERMISSION_KEY)
+    if not isinstance(existing, dict):
+        return permission_request
+    if existing.get("id") != permission_request.get("id"):
+        return permission_request
+
+    existing_response = existing.get("operator_response")
+    has_decision = (
+        isinstance(existing_response, dict)
+        and str(existing_response.get("decision") or "").strip().lower() in {"approved", "denied"}
+    )
+    sticky_status = str(existing.get("status") or "") in _OPERATOR_PERMISSION_RESPONSE_STATUSES
+    if not has_decision and not sticky_status:
+        return permission_request
+
+    merged = dict(permission_request)
+    merged["status"] = existing.get("status") or merged.get("status")
+    merged["created_at"] = existing.get("created_at") or merged.get("created_at")
+    merged["operator_response"] = existing_response or merged.get("operator_response")
+    if isinstance(existing.get("feedback"), dict):
+        merged["feedback"] = existing["feedback"]
+    merged["last_detected_at"] = permission_request.get("created_at")
+    return merged
+
+
+def _maybe_update_storage_vitals(*, now: Optional[float] = None, force: bool = False) -> None:
+    global _last_storage_vitals
+    sample_now = time.time() if now is None else float(now)
+    if not force and _last_storage_vitals and (sample_now - _last_storage_vitals) < _STORAGE_VITALS_INTERVAL:
+        return
+
+    permission_request = None
+    try:
+        cfg = load_config()
+        payload = sample_storage_vitals(CHILD, cfg)
+        permission_request = attach_storage_permission_requests(payload, CHILD, cfg)
+    except Exception as exc:
+        payload = {
+            "available": False,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+        }
+
+    if permission_request is not None:
+        permission_request = _merge_operator_permission_response(permission_request)
+        if isinstance(payload, dict):
+            payload["operator_permission_requests"] = [permission_request]
+            summary = payload.setdefault("summary", {})
+            if isinstance(summary, dict):
+                summary["pending_operator_permission_count"] = 1
+                summary["pending_operator_permission_types"] = [permission_request.get("request_type")]
+
+    update_inastate("storage_vitals", payload)
+    if permission_request is not None:
+        update_inastate(OPERATOR_PERMISSION_KEY, permission_request)
+    else:
+        try:
+            existing_request = get_inastate(OPERATOR_PERMISSION_KEY)
+            if (
+                isinstance(existing_request, dict)
+                and existing_request.get("request_type") == FAST_RUNTIME_PERMISSION_TYPE
+            ):
+                update_inastate(OPERATOR_PERMISSION_KEY, None)
+        except Exception:
+            pass
+    _last_storage_vitals = sample_now
 
 
 def increment_inastate_metric(metric: str, amount: int = 1):
@@ -3310,6 +3475,108 @@ def queue_github_patch_attempt(
     )
 
 
+def _should_request_continuity_core_map_proposal(resource_context: Dict[str, Any]) -> bool:
+    largest_module = str(resource_context.get("largest_module") or "").strip().lower()
+    if largest_module not in {"meaning_map.py", "meaning_map"}:
+        return False
+    max_total = _coerce_float(resource_context.get("scheduler_max_total_rss_gb"), 0.0)
+    if max_total <= 0.0:
+        return False
+    largest_ram = _coerce_float(resource_context.get("largest_module_ram_gb"), 0.0)
+    ina_rss = _coerce_float(resource_context.get("ina_rss_gb"), 0.0)
+    return bool(largest_ram > max_total or ina_rss > max_total)
+
+
+def _format_continuity_core_map_options(proposal: Dict[str, Any]) -> str:
+    options = proposal.get("options") if isinstance(proposal.get("options"), list) else []
+    lines = [
+        "Ask Ina to compare these continuity-engine integration methods and return a recommendation before code changes:"
+    ]
+    for index, option in enumerate([item for item in options if isinstance(item, dict)][:3], 1):
+        title = str(option.get("title") or option.get("id") or f"Option {index}").strip()
+        method = str(option.get("method") or "").strip()
+        memory_profile = str(option.get("memory_profile") or "").strip()
+        line = f"{index}. {title}"
+        if method:
+            line += f": {method}"
+        if memory_profile:
+            line += f" Memory profile: {memory_profile}."
+        lines.append(line)
+    limit_rules = proposal.get("limit_rules") if isinstance(proposal.get("limit_rules"), dict) else {}
+    max_total = _coerce_float(limit_rules.get("max_total_rss_gb"), 0.0)
+    if max_total > 0.0:
+        lines.append(f"All options must keep normal-boot projected Ina RSS under {max_total:g}GB.")
+    lines.append("This is proposal-only; do not directly patch meaning_map.py from the disruption report.")
+    return "\n".join(lines)
+
+
+def _continuity_core_map_review_payload(
+    resource_context: Dict[str, Any],
+    guard_level: str,
+    limits: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    limits = limits or _process_scheduler_limits()
+    trigger = {
+        "source": "resource_vitals",
+        "largest_module": resource_context.get("largest_module"),
+        "largest_module_ram_gb": resource_context.get("largest_module_ram_gb"),
+        "ina_rss_gb": resource_context.get("ina_rss_gb"),
+        "memory_guard_level": guard_level,
+        "note": "meaning_map exceeded scheduler total RSS budget after a runtime disruption",
+    }
+    try:
+        proposal = continuity_manager.propose_minimum_core_map_integration(
+            limit_rules={
+                "max_total_rss_gb": limits.get("max_total_rss_gb"),
+                "max_managed_rss_gb": limits.get("max_managed_rss_gb"),
+                "min_available_gb": limits.get("min_available_gb"),
+                "memory_estimate_high_gb": limits.get("memory_estimate_high_gb"),
+            },
+            trigger=trigger,
+        )
+    except Exception:
+        proposal = {
+            "status": "proposal_requested",
+            "review_required": True,
+            "trigger": trigger,
+            "limit_rules": {
+                "max_total_rss_gb": limits.get("max_total_rss_gb"),
+                "max_managed_rss_gb": limits.get("max_managed_rss_gb"),
+                "min_available_gb": limits.get("min_available_gb"),
+            },
+            "options": [],
+        }
+
+    max_total = _coerce_float(limits.get("max_total_rss_gb"), 96.0)
+    largest_ram = _coerce_float(resource_context.get("largest_module_ram_gb"), 0.0)
+    ina_rss = _coerce_float(resource_context.get("ina_rss_gb"), 0.0)
+    problem = (
+        f"`meaning_map.py` is reported as the dominant RAM holder at {largest_ram:.1f}GB, "
+        f"with Ina RSS around {ina_rss:.1f}GB against the scheduler total limit of {max_total:.1f}GB. "
+        "Because this followed a runtime disruption, request proposal options for using the continuity engine "
+        "as a minimum core map for normal boots instead of directly fixing the disrupted map."
+    )
+    return {
+        "title": "Proposal request: continuity engine as minimum boot core map",
+        "problem": problem,
+        "suggestion": _format_continuity_core_map_options(proposal),
+        "touched_files": ["continuity_manager.py", "model_manager.py", "meaning_map.py", "self_adjusment_scheduler.py"],
+        "review_notes": [
+            "Human review required before implementation.",
+            f"Normal boot must respect max_total_rss_gb={max_total:.1f}.",
+            "Do not treat this as approval to directly rewrite or expand meaning_map.py.",
+            "Prefer a bounded continuity core map that can boot without a corpus-wide scan.",
+        ],
+        "metadata": {
+            "source": "resource_vitals",
+            "proposal_type": "continuity_core_map_boot",
+            "memory_guard_level": guard_level,
+            "largest_module": resource_context.get("largest_module"),
+            "continuity_core_map_proposal": proposal,
+        },
+    }
+
+
 def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, Any]] = None) -> Optional[str]:
     cfg = load_config()
     policy = get_github_submission_config(cfg)
@@ -3340,11 +3607,13 @@ def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, An
         return None
 
     largest_module = str(resource_context.get("largest_module") or "runtime").strip() or "runtime"
+    continuity_proposal_mode = _should_request_continuity_core_map_proposal(resource_context)
     optimization_hint = str(resource_context.get("optimization_hint") or "").strip()
     summary = str(resource_context.get("summary") or "").strip()
     trend_summary = str(resource_context.get("trend_summary") or "").strip()
     fingerprint_basis = "|".join(
         [
+            "continuity_core_map" if continuity_proposal_mode else "optimization",
             guard_level,
             str(round(trend_pressure, 3)),
             str(round(current_pressure, 3)),
@@ -3362,23 +3631,17 @@ def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, An
         if last_ts and (now - last_ts) < cooldown_sec:
             return None
 
-    title = f"Optimisation request: {largest_module} is driving RAM pressure"
-    problem_lines = [
-        f"I am seeing sustained RAM pressure centered on `{largest_module}`.",
-        f"Current pressure level: `{resource_context.get('pressure_level', 'unknown')}`.",
-        f"Trend: short=`{short_direction}`, long=`{long_direction}`.",
-    ]
-    if summary:
-        problem_lines.append(summary)
-    if trend_summary:
-        problem_lines.append(trend_summary)
-    problem = " ".join(line for line in problem_lines if line)
-
     evidence = [
         f"resource trend pressure={trend_pressure:.3f}",
         f"current pressure={current_pressure:.3f}",
         f"largest module={largest_module} ({resource_context.get('largest_module_ram') or 'unknown RAM'})",
     ]
+    max_total = _coerce_float(resource_context.get("scheduler_max_total_rss_gb"), 0.0)
+    ina_rss = _coerce_float(resource_context.get("ina_rss_gb"), 0.0)
+    if max_total > 0.0:
+        evidence.append(f"scheduler total RSS limit={max_total:.1f} GB")
+    if ina_rss > 0.0:
+        evidence.append(f"reported Ina RSS={ina_rss:.1f} GB")
     if resource_context.get("short_ram_delta_gb"):
         evidence.append(f"short RAM delta={resource_context.get('short_ram_delta_gb')} GB")
     if resource_context.get("long_ram_delta_gb"):
@@ -3404,29 +3667,62 @@ def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, An
     if largest_module.endswith(".py") and largest_module not in touched_files:
         touched_files.insert(0, largest_module)
 
-    review_notes = [
-        "Human review required before merge or execution.",
-        "Prefer profiling or bounded changes over broad deletions.",
-        "If a patch is proposed later, review it as a draft, not as an approved fix.",
-    ]
-    if guard_level in {"soft", "hard"}:
-        review_notes.append(f"memory_guard level is currently {guard_level}.")
+    if continuity_proposal_mode:
+        limits = _process_scheduler_limits(cfg)
+        proposal_payload = _continuity_core_map_review_payload(resource_context, guard_level, limits)
+        title = proposal_payload["title"]
+        problem = proposal_payload["problem"]
+        suggestion = proposal_payload["suggestion"]
+        touched_files = proposal_payload["touched_files"]
+        review_notes = proposal_payload["review_notes"]
+        metadata = proposal_payload["metadata"]
+        entry_id = queue_github_feature_request(
+            title,
+            problem,
+            submission_mode="explain",
+            suggestion=suggestion,
+            evidence=evidence,
+            touched_files=touched_files,
+            review_notes=review_notes,
+            confidence=max(trend_pressure, current_pressure),
+            metadata=metadata,
+        )
+    else:
+        title = f"Optimisation request: {largest_module} is driving RAM pressure"
+        problem_lines = [
+            f"I am seeing sustained RAM pressure centered on `{largest_module}`.",
+            f"Current pressure level: `{resource_context.get('pressure_level', 'unknown')}`.",
+            f"Trend: short=`{short_direction}`, long=`{long_direction}`.",
+        ]
+        if summary:
+            problem_lines.append(summary)
+        if trend_summary:
+            problem_lines.append(trend_summary)
+        problem = " ".join(line for line in problem_lines if line)
 
-    entry_id = queue_github_optimization_request(
-        title,
-        problem,
-        submission_mode="explain",
-        suggestion=optimization_hint or "Please inspect the dominant RAM holder and propose a bounded optimisation path.",
-        evidence=evidence,
-        touched_files=touched_files,
-        review_notes=review_notes,
-        confidence=max(trend_pressure, current_pressure),
-        metadata={
-            "source": "resource_vitals",
-            "memory_guard_level": guard_level,
-            "largest_module": largest_module,
-        },
-    )
+        review_notes = [
+            "Human review required before merge or execution.",
+            "Prefer profiling or bounded changes over broad deletions.",
+            "If a patch is proposed later, review it as a draft, not as an approved fix.",
+        ]
+        if guard_level in {"soft", "hard"}:
+            review_notes.append(f"memory_guard level is currently {guard_level}.")
+
+        entry_id = queue_github_optimization_request(
+            title,
+            problem,
+            submission_mode="explain",
+            suggestion=optimization_hint or "Please inspect the dominant RAM holder and propose a bounded optimisation path.",
+            evidence=evidence,
+            touched_files=touched_files,
+            review_notes=review_notes,
+            confidence=max(trend_pressure, current_pressure),
+            metadata={
+                "source": "resource_vitals",
+                "memory_guard_level": guard_level,
+                "largest_module": largest_module,
+            },
+        )
     if not entry_id:
         return None
 
@@ -3849,6 +4145,24 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
         if str(item.get("decision") or "").strip().lower() == "blocked"
     ]
     scheduler_last_block = scheduler_blocked[-1] if scheduler_blocked else {}
+    scheduler_limits = _process_scheduler_limits()
+    ina_rss_gb = _resource_vitals_ram_gb(payload)
+    scheduler_ina_rss = _coerce_float(scheduler.get("ina_rss_gb"), 0.0)
+    if scheduler_ina_rss > ina_rss_gb:
+        ina_rss_gb = round(scheduler_ina_rss, 3)
+    largest_module_ram_gb = _resource_module_ram_gb(largest)
+    scheduler_max_total = _coerce_float(
+        scheduler.get("max_total_rss_gb"),
+        _coerce_float(scheduler_limits.get("max_total_rss_gb"), 0.0),
+    )
+    scheduler_max_managed = _coerce_float(
+        scheduler.get("max_managed_rss_gb"),
+        _coerce_float(scheduler_limits.get("max_managed_rss_gb"), 0.0),
+    )
+    scheduler_min_available = _coerce_float(
+        scheduler.get("min_available_gb"),
+        _coerce_float(scheduler_limits.get("min_available_gb"), 0.0),
+    )
 
     return {
         "available": bool(payload),
@@ -3867,9 +4181,18 @@ def _extract_resource_context(resource_vitals: Optional[Dict[str, Any]] = None) 
         "top_cpu_modules": top_cpu_modules,
         "largest_module": str(largest.get("name") or ""),
         "largest_module_ram": str(largest.get("ram_human") or ""),
+        "largest_module_ram_gb": round(largest_module_ram_gb, 3),
         "hottest_module": str(hottest.get("name") or ""),
         "hottest_module_cpu_percent": round(_coerce_float(hottest.get("cpu_percent"), 0.0), 1) if hottest else 0.0,
         "samples": int(_coerce_float(trend.get("samples"), 0.0)),
+        "ina_rss_gb": round(ina_rss_gb, 3),
+        "scheduler_max_total_rss_gb": round(max(0.0, scheduler_max_total), 3),
+        "scheduler_max_managed_rss_gb": round(max(0.0, scheduler_max_managed), 3),
+        "scheduler_min_available_gb": round(max(0.0, scheduler_min_available), 3),
+        "over_scheduler_total_rss_limit": bool(scheduler_max_total > 0.0 and ina_rss_gb > scheduler_max_total),
+        "largest_module_over_total_rss_limit": bool(
+            scheduler_max_total > 0.0 and largest_module_ram_gb > scheduler_max_total
+        ),
         "scheduler_available": bool(scheduler),
         "scheduler_summary": scheduler_summary,
         "scheduler_learning_hint": scheduler_learning_hint,
@@ -3958,7 +4281,14 @@ _last_deep_recall_snapshot: Optional[Dict[str, Any]] = None
 
 
 def _memory_index_db_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "memory_map.sqlite"
+    fallback = Path("AI_Children") / child / "memory" / "memory_map.sqlite"
+    return fast_runtime_path(
+        child,
+        "memory_map.sqlite",
+        fallback,
+        subdir="index",
+        root_keys=("fast_index_root", "fast_runtime_root", "fast_root"),
+    )
 
 
 def _memory_index_db_is_current(json_path: Path, db_path: Path) -> bool:
@@ -5065,7 +5395,7 @@ def _check_self_adjustment():
     """
     global _last_opportunities
     opportunities = adjustment_scheduler.check_opportunities()
-    prompts = adjustment_scheduler.propose_introspection_prompts()
+    prompts = adjustment_scheduler.propose_introspection_prompts(_process_scheduler_limits())
 
     update_inastate("self_adjustment_opportunities", opportunities)
     update_inastate("introspection_prompts", prompts)
@@ -8386,6 +8716,13 @@ def _update_machine_semantics():
     reasons = sorted(reasons, key=lambda r: r["pressure"] * r["weight"], reverse=True)
     importance_score = _clamp01(total_contrib / max(total_weight, 1.0), default=0.0)
 
+    storage_context = get_inastate("storage_vitals") or {}
+    if not isinstance(storage_context, dict):
+        storage_context = {}
+    storage_permission_request = get_inastate(OPERATOR_PERMISSION_KEY)
+    if not isinstance(storage_permission_request, dict):
+        storage_permission_request = None
+
     machine_semantics = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "scaffold_version": scaffold.get("version", 1),
@@ -8409,6 +8746,15 @@ def _update_machine_semantics():
                 "next_slots": resource_context.get("scheduler_next_slots"),
                 "last_block_reason": resource_context.get("scheduler_last_block_reason"),
             },
+        },
+        "storage_context": {
+            "available": storage_context.get("available", False),
+            "updated_at": storage_context.get("updated_at"),
+            "directory_entry_soft_limit": storage_context.get("directory_entry_soft_limit"),
+            "summary": storage_context.get("summary"),
+            "roles": storage_context.get("roles"),
+            "operator_permission_requests": storage_context.get("operator_permission_requests"),
+            "operator_permission_request": storage_permission_request,
         },
         "why_it_matters": {
             "score": round(importance_score, 3),

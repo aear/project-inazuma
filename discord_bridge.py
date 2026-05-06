@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -15,7 +16,20 @@ try:
 except Exception:
     fcntl = None  # type: ignore
 
-import discord
+try:
+    import discord
+except ModuleNotFoundError as exc:
+    if exc.name == "audioop":
+        raise RuntimeError(
+            "Python 3.13 removed the stdlib audioop module. Install dependencies from "
+            "requirements.txt so audioop-lts is available for Discord voice support."
+        ) from exc
+    if exc.name == "discord":
+        raise RuntimeError(
+            "Discord support is not installed. Run `python -m pip install -r requirements.txt` "
+            "to install py-cord[voice] and its voice dependencies."
+        ) from exc
+    raise
 
 from comms_core import CommsCore, CommsResponse, load_secret
 from backend_discord import (
@@ -81,6 +95,10 @@ IMAGE_ATTACHMENT_MIME_MAP = {
 }
 DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT = 4
+AUDIO_ATTACHMENT_EXTENSIONS = {".wav", ".mp3", ".ogg", ".opus", ".flac", ".m4a", ".aac"}
+DEFAULT_DISCORD_SEND_INTERVAL_SECONDS = 0.35
+DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS = 0.25
+DEFAULT_DISCORD_SEND_RETRIES = 3
 
 _DISCORD_BRIDGE_LOCK_HANDLE = None
 
@@ -228,6 +246,22 @@ def get_voice_io_config() -> dict:
     }
 
 
+def _coerce_nonnegative_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    return parsed if parsed >= 0.0 else default
+
+
+def _coerce_positive_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def get_outbox_policy() -> dict:
     cfg = get_discord_config()
     policy = cfg.get("outbox_policy") if isinstance(cfg, dict) else None
@@ -237,6 +271,9 @@ def get_outbox_policy() -> dict:
         "archive_path": None,
         "flush_burst": 24,
         "flush_stale_mode": "drop",
+        "min_send_interval_seconds": DEFAULT_DISCORD_SEND_INTERVAL_SECONDS,
+        "rate_limit_padding_seconds": DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS,
+        "max_send_retries": DEFAULT_DISCORD_SEND_RETRIES,
     }
     if not isinstance(policy, dict):
         return defaults
@@ -260,6 +297,24 @@ def get_outbox_policy() -> dict:
             )
     stale_mode = str(policy.get("flush_stale_mode") or defaults["flush_stale_mode"]).strip().lower() or defaults["flush_stale_mode"]
     result["flush_stale_mode"] = stale_mode if stale_mode in {"drop", "archive"} else defaults["flush_stale_mode"]
+    interval_raw = policy.get("min_send_interval_seconds", policy.get("send_interval_seconds"))
+    if interval_raw is not None:
+        result["min_send_interval_seconds"] = _coerce_nonnegative_float(
+            interval_raw,
+            defaults["min_send_interval_seconds"],
+        )
+    padding_raw = policy.get("rate_limit_padding_seconds")
+    if padding_raw is not None:
+        result["rate_limit_padding_seconds"] = _coerce_nonnegative_float(
+            padding_raw,
+            defaults["rate_limit_padding_seconds"],
+        )
+    retry_raw = policy.get("max_send_retries")
+    if retry_raw is not None:
+        result["max_send_retries"] = _coerce_positive_int(
+            retry_raw,
+            defaults["max_send_retries"],
+        )
     archive_path = policy.get("archive_path")
     if archive_path:
         result["archive_path"] = str(archive_path)
@@ -452,6 +507,44 @@ def _coerce_int(value):
         return None
 
 
+def _header_float(headers, key: str) -> Optional[float]:
+    if not headers:
+        return None
+    try:
+        raw = headers.get(key)
+    except Exception:
+        raw = None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _discord_retry_after(exc: Exception) -> Optional[float]:
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    for header_name in ("Retry-After", "X-RateLimit-Reset-After"):
+        parsed = _header_float(headers, header_name)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _attachment_path_is_audio(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    return Path(path).suffix.lower() in AUDIO_ATTACHMENT_EXTENSIONS
+
+
 def _find_channel_by_name(client: discord.Client, name: str, channel_type) -> discord.abc.GuildChannel | None:
     """
     Search across all guilds the bot can see to find a channel by exact name and type.
@@ -502,6 +595,7 @@ def resolve_configured_channels(client: discord.Client):
 
 DEFAULT_OWNER_ID = 123456789012345678  # <-- replace via config.json -> discord.owner_user_id
 VOICE_JOIN_COMMANDS = {"/ina join", "/ina voice", "/ina voice join", "/ina join voice"}
+VOICE_LEAVE_COMMANDS = {"/ina leave", "/ina voice leave", "/ina leave voice", "/ina stop voice"}
 
 
 def _resolve_primary_user_id() -> int:
@@ -744,6 +838,9 @@ class InaDiscordClient(discord.Client):
         self._typed_archive_path = Path(archive_override) if archive_override else child_memory / "typed_outbox_archive.jsonl"
         self._typed_outbox_seen = set()
         self._typed_outbox_history_offset = 0
+        self._discord_send_lock = asyncio.Lock()
+        self._next_discord_send_at = 0.0
+        self._voice_playback_lock = asyncio.Lock()
         self._load_outbox_history()
         self._typed_outbox_task = None
 
@@ -804,6 +901,9 @@ class InaDiscordClient(discord.Client):
             if lower in VOICE_JOIN_COMMANDS:
                 await self._handle_voice_join(message)
                 return
+            if lower in VOICE_LEAVE_COMMANDS:
+                await self._handle_voice_leave(message)
+                return
             image_attachments = await self._ingest_image_attachments(message)
             self._route_to_comms(
                 message,
@@ -822,6 +922,9 @@ class InaDiscordClient(discord.Client):
 
         if lower in VOICE_JOIN_COMMANDS:
             await self._handle_voice_join(message)
+            return
+        if lower in VOICE_LEAVE_COMMANDS:
+            await self._handle_voice_leave(message)
             return
         if lower in {"/ina learn history", "/ina history learn"} and message.author.id == SAKURA_USER_ID:
             await message.channel.send("Scanning recent history for language training...")
@@ -890,6 +993,10 @@ class InaDiscordClient(discord.Client):
         if not completed and not terminal:
             await asyncio.sleep(1.0)
             await _attempt_join("after reset")
+
+    async def _handle_voice_leave(self, message: discord.Message) -> None:
+        await self._reset_voice_client()
+        await message.channel.send("Left voice channel.")
 
     async def _ingest_image_attachments(self, message: discord.Message) -> list[dict]:
         level = get_memory_guard_level()
@@ -1295,6 +1402,157 @@ class InaDiscordClient(discord.Client):
         if entry_id:
             self._log_outbox_history(entry_id, "archived", reason=reason)
 
+    async def _pace_discord_send(self) -> None:
+        interval = _coerce_nonnegative_float(
+            self._outbox_policy.get("min_send_interval_seconds"),
+            DEFAULT_DISCORD_SEND_INTERVAL_SECONDS,
+        )
+        async with self._discord_send_lock:
+            now = time.monotonic()
+            wait_for = self._next_discord_send_at - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._next_discord_send_at = time.monotonic() + interval
+
+    async def send_discord_message(
+        self,
+        destination,
+        text: str,
+        *,
+        file_factory=None,
+        reason: str = "message",
+    ) -> bool:
+        """
+        Send a Discord message with local pacing and 429-aware retries.
+
+        py-cord already handles ordinary route buckets internally. This wrapper
+        adds a small app-level gate for our outbox flushes and honors retry
+        headers if Discord still returns a 429 or transient server error.
+        """
+        retries = _coerce_positive_int(
+            self._outbox_policy.get("max_send_retries"),
+            DEFAULT_DISCORD_SEND_RETRIES,
+        )
+        padding = _coerce_nonnegative_float(
+            self._outbox_policy.get("rate_limit_padding_seconds"),
+            DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS,
+        )
+        attempts = retries + 1
+        for attempt in range(1, attempts + 1):
+            file = None
+            try:
+                await self._pace_discord_send()
+                file = file_factory() if file_factory else None
+                await destination.send(text, file=file)
+                return True
+            except discord.HTTPException as exc:
+                status = getattr(exc, "status", None)
+                retry_after = _discord_retry_after(exc)
+                retryable = status == 429 or (isinstance(status, int) and 500 <= status < 600)
+                if not retryable or attempt >= attempts:
+                    logger.exception(
+                        "Discord send failed for %s after %s/%s attempts (status=%s).",
+                        reason,
+                        attempt,
+                        attempts,
+                        status,
+                    )
+                    return False
+                delay = (retry_after if retry_after is not None else min(2 ** attempt, 30.0)) + padding
+                logger.warning(
+                    "Discord send for %s hit status %s; retrying in %.2fs (attempt %s/%s).",
+                    reason,
+                    status,
+                    delay,
+                    attempt,
+                    attempts,
+                )
+                await asyncio.sleep(delay)
+            except Exception:
+                logger.exception("Discord send failed for %s.", reason)
+                return False
+            finally:
+                if file is not None:
+                    try:
+                        file.close()
+                    except Exception:
+                        pass
+        return False
+
+    def _entry_wants_voice_playback(self, entry: dict, attachment_path: Optional[str]) -> bool:
+        if not _attachment_path_is_audio(attachment_path):
+            return False
+        cfg = get_discord_config()
+        if cfg.get("voice_playback_enabled") is False:
+            return False
+        metadata = entry.get("metadata") if isinstance(entry, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("voice_target") or metadata.get("delivery") == "discord_voice":
+            return True
+        if cfg.get("prefer_voice_for_sounds") and metadata.get("source") in {
+            "symbol_sequence",
+            "word_hint",
+            "early_comm",
+        }:
+            return True
+        return bool(cfg.get("voice_play_all_audio_attachments", False))
+
+    async def _maybe_play_voice_attachment(self, entry: dict, attachment_path: Optional[str]) -> bool:
+        if not self._entry_wants_voice_playback(entry, attachment_path):
+            return False
+        path = Path(str(attachment_path))
+        if not path.exists() or not path.is_file():
+            logger.warning("Voice attachment missing for entry %s: %s", entry.get("id"), attachment_path)
+            return False
+
+        ffmpeg_audio = getattr(discord, "FFmpegPCMAudio", None)
+        if ffmpeg_audio is None:
+            logger.warning("Discord FFmpegPCMAudio unavailable; cannot play %s into voice.", path)
+            return False
+
+        if self.voice_channel is None:
+            _text_channel, self.voice_channel = resolve_configured_channels(self)
+        if self.voice_channel is None:
+            logger.warning("No configured voice channel available for voice attachment %s.", path)
+            return False
+
+        cfg = get_discord_config()
+        timeout = _coerce_nonnegative_float(cfg.get("voice_playback_timeout_seconds"), 120.0) or 120.0
+        async with self._voice_playback_lock:
+            try:
+                voice_client = await self.ensure_voice_connected(self.voice_channel)
+                while voice_client.is_playing() or voice_client.is_paused():
+                    await asyncio.sleep(0.25)
+
+                loop = asyncio.get_running_loop()
+                done = loop.create_future()
+
+                def _after_playback(error):
+                    def _finish():
+                        if not done.done():
+                            done.set_result(error)
+
+                    loop.call_soon_threadsafe(_finish)
+
+                source = ffmpeg_audio(str(path), before_options="-nostdin", options="-vn")
+                voice_client.play(source, after=_after_playback)
+                error = await asyncio.wait_for(done, timeout=timeout)
+                if error:
+                    logger.warning("Voice playback failed for %s: %s", path, error)
+                    return False
+                logger.info("Played Discord voice attachment %s for entry %s.", path, entry.get("id"))
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("Timed out playing Discord voice attachment %s.", path)
+                try:
+                    if self.voice_client and self.voice_client.is_playing():
+                        self.voice_client.stop()
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception("Failed to play Discord voice attachment %s.", path)
+        return False
+
     async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:
         text = entry.get("text")
         allow_empty = bool(entry.get("allow_empty"))
@@ -1326,15 +1584,19 @@ class InaDiscordClient(discord.Client):
         channel_id = entry.get("channel_id")
         target_user_id = entry.get("user_id")
         sent = False
+        voice_played = await self._maybe_play_voice_attachment(entry, attachment_path)
 
         async def _send_dm(user_id: int) -> bool:
             try:
                 user = self.get_user(user_id) or await self.fetch_user(user_id)
                 if not user:
                     return False
-                file = _build_file()
-                await user.send(text_str, file=file)
-                return True
+                return await self.send_discord_message(
+                    user,
+                    text_str,
+                    file_factory=_build_file if attachment_path else None,
+                    reason=f"typed_outbox:{entry.get('id')}:dm",
+                )
             except Exception:
                 logger.exception("Failed to DM user %s for typed outbox entry %s", user_id, entry.get("id"))
                 return False
@@ -1369,9 +1631,12 @@ class InaDiscordClient(discord.Client):
             try:
                 channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
                 if channel:
-                    file = _build_file()
-                    await channel.send(text_str, file=file)
-                    sent = True
+                    sent = await self.send_discord_message(
+                        channel,
+                        text_str,
+                        file_factory=_build_file if attachment_path else None,
+                        reason=f"typed_outbox:{entry.get('id')}:channel",
+                    )
             except Exception:
                 logger.exception(
                     "Failed to send typed outbox entry %s to channel %s", entry.get("id"), channel_id
@@ -1379,19 +1644,23 @@ class InaDiscordClient(discord.Client):
 
         if not sent and target == "text_channel" and self.text_channel:
             try:
-                file = _build_file()
-                await self.text_channel.send(text_str, file=file)
-                sent = True
+                sent = await self.send_discord_message(
+                    self.text_channel,
+                    text_str,
+                    file_factory=_build_file if attachment_path else None,
+                    reason=f"typed_outbox:{entry.get('id')}:configured_text",
+                )
             except Exception:
                 logger.exception(
                     "Failed to send typed outbox entry %s to configured text channel", entry.get("id")
                 )
 
-        if sent:
+        if sent or voice_played:
             logger.info(
-                "Delivered typed outbox entry %s (target=%s, meta=%s)",
+                "Delivered typed outbox entry %s (target=%s, voice_played=%s, meta=%s)",
                 entry.get("id"),
                 target,
+                voice_played,
                 entry.get("metadata"),
             )
             entry_id = entry.get("id")
@@ -1399,7 +1668,7 @@ class InaDiscordClient(discord.Client):
                 self._log_outbox_history(str(entry_id), "sent")
         else:
             logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
-        return sent
+        return sent or voice_played
 
     async def _watch_typed_outbox(self):
         while not self.is_closed():

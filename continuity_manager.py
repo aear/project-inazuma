@@ -105,6 +105,115 @@ class ContinuityManager:
         self._save_fingerprint(current_fp)
         return status
 
+    def propose_minimum_core_map_integration(
+        self,
+        *,
+        limit_rules: Optional[Dict[str, object]] = None,
+        trigger: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        """
+        Return review-only options for using continuity as a bounded boot core.
+
+        This intentionally does not mutate the meaning map. It gives Ina a few
+        low-memory integration paths to compare before a human chooses one.
+        """
+        raw_limits = limit_rules if isinstance(limit_rules, dict) else {}
+        max_total = _safe_float(raw_limits.get("max_total_rss_gb"), 96.0)
+        if max_total <= 0.0:
+            max_total = 96.0
+        max_managed = _safe_float(raw_limits.get("max_managed_rss_gb"), 0.0)
+        min_available = _safe_float(raw_limits.get("min_available_gb"), 8.0)
+        memory_estimate_high = _safe_float(raw_limits.get("memory_estimate_high_gb"), 12.0)
+        trigger_payload = trigger if isinstance(trigger, dict) else {}
+
+        return {
+            "generated_at": _now_iso(),
+            "child": self.child,
+            "status": "proposal_only",
+            "review_required": True,
+            "purpose": "Use the continuity engine as a minimum boot core map before full meaning-map refreshes.",
+            "trigger": trigger_payload,
+            "limit_rules": {
+                "max_total_rss_gb": round(max_total, 3),
+                "max_managed_rss_gb": round(max_managed, 3),
+                "min_available_gb": round(min_available, 3),
+                "memory_estimate_high_gb": round(memory_estimate_high, 3),
+                "normal_boot_memory_class": "low",
+                "hard_rule": (
+                    "Do not start or continue a full meaning-map refresh when current or projected Ina RSS "
+                    "would exceed max_total_rss_gb."
+                ),
+            },
+            "minimum_core_bounds": {
+                "max_fragments_sampled": int(self.max_fragments),
+                "max_threads_exported": 200,
+                "max_anchor_tags": 512,
+                "requires_full_fragment_scan_on_boot": False,
+            },
+            "options": [
+                {
+                    "id": "continuity_snapshot_boot_core",
+                    "title": "Boot from a compact continuity snapshot",
+                    "method": (
+                        "Build a small continuity_core_map.json from the previous fingerprint and continuity threads, "
+                        "publish it to inastate during normal boot, and queue meaning_map_refresh only after the "
+                        "scheduler reports enough headroom."
+                    ),
+                    "normal_boot_flow": [
+                        "load continuity/fingerprint.json and continuity/continuity_map.json",
+                        "export the strongest stable threads and tags into a bounded core map",
+                        "publish continuity_core_map_status for early cognition",
+                        "defer full meaning_map.py refresh until memory guard is ok and projected RSS fits the scheduler budget",
+                    ],
+                    "memory_profile": "low and bounded; no corpus-wide meaning-map traversal during normal boot",
+                    "review_points": [
+                        "choose thread ranking and expiry rules",
+                        "confirm whether the core map is advisory or read-through for meaning_map consumers",
+                    ],
+                },
+                {
+                    "id": "continuity_anchor_overlay",
+                    "title": "Use continuity anchors as a meaning-map overlay",
+                    "method": (
+                        "Expose continuity anchors as a read-only overlay that meaning_map.py can consume in small batches, "
+                        "so early boot has stable identity/meaning anchors without loading the full map."
+                    ),
+                    "normal_boot_flow": [
+                        "continuity manager emits anchors grouped by symbol, tag, and emotional signature",
+                        "meaning-map readers check the overlay first",
+                        "background refresh merges only dirty or missing anchors when resources are below budget",
+                    ],
+                    "memory_profile": "low at boot; medium only during scheduled merge batches",
+                    "review_points": [
+                        "define overlay precedence when anchors disagree with later meaning-map evidence",
+                        "set a strict batch size for merge passes",
+                    ],
+                },
+                {
+                    "id": "two_phase_core_then_warmup",
+                    "title": "Two-phase core map plus scheduler warmup",
+                    "method": (
+                        "Treat continuity as phase one and the full meaning map as phase two. Normal boot gets the "
+                        "minimum core immediately; warmup runs only through scheduler slots with explicit memory estimates."
+                    ),
+                    "normal_boot_flow": [
+                        "phase one: continuity_core_map loads as the default boot map",
+                        "phase two: enqueue meaning_map_refresh with a small projected batch budget",
+                        "pause or cancel warmup if total RSS, managed RSS, or available RAM crosses the configured limits",
+                    ],
+                    "memory_profile": "low at boot, then scheduler-governed batch work",
+                    "review_points": [
+                        "decide whether warmup is automatic, dream-only, or operator-approved",
+                        "require telemetry showing RSS stayed below max_total_rss_gb during trial boots",
+                    ],
+                },
+            ],
+            "non_goals": [
+                "Do not directly repair or rewrite the disrupted meaning map from this proposal.",
+                "Do not bypass scheduler memory limits for normal boots.",
+            ],
+        }
+
     # ----------------------------------------------------------------- helpers
     def _fragment_paths(self) -> List[Path]:
         if not self.fragments_root.exists():

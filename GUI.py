@@ -172,6 +172,13 @@ RESOURCE_PUBLISH_INTERVAL_SEC = float(os.environ.get("INA_RESOURCE_PUBLISH_INTER
 RESOURCE_HISTORY_MAX_SAMPLES = max(12, int(float(os.environ.get("INA_RESOURCE_HISTORY_MAX_SAMPLES", "240"))))
 RESOURCE_TREND_SHORT_SAMPLES = max(4, int(float(os.environ.get("INA_RESOURCE_TREND_SHORT_SAMPLES", "8"))))
 RESOURCE_TREND_LONG_SAMPLES = max(8, int(float(os.environ.get("INA_RESOURCE_TREND_LONG_SAMPLES", "40"))))
+OPERATOR_PERMISSION_KEY = "operator_permission_request"
+OPERATOR_PERMISSION_HISTORY_KEY = "operator_permission_feedback_history"
+operator_permission_status_var = None
+operator_permission_detail_var = None
+operator_permission_command_box = None
+operator_permission_feedback_box = None
+operator_permission_last_marker = None
 
 
 def refresh_config():
@@ -418,6 +425,108 @@ def _clamp_value(value, lo=-1.0, hi=1.0):
         return hi
     return v
 
+
+def _safe_resolve_path(value, base=None):
+    try:
+        path = Path(value)
+        if base is not None and not path.is_absolute():
+            path = Path(base) / path
+        return path.expanduser().resolve()
+    except Exception:
+        return None
+
+
+def _path_under_any(path, roots):
+    resolved = _safe_resolve_path(path)
+    if resolved is None:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _process_scan_roots():
+    roots = []
+    for raw in (Path(__file__).resolve().parent, Path.cwd()):
+        resolved = _safe_resolve_path(raw)
+        if resolved is not None:
+            roots.append(resolved)
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    layout = cfg.get('storage_layout') if isinstance(cfg, dict) else {}
+    if isinstance(layout, dict):
+        for key in ('durable_project_root', 'cold_root', 'cold_storage_root', 'fast_runtime_root', 'fast_root'):
+            raw = layout.get(key)
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                raw = raw.format(child=cfg.get('current_child') or 'Inazuma_Yagami')
+            except Exception:
+                raw = raw.replace('{child}', str(cfg.get('current_child') or 'Inazuma_Yagami'))
+            resolved = _safe_resolve_path(raw)
+            if resolved is not None:
+                roots.append(resolved)
+    unique = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _project_script_names():
+    root = _safe_resolve_path(Path(__file__).resolve().parent)
+    if root is None:
+        return set()
+    try:
+        return {path.name for path in root.glob('*.py')}
+    except Exception:
+        return set()
+
+
+def _process_script_path(cmdline, cwd):
+    for part in cmdline[1:]:
+        text = str(part)
+        if not text.endswith('.py'):
+            continue
+        return _safe_resolve_path(text, cwd)
+    return None
+
+
+def _looks_like_ina_runtime_process(proc, roots, script_names):
+    try:
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        return False
+    if not cmdline:
+        return False
+    exe_name = os.path.basename(str(cmdline[0])).lower()
+    has_python_exe = 'python' in exe_name
+    has_script_arg = any(str(part).endswith('.py') for part in cmdline[1:])
+    if not has_python_exe and not has_script_arg:
+        return False
+    try:
+        cwd = proc.cwd()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        cwd = None
+    script_path = _process_script_path(cmdline, cwd)
+    if script_path is not None and _path_under_any(script_path, roots):
+        return True
+    if script_path is not None and script_path.name in script_names:
+        cwd_path = _safe_resolve_path(cwd) if cwd else None
+        if cwd_path is not None and _path_under_any(cwd_path, roots):
+            return True
+    return False
+
+
 def _ina_processes():
     try:
         root_proc = psutil.Process(os.getpid())
@@ -427,7 +536,24 @@ def _ina_processes():
         children = root_proc.children(recursive=True)
     except psutil.Error:
         children = []
-    return [root_proc] + children
+    processes = {int(root_proc.pid): root_proc}
+    for child in children:
+        processes[int(child.pid)] = child
+
+    roots = _process_scan_roots()
+    script_names = _project_script_names()
+    if roots:
+        try:
+            iterator = psutil.process_iter(['pid'])
+        except Exception:
+            iterator = []
+        for proc in iterator:
+            pid = int(getattr(proc, 'pid', 0) or 0)
+            if pid <= 0 or pid in processes:
+                continue
+            if _looks_like_ina_runtime_process(proc, roots, script_names):
+                processes[pid] = proc
+    return list(processes.values())
 
 def _process_cpu_sample_key(proc):
     try:
@@ -565,6 +691,9 @@ def _scheduler_snapshot():
         'cpu_percent': round(float(planner.get('cpu_percent') or 0.0), 1),
         'gpu_utilization_percent': round(float(planner.get('gpu_utilization_percent') or 0.0), 1),
         'gpu_available': bool(planner.get('gpu_available', False)),
+        'ina_rss_gb': round(float(planner.get('ina_rss_gb') or slot_summary.get('total_rss_gb') or 0.0), 3),
+        'max_total_rss_gb': round(float(planner.get('max_total_rss_gb') or slot_summary.get('max_total_rss_gb') or 0.0), 3),
+        'ina_rss_source': str(planner.get('ina_rss_source') or slot_summary.get('ina_rss_source') or 'process_tree').strip().lower() or 'process_tree',
         'max_parallel_tasks': int(slot_summary.get('max_parallel_tasks') or 0),
         'max_queue_slots': int(slot_summary.get('max_queue_slots') or 0),
     }
@@ -587,6 +716,14 @@ def _format_scheduler_slots(scheduler):
         f"Running {int(scheduler.get('running_count') or 0)}/{int(scheduler.get('max_parallel_tasks') or 0)}  |  Queue {int(scheduler.get('queue_depth') or 0)}/{int(scheduler.get('max_queue_slots') or 0)}  |  Guard {scheduler.get('memory_guard_level')}",
         f"CPU {float(scheduler.get('cpu_percent') or 0.0):.1f}%" + (f"  |  GPU {float(scheduler.get('gpu_utilization_percent') or 0.0):.1f}%" if scheduler.get('gpu_available') else ''),
     ]
+    ina_rss = float(scheduler.get('ina_rss_gb') or 0.0)
+    max_total = float(scheduler.get('max_total_rss_gb') or 0.0)
+    if ina_rss > 0.0:
+        source = ' via vitals' if scheduler.get('ina_rss_source') == 'resource_vitals' else ''
+        if max_total > 0.0:
+            lines.append(f"Ina RSS: {ina_rss:.1f}/{max_total:.1f}GB{source}")
+        else:
+            lines.append(f"Ina RSS: {ina_rss:.1f}GB{source}")
     running = scheduler.get('running') or []
     queued = scheduler.get('next_slots') or []
     if running:
@@ -1002,6 +1139,144 @@ def _offer_meal_from_gui(meal_name: str):
     append_status(f"[Vitals] Offered {meal_name.replace('_', ' ')} to Ina.\n")
     _refresh_nutrition_section()
 
+def _set_text_widget(widget, text, *, disabled=False):
+    if widget is None:
+        return
+    widget.config(state=tk.NORMAL)
+    widget.delete("1.0", tk.END)
+    if text:
+        widget.insert(tk.END, text)
+    widget.config(state=tk.DISABLED if disabled else tk.NORMAL)
+
+
+def _operator_permission_commands_text(request):
+    commands = request.get("commands") if isinstance(request, dict) else None
+    if not isinstance(commands, list) or not commands:
+        return ""
+    lines = []
+    for idx, item in enumerate(commands, start=1):
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label") or f"Command {idx}"
+        command = item.get("command") or ""
+        purpose = item.get("purpose")
+        sudo_note = "sudo" if item.get("requires_sudo") else "user"
+        lines.append(f"{idx}. {label} ({sudo_note})")
+        if purpose:
+            lines.append(f"   {purpose}")
+        if command:
+            lines.append(f"   {command}")
+    return "\n".join(lines)
+
+
+def _operator_permission_detail_text(request):
+    if not isinstance(request, dict):
+        return "No pending permission request."
+    target = request.get("target") if isinstance(request.get("target"), dict) else {}
+    response = request.get("operator_response") if isinstance(request.get("operator_response"), dict) else {}
+    lines = [
+        request.get("summary") or "Permission request is pending.",
+        f"Status: {request.get('status', 'unknown')}",
+    ]
+    if request.get("why"):
+        lines.append(f"Why: {request['why']}")
+    if target.get("device") or target.get("mount"):
+        lines.append(f"Target: {target.get('device') or '--'} at {target.get('mount') or '--'}")
+    if target.get("runtime_root"):
+        lines.append(f"Runtime path: {target['runtime_root']}")
+    if response.get("decision"):
+        lines.append(f"Your answer: {response.get('decision')} — {response.get('reason') or 'no reason recorded'}")
+    return "\n".join(lines)
+
+
+def _refresh_operator_permission_section():
+    global operator_permission_last_marker
+    if operator_permission_status_var is None:
+        return
+
+    request = get_inastate(OPERATOR_PERMISSION_KEY) or {}
+    if not isinstance(request, dict) or not request:
+        operator_permission_status_var.set("Operator permission: none pending")
+        if operator_permission_detail_var is not None:
+            operator_permission_detail_var.set("No pending permission request.")
+        _set_text_widget(operator_permission_command_box, "", disabled=True)
+        if operator_permission_last_marker is not None:
+            _set_text_widget(operator_permission_feedback_box, "", disabled=False)
+        operator_permission_last_marker = None
+        return
+
+    status = str(request.get("status") or "pending_operator_authorization")
+    title = request.get("title") or "Operator permission request"
+    marker = f"{request.get('id')}:{status}"
+    operator_permission_status_var.set(f"{title} [{status}]")
+    if operator_permission_detail_var is not None:
+        operator_permission_detail_var.set(_operator_permission_detail_text(request))
+    _set_text_widget(operator_permission_command_box, _operator_permission_commands_text(request), disabled=True)
+
+    if marker != operator_permission_last_marker:
+        response = request.get("operator_response") if isinstance(request.get("operator_response"), dict) else {}
+        _set_text_widget(operator_permission_feedback_box, response.get("reason") or "", disabled=False)
+        operator_permission_last_marker = marker
+
+
+def _respond_operator_permission(decision):
+    decision = str(decision or "").strip().lower()
+    if decision not in {"approved", "denied"}:
+        return
+    request = get_inastate(OPERATOR_PERMISSION_KEY) or {}
+    if not isinstance(request, dict) or not request:
+        messagebox.showinfo("Operator Permission", "There is no pending permission request.")
+        return
+
+    reason = operator_permission_feedback_box.get("1.0", tk.END).strip() if operator_permission_feedback_box else ""
+    if not reason:
+        messagebox.showwarning("Operator Permission", "Please add a reason before sending your answer.")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    status = "approved_pending_manual_execution" if decision == "approved" else "denied_by_operator"
+    response = request.get("operator_response") if isinstance(request.get("operator_response"), dict) else {}
+    response = dict(response)
+    response.update({
+        "decision": decision,
+        "approved": decision == "approved",
+        "reason": reason,
+        "responded_at": now,
+        "responded_by": "gui",
+    })
+    request["operator_response"] = response
+    request["status"] = status
+    request["operator_next_step"] = (
+        "operator_may_run_commands_manually" if decision == "approved" else "use_hdd_fallback_without_reprompting"
+    )
+
+    feedback = request.get("feedback") if isinstance(request.get("feedback"), dict) else {}
+    feedback = dict(feedback)
+    feedback["last_response"] = {
+        "decision": decision,
+        "reason": reason,
+        "responded_at": now,
+        "responded_by": "gui",
+    }
+    request["feedback"] = feedback
+
+    history = get_inastate(OPERATOR_PERMISSION_HISTORY_KEY) or []
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "request_id": request.get("id"),
+        "request_type": request.get("request_type"),
+        "decision": decision,
+        "reason": reason,
+        "responded_at": now,
+        "responded_by": "gui",
+    })
+    update_inastate(OPERATOR_PERMISSION_KEY, request)
+    update_inastate(OPERATOR_PERMISSION_HISTORY_KEY, history[-50:])
+    append_status(f"[Operator] Permission request {decision}: {reason}\n")
+    _refresh_operator_permission_section()
+
+
 def _apply_energy_value(value=None, reason="manual"):
     if energy_var is None:
         return
@@ -1087,12 +1362,15 @@ def _update_usage_labels():
     _publish_resource_snapshot(stats)
     _refresh_energy_label()
     _refresh_nutrition_section()
+    _refresh_operator_permission_section()
     vitals_window.after(1500, _update_usage_labels)
 
 def open_vitals_window():
     global vitals_window, _usage_labels, energy_var, energy_status_var, emotion_vars
     global hunger_status_var, fitness_status_var, nutrition_info_var, last_meal_status_var, metabolic_status_var
     global offer_status_var, offer_note_var
+    global operator_permission_status_var, operator_permission_detail_var
+    global operator_permission_command_box, operator_permission_feedback_box, operator_permission_last_marker
 
     if vitals_window is not None and vitals_window.winfo_exists():
         vitals_window.lift()
@@ -1205,6 +1483,43 @@ def open_vitals_window():
     _usage_labels['scheduler_note'].pack(anchor='w', fill=tk.X, pady=(2, 0))
     _usage_labels['scheduler_slots'].pack(anchor='w', fill=tk.X, pady=(2, 0))
 
+    permission_frame = tk.LabelFrame(content, text='Operator permission request')
+    permission_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
+
+    operator_permission_status_var = tk.StringVar(value='Operator permission: checking...')
+    operator_permission_detail_var = tk.StringVar(value='No pending permission request.')
+    operator_permission_last_marker = None
+
+    tk.Label(
+        permission_frame,
+        textvariable=operator_permission_status_var,
+        justify=tk.LEFT,
+        anchor='w',
+        wraplength=680,
+    ).pack(anchor='w', fill=tk.X, padx=6, pady=(4, 0))
+    tk.Label(
+        permission_frame,
+        textvariable=operator_permission_detail_var,
+        justify=tk.LEFT,
+        anchor='w',
+        wraplength=680,
+    ).pack(anchor='w', fill=tk.X, padx=6, pady=(2, 4))
+
+    tk.Label(permission_frame, text='Commands').pack(anchor='w', padx=6)
+    operator_permission_command_box = tk.Text(permission_frame, height=5, wrap=tk.WORD, font='TkFixedFont')
+    operator_permission_command_box.pack(fill=tk.X, padx=6, pady=(2, 4))
+    operator_permission_command_box.config(state=tk.DISABLED)
+
+    tk.Label(permission_frame, text='Reason').pack(anchor='w', padx=6)
+    operator_permission_feedback_box = tk.Text(permission_frame, height=3, wrap=tk.WORD)
+    operator_permission_feedback_box.pack(fill=tk.X, padx=6, pady=(2, 4))
+
+    permission_buttons = tk.Frame(permission_frame)
+    permission_buttons.pack(fill=tk.X, padx=6, pady=(0, 6))
+    tk.Button(permission_buttons, text='Approve', command=lambda: _respond_operator_permission('approved')).pack(side=tk.LEFT, padx=4)
+    tk.Button(permission_buttons, text='Deny', command=lambda: _respond_operator_permission('denied')).pack(side=tk.LEFT, padx=4)
+    tk.Button(permission_buttons, text='Reload', command=_refresh_operator_permission_section).pack(side=tk.RIGHT, padx=4)
+
     energy_frame = tk.LabelFrame(content, text='Energy')
     energy_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
 
@@ -1311,6 +1626,7 @@ def open_vitals_window():
     _prime_usage_counters()
     _refresh_energy_label()
     _refresh_nutrition_section()
+    _refresh_operator_permission_section()
     vitals_window.after(500, _update_usage_labels)
 
 def open_logs():

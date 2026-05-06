@@ -22,10 +22,23 @@ import xml.etree.ElementTree as ET
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path
-from PIL import Image
-import numpy as np
+
+_IMAGE_IMPORT_ERROR = None
+try:
+    from PIL import Image
+except Exception as e:  # pragma: no cover - optional dependency
+    Image = None
+    _IMAGE_IMPORT_ERROR = e
+
+_NUMPY_IMPORT_ERROR = None
+try:
+    import numpy as np
+except Exception as e:  # pragma: no cover - optional dependency
+    np = None
+    _NUMPY_IMPORT_ERROR = e
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
+from simple_image_fallback import ImageFallbackError, extract_image_features
 from self_read_reporting import is_broken_pipe_error, report_self_read_broken_pipe
 from text_memory import update_text_vocab
 
@@ -60,7 +73,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
 FRAG_LIMIT = 1000
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
 DOCUMENT_EXTENSIONS = {".pdf", ".odt"}
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pgm", ".ppm", ".pnm"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".webm"}
 SIMPLE_COMPRESSED_EXTENSIONS = {".gz", ".bz2", ".xz"}
@@ -885,9 +898,6 @@ def fragment_image(image_source, transformer, source_label=None):
             image_source.seek(0)
             open_target = image_source
 
-        with Image.open(open_target) as img:
-            array = np.array(img.convert("L")).flatten().tolist()
-
         if source_label:
             source = source_label
         elif isinstance(image_source, (str, Path)):
@@ -895,16 +905,73 @@ def fragment_image(image_source, transformer, source_label=None):
         else:
             source = getattr(image_source, "name", "<memory_image>")
 
+        label = source_label or source
+        array = None
+        fallback_metadata = None
+        pillow_error = None
+
+        if Image is not None and np is not None:
+            try:
+                with Image.open(open_target) as img:
+                    array = np.array(img.convert("L")).flatten().tolist()
+            except Exception as e:
+                pillow_error = e
+
+        if array is None:
+            if not isinstance(open_target, (str, Path)):
+                try:
+                    open_target.seek(0)
+                except Exception:
+                    pass
+            try:
+                fallback = extract_image_features(open_target, limit=1024)
+            except ImageFallbackError as e:
+                reason = e
+                if pillow_error is not None:
+                    reason = f"Pillow path failed ({pillow_error}); fallback path failed ({e})"
+                elif Image is None or np is None:
+                    missing = _IMAGE_IMPORT_ERROR if Image is None else _NUMPY_IMPORT_ERROR
+                    reason = f"optional dependency unavailable ({missing}); fallback path failed ({e})"
+                log_to_statusbox(f"[RawFileManager] Image support unavailable for {label}: {reason}")
+                return []
+            except Exception as e:
+                log_to_statusbox(f"[RawFileManager] Fallback image decoder failed for {label}: {e}")
+                return []
+
+            array = fallback.get("features") or []
+            if not array:
+                log_to_statusbox(f"[RawFileManager] Fallback image decoder found no pixels for {label}.")
+                return []
+            fallback_metadata = {
+                "decoder": fallback.get("decoder"),
+                "format": fallback.get("format"),
+                "width": fallback.get("width"),
+                "height": fallback.get("height"),
+                "feature_count": fallback.get("feature_count"),
+                "source_pixels": fallback.get("source_pixels"),
+            }
+            if pillow_error is not None:
+                fallback_metadata["pillow_error"] = str(pillow_error)[:250]
+            elif Image is None or np is None:
+                missing = _IMAGE_IMPORT_ERROR if Image is None else _NUMPY_IMPORT_ERROR
+                fallback_metadata["dependency_gap"] = str(missing)[:250]
+
         summary_name = Path(source).name if isinstance(source, str) else "image"
+        tags = ["self_read", "image"]
+        if fallback_metadata:
+            tags.append("fallback_image_decoder")
+
         frag = {
             "modality": "image",
             "image_features": array[:1024],
             "summary": f"Visual symbol or artifact from {summary_name}",
-            "tags": ["self_read", "image"],
+            "tags": tags,
             "source": source,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"focus": 0.3, "novelty": 0.5}
         }
+        if fallback_metadata:
+            frag["image_fallback"] = fallback_metadata
         vec = transformer.encode_image_fragment(frag)
         frag["importance"] = vec["importance"]
         return [frag]
@@ -1046,7 +1113,7 @@ def fragment_video(video_path, transformer, source_label=None):
                 capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
 
             success, frame = capture.read()
-            if success and frame is not None:
+            if success and frame is not None and Image is not None and np is not None:
                 try:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     preview_image = Image.fromarray(frame_rgb).convert("L").resize((32, 32))
@@ -1211,7 +1278,7 @@ def process_archive(path, transformer):
 
 def self_read_and_train():
     child = get_child()
-    default_root = Path.home() / "Projects" / "Project Inazuma"
+    default_root = Path(__file__).resolve().parent
     prefs = load_self_read_preferences(child)
     prefs = _apply_skip_requests(child, prefs)
     source_choices = prefs.get("source_choices", DEFAULT_SELF_READ_PREFS["source_choices"])

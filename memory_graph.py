@@ -24,6 +24,12 @@ from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
 from experience_storage import iter_event_paths
 from io_utils import atomic_write_json, file_lock, load_json_dict
+from storage_layout import fast_runtime_path
+
+try:
+    from memory_mirror_db import mirror_json_file as _mirror_json_file_on_access
+except Exception:  # pragma: no cover
+    _mirror_json_file_on_access = None
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -141,6 +147,39 @@ def _load_config():
         except Exception:
             return {}
     return {}
+
+
+def _child_from_memory_path(path: Path) -> Optional[str]:
+    parts = Path(path).parts
+    try:
+        index = parts.index("AI_Children")
+    except ValueError:
+        return None
+    if index + 1 >= len(parts):
+        return None
+    child = str(parts[index + 1]).strip()
+    return child or None
+
+
+def _mirror_memory_json_on_access(
+    kind: str,
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    child: Optional[str] = None,
+) -> None:
+    if _mirror_json_file_on_access is None or not isinstance(payload, dict):
+        return
+    mirror_child = child or _child_from_memory_path(path)
+    if not mirror_child:
+        cfg = _load_config()
+        mirror_child = str(cfg.get("current_child") or "").strip()
+    if not mirror_child:
+        return
+    try:
+        _mirror_json_file_on_access(mirror_child, kind, path, payload=payload)
+    except Exception:
+        return
 
 
 def _neural_settings():
@@ -1055,6 +1094,7 @@ def _load_fragment_from_path(path: Path) -> Optional[Dict[str, Any]]:
         parent_tier = path.parent.name
         if parent_tier in MEMORY_TIERS:
             data["tier"] = parent_tier
+    _mirror_memory_json_on_access("fragment", path, data)
     return data
 
 
@@ -1396,6 +1436,7 @@ def _experience_candidate_from_path(
     payload = _safe_load_json_file(path)
     if not payload:
         return None
+    _mirror_memory_json_on_access(kind, path, payload, child=child)
     if payload.get("cold_experience") or payload.get("experience_compacted_at"):
         return None
     if _is_protected_experience(payload, retention):
@@ -1648,6 +1689,7 @@ def _compact_experience_file(
     payload = _safe_load_json_file(path)
     if not payload:
         return {"status": "unreadable", "path": str(path)}
+    _mirror_memory_json_on_access(str(item.get("kind") or "experience_event"), path, payload, child=child)
     if payload.get("cold_experience") or payload.get("experience_compacted_at"):
         return {"status": "already_compacted", "path": str(path)}
 
@@ -2265,6 +2307,7 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
                 continue
             if "id" not in data:
                 continue
+            _mirror_memory_json_on_access("experience_event", path, data, child=child)
             total += 1
             entry = (_ts_value(data, path), str(path), data)
             if len(heap) < limit_val:
@@ -2283,6 +2326,7 @@ def load_experience_events(child: str, base_path: Optional[Path] = None, limit: 
                 continue
             if "id" not in data:
                 continue
+            _mirror_memory_json_on_access("experience_event", path, data, child=child)
             events.append(data)
         total = len(events)
 
@@ -2890,15 +2934,36 @@ def _neural_dirty_index_path(child: str) -> Path:
 
 
 def _neural_snapshot_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_snapshot_csr.json"
+    fallback = Path("AI_Children") / child / "memory" / "neural" / "neural_memory_snapshot_csr.json"
+    return fast_runtime_path(
+        child,
+        "neural_memory_snapshot_csr.json",
+        fallback,
+        subdir="neural",
+        root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+    )
 
 
 def _neural_spill_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_spill.sqlite"
+    fallback = Path("AI_Children") / child / "memory" / "neural" / "neural_memory_spill.sqlite"
+    return fast_runtime_path(
+        child,
+        "neural_memory_spill.sqlite",
+        fallback,
+        subdir="neural",
+        root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+    )
 
 
 def _neural_synapse_spool_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_synapse_spool.sqlite"
+    fallback = Path("AI_Children") / child / "memory" / "neural" / "neural_synapse_spool.sqlite"
+    return fast_runtime_path(
+        child,
+        "neural_synapse_spool.sqlite",
+        fallback,
+        subdir="neural",
+        root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+    )
 
 
 def _custom_transformer_usage_path(child: str) -> Path:
@@ -2906,7 +2971,14 @@ def _custom_transformer_usage_path(child: str) -> Path:
 
 
 def _memory_index_db_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "memory_map.sqlite"
+    fallback = Path("AI_Children") / child / "memory" / "memory_map.sqlite"
+    return fast_runtime_path(
+        child,
+        "memory_map.sqlite",
+        fallback,
+        subdir="index",
+        root_keys=("fast_index_root", "fast_runtime_root", "fast_root"),
+    )
 
 
 def _load_json_dict(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:

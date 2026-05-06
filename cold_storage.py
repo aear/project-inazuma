@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 DEFAULT_POLICY: Dict[str, Any] = {
     "enabled": True,
     "auto_compact": False,
+    "storage_root": None,
     "symbol_limit": 12,
     "word_limit": 12,
     "tag_limit": 12,
@@ -77,7 +78,13 @@ def _guess_child_from_path(path: Path) -> Optional[str]:
     return None
 
 
-def _cold_storage_root(child: str) -> Path:
+def _cold_storage_root(child: str, policy: Optional[Dict[str, Any]] = None) -> Path:
+    raw = policy.get("storage_root") if isinstance(policy, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return Path(raw.format(child=child)).expanduser()
+        except Exception:
+            return Path(raw.replace("{child}", child)).expanduser()
     return Path("AI_Children") / child / "memory" / "cold_storage"
 
 
@@ -280,6 +287,11 @@ def policy_from_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         raw = cfg.get("cold_storage_policy")
         if isinstance(raw, dict):
             policy.update({k: raw.get(k, policy[k]) for k in policy.keys() if k in raw})
+        layout = cfg.get("storage_layout")
+        if isinstance(layout, dict) and not policy.get("storage_root"):
+            root_value = layout.get("cold_storage_root") or layout.get("durable_cold_storage_root")
+            if isinstance(root_value, str) and root_value.strip():
+                policy["storage_root"] = root_value.strip()
 
     policy["enabled"] = bool(policy.get("enabled", True))
     policy["auto_compact"] = bool(policy.get("auto_compact", False))
@@ -735,7 +747,7 @@ def compact_fragment_file(
         return None
 
     stub, core, shards, ticket = compact_fragment(fragment, policy=policy)
-    storage_root = _cold_storage_root(child)
+    storage_root = _cold_storage_root(child, policy)
     shard_refs = _write_shards(storage_root, core.get("fragment_id", "unknown"), shards)
     if shard_refs:
         stub["cold_shards"] = shard_refs

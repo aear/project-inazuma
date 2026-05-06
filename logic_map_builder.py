@@ -252,7 +252,7 @@ def build_logic_neural_map(logic_entries: List[Dict[str, Any]], *, policy: Dict[
     }
 
 def save_logic_neural_map(child, logic_map):
-    out_path = Path.home() / "Projects" / "Project Inazuma" / "AI_Children" / child / "memory" / "neural" / "logic_neural_map.json"
+    out_path = Path("AI_Children") / child / "memory" / "neural" / "logic_neural_map.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(logic_map, f, indent=4)
