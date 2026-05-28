@@ -298,7 +298,7 @@ class LiveExperienceBridge:
             entity_links=entity_links,
             timestamp=timestamp,
         )
-        meta_path = self._media_dir / f"{event_id}_dialogue.json"
+        meta_path = Path(self._media_dir) / f"{event_id}_dialogue.json"
         try:
             if meta_path.exists():
                 with open(meta_path, "r", encoding="utf-8") as fh:

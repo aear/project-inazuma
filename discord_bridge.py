@@ -1286,7 +1286,10 @@ class InaDiscordClient(discord.Client):
                             self._mark_outbox_entry_without_archive(entry, "flush_stale", status="flushed")
                             stats["flushed_stale_count"] += 1
                         else:
-                            self._archive_outbox_entry(entry, "stale_buffer")
+                            # Defer archive to avoid blocking the async loop
+                            if "_deferred_archives" not in stats:
+                                stats["_deferred_archives"] = []
+                            stats["_deferred_archives"].append((entry, "stale_buffer"))
                             stats["archived_stale_count"] += 1
                         continue
                     self._typed_outbox_seen.add(entry_id)
@@ -1401,6 +1404,19 @@ class InaDiscordClient(discord.Client):
                 logger.exception("Failed to log archived outbox entry %s to history bridge", entry_id or "<unknown>")
         if entry_id:
             self._log_outbox_history(entry_id, "archived", reason=reason)
+
+    async def _process_deferred_archives(self, deferred_archives: list) -> None:
+        """Process deferred archive operations in a thread to avoid blocking the event loop."""
+        if not deferred_archives:
+            return
+        
+        loop = asyncio.get_event_loop()
+        for entry, reason in deferred_archives:
+            try:
+                # Run the blocking archive operation in a thread pool
+                await loop.run_in_executor(None, lambda e=entry, r=reason: self._archive_outbox_entry(e, r))
+            except Exception:
+                logger.exception("Failed to process deferred archive for entry %s", entry.get("id", "<unknown>"))
 
     async def _pace_discord_send(self) -> None:
         interval = _coerce_nonnegative_float(
@@ -1679,6 +1695,10 @@ class InaDiscordClient(discord.Client):
                 if flush_request:
                     sleep_sec = 1
                 pending, stats = self._read_typed_outbox(flush_request=flush_request)
+                # Process deferred archives asynchronously
+                deferred = stats.pop("_deferred_archives", [])
+                if deferred:
+                    await self._process_deferred_archives(deferred)
                 delivered = 0
                 for entry in pending:
                     if await self._deliver_typed_outbox_entry(entry):

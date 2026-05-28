@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import re
+import signal
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
@@ -49,25 +50,50 @@ def candidate_event_paths(events_dir: Path, event_id: str) -> List[Path]:
     return [sharded, legacy] if sharded != legacy else [legacy]
 
 
+def _path_exists_with_timeout(path: Path, timeout_sec: float = 2.0) -> bool:
+    """Check if a path exists with a timeout guard.
+    
+    On systems where filesystem latency can cause blocking, this wrapper
+    adds a timeout to prevent the check from indefinitely blocking async contexts.
+    """
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(f"path.exists() timeout for {path}")
+    
+    try:
+        # Set a signal alarm (UNIX only)
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(int(timeout_sec) + 1)  # +1 for safety margin
+        try:
+            result = path.exists()
+            return result
+        finally:
+            signal.alarm(0)  # Cancel alarm
+            signal.signal(signal.SIGALRM, old_handler)
+    except (TimeoutError, ValueError, AttributeError):
+        # Timeout occurred, or signal not available on this platform
+        # Default to sharded path (safe default for new events)
+        return False
+
+
 def resolve_event_path(events_dir: Path, event_id: str) -> Path:
     for path in candidate_event_paths(events_dir, event_id):
-        if path.exists():
+        if _path_exists_with_timeout(path, timeout_sec=1.0):
             return path
     return sharded_event_path(events_dir, event_id)
 
 
 def iter_event_paths(events_dir: Path, *, include_legacy: bool = True) -> Iterator[Path]:
-    if not events_dir.exists():
+    if not _path_exists_with_timeout(events_dir, timeout_sec=1.0):
         return
     if include_legacy:
         yield from _iter_files(events_dir.glob("evt_*.json"))
 
     time_root = events_dir / TIME_SHARD_ROOT
-    if time_root.exists():
+    if _path_exists_with_timeout(time_root, timeout_sec=1.0):
         yield from _iter_files(time_root.rglob("evt_*.json"))
 
     hash_root = events_dir / HASH_SHARD_ROOT
-    if hash_root.exists():
+    if _path_exists_with_timeout(hash_root, timeout_sec=1.0):
         yield from _iter_files(hash_root.rglob("*.json"))
 
 
