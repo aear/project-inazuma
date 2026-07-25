@@ -27,9 +27,13 @@ from io_utils import atomic_write_json, file_lock, load_json_dict
 from storage_layout import fast_runtime_path
 
 try:
-    from memory_mirror_db import mirror_json_file as _mirror_json_file_on_access
+    from memory_mirror_db import (
+        experience_catalog_candidates as _experience_catalog_candidates,
+        mirror_json_file as _mirror_json_file_on_access,
+    )
 except Exception:  # pragma: no cover
     _mirror_json_file_on_access = None
+    _experience_catalog_candidates = None
 
 if TYPE_CHECKING:  # pragma: no cover
     from transformers.fractal_multidimensional_transformers import FractalTransformer
@@ -1514,6 +1518,28 @@ def _select_experience_prune_candidates(
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=timezone.utc)
     now_ts = now_dt.timestamp()
+    if _experience_catalog_candidates is not None:
+        try:
+            catalogued = _experience_catalog_candidates(
+                child,
+                limit=limit,
+                min_age_hours=settings["min_age_hours"],
+                max_importance=settings["max_importance"],
+                min_size_bytes=settings["min_size_bytes"],
+                now=now_dt,
+                config=_load_config(),
+            )
+        except Exception as exc:
+            log_to_statusbox(
+                f"[Memory] Catalogue candidate query failed; using filesystem fallback: {exc}"
+            )
+        else:
+            if catalogued is not None:
+                log_to_statusbox(
+                    f"[Memory] Selected {len(catalogued)} experience candidate(s) from the verified catalogue."
+                )
+                return catalogued
+
     base = _memory_root(child) / "experiences"
     paths = [
         ("experience_event", base / "events"),

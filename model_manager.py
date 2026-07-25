@@ -234,6 +234,17 @@ _PROCESS_TASK_PROFILES = {
         "gpu_class": "none",
         "exclusive_group": "conscious_mode",
     },
+    "memory_reconciliation_step": {
+        "kind": "subprocess",
+        "command": ["python", "memory_reconciliation.py", "--max-new-records", "50000", "--max-seconds", "30"],
+        "module": "memory_reconciliation",
+        "priority": 62,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "memory_recall",
+    },
+
     "meditation_state_run": {
         "kind": "subprocess",
         "command": ["python", "meditation_state.py"],
@@ -4843,6 +4854,48 @@ def _enqueue_deep_recall_task_if_needed(state: Dict[str, Any], limits: Dict[str,
     )
 
 
+def _enqueue_reconciliation_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    cfg = load_config()
+    policy = cfg.get("memory_reconciliation_policy") if isinstance(cfg, dict) else None
+    if isinstance(policy, dict) and not bool(policy.get("enabled", True)):
+        _remove_process_task(state, "memory_reconciliation_step", limits=limits, reason="reconciliation_disabled")
+        return
+    state_path = MEMORY_PATH / "reconciliation_state.json"
+    reconciliation = {}
+    if state_path.exists():
+        try:
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            reconciliation = raw if isinstance(raw, dict) else {}
+        except Exception:
+            reconciliation = {}
+    if reconciliation.get("completed"):
+        _remove_process_task(state, "memory_reconciliation_step", limits=limits, reason="reconciliation_complete")
+        return
+    updated_at = reconciliation.get("updated_at")
+    cooldown = float(policy.get("cooldown_seconds", 300.0) or 0.0) if isinstance(policy, dict) else 300.0
+    if updated_at and cooldown > 0:
+        try:
+            updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - updated).total_seconds() < cooldown:
+                _remove_process_task(state, "memory_reconciliation_step", limits=limits, reason="reconciliation_cooldown")
+                return
+        except Exception:
+            pass
+    _enqueue_process_task(
+        state,
+        "memory_reconciliation_step",
+        limits=limits,
+        reason="orphan_audit_resume",
+        metadata={
+            "generation": reconciliation.get("generation", 1),
+            "last_path": reconciliation.get("last_path"),
+            "totals": reconciliation.get("totals", {}),
+        },
+    )
+
+
 def _scheduler_run_step_task(entry: Dict[str, Any], state: Dict[str, Any], limits: Dict[str, Any]) -> None:
     task_key = str(entry.get("task_key") or "").strip()
     started_at = datetime.now(timezone.utc).isoformat()
@@ -4869,6 +4922,8 @@ def _scheduler_run_step_task(entry: Dict[str, Any], state: Dict[str, Any], limit
         "priority": entry.get("priority"),
     }
     if task_key == "deep_recall_step":
+
+
         ran = _step_deep_recall()
         history_payload["status"] = "completed" if ran else "deferred"
         history_payload["reason"] = "deep_recall_step" if ran else "deep_recall_paused"
@@ -4939,6 +4994,7 @@ def _process_scheduler_tick(memory_guard: Optional[Dict[str, Any]] = None) -> Di
     limits = _process_scheduler_limits()
     state = _load_process_scheduler_state()
     _reconcile_process_scheduler_running(state, limits)
+    _enqueue_reconciliation_task_if_needed(state, limits)
     _enqueue_deep_recall_task_if_needed(state, limits)
     resources = _scheduler_resource_snapshot(memory_guard=memory_guard, limits=limits)
     state["resources"] = resources

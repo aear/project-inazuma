@@ -897,7 +897,12 @@ class InaDiscordClient(discord.Client):
                 message.channel.id,
             )
             self._record_social_contact(message)
-            self._remember_last_dm_contact(message)
+            # inastate.json is shared with the memory graph and its advisory
+            # lock can be held for a long time when the backing disk is busy.
+            # Never wait for that synchronous lock on Discord's event loop:
+            # doing so prevents gateway heartbeats and eventually disconnects
+            # the client.
+            await asyncio.to_thread(self._remember_last_dm_contact, message)
             if lower in VOICE_JOIN_COMMANDS:
                 await self._handle_voice_join(message)
                 return
@@ -1691,10 +1696,20 @@ class InaDiscordClient(discord.Client):
             flush_request = None
             sleep_sec = 3
             try:
-                flush_request = self._read_outbox_flush_request()
+                # Both helpers below perform synchronous disk I/O. In
+                # particular, an outbox flush may wait on inastate.lock, which
+                # is also used by the memory graph. Keep all of it off the
+                # gateway event loop so Discord heartbeats remain responsive
+                # during sustained storage contention.
+                flush_request = await asyncio.to_thread(
+                    self._read_outbox_flush_request
+                )
                 if flush_request:
                     sleep_sec = 1
-                pending, stats = self._read_typed_outbox(flush_request=flush_request)
+                pending, stats = await asyncio.to_thread(
+                    self._read_typed_outbox,
+                    flush_request=flush_request,
+                )
                 # Process deferred archives asynchronously
                 deferred = stats.pop("_deferred_archives", [])
                 if deferred:
@@ -1719,9 +1734,14 @@ class InaDiscordClient(discord.Client):
                                 "last_archived_stale_count": stats.get("archived_stale_count", 0),
                             }
                         )
-                        update_inastate("discord_outbox_flush", payload)
+                        await asyncio.to_thread(
+                            update_inastate,
+                            "discord_outbox_flush",
+                            payload,
+                        )
                     else:
-                        self._complete_outbox_flush(
+                        await asyncio.to_thread(
+                            self._complete_outbox_flush,
                             flush_request,
                             last_polled_at=now_iso,
                             last_batch_size=len(pending),
