@@ -7,6 +7,25 @@ import language_processing as lp
 
 
 
+def test_text_length_profile_accepts_varied_words_and_sentences():
+    profile = lp.text_length_profile("I. extraordinarily vary words now! Two more?")
+    assert profile["sentence_word_counts"] == [1, 4, 2]
+    assert profile["word_lengths"][1] == len("extraordinarily")
+
+
+def test_ina_expression_length_is_bounded_and_drive_sensitive():
+    quiet = lp.adaptive_symbol_limit(
+        "same input", 6, child="Ina", available_symbols=6,
+        context={"expression_drive": 0.0, "tags": ["discord"]},
+    )
+    expressive = lp.adaptive_symbol_limit(
+        "same input", 6, child="Ina", available_symbols=6,
+        context={"expression_drive": 1.0, "tags": ["discord"]},
+    )
+    assert 1 <= quiet <= expressive <= 6
+    assert lp.adaptive_symbol_limit("tiny", 6, available_symbols=2) == 2
+
+
 def test_build_dual_symbolic_message_combines_native_and_guess(monkeypatch):
     monkeypatch.setattr(
         lp,

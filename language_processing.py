@@ -42,6 +42,56 @@ NEUTRAL_SOUND_FINGERPRINT = {
 }
 
 
+def text_length_profile(text: str) -> Dict[str, Any]:
+    """Describe text shape without assuming fixed word or sentence lengths."""
+    words = re.findall(r"[A-Za-z0-9']+", text or "")
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip())
+        if part.strip()
+    ]
+    sentence_word_counts = [len(re.findall(r"[A-Za-z0-9']+", sentence)) for sentence in sentences]
+    word_lengths = [len(word) for word in words]
+    return {
+        "word_count": len(words),
+        "sentence_count": len(sentences),
+        "word_lengths": word_lengths,
+        "sentence_word_counts": sentence_word_counts,
+        "average_word_length": round(sum(word_lengths) / len(word_lengths), 3) if word_lengths else 0.0,
+        "average_sentence_words": round(sum(sentence_word_counts) / len(sentence_word_counts), 3) if sentence_word_counts else 0.0,
+    }
+
+
+def adaptive_symbol_limit(
+    text: str,
+    configured_max: int = 4,
+    *,
+    child: str = "Inazuma_Yagami",
+    available_symbols: Optional[int] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Let Ina choose a bounded utterance length instead of mirroring input length."""
+    try:
+        ceiling = max(1, int(configured_max))
+    except (TypeError, ValueError):
+        ceiling = 4
+    available = max(1, int(available_symbols or ceiling))
+    ceiling = min(ceiling, available)
+    if ceiling <= 2:
+        return ceiling
+
+    decision_context = context if isinstance(context, dict) else {}
+    try:
+        drive = max(0.0, min(1.0, float(decision_context.get("expression_drive", 0.5))))
+    except (TypeError, ValueError):
+        drive = 0.5
+    tags = sorted(_words_from_value(decision_context.get("tags")))
+    seed = _stable_symbol_seed("|".join([child, text, *tags]))
+    spontaneous_choice = 1 + (seed % ceiling)
+    drive_choice = 1 + round(drive * (ceiling - 1))
+    return max(1, min(ceiling, round((spontaneous_choice + drive_choice) / 2)))
+
+
 def _hz_to_mel(hz: float) -> float:
     return 2595.0 * math.log10(1.0 + hz / 700.0)
 
@@ -1608,7 +1658,10 @@ def generate_symbolic_reply_from_text(
     if not matched:
         return None
 
-    symbols_to_speak = matched[:max_symbols]
+    symbol_limit = adaptive_symbol_limit(
+        text, max_symbols, child=child, available_symbols=len(matched), context=context
+    )
+    symbols_to_speak = matched[:symbol_limit]
     try:
         speak_symbolically(symbols_to_speak, child=child)
     except Exception:
@@ -1644,6 +1697,8 @@ def generate_symbolic_reply_from_text(
         "native_sources": (dual_message or {}).get("native_sources") or {},
         "gloss_sources": (dual_message or {}).get("gloss_sources") or {},
         "transformer_insights": transformer_insights,
+        "length_profile": text_length_profile(text),
+        "symbol_limit": symbol_limit,
     }
 
 

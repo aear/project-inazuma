@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import asyncio
+import difflib
 try:
     import fcntl  # type: ignore
 except Exception:
@@ -260,6 +261,41 @@ def _coerce_positive_int(value, default: int) -> int:
     except Exception:
         return default
     return parsed if parsed > 0 else default
+
+
+def infer_message_edit(original: str, edited: str) -> dict:
+    """Return an inspectable, non-psychological inference about an edit."""
+    before = original or ""
+    after = edited or ""
+    before_words, after_words = before.split(), after.split()
+    matcher = difflib.SequenceMatcher(a=before_words, b=after_words)
+    added, removed = [], []
+    for opcode, i1, i2, j1, j2 in matcher.get_opcodes():
+        if opcode in {"insert", "replace"}:
+            added.extend(after_words[j1:j2])
+        if opcode in {"delete", "replace"}:
+            removed.extend(before_words[i1:i2])
+    if not before.strip() and after.strip():
+        likely_reason = "added_missing_content"
+    elif before.strip() and not after.strip():
+        likely_reason = "removed_content"
+    elif added and not removed:
+        likely_reason = "expanded_or_clarified"
+    elif removed and not added:
+        likely_reason = "shortened_or_retracted"
+    elif before.casefold() == after.casefold():
+        likely_reason = "capitalization_or_formatting"
+    elif re.sub(r"\W+", "", before).casefold() == re.sub(r"\W+", "", after).casefold():
+        likely_reason = "punctuation_or_formatting"
+    else:
+        likely_reason = "reworded_or_corrected"
+    return {
+        "original": before, "edited": after,
+        "added_words": added[:32], "removed_words": removed[:32],
+        "similarity": round(matcher.ratio(), 4),
+        "likely_reason": likely_reason,
+        "inference_kind": "surface_change_heuristic",
+    }
 
 
 def get_outbox_policy() -> dict:
@@ -691,6 +727,23 @@ def process_inbound_message(msg) -> CommsResponse:
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
 
     tokens = _extract_tokens(user_text)
+    conversation_context = (msg.metadata or {}).get("conversation_context") or []
+    edit_analysis = (msg.metadata or {}).get("message_edit")
+    is_roleplay = bool((msg.metadata or {}).get("is_roleplay_context"))
+    context_lines = [
+        f"{turn.get('author_name', 'unknown')}: {turn.get('content', '')}"
+        for turn in conversation_context[-12:]
+        if isinstance(turn, dict)
+    ]
+    if context_lines:
+        prompt_text = "Recent conversation (context only):\n" + "\n".join(context_lines) + "\n\nCurrent message:\n" + prompt_text
+    if edit_analysis:
+        prompt_text = (
+            "The current message was edited. Original: " + edit_analysis.get("original", "")
+            + "\nSurface-change inference: " + edit_analysis.get("likely_reason", "unknown")
+            + "\nEdited message: " + prompt_text
+        )
+
     symbolic_context = {
         "source": "discord",
         "source_text": user_text,
@@ -699,14 +752,19 @@ def process_inbound_message(msg) -> CommsResponse:
             "discord",
             "text",
             "dm" if (msg.metadata or {}).get("is_dm") else "guild",
+            *(["roleplay"] if is_roleplay else []),
+            *(["edited"] if edit_analysis else []),
         ],
         "channel": msg.channel.name,
+        "conversation_context": conversation_context,
+        "message_edit": edit_analysis,
+        "expression_drive": urge_level,
     }
     symbolic = generate_symbolic_reply_from_text(
         user_text,
         child=child,
         base_path=Path("AI_Children"),
-        max_symbols=4,
+        max_symbols=_coerce_positive_int(cfg.get("max_reply_symbols", 6), 6),
         context=symbolic_context,
     )
     symbolic_unknown: list[str] = symbolic.get("unknown") if symbolic else []
@@ -844,6 +902,74 @@ class InaDiscordClient(discord.Client):
         self._load_outbox_history()
         self._typed_outbox_task = None
 
+    def _roleplay_mode(self, message: discord.Message) -> Optional[str]:
+        """Return read_only/respond for configured RP spaces (Umani-compatible)."""
+        if message.guild is None:
+            return None
+        cfg = get_discord_config().get("roleplay") or {}
+        if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+            return None
+        guild_ids = {str(value) for value in cfg.get("guild_ids", [])}
+        guild_names = {str(value).strip().casefold() for value in cfg.get("guild_names", ["Umani RP", "Umani"])}
+        channel_ids = {str(value) for value in cfg.get("channel_ids", [])}
+        reply_channel_ids = {str(value) for value in cfg.get("reply_channel_ids", [])}
+        reply_channel_names = {
+            str(value).strip().casefold()
+            for value in cfg.get("reply_channel_names", ["ina-text"])
+        }
+        guild_name = str(getattr(message.guild, "name", "")).strip().casefold()
+        guild_match = str(message.guild.id) in guild_ids or guild_name in guild_names
+        channel_match = not channel_ids or str(message.channel.id) in channel_ids
+        if not (guild_match and channel_match):
+            return None
+        channel_name = str(getattr(message.channel, "name", "")).strip().casefold()
+        reply_exception = (
+            str(message.channel.id) in reply_channel_ids
+            or channel_name in reply_channel_names
+        )
+        return "respond" if reply_exception or cfg.get("allow_replies", False) else "read_only"
+
+    async def _recent_message_context(self, message: discord.Message) -> list[dict]:
+        """Read a small, bounded slice of prior channel context."""
+        cfg = get_discord_config()
+        limit = _coerce_positive_int(cfg.get("history_context_limit", 12), 12)
+        limit = min(limit, 50)
+        turns = []
+        try:
+            async for prior in message.channel.history(limit=limit, before=message, oldest_first=False):
+                content = (prior.content or "").strip()
+                if not content:
+                    continue
+                turns.append({
+                    "message_id": str(prior.id),
+                    "author_id": str(prior.author.id),
+                    "author_name": getattr(prior.author, "display_name", None) or str(prior.author),
+                    "content": content[:2000],
+                    "created_at": prior.created_at.replace(tzinfo=timezone.utc).isoformat(),
+                })
+        except Exception:
+            logger.exception("Failed to read recent Discord context for channel %s", message.channel.id)
+        turns.reverse()
+        return turns
+
+    def _remember_roleplay_turn(self, message: discord.Message, context: list[dict], *, edited: bool = False) -> None:
+        tags = ["discord", "roleplay", "umani_compatible", "history"]
+        if edited:
+            tags.append("edited")
+        self.history_bridge.log_conversation_turn(
+            message.content or "",
+            speaker=getattr(message.author, "display_name", None) or str(message.author),
+            tags=tags,
+            entity_links=[{
+                "type": "discord_roleplay_message",
+                "message_id": str(message.id),
+                "channel_id": str(message.channel.id),
+                "guild_id": str(message.guild.id) if message.guild else None,
+                "context_message_ids": [turn["message_id"] for turn in context],
+            }],
+            timestamp=message.edited_at.isoformat() if edited and message.edited_at else message.created_at.isoformat(),
+        )
+
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user and self.user.id)
         logger.info("Discord bridge is active. DMs from owner (%s) + configured text channel will be routed.", SAKURA_USER_ID)
@@ -851,10 +977,67 @@ class InaDiscordClient(discord.Client):
         if self._typed_outbox_task is None:
             self._typed_outbox_task = asyncio.create_task(self._watch_typed_outbox())
 
-    async def on_message(self, message: discord.Message) -> None:
-        # Ignore messages from ourselves or other bots
-        if message.author.bot:
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        """Record and process meaningful Discord message edits."""
+        if (before.content or "") == (after.content or ""):
             return
+        if self.user and after.author.id == self.user.id:
+            return
+        if after.author.bot:
+            rp_cfg = get_discord_config().get("roleplay") or {}
+            if self._roleplay_mode(after) is None or rp_cfg.get("include_bot_messages", True) is False:
+                return
+        edit_analysis = infer_message_edit(before.content or "", after.content or "")
+        is_dm = after.guild is None
+        if is_dm:
+            trusted = (
+                after.author.id == SAKURA_USER_ID
+                or is_owner_friend(after.author.id)
+                or is_high_trust(after.author.id)
+            )
+            if not trusted:
+                return
+            roleplay_mode = None
+        else:
+            in_primary = self.text_channel is not None and after.channel.id == self.text_channel.id
+            roleplay_mode = self._roleplay_mode(after)
+            if not in_primary and roleplay_mode is None:
+                return
+
+        context = await self._recent_message_context(after)
+        try:
+            await asyncio.to_thread(
+                self.history_bridge.log_conversation_turn,
+                after.content or "",
+                speaker=getattr(after.author, "display_name", None) or str(after.author),
+                tags=["discord", "message_edit", edit_analysis["likely_reason"]],
+                entity_links=[{
+                    "type": "discord_message_edit",
+                    "message_id": str(after.id),
+                    **edit_analysis,
+                }],
+                timestamp=after.edited_at.isoformat() if after.edited_at else datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            logger.exception("Failed to retain Discord edit %s", after.id)
+        if roleplay_mode == "read_only":
+            return
+        self._route_to_comms(
+            after, is_dm=is_dm,
+            owner_friend=is_owner_friend(after.author.id) if is_dm else False,
+            high_trust=is_high_trust(after.author.id) if is_dm else False,
+            conversation_context=context, edit_analysis=edit_analysis,
+            roleplay=bool(roleplay_mode),
+        )
+
+    async def on_message(self, message: discord.Message) -> None:
+        # Never loop on Ina's own posts. RP proxy/webhook bots may be readable.
+        if self.user and message.author.id == self.user.id:
+            return
+        if message.author.bot:
+            rp_cfg = get_discord_config().get("roleplay") or {}
+            if self._roleplay_mode(message) is None or rp_cfg.get("include_bot_messages", True) is False:
+                return
 
         content = (message.content or "").strip()
         lower = content.lower()
@@ -910,20 +1093,29 @@ class InaDiscordClient(discord.Client):
                 await self._handle_voice_leave(message)
                 return
             image_attachments = await self._ingest_image_attachments(message)
+            recent_context = await self._recent_message_context(message)
             self._route_to_comms(
                 message,
                 is_dm=True,
                 owner_friend=owner_friend,
                 high_trust=high_trust,
                 image_attachments=image_attachments,
+                conversation_context=recent_context,
             )
             return
 
-        # Guild messages: only handle those in the configured text channel
-        if self.text_channel is None or message.channel.id != self.text_channel.id:
+        # Guild messages: configured bridge channel or a compatible RP space.
+        in_primary_channel = self.text_channel is not None and message.channel.id == self.text_channel.id
+        roleplay_mode = self._roleplay_mode(message)
+        if not in_primary_channel and roleplay_mode is None:
             return
 
         self._record_social_contact(message)
+        recent_context = await self._recent_message_context(message)
+        if roleplay_mode:
+            await asyncio.to_thread(self._remember_roleplay_turn, message, recent_context)
+            if roleplay_mode == "read_only":
+                return
 
         if lower in VOICE_JOIN_COMMANDS:
             await self._handle_voice_join(message)
@@ -942,7 +1134,10 @@ class InaDiscordClient(discord.Client):
 
         logger.info("Inbound guild message in text channel %s: %s", message.channel.id, content)
         image_attachments = await self._ingest_image_attachments(message)
-        self._route_to_comms(message, is_dm=False, image_attachments=image_attachments)
+        self._route_to_comms(
+            message, is_dm=False, image_attachments=image_attachments,
+            conversation_context=recent_context, roleplay=bool(roleplay_mode),
+        )
 
     async def _handle_voice_join(self, message: discord.Message) -> None:
         target_channel = self.voice_channel
@@ -1136,6 +1331,9 @@ class InaDiscordClient(discord.Client):
         owner_friend: bool = False,
         high_trust: bool = False,
         image_attachments: Optional[list[dict]] = None,
+        conversation_context: Optional[list[dict]] = None,
+        edit_analysis: Optional[dict] = None,
+        roleplay: bool = False,
     ) -> None:
         sender = make_sender_info_from_discord(message, backend_name=BACKEND_NAME)
         channel = make_channel_info_from_discord(message, backend_name=BACKEND_NAME)
@@ -1145,7 +1343,12 @@ class InaDiscordClient(discord.Client):
             "is_dm": is_dm,
             "is_owner_friend": owner_friend,
             "is_high_trust": high_trust,
+            "conversation_context": list(conversation_context or []),
+            "is_roleplay_context": roleplay,
         }
+        if edit_analysis:
+            metadata["message_edit"] = edit_analysis
+            metadata["is_edited_message"] = True
         if image_attachments:
             metadata["image_attachments"] = image_attachments
             metadata["image_attachment_count"] = len(image_attachments)
