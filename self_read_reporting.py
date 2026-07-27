@@ -162,7 +162,7 @@ def _queue_broken_pipe_issue(
     return queue_github_submission(
         title,
         summary,
-        kind="request",
+        kind="bug_report",
         submission_mode="explain",
         suggestion=(
             "Reconnect or harden the pipe consumer, and downgrade repeated broken-pipe noise into a clearer "

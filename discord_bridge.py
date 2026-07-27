@@ -49,6 +49,7 @@ from social_map import (
 from language_processing import generate_symbolic_reply_from_text
 from live_experience_bridge import LiveExperienceBridge
 from model_manager import get_inastate, update_inastate
+from io_pressure import pressure_signal
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -976,6 +977,8 @@ class InaDiscordClient(discord.Client):
         self.text_channel, self.voice_channel = resolve_configured_channels(self)
         if self._typed_outbox_task is None:
             self._typed_outbox_task = asyncio.create_task(self._watch_typed_outbox())
+        if getattr(self, "_io_pressure_task", None) is None:
+            self._io_pressure_task = asyncio.create_task(self._watch_io_pressure())
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         """Record and process meaningful Discord message edits."""
@@ -1893,6 +1896,19 @@ class InaDiscordClient(discord.Client):
         else:
             logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
         return sent or voice_played
+
+    async def _watch_io_pressure(self):
+        """Measure gateway-loop stalls and ask managed batch I/O to yield."""
+        interval = 2.0
+        expected = asyncio.get_running_loop().time() + interval
+        while not self.is_closed():
+            await asyncio.sleep(interval)
+            now = asyncio.get_running_loop().time()
+            lag = max(0.0, now - expected)
+            expected = now + interval
+            policy = load_root_config().get("io_pressure", {})
+            signal = pressure_signal("discord", lag, policy=policy)
+            await asyncio.to_thread(update_inastate, "io_pressure", signal)
 
     async def _watch_typed_outbox(self):
         while not self.is_closed():

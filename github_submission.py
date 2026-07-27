@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -19,6 +21,13 @@ DEFAULT_GITHUB_SUBMISSION: Dict[str, Any] = {
     "labels": ["ina-suggestion", "needs-review"],
     "optimization_labels": ["ina-suggestion", "optimization", "needs-review"],
     "feature_labels": ["ina-suggestion", "feature-request", "needs-review"],
+    "bug_labels": ["ina-suggestion", "bug", "needs-review"],
+    "issue_labels": ["ina-suggestion", "operational-issue", "needs-review"],
+    "auto_queue_bug_reports": True,
+    "auto_queue_issue_reports": True,
+    "auto_queue_feature_requests": True,
+    "finding_cooldown_minutes": 180,
+    "finding_min_confidence": 0.35,
     "max_batch": 2,
     "max_age_minutes": 1440,
     "poll_interval_sec": 60.0,
@@ -94,10 +103,14 @@ def get_github_submission_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     policy["labels"] = _clean_labels(raw.get("labels"), policy["labels"])
     policy["optimization_labels"] = _clean_labels(raw.get("optimization_labels"), policy["optimization_labels"])
     policy["feature_labels"] = _clean_labels(raw.get("feature_labels"), policy["feature_labels"])
+    policy["bug_labels"] = _clean_labels(raw.get("bug_labels"), policy["bug_labels"])
+    policy["issue_labels"] = _clean_labels(raw.get("issue_labels"), policy["issue_labels"])
     policy["max_batch"] = _coerce_int(raw.get("max_batch"), int(policy["max_batch"]), minimum=1)
     policy["max_age_minutes"] = _coerce_int(raw.get("max_age_minutes"), int(policy["max_age_minutes"]), minimum=1)
     policy["daily_issue_cap"] = _coerce_int(raw.get("daily_issue_cap"), int(policy["daily_issue_cap"]), minimum=1)
     policy["cooldown_minutes"] = _coerce_int(raw.get("cooldown_minutes"), int(policy["cooldown_minutes"]), minimum=1)
+    policy["finding_cooldown_minutes"] = _coerce_int(raw.get("finding_cooldown_minutes"), int(policy["finding_cooldown_minutes"]), minimum=1)
+    policy["finding_min_confidence"] = min(1.0, _coerce_float(raw.get("finding_min_confidence"), float(policy["finding_min_confidence"]), minimum=0.0))
     policy["poll_interval_sec"] = _coerce_float(raw.get("poll_interval_sec"), float(policy["poll_interval_sec"]), minimum=5.0)
     policy["min_resource_trend_pressure"] = min(1.0, _coerce_float(raw.get("min_resource_trend_pressure"), float(policy["min_resource_trend_pressure"]), minimum=0.0))
     policy["max_patch_excerpt_chars"] = _coerce_int(raw.get("max_patch_excerpt_chars"), int(policy["max_patch_excerpt_chars"]), minimum=256)
@@ -105,6 +118,8 @@ def get_github_submission_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     policy["auto_submit_optimization_requests"] = bool(
         raw.get("auto_submit_optimization_requests", policy["auto_submit_optimization_requests"])
     )
+    for key in ("auto_queue_bug_reports", "auto_queue_issue_reports", "auto_queue_feature_requests"):
+        policy[key] = bool(raw.get(key, policy[key]))
     return policy
 
 
@@ -304,6 +319,101 @@ def append_github_issue_entry(
     return entry_id if _append_jsonl(github_outbox_path(child), entry) else None
 
 
+
+def github_finding_state_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "github_finding_state.json"
+
+
+def _finding_kind(value: Any) -> str:
+    key = str(value or "issue").strip().lower().replace("-", "_")
+    if key in {"bug", "bug_report", "defect", "failure", "exception"}: return "bug_report"
+    if key in {"feature", "feature_request", "enhancement", "idea"}: return "feature_request"
+    return "issue_report"
+
+
+def _finding_fingerprint(kind: str, title: str, component: str, dedupe_key: Optional[str]) -> str:
+    if dedupe_key and str(dedupe_key).strip():
+        basis = str(dedupe_key).strip().lower()
+    else:
+        stable_title = re.sub(r"\b(?:0x[0-9a-f]+|\d+)\b", "#", str(title).strip().lower())
+        basis = "|".join((kind, str(component or "unknown").strip().lower(), stable_title))
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_finding_state(child: str) -> Dict[str, Any]:
+    path = github_finding_state_path(child)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_finding_state(child: str, payload: Dict[str, Any]) -> None:
+    path = github_finding_state_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def report_github_finding(
+    child: str,
+    title: str,
+    summary: str,
+    *,
+    kind: str = "issue",
+    component: str = "unknown",
+    severity: str = "medium",
+    confidence: float = 0.5,
+    evidence: Optional[List[str]] = None,
+    reproduction_steps: Optional[List[str]] = None,
+    expected: Optional[str] = None,
+    actual: Optional[str] = None,
+    impact: Optional[str] = None,
+    suggestion: Optional[str] = None,
+    touched_files: Optional[List[str]] = None,
+    dedupe_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Queue a structured finding, with confidence gating and cooldown dedupe."""
+    policy = get_github_submission_config(cfg)
+    normalized_kind = _finding_kind(kind)
+    if not policy.get("enabled", False): return {"queued": False, "reason": "disabled"}
+    gate = {"bug_report": "auto_queue_bug_reports", "issue_report": "auto_queue_issue_reports", "feature_request": "auto_queue_feature_requests"}[normalized_kind]
+    if not policy.get(gate, True): return {"queued": False, "reason": "kind_disabled", "kind": normalized_kind}
+    try: score = max(0.0, min(1.0, float(confidence)))
+    except Exception: score = 0.0
+    if score < float(policy.get("finding_min_confidence", 0.35)):
+        return {"queued": False, "reason": "low_confidence", "kind": normalized_kind, "confidence": score}
+    title_text, summary_text = str(title or "").strip(), str(summary or "").strip()
+    if not title_text or not summary_text: return {"queued": False, "reason": "missing_summary"}
+    fingerprint = _finding_fingerprint(normalized_kind, title_text, component, dedupe_key)
+    state = _load_finding_state(child); prior = state.get(fingerprint) if isinstance(state.get(fingerprint), dict) else {}
+    now = datetime.now(timezone.utc)
+    try: prior_at = datetime.fromisoformat(str(prior.get("last_queued_at") or "").replace("Z", "+00:00"))
+    except Exception: prior_at = None
+    if prior_at and prior_at.tzinfo is None: prior_at = prior_at.replace(tzinfo=timezone.utc)
+    if prior_at and (now - prior_at.astimezone(timezone.utc)) < timedelta(minutes=int(policy["finding_cooldown_minutes"])):
+        return {"queued": False, "reason": "cooldown", "kind": normalized_kind, "fingerprint": fingerprint, "existing_entry_id": prior.get("entry_id")}
+    lines = [summary_text]
+    for heading, value in (("Impact", impact), ("Expected Behavior", expected), ("Actual Behavior", actual), ("Suggested Direction", suggestion)):
+        text = str(value or "").strip()
+        if text: lines.extend(["", f"## {heading}", text])
+    steps = [str(item).strip() for item in (reproduction_steps or []) if str(item).strip()]
+    if steps:
+        lines.extend(["", "## Reproduction Steps"])
+        lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
+    meta = dict(metadata or {})
+    meta.update({"source": meta.get("source") or "ina_finding", "component": str(component or "unknown"), "severity": str(severity or "medium").lower(), "confidence": round(score, 3), "finding_fingerprint": fingerprint, "evidence": [str(item).strip() for item in (evidence or []) if str(item).strip()], "touched_files": [str(item).strip() for item in (touched_files or []) if str(item).strip()]})
+    entry_id = append_github_issue_entry(child, title_text, "\n".join(lines), kind=normalized_kind, labels=labels_for_kind(normalized_kind, cfg), metadata=meta)
+    if not entry_id: return {"queued": False, "reason": "queue_write_failed", "fingerprint": fingerprint}
+    state[fingerprint] = {"entry_id": entry_id, "kind": normalized_kind, "title": title_text, "last_queued_at": now.isoformat()}
+    try: _save_finding_state(child, state)
+    except Exception: pass
+    return {"queued": True, "entry_id": entry_id, "kind": normalized_kind, "fingerprint": fingerprint}
+
 def _entry_timestamp(entry: Dict[str, Any]) -> Optional[datetime]:
     created_at = entry.get("created_at")
     if not created_at:
@@ -451,6 +561,10 @@ def build_issue_title(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = Non
 def labels_for_kind(kind: str, cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     policy = get_github_submission_config(cfg)
     kind_key = str(kind or "request").strip().lower()
+    if kind_key in {"bug", "bug_report", "defect"}:
+        return list(policy.get("bug_labels", []))
+    if kind_key in {"issue", "issue_report", "operational_issue", "incident"}:
+        return list(policy.get("issue_labels", []))
     if kind_key in {"feature", "feature_request", "feature_patch", "feature_proposal"}:
         return list(policy.get("feature_labels", []))
     if kind_key in {"optimization", "optimization_request", "optimization_patch", "patch_attempt"}:
@@ -480,6 +594,10 @@ def build_issue_body(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None
     lines.append(f"- created_at: `{str(entry.get('created_at') or '')}`")
     if confidence is not None:
         lines.append(f"- confidence: `{confidence}`")
+    for key in ("component", "severity", "finding_fingerprint"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            lines.append(f"- {key}: `{value}`")
     if labels:
         lines.append(f"- suggested_labels: `{', '.join(str(label) for label in labels if label)}`")
 
@@ -591,6 +709,7 @@ __all__ = [
     "get_current_child",
     "get_github_submission_config",
     "github_attachment_dir",
+    "github_finding_state_path",
     "github_bridge_lock_path",
     "github_outbox_archive_path",
     "github_outbox_history_path",
@@ -601,6 +720,7 @@ __all__ = [
     "log_history",
     "maybe_queue_submission_discord_notice",
     "read_pending_entries",
+    "report_github_finding",
     "resolve_github_token",
     "submit_issue",
     "typed_outbox_path",

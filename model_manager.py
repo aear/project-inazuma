@@ -32,12 +32,13 @@ from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
 from storage_layout import fast_runtime_path
 from storage_vitals import sample_storage_vitals
+from io_pressure import active_pressure
 from operator_permissions import (
     FAST_RUNTIME_PERMISSION_TYPE,
     OPERATOR_PERMISSION_KEY,
     attach_storage_permission_requests,
 )
-from github_submission import append_github_issue_entry, get_github_submission_config, labels_for_kind
+from github_submission import append_github_issue_entry, get_github_submission_config, labels_for_kind, report_github_finding
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 try:
@@ -973,6 +974,7 @@ def _scheduler_resource_profile(profile: Dict[str, Any], limits: Optional[Dict[s
         "gpu_class": profile.get("gpu_class"),
         "exclusive_group": profile.get("exclusive_group"),
         "memory_estimate_gb": _scheduler_memory_estimate_gb(profile, limits),
+        "io_class": profile.get("io_class", "high" if profile.get("module") in {"memory_graph", "memory_reconciliation", "meaning_map", "neural_graph", "logic_map", "emotion_map"} else "low"),
         "memory_limit_gb": _scheduler_task_memory_limit_gb(profile, limits),
     }
 
@@ -1343,6 +1345,7 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
         "gpu_memory_percent": round(float(gpu.get("memory_percent", 0.0) or 0.0), 1),
         "gpu_memory_used_mb": round(float(gpu.get("memory_used_mb", 0.0) or 0.0), 1),
         "running_modules": sorted(running_modules),
+        "io_pressure_level": active_pressure(get_inastate("io_pressure"), policy=load_config().get("io_pressure", {})),
         "resource_vitals_timestamp": vitals.get("timestamp") or vitals.get("updated_at"),
         "resource_vitals_top_modules": [
             item for item in (vitals.get("top_modules") if isinstance(vitals.get("top_modules"), list) else [])[:6]
@@ -1755,6 +1758,13 @@ def _scheduler_can_start_task(entry: Dict[str, Any], state: Dict[str, Any], reso
         available_gb = float(memory.get("ram_available_gb", 0.0) or 0.0)
         if min_available > 0 and available_gb > 0 and (available_gb - estimate_gb) < min_available:
             return False, "scheduler_available_ram_limit"
+
+    io_class = str(profile.get("io_class") or ("high" if profile.get("module") in {"memory_graph", "memory_reconciliation", "meaning_map", "neural_graph", "logic_map", "emotion_map"} else "low")).lower()
+    io_pressure_level = str(resources.get("io_pressure_level") or "clear").lower()
+    if io_pressure_level == "hard" and io_class != "low":
+        return False, "latency_io_pressure_hard"
+    if io_pressure_level == "soft" and io_class == "high":
+        return False, "latency_io_pressure_soft"
 
     cpu_percent = float(resources.get("cpu_percent", 0.0) or 0.0)
     if cpu_percent >= float(limits.get("cpu_hard_percent", 85.0)):
@@ -3410,6 +3420,50 @@ def queue_github_optimization_request(
     )
 
 
+def queue_github_bug_report(
+    title: str,
+    problem: str,
+    *,
+    component: str = "unknown",
+    severity: str = "medium",
+    confidence: float = 0.5,
+    evidence: Optional[List[str]] = None,
+    reproduction_steps: Optional[List[str]] = None,
+    expected: Optional[str] = None,
+    actual: Optional[str] = None,
+    impact: Optional[str] = None,
+    suggestion: Optional[str] = None,
+    touched_files: Optional[List[str]] = None,
+    dedupe_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Public runtime hook for any subsystem that discovers a defect."""
+    result = report_github_finding(
+        CHILD, title, problem, kind="bug", component=component, severity=severity,
+        confidence=confidence, evidence=evidence, reproduction_steps=reproduction_steps,
+        expected=expected, actual=actual, impact=impact, suggestion=suggestion,
+        touched_files=touched_files, dedupe_key=dedupe_key, metadata=metadata, cfg=load_config(),
+    )
+    if result.get("queued"):
+        update_inastate("last_github_submission", {"id": result.get("entry_id"), "title": title, "kind": "bug_report", "timestamp": datetime.now(timezone.utc).isoformat(), "metadata": metadata or {}})
+        log_to_statusbox(f"[Manager] Queued Ina bug report {result.get('entry_id')}.")
+    return result
+
+
+def queue_github_finding(
+    title: str,
+    summary: str,
+    *,
+    kind: str = "issue",
+    component: str = "unknown",
+    severity: str = "medium",
+    confidence: float = 0.5,
+    **details: Any,
+) -> Dict[str, Any]:
+    """General hook for operational issues, bugs, ideas, and feature requests."""
+    return report_github_finding(CHILD, title, summary, kind=kind, component=component, severity=severity, confidence=confidence, cfg=load_config(), **details)
+
+
 def queue_github_feature_request(
     title: str,
     request: str,
@@ -3588,6 +3642,38 @@ def _continuity_core_map_review_payload(
     }
 
 
+def _resource_pressure_warrants_github_report(
+    resource_context: Dict[str, Any],
+    policy: Dict[str, Any],
+) -> bool:
+    """Require current evidence, rather than a possibly stale guard label."""
+    threshold = float(policy.get("min_resource_trend_pressure", 0.74) or 0.74)
+    trend_pressure = float(resource_context.get("trend_pressure", 0.0) or 0.0)
+    current_pressure = float(resource_context.get("current_pressure", 0.0) or 0.0)
+    if max(trend_pressure, current_pressure) >= threshold:
+        return True
+
+    max_total = _coerce_float(resource_context.get("scheduler_max_total_rss_gb"), 0.0)
+    ina_rss = _coerce_float(resource_context.get("ina_rss_gb"), 0.0)
+    return max_total > 0.0 and ina_rss >= max_total * 0.8
+
+
+def _github_optimization_fingerprint(
+    *,
+    continuity_proposal_mode: bool,
+    largest_module: str,
+) -> str:
+    # Keep one cooldown identity per target. Volatile pressure samples and trend
+    # directions belong in evidence, not in duplicate identity.
+    fingerprint_basis = "|".join(
+        [
+            "continuity_core_map" if continuity_proposal_mode else "optimization",
+            largest_module,
+        ]
+    )
+    return hashlib.sha1(fingerprint_basis.encode("utf-8")).hexdigest()[:16]
+
+
 def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, Any]] = None) -> Optional[str]:
     cfg = load_config()
     policy = get_github_submission_config(cfg)
@@ -3606,7 +3692,7 @@ def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, An
     current_pressure = float(resource_context.get("current_pressure", 0.0) or 0.0)
     short_direction = str(resource_context.get("short_direction") or "unknown").strip().lower()
     long_direction = str(resource_context.get("long_direction") or "unknown").strip().lower()
-    if guard_level not in {"soft", "hard"} and trend_pressure < float(policy.get("min_resource_trend_pressure", 0.74)):
+    if not _resource_pressure_warrants_github_report(resource_context, policy):
         return None
     if short_direction == "falling" and long_direction == "falling" and guard_level not in {"soft", "hard"}:
         return None
@@ -3622,19 +3708,10 @@ def _maybe_queue_github_optimization_request(memory_guard: Optional[Dict[str, An
     optimization_hint = str(resource_context.get("optimization_hint") or "").strip()
     summary = str(resource_context.get("summary") or "").strip()
     trend_summary = str(resource_context.get("trend_summary") or "").strip()
-    fingerprint_basis = "|".join(
-        [
-            "continuity_core_map" if continuity_proposal_mode else "optimization",
-            guard_level,
-            str(round(trend_pressure, 3)),
-            str(round(current_pressure, 3)),
-            largest_module,
-            optimization_hint,
-            short_direction,
-            long_direction,
-        ]
+    fingerprint = _github_optimization_fingerprint(
+        continuity_proposal_mode=continuity_proposal_mode,
+        largest_module=largest_module,
     )
-    fingerprint = hashlib.sha1(fingerprint_basis.encode("utf-8")).hexdigest()[:16]
     now = time.time()
     cooldown_sec = float(policy.get("cooldown_minutes", 180) or 180) * 60.0
     if fingerprint == str(state.get("last_fingerprint") or ""):

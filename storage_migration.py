@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,80 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
         handle.write("\n")
     tmp_path.replace(path)
 
+
+
+def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_link: bool = True) -> Dict[str, Any]:
+    """Checksum-copy a tree, then retain its old name as a compatibility link."""
+    source, target = Path(source).expanduser(), Path(target).expanduser()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = source.with_name(f"{source.name}.ina-migration-backup-{stamp}")
+    report: Dict[str, Any] = {"source": str(source), "target": str(target), "backup": str(backup), "apply": apply, "files": [], "copied": 0, "verified": 0, "failed": 0, "bytes": 0, "cutover": False}
+    if source.is_symlink():
+        report.update(status="already_linked", link_target=os.readlink(source)); return report
+    if not source.exists(): report["status"] = "missing_source"; return report
+    if target.exists() and not target.is_dir(): report["status"] = "target_not_directory"; return report
+    try:
+        target.resolve().relative_to(source.resolve())
+        report["status"] = "source_contains_target"; return report
+    except ValueError: pass
+    for src in sorted(source.rglob("*")):
+        rel, dst = src.relative_to(source), target / src.relative_to(source)
+        if src.is_symlink():
+            item = {"rel_path": rel.as_posix(), "source": str(src), "target": str(dst), "kind": "symlink", "link_target": os.readlink(src)}
+            try:
+                if apply:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.is_symlink() and os.readlink(dst) == item["link_target"]:
+                        item["status"] = "verified"
+                    elif dst.exists() or dst.is_symlink():
+                        raise OSError("target conflicts with source symlink")
+                    else:
+                        dst.symlink_to(item["link_target"], target_is_directory=src.is_dir())
+                        item["status"] = "verified"
+                    report["verified"] += 1
+                else: item["status"] = "planned"
+            except OSError as exc:
+                item.update(status="failed", error=str(exc)); report["failed"] += 1
+            report["files"].append(item); continue
+        if src.is_dir():
+            if apply: dst.mkdir(parents=True, exist_ok=True)
+            continue
+        if not src.is_file(): continue
+        item = {"rel_path": rel.as_posix(), "source": str(src), "target": str(dst), "kind": "file"}
+        try:
+            item["size"] = src.stat().st_size; report["bytes"] += item["size"]
+            source_hash = _hash_file(src); item["sha256"] = source_hash
+            if not source_hash: raise OSError("source checksum failed")
+            if apply:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.exists() or _hash_file(dst) != source_hash:
+                    shutil.copy2(src, dst); report["copied"] += 1
+                if _hash_file(dst) != source_hash: raise OSError("target checksum failed")
+                report["verified"] += 1; item["status"] = "verified"
+            else: item["status"] = "planned"
+        except OSError as exc:
+            item.update(status="failed", error=str(exc)); report["failed"] += 1
+        report["files"].append(item)
+    if apply and report["failed"] == 0:
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            source.rename(backup)
+            link_value = os.path.relpath(target, source.parent) if relative_link else str(target.resolve())
+            pending = source.with_name(f".{source.name}.ina-link-{stamp}")
+            pending.symlink_to(link_value, target_is_directory=True); pending.replace(source)
+            report.update(cutover=True, link_target=link_value)
+        except Exception as exc:
+            report.update(failed=report["failed"] + 1, cutover_error=str(exc))
+            try:
+                if source.is_symlink(): source.unlink()
+                if backup.exists() and not source.exists(): backup.rename(source)
+                report["rolled_back"] = True
+            except Exception as rollback_exc: report["rollback_error"] = str(rollback_exc)
+    report["status"] = "ok" if report["failed"] == 0 else "failed"
+    if apply:
+        manifest = target / "migration_manifests" / f"tree_migration_{stamp}.json"
+        _atomic_write_json(manifest, report); report["manifest"] = str(manifest)
+    return report
 
 def _resolve_cold_storage_paths(child: str, cfg: Dict[str, Any]) -> tuple[Path, Path]:
     source = Path("AI_Children") / child / "memory" / "cold_storage"
@@ -306,11 +381,18 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of flat event files considered.")
     parser.add_argument("--keep-legacy", action="store_true", help="Copy into shards but keep the original flat event files.")
     parser.add_argument("--detail-limit", type=int, default=200, help="Maximum per-file entries retained in sharding reports.")
+    parser.add_argument("--migrate-source", type=Path, help="Tree to move while preserving this path as a symlink.")
+    parser.add_argument("--migrate-target", type=Path, help="Destination tree on an NVMe or new-system mount.")
+    parser.add_argument("--absolute-link", action="store_true", help="Use an absolute compatibility link; relative is portable by default.")
     args = parser.parse_args()
 
     cfg = _load_config()
     child = args.child or cfg.get("current_child") or "Inazuma_Yagami"
-    if args.shard_experience_events:
+    if bool(args.migrate_source) != bool(args.migrate_target):
+        parser.error("--migrate-source and --migrate-target must be supplied together")
+    if args.migrate_source:
+        report = migrate_tree_and_link(args.migrate_source, args.migrate_target, apply=bool(args.apply), relative_link=not args.absolute_link)
+    elif args.shard_experience_events:
         report = shard_experience_events(
             str(child),
             apply=bool(args.apply),
