@@ -252,7 +252,7 @@ def sample_storage_vitals(
         if isinstance(sample.get("directory_index"), dict) and isinstance(sample.get("directory_index", {}).get("reported_hard_entry_limit"), int)
     ]
 
-    return {
+    payload = {
         "available": bool(roles),
         "updated_at": _now_iso(),
         "child": current_child,
@@ -268,6 +268,18 @@ def sample_storage_vitals(
         },
         "roles": roles,
     }
+    try:
+        from adaptive_storage import update_from_storage_vitals
+        adaptive = update_from_storage_vitals(current_child, cfg, payload)
+        payload["adaptive_placement"] = {
+            "updated_at": adaptive.get("updated_at"),
+            "last_probe_at": adaptive.get("last_probe_at"),
+            "decisions": adaptive.get("decisions", {}),
+            "devices": adaptive.get("devices", {}),
+        }
+    except Exception as exc:
+        payload["adaptive_placement"] = {"available": False, "error": str(exc)}
+    return payload
 
 
 __all__ = ["sample_storage_vitals"]

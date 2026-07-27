@@ -23,7 +23,7 @@ from typing import Dict, Any, Iterable, List, Optional, Set, Tuple, TYPE_CHECKIN
 from gui_hook import log_to_statusbox
 from body_schema import get_region_anchors
 from experience_storage import iter_event_paths
-from io_utils import atomic_write_json, file_lock, load_json_dict
+from io_utils import atomic_write_json, file_lock, flush_for_durability, load_json_dict
 from storage_layout import fast_runtime_path
 
 try:
@@ -2929,8 +2929,7 @@ def _atomic_write_json_stream(path: Path, write_fn) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             write_fn(fh)
-            fh.flush()
-            os.fsync(fh.fileno())
+            flush_for_durability(fh, path)
         os.replace(tmp_path, path)
     except Exception:
         try:

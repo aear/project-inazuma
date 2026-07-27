@@ -42,6 +42,16 @@ def storage_layout(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _artifact_class(subdir: Optional[str], root_keys: Iterable[str]) -> str:
+    labels = {str(item).lower() for item in root_keys}
+    sub = str(subdir or "").lower()
+    if sub == "index" or "fast_index_root" in labels:
+        return "index"
+    if sub == "neural" or "fast_neural_root" in labels:
+        return "neural"
+    return "runtime"
+
+
 def fast_runtime_path(
     child: str,
     filename: str,
@@ -51,7 +61,7 @@ def fast_runtime_path(
     root_keys: Iterable[str] = ("fast_runtime_root", "fast_root"),
     config: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Return a fast-device path for rebuildable runtime files when available."""
+    """Choose a device for rebuildable runtime data; durable memory is excluded."""
 
     cfg = config if isinstance(config, dict) else load_config()
     layout = storage_layout(cfg)
@@ -67,7 +77,9 @@ def fast_runtime_path(
     if mount is not None and not mount.is_mount():
         return fallback
 
-    for key in root_keys:
+    keys = tuple(root_keys)
+    fast_candidate = None
+    for key in keys:
         root = format_child_path(layout.get(key), child)
         if root is None:
             continue
@@ -75,8 +87,22 @@ def fast_runtime_path(
             root = root / "AI_Children" / child / "memory" / "fast_runtime"
         if subdir and key in {"fast_runtime_root", "fast_root"}:
             root = root / subdir
-        if not root_is_writable(root):
-            continue
-        return root / filename
+        if root_is_writable(root):
+            fast_candidate = root / filename
+            break
 
-    return fallback
+    if fast_candidate is None:
+        return fallback
+
+    try:
+        from adaptive_storage import recommend_rebuildable_tier
+        tier = recommend_rebuildable_tier(
+            child,
+            _artifact_class(subdir, keys),
+            cfg,
+            fast_available=True,
+            durable_available=root_is_writable(Path(fallback)),
+        )
+    except Exception:
+        tier = "fast"
+    return fallback if tier == "durable" else fast_candidate

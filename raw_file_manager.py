@@ -101,7 +101,15 @@ DEFAULT_SELF_READ_PREFS = {
         "books": True,
         "venv": False,
     },
-    "skip_files": [],
+    # OS-managed swap files are storage infrastructure, not readable content.
+    # Match by filename so the protection follows every configured drive.
+    "skip_files": [
+        "swapfile",
+        "swapfile.*",
+        "swapfile[0-9]*",
+        ".swapfile",
+        ".swapfile.*",
+    ],
 }
 
 SOURCE_ANNOTATIONS = {
@@ -528,11 +536,8 @@ def _acquire_runtime_lock():
     lock_handle.seek(0)
     lock_handle.truncate()
     lock_handle.write(json.dumps(payload, ensure_ascii=True))
+    # The held flock is authoritative; the lock payload is only live telemetry.
     lock_handle.flush()
-    try:
-        os.fsync(lock_handle.fileno())
-    except Exception:
-        pass
 
     _SELF_READ_LOCK_HANDLE = lock_handle
     _SELF_READ_LOCK_HELD = True

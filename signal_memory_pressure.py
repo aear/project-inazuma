@@ -43,8 +43,8 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=4, ensure_ascii=True)
+            # This is transient pressure telemetry; atomic replace is enough.
             handle.flush()
-            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
     except Exception:
         try:
