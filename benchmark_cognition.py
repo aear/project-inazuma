@@ -12,10 +12,11 @@ import secrets
 import shlex
 from pathlib import Path
 
+from cognitive_benchmarks.audit import audit_surface_cues, surface_cues_pass
 from cognitive_benchmarks.backends import CommandScorer, HuggingFaceCausalScorer
 from cognitive_benchmarks.core import load_cases, run_benchmark
 from cognitive_benchmarks.schedule import MonthlyCadence
-from cognitive_benchmarks.procedural import generate_cases
+from cognitive_benchmarks.procedural import PROCEDURAL_VERSION, generate_cases
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CASES = ROOT / "benchmarks" / "persistent_cognition_v1.jsonl"
@@ -39,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--procedural", action="store_true", help="generate fresh in-memory cases")
     parser.add_argument("--procedural-count", type=int, default=4, help="cases per category")
     parser.add_argument("--seed", type=int, help="debug/reproduction seed; random by default")
+    parser.add_argument("--audit-only", action="store_true", help="audit procedural surface cues without scoring")
     parser.add_argument("--answer-key", type=Path, help="separate held-out JSON answer key")
     parser.add_argument("--allow-public-suite", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
@@ -68,6 +70,14 @@ def main() -> int:
             "--allow-public-suite for a non-evidentiary smoke test."
         )
 
+    seed = args.seed if args.seed is not None else secrets.randbits(128)
+    if args.audit_only:
+        audit = audit_surface_cues(
+            generate_cases(count_per_category=200, seed=seed)
+        )
+        print(json.dumps({**audit, "passed": surface_cues_pass(audit)}, indent=2))
+        return 0 if surface_cues_pass(audit) else 2
+
     cadence = MonthlyCadence(args.output_dir / "cadence.json")
     suite = "procedural-cognition" if procedural else "persistent-cognition"
     if args.monthly and not args.force and not cadence.is_due(suite, args.model):
@@ -76,6 +86,13 @@ def main() -> int:
                           "last_completed": last.isoformat() if last else None}, indent=2))
         return 0
 
+    if procedural:
+        preflight = audit_surface_cues(
+            generate_cases(count_per_category=100, seed=seed ^ 0x51A110)
+        )
+        if not surface_cues_pass(preflight):
+            raise SystemExit("Procedural suite failed shallow-cue preflight")
+
     if args.backend == "command":
         if not args.command:
             raise SystemExit("--command is required for the command backend")
@@ -83,13 +100,15 @@ def main() -> int:
     else:
         scorer = HuggingFaceCausalScorer(args.model, device=args.device)
 
-    seed = args.seed if args.seed is not None else secrets.randbits(128)
     cases = (
         generate_cases(count_per_category=max(1, args.procedural_count), seed=seed)
         if procedural
         else load_cases(args.cases, answer_key_path=args.answer_key)
     )
-    result = run_benchmark(cases, scorer, benchmark=suite)
+    result = run_benchmark(
+        cases, scorer, benchmark=suite,
+        benchmark_version=PROCEDURAL_VERSION if procedural else "1",
+    )
     payload = result.to_dict()
     payload["evaluation_protocol"] = (
         "procedural-generative" if procedural else

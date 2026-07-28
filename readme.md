@@ -76,6 +76,11 @@ contradiction, revision, and causal rules counts as capability. Entities, values
 scenarios, and answer positions vary from a one-use random seed. Only a seed
 fingerprint is recorded, and per-case results are withheld.
 
+`--audit-only --procedural` performs a non-scored preflight and does not update
+benchmark history or monthly cadence. Procedural version 2 also runs this gate
+automatically before scoring; it rejects templates exploitable by fixed-position,
+shortest/longest-choice, or prompt-token-overlap heuristics.
+
 The checked-in suite is public and therefore only a smoke test for a system
 that can inspect this repository. For a scored Ina run, keep questions in a
 JSONL file without `answer` fields and keep the answers in a separate JSON

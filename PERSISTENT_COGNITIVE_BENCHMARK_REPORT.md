@@ -94,6 +94,25 @@ finding a benchmark weakness before an Ina score was reported.
 8. Keep training and autobiographical writes disabled for evaluation prompts, or
    use a stateless snapshot/adapter, so the test does not alter what it measures.
 
+## Improvements made after calibration
+
+Procedural suite version 2 addresses the calibration finding without recording a
+second benchmark result. Candidate locations, values, events, and causal actions
+now appear symmetrically in prompts; causal distractors come from the same action
+family; contradiction labels have equal character length; answer positions cycle
+across cases; and each capability has multiple prompt phrasings.
+
+A non-scored preflight now evaluates fixed-position, shortest-choice,
+longest-choice, and prompt-token-overlap heuristics on 1,000 generated cases. On
+the deterministic development audit, expected aggregate chance was 36.67%; the
+heuristics scored 35.8% to 37.5%, except the deliberately equivalent position
+baselines at 36.7%. Every category remained within its configured tolerance. The
+preflight passed and did not write benchmark history or advance monthly cadence.
+
+Procedural scoring invokes a smaller form of this preflight automatically and
+refuses to continue if shallow cues exceed the validity threshold. A manual audit
+is available with `python benchmark_cognition.py --procedural --audit-only`.
+
 ## Live Ina attempt and current blocker
 
 During this calibration, the world server responded on local port 6969, but its

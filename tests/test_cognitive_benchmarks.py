@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cognitive_benchmarks.audit import audit_surface_cues, surface_cues_pass
 from cognitive_benchmarks.core import BenchmarkCase, load_cases, run_benchmark
 from cognitive_benchmarks.procedural import generate_cases
 from cognitive_benchmarks.schedule import MonthlyCadence
@@ -75,3 +76,13 @@ def test_procedural_suite_is_reproducible_but_varies_by_seed():
     assert len(first) == 15
     assert len({case.category for case in first}) == 5
     assert all(0 <= case.answer < len(case.choices) for case in first)
+
+
+def test_procedural_suite_passes_surface_cue_preflight():
+    cases = generate_cases(count_per_category=200, seed=0x1A2B3C)
+    audit = audit_surface_cues(cases)
+
+    assert audit["total"] == 1000
+    assert surface_cues_pass(audit)
+    assert audit["heuristics"]["shortest-choice"]["accuracy"] < 0.45
+    assert audit["heuristics"]["token-overlap"]["accuracy"] < 0.45
