@@ -323,6 +323,57 @@ def _decode(data: bytes) -> Tuple[str, int, int, List[int]]:
     raise ImageFallbackError("stdlib fallback supports PNG, BMP, PGM, and PPM images")
 
 
+def extract_image_grid(
+    source: Any,
+    *,
+    max_width: int = 128,
+    max_height: int = 128,
+) -> Dict[str, Any]:
+    """Decode an image into a bounded spatial grayscale grid.
+
+    Unlike :func:`extract_image_features`, this preserves two-dimensional
+    neighbourhoods for visual-token discovery. Downsampling uses a bounded
+    set of samples across each source cell so thin forms are less likely to
+    disappear, and never returns more than ``max_width * max_height`` pixels.
+    """
+
+    data = _read_source(source)
+    image_format, width, height, pixels = _decode(data)
+    target_width = max(1, min(int(max_width), width))
+    target_height = max(1, min(int(max_height), height))
+    scale = min(1.0, target_width / float(width), target_height / float(height))
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+
+    sampled: List[int] = []
+    for target_y in range(target_height):
+        source_y0 = int(target_y * height / target_height)
+        source_y1 = max(source_y0 + 1, int((target_y + 1) * height / target_height))
+        y_step = max(1, (source_y1 - source_y0) // 4)
+        y_samples = list(range(source_y0, source_y1, y_step))[:4]
+        for target_x in range(target_width):
+            source_x0 = int(target_x * width / target_width)
+            source_x1 = max(source_x0 + 1, int((target_x + 1) * width / target_width))
+            x_step = max(1, (source_x1 - source_x0) // 4)
+            x_samples = list(range(source_x0, source_x1, x_step))[:4]
+            values = [
+                pixels[min(height - 1, source_y) * width + min(width - 1, source_x)]
+                for source_y in y_samples
+                for source_x in x_samples
+            ]
+            sampled.append(int(round(sum(values) / max(1, len(values)))))
+
+    return {
+        "decoder": "simple_image_fallback",
+        "format": image_format,
+        "source_width": width,
+        "source_height": height,
+        "width": target_width,
+        "height": target_height,
+        "pixels": sampled,
+    }
+
+
 def extract_image_features(source: Any, *, limit: int = 1024) -> Dict[str, Any]:
     """Decode simple image formats into grayscale feature values.
 
@@ -343,4 +394,4 @@ def extract_image_features(source: Any, *, limit: int = 1024) -> Dict[str, Any]:
     }
 
 
-__all__ = ["ImageFallbackError", "extract_image_features"]
+__all__ = ["ImageFallbackError", "extract_image_features", "extract_image_grid"]

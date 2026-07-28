@@ -1,0 +1,348 @@
+from types import SimpleNamespace
+
+import discord_bridge as db
+
+
+class _Adapter:
+    def __init__(self, response="adapter reply"):
+        self.calls = []
+        self.response = response
+
+    def handle_prompt(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        return self.response
+
+
+def _message(text, *, attachments=None, context=None):
+    return SimpleNamespace(
+        text=text,
+        metadata={
+            "image_attachments": attachments or [],
+            "conversation_context": context or [],
+            "is_dm": False,
+        },
+        sender=SimpleNamespace(
+            backend_id="1", display_name="Sakura", internal_id="sakura"
+        ),
+        channel=SimpleNamespace(backend_id="2", name="ina-text"),
+    )
+
+
+def _enable_replying(monkeypatch):
+    monkeypatch.setattr(
+        db, "load_root_config", lambda: {"ignore_urge_for_typing": True}
+    )
+    monkeypatch.setattr(db, "get_current_child", lambda: "TestChild")
+
+
+def test_attachment_does_not_override_complete_symbolic_reply(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter()
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(
+        db,
+        "generate_symbolic_reply_from_text",
+        lambda *args, **kwargs: {
+            "text": "known symbolic reply",
+            "symbols": ["sym"],
+            "unknown": [],
+        },
+    )
+
+    result = db.process_inbound_message(
+        _message(
+            "Read em and weep",
+            attachments=[{"original_filename": "chart.png"}],
+            context=[{"author_name": "Someone", "content": "prior context"}],
+        )
+    )
+
+    assert result.text == "known symbolic reply"
+    assert adapter.calls == []
+
+
+def test_adapter_only_receives_operator_text(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("grounding response")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+
+    result = db.process_inbound_message(
+        _message(
+            "novelword",
+            context=[{"author_name": "ContextUser", "content": "contextonlyword"}],
+        )
+    )
+
+    assert result.text == "grounding response"
+    assert adapter.calls[0][0] == "novelword"
+
+
+def test_adapter_turn_is_linked_to_visual_experience(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("grounding response")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+    perception = {
+        "event_id": "evt_visual",
+        "recognized_symbols": [],
+        "orientation": "landscape",
+        "brightness": 0.2,
+        "contrast": 0.4,
+    }
+
+    result = db.process_inbound_message(
+        _message(
+            "What do you see?",
+            attachments=[{
+                "original_filename": "chart.png",
+                "vision_perception": perception,
+            }],
+        )
+    )
+
+    assert result.text == "grounding response"
+    links = adapter.calls[0][1]["entity_links"]
+    assert any(
+        link.get("type") == "vision_perception"
+        and link.get("event_id") == "evt_visual"
+        for link in links
+    )
+    assert result.metadata["vision_context"]["perceptions"] == [perception]
+
+
+def test_caption_words_feed_linked_visual_token_evidence(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("grounding response")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+    calls = []
+
+    def learn(event_ids, words, **kwargs):
+        calls.append((event_ids, words, kwargs))
+        return {
+            "status": "learned",
+            "updated_clusters": ["vtoken_form"],
+            "hypotheses": [],
+        }
+
+    monkeypatch.setattr(db, "observe_visual_words", learn)
+    perception = {
+        "event_id": "evt_visual",
+        "recognized_symbols": [],
+        "visual_token_learning": {
+            "candidate_ids": ["vtoken_form"],
+            "matches": [],
+        },
+    }
+
+    db.process_inbound_message(
+        _message(
+            "zabble form",
+            attachments=[{
+                "original_filename": "forms.png",
+                "vision_perception": perception,
+            }],
+        )
+    )
+
+    assert calls
+    assert calls[0][0] == ["evt_visual"]
+    assert calls[0][1] == ["zabble", "form"]
+    assert calls[0][2]["child"] == "TestChild"
+
+
+def test_image_only_turn_uses_stored_image_acknowledgement(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("should not be used")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+
+    result = db.process_inbound_message(
+        _message("", attachments=[{"original_filename": "chart.png"}])
+    )
+
+    assert "vision pass did not produce a usable perception" in result.text
+    assert result.metadata["adapter"] == "image_acknowledgement"
+    assert adapter.calls == []
+
+
+def test_recognized_visual_symbol_participates_in_reply(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("should not be used")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+    seen = {}
+
+    def build_message(symbols, **kwargs):
+        seen["symbols"] = symbols
+        seen["context"] = kwargs["context"]
+        return {"text": "visual symbolic reply", "native_text": "vision-native"}
+
+    monkeypatch.setattr(db, "build_dual_symbolic_message", build_message)
+    perception = {
+        "event_id": "evt_vision",
+        "recognized_symbols": ["vision_symbol_known"],
+        "orientation": "landscape",
+        "brightness": 0.4,
+        "contrast": 0.2,
+    }
+
+    result = db.process_inbound_message(
+        _message(
+            "",
+            attachments=[
+                {
+                    "original_filename": "chart.png",
+                    "vision_perception": perception,
+                }
+            ],
+        )
+    )
+
+    assert result.text == "visual symbolic reply"
+    assert result.metadata["symbols"] == ["vision_symbol_known"]
+    assert result.metadata["vision_context"]["event_ids"] == ["evt_vision"]
+    assert seen["symbols"] == ["vision_symbol_known"]
+    assert seen["context"]["vision"]["perceptions"] == [perception]
+    assert adapter.calls == []
+
+
+def test_mature_visual_word_hypothesis_enters_symbolic_language(monkeypatch):
+    _enable_replying(monkeypatch)
+    adapter = _Adapter("should not be used")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    seen = {}
+
+    def generate(text, **kwargs):
+        seen["input"] = text
+        seen["context"] = kwargs["context"]
+        return {
+            "text": "self-read symbolic response",
+            "symbols": ["symbol_for_zabble"],
+            "unknown": [],
+        }
+
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", generate)
+    perception = {
+        "event_id": "evt_visual",
+        "recognized_symbols": [],
+        "orientation": "landscape",
+        "brightness": 0.4,
+        "contrast": 0.2,
+        "visual_token_learning": {
+            "candidate_ids": ["vtoken_form"],
+            "matches": [{
+                "cluster_id": "vtoken_form",
+                "hypotheses": [{
+                    "word": "zabble",
+                    "support": 4,
+                    "confidence": 0.75,
+                }],
+            }],
+        },
+    }
+
+    result = db.process_inbound_message(
+        _message(
+            "",
+            attachments=[{
+                "original_filename": "forms.png",
+                "vision_perception": perception,
+            }],
+        )
+    )
+
+    assert result.text == "self-read symbolic response"
+    assert seen["input"] == "zabble"
+    assert seen["context"]["source_text"] == ""
+    assert seen["context"]["visual_inference_words"] == ["zabble"]
+    assert result.metadata["visual_inference_words"] == ["zabble"]
+    assert adapter.calls == []
+
+
+def test_unrecognized_image_ack_reports_measured_visual_properties(monkeypatch):
+    _enable_replying(monkeypatch)
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: None)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+
+    result = db.process_inbound_message(
+        _message(
+            "",
+            attachments=[
+                {
+                    "original_filename": "chart.png",
+                    "vision_perception": {
+                        "recognized_symbols": [],
+                        "orientation": "landscape",
+                        "brightness": 0.2,
+                        "contrast": 0.4,
+                    },
+                }
+            ],
+        )
+    )
+
+    assert "landscape, dark, high-contrast" in result.text
+    assert "did not match a visual symbol" in result.text
+
+
+def test_dependency_free_image_pass_reaches_vision_and_runtime_state(tmp_path, monkeypatch):
+    class VisionBridge:
+        calls = []
+
+        def __init__(self, **kwargs):
+            pass
+
+        def log_screen_snapshot(self, frame, **kwargs):
+            self.calls.append((frame, kwargs))
+            return "evt_visual"
+
+    image_path = tmp_path / "sample.pgm"
+    pixels = bytes([0, 255] * (80 * 40 // 2))
+    image_path.write_bytes(b"P5\n80 40\n255\n" + pixels)
+    learned = db.extract_image_features(image_path, limit=1024)["features"][:512]
+    state_updates = []
+
+    monkeypatch.setattr(db, "Image", None)
+    monkeypatch.setattr(db, "np", None)
+    monkeypatch.setattr(db, "LiveExperienceBridge", VisionBridge)
+    monkeypatch.setattr(
+        db,
+        "observe_visual_tokens",
+        lambda *a, **k: {
+            "status": "observed",
+            "candidate_ids": ["vtoken_test"],
+            "matches": [],
+        },
+    )
+    monkeypatch.setattr(
+        db,
+        "load_generated_symbols",
+        lambda *a, **k: [{"id": "vision_symbol", "image_features": learned}],
+    )
+    monkeypatch.setattr(
+        db, "update_inastate", lambda key, value: state_updates.append((key, value))
+    )
+    monkeypatch.setattr(db, "should_accept_fragment", lambda **kwargs: (False, "test"))
+
+    fragment = db._build_discord_image_fragment(
+        path=image_path,
+        child="TestChild",
+        fragment_id="frag_test",
+        tags=["discord", "image"],
+        summary="test image",
+        source_context={"discord_message_id": "1"},
+        rel_path="discord_attachments/sample.pgm",
+    )
+
+    perception = fragment["vision_perception"]
+    assert fragment["stored"] is False
+    assert perception["decoder"] == "simple_image_fallback"
+    assert perception["event_id"] == "evt_visual"
+    assert perception["recognized_symbols"] == ["vision_symbol"]
+    assert perception["orientation"] == "landscape"
+    assert perception["visual_token_learning"]["candidate_ids"] == ["vtoken_test"]
+    assert "vtoken_test" in fragment["tags"]
+    assert state_updates[-1] == ("last_discord_vision", perception)
+    assert VisionBridge.calls

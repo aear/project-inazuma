@@ -46,7 +46,15 @@ from social_map import (
     record_dm_attempt,
     update_social_entry,
 )
-from language_processing import generate_symbolic_reply_from_text
+from language_processing import (
+    build_dual_symbolic_message,
+    generate_symbolic_reply_from_text,
+    load_generated_symbols,
+)
+from simple_image_fallback import ImageFallbackError, extract_image_features
+from vector_math import cosine_similarity as visual_cosine_similarity
+from visual_token_learning import observe_image as observe_visual_tokens
+from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
 from model_manager import get_inastate, update_inastate
 from io_pressure import pressure_signal
@@ -476,6 +484,87 @@ def _format_image_attachment_note(attachments):
     return f"[Image attachment(s): {', '.join(names)}]"
 
 
+def _collect_vision_context(attachments):
+    perceptions = [
+        entry.get("vision_perception")
+        for entry in attachments or []
+        if isinstance(entry, dict) and isinstance(entry.get("vision_perception"), dict)
+    ]
+    symbols = []
+    event_ids = []
+    visual_token_ids = []
+    hypotheses = []
+    for perception in perceptions:
+        for symbol in perception.get("recognized_symbols") or []:
+            if symbol and symbol not in symbols:
+                symbols.append(str(symbol))
+        event_id = perception.get("event_id")
+        if event_id and event_id not in event_ids:
+            event_ids.append(str(event_id))
+        learning = perception.get("visual_token_learning") or {}
+        for token_id in learning.get("candidate_ids") or []:
+            if token_id and token_id not in visual_token_ids:
+                visual_token_ids.append(str(token_id))
+        for match in learning.get("matches") or []:
+            if not isinstance(match, dict):
+                continue
+            for hypothesis in match.get("hypotheses") or []:
+                if not isinstance(hypothesis, dict) or not hypothesis.get("word"):
+                    continue
+                row = {"cluster_id": match.get("cluster_id"), **hypothesis}
+                key = (row.get("cluster_id"), row.get("word"))
+                if not any((item.get("cluster_id"), item.get("word")) == key for item in hypotheses):
+                    hypotheses.append(row)
+    hypotheses.sort(
+        key=lambda item: (-float(item.get("confidence", 0.0)), -int(item.get("support", 0)), item.get("word", ""))
+    )
+    return {
+        "perceptions": perceptions,
+        "recognized_symbols": symbols,
+        "event_ids": event_ids,
+        "visual_token_ids": visual_token_ids,
+        "hypotheses": hypotheses[:16],
+    }
+
+
+def _format_image_perception_ack(attachments, vision_context):
+    names = [
+        entry.get("original_filename") or entry.get("filename")
+        for entry in attachments or []
+        if isinstance(entry, dict)
+    ]
+    names = [str(name) for name in names if name]
+    subject = f" '{names[0]}'" if len(names) == 1 else ""
+    perceptions = vision_context.get("perceptions") or []
+    if not perceptions:
+        return (
+            f"I received and stored the image attachment{subject} as image memory, "
+            "but my vision pass did not produce a usable perception."
+        )
+
+    perception = perceptions[0]
+    brightness = float(perception.get("brightness", 0.5))
+    contrast = float(perception.get("contrast", 0.0))
+    light_word = "dark" if brightness < 0.33 else "bright" if brightness > 0.67 else "mid-lit"
+    contrast_word = "high-contrast" if contrast > 0.25 else "low-contrast" if contrast < 0.10 else "moderate-contrast"
+    orientation = perception.get("orientation") or "unknown-orientation"
+    hypotheses = vision_context.get("hypotheses") or []
+    strong = [item for item in hypotheses if float(item.get("confidence", 0.0)) >= 0.55]
+    if strong:
+        best = strong[0]
+        return (
+            f"I looked at and stored the image attachment{subject}. My vision registered "
+            f"a {orientation}, {light_word}, {contrast_word} image. A recurring visual form "
+            f"tentatively reminds me of '{best['word']}' "
+            f"(confidence {float(best.get('confidence', 0.0)):.2f})."
+        )
+    return (
+        f"I looked at and stored the image attachment{subject}. My vision registered "
+        f"a {orientation}, {light_word}, {contrast_word} image, but it did not match "
+        "a visual symbol I have learned yet."
+    )
+
+
 def _save_fragment(child, fragment):
     frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{fragment['id']}.json"
     frag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -493,17 +582,111 @@ def _build_discord_image_fragment(
     source_context: dict,
     rel_path: Optional[str],
 ):
-    if Image is None or np is None or FractalTransformer is None:
-        logger.warning("Image processing unavailable; check pillow/numpy imports and transformer availability.")
-        return None
-    try:
-        with Image.open(path) as img:
-            array = np.array(img.convert("L")).flatten().tolist()
-    except Exception:
-        logger.exception("Failed to open image attachment at %s", path)
-        return None
+    rgb_image = None
+    decoder = "pillow_numpy"
+    width = 0
+    height = 0
+    array = []
+
+    if Image is not None and np is not None:
+        try:
+            with Image.open(path) as img:
+                width, height = img.size
+                rgb_image = np.array(img.convert("RGB"))
+                array = np.array(img.convert("L")).flatten().tolist()
+        except Exception:
+            logger.exception("Failed to open image attachment through Pillow at %s", path)
+
+    if not array:
+        try:
+            fallback = extract_image_features(path, limit=1024)
+            array = fallback.get("features") or []
+            width = int(fallback.get("width") or 0)
+            height = int(fallback.get("height") or 0)
+            decoder = str(fallback.get("decoder") or "simple_image_fallback")
+        except ImageFallbackError as exc:
+            logger.warning("Discord image vision decoder could not read %s: %s", path.name, exc)
+            return None
+        except Exception:
+            logger.exception("Discord image vision decoder failed for %s", path.name)
+            return None
+
     if not array:
         return None
+
+    normalized = [max(0.0, min(255.0, float(value))) for value in array]
+    brightness = sum(normalized) / (len(normalized) * 255.0)
+    mean_pixel = sum(normalized) / len(normalized)
+    variance = sum((value - mean_pixel) ** 2 for value in normalized) / len(normalized)
+    contrast = (variance ** 0.5) / 255.0
+    dominant_color = "unknown"
+    if rgb_image is not None:
+        channel_means = rgb_image.mean(axis=(0, 1)) / 255.0
+        dominant_index = int(np.argmax(channel_means))
+        dominant_color = ("red", "green", "blue")[dominant_index]
+        if max(channel_means) - min(channel_means) < 0.08:
+            dominant_color = "neutral"
+
+    orientation = "square"
+    if width > height * 1.1:
+        orientation = "landscape"
+    elif height > width * 1.1:
+        orientation = "portrait"
+
+    vision_symbols = []
+    for entry in load_generated_symbols(child, base_path=Path("AI_Children")):
+        stored = entry.get("image_features") if isinstance(entry, dict) else None
+        symbol_id = entry.get("id") if isinstance(entry, dict) else None
+        if not stored or not symbol_id:
+            continue
+        try:
+            similarity = visual_cosine_similarity(normalized[:512], stored)
+        except Exception:
+            continue
+        if similarity > 0.93 and symbol_id not in vision_symbols:
+            vision_symbols.append(str(symbol_id))
+
+    event_id = None
+    try:
+        vision_bridge = LiveExperienceBridge(child=child, base_path=Path("AI_Children"))
+        event_id = vision_bridge.log_screen_snapshot(
+            rgb_image if rgb_image is not None else normalized,
+            tags=["discord", "vision", "image", "attachment", "inbound"],
+            narrative=summary,
+            metadata={**source_context, "vision_decoder": decoder},
+        )
+    except Exception:
+        logger.exception("Failed to ground Discord image as a vision experience: %s", path.name)
+
+    visual_token_learning = {}
+    try:
+        visual_token_learning = observe_visual_tokens(
+            path,
+            child=child,
+            event_id=event_id,
+            base_path=Path("AI_Children"),
+        )
+    except Exception:
+        logger.exception("Discord visual-token learning failed for %s", path.name)
+
+    perception = {
+        "event_id": event_id,
+        "recognized_symbols": vision_symbols,
+        "width": int(width),
+        "height": int(height),
+        "orientation": orientation,
+        "brightness": round(brightness, 4),
+        "contrast": round(contrast, 4),
+        "dominant_color": dominant_color,
+        "decoder": decoder,
+        "source": "ina_vision",
+        "visual_token_learning": visual_token_learning,
+    }
+    try:
+        update_inastate("last_discord_vision", perception)
+    except Exception:
+        logger.exception("Failed to publish Discord vision state for %s", path.name)
+
     fragment = {
         "id": fragment_id,
         "summary": summary,
@@ -511,18 +694,35 @@ def _build_discord_image_fragment(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "discord_attachment",
         "modality": "image",
-        "image_features": array[:1024],
+        "image_features": normalized[:1024],
         "image_path": rel_path or str(path),
         "emotions": {"curiosity": 0.3, "focus": 0.3},
         "source_context": source_context,
+        "event_ref": event_id,
+        "vision_perception": perception,
     }
+    fragment["tags"].extend(
+        symbol for symbol in vision_symbols if symbol not in fragment["tags"]
+    )
+    visual_token_ids = list(visual_token_learning.get("candidate_ids") or [])[:16]
+    fragment["visual_token_ids"] = visual_token_ids
+    fragment["tags"].extend(
+        token_id for token_id in visual_token_ids if token_id not in fragment["tags"]
+    )
     allowed, reason = should_accept_fragment(fragment=fragment)
     if not allowed:
         logger.info("Skipping discord image fragment %s (%s).", fragment_id, reason)
-        return None
-    transformer = FractalTransformer()
-    vec = transformer.encode_image_fragment(fragment)
-    fragment["importance"] = vec.get("importance")
+        fragment["stored"] = False
+        fragment["storage_rejection_reason"] = reason
+        return fragment
+
+    if FractalTransformer is not None:
+        transformer = FractalTransformer()
+        vec = transformer.encode_image_fragment(fragment)
+        fragment["importance"] = vec.get("importance")
+    else:
+        fragment["importance"] = round(sum(value / 255.0 for value in normalized) / len(normalized), 4)
+    fragment["stored"] = True
     _save_fragment(child, fragment)
     return fragment
 
@@ -693,6 +893,7 @@ def process_inbound_message(msg) -> CommsResponse:
     if msg.metadata:
         attachments = msg.metadata.get("image_attachments") or []
     attachment_note = _format_image_attachment_note(attachments)
+    vision_context = _collect_vision_context(attachments)
     prompt_text = user_text
     if attachment_note:
         prompt_text = f"{user_text}\n\n{attachment_note}" if user_text.strip() else attachment_note
@@ -726,8 +927,38 @@ def process_inbound_message(msg) -> CommsResponse:
     reply_text = None
     adapter = get_chat_adapter()
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
+    if vision_context.get("perceptions"):
+        metadata["vision_context"] = vision_context
 
     tokens = _extract_tokens(user_text)
+    if tokens and vision_context.get("event_ids") and vision_context.get("visual_token_ids"):
+        try:
+            learning_update = observe_visual_words(
+                vision_context["event_ids"],
+                tokens,
+                child=child,
+                base_path=Path("AI_Children"),
+            )
+            vision_context["word_learning"] = learning_update
+            learned_hypotheses = learning_update.get("hypotheses") or []
+            combined_hypotheses = [
+                *learned_hypotheses,
+                *vision_context.get("hypotheses", []),
+            ]
+            deduplicated = {}
+            for hypothesis in combined_hypotheses:
+                if not isinstance(hypothesis, dict) or not hypothesis.get("word"):
+                    continue
+                key = (hypothesis.get("cluster_id"), hypothesis.get("word"))
+                current = deduplicated.get(key)
+                if current is None or float(hypothesis.get("confidence", 0.0)) > float(current.get("confidence", 0.0)):
+                    deduplicated[key] = hypothesis
+            vision_context["hypotheses"] = sorted(
+                deduplicated.values(),
+                key=lambda item: (-float(item.get("confidence", 0.0)), -int(item.get("support", 0)), item.get("word", "")),
+            )[:16]
+        except Exception:
+            logger.exception("Discord visual-token word learning failed")
     conversation_context = (msg.metadata or {}).get("conversation_context") or []
     edit_analysis = (msg.metadata or {}).get("message_edit")
     is_roleplay = bool((msg.metadata or {}).get("is_roleplay_context"))
@@ -745,29 +976,80 @@ def process_inbound_message(msg) -> CommsResponse:
             + "\nEdited message: " + prompt_text
         )
 
+    visual_inference_words = []
+    if not user_text.strip():
+        for hypothesis in vision_context.get("hypotheses") or []:
+            if float(hypothesis.get("confidence", 0.0)) < 0.70:
+                continue
+            word = str(hypothesis.get("word") or "").strip().lower()
+            if word and word not in visual_inference_words:
+                visual_inference_words.append(word)
+            if len(visual_inference_words) >= 4:
+                break
+    symbolic_input = user_text if user_text.strip() else " ".join(visual_inference_words)
+
     symbolic_context = {
         "source": "discord",
         "source_text": user_text,
         "tokens": tokens,
+        "visual_inference_words": visual_inference_words,
         "tags": [
             "discord",
             "text",
             "dm" if (msg.metadata or {}).get("is_dm") else "guild",
             *(["roleplay"] if is_roleplay else []),
             *(["edited"] if edit_analysis else []),
+            *(["vision", "image"] if attachments else []),
+            *vision_context.get("recognized_symbols", []),
         ],
         "channel": msg.channel.name,
         "conversation_context": conversation_context,
         "message_edit": edit_analysis,
         "expression_drive": urge_level,
+        "vision": vision_context,
     }
     symbolic = generate_symbolic_reply_from_text(
-        user_text,
+        symbolic_input,
         child=child,
         base_path=Path("AI_Children"),
         max_symbols=_coerce_positive_int(cfg.get("max_reply_symbols", 6), 6),
         context=symbolic_context,
     )
+    vision_symbols = vision_context.get("recognized_symbols") or []
+    if vision_symbols:
+        text_symbols = list(symbolic.get("symbols") or []) if symbolic else []
+        combined_symbols = list(dict.fromkeys([*text_symbols, *vision_symbols]))
+        combined_symbols = combined_symbols[: _coerce_positive_int(cfg.get("max_reply_symbols", 6), 6)]
+        visual_message = build_dual_symbolic_message(
+            combined_symbols,
+            child=child,
+            base_path=Path("AI_Children"),
+            context=symbolic_context,
+            fallback_to_symbol_to_token=False,
+            native_style="glyphs",
+        )
+        visual_text = (visual_message or {}).get("text") or " ".join(combined_symbols)
+        if symbolic:
+            symbolic = {
+                **symbolic,
+                "text": visual_text,
+                "symbols": combined_symbols,
+                "native_text": (visual_message or {}).get("native_text"),
+                "gloss_text": (visual_message or {}).get("gloss_text"),
+                "native_sources": (visual_message or {}).get("native_sources") or {},
+                "gloss_sources": (visual_message or {}).get("gloss_sources") or {},
+            }
+        else:
+            symbolic = {
+                "text": visual_text,
+                "symbols": combined_symbols,
+                "unknown": [],
+                "native_text": (visual_message or {}).get("native_text"),
+                "gloss_text": (visual_message or {}).get("gloss_text"),
+                "native_sources": (visual_message or {}).get("native_sources") or {},
+                "gloss_sources": (visual_message or {}).get("gloss_sources") or {},
+            }
+
     symbolic_unknown: list[str] = symbolic.get("unknown") if symbolic else []
     symbolic_text = symbolic.get("text") if symbolic else None
     symbolic_native_text = symbolic.get("native_text") if symbolic else None
@@ -782,12 +1064,18 @@ def process_inbound_message(msg) -> CommsResponse:
                 "symbolic_gloss_text": symbolic_gloss_text,
                 "symbolic_native_sources": symbolic.get("native_sources"),
                 "symbolic_gloss_sources": symbolic.get("gloss_sources"),
+                "vision_context": vision_context,
+                "visual_inference_words": visual_inference_words,
             }
         )
-        if not symbolic_unknown and not attachments:
+        # A successfully composed symbolic reply remains valid when the turn also
+        # contains an image. The attachment has already been stored as memory;
+        # forcing this turn through the text-only LM adapter makes that adapter
+        # tokenize conversation scaffolding and report it as unknown vocabulary.
+        if not symbolic_unknown:
             return CommsResponse(text=symbolic_text, metadata=metadata)
 
-    if adapter:
+    if adapter and (user_text.strip() or not attachments):
         try:
             entity_links = [
                 {
@@ -800,16 +1088,37 @@ def process_inbound_message(msg) -> CommsResponse:
                     "is_dm": msg.metadata.get("is_dm") if msg.metadata else None,
                 }
             ]
-            # If Ina still has unknown words, ask LM adapter for explanations/examples.
+            entity_links.extend(
+                {
+                    "type": "vision_perception",
+                    "event_id": perception.get("event_id"),
+                    "recognized_symbols": perception.get("recognized_symbols") or [],
+                    "visual_token_ids": (
+                        perception.get("visual_token_learning") or {}
+                    ).get("candidate_ids") or [],
+                    "visual_word_hypotheses": [
+                        hypothesis
+                        for match in (
+                            (perception.get("visual_token_learning") or {}).get("matches") or []
+                        )
+                        if isinstance(match, dict)
+                        for hypothesis in match.get("hypotheses") or []
+                        if isinstance(hypothesis, dict)
+                    ][:16],
+                    "orientation": perception.get("orientation"),
+                    "brightness": perception.get("brightness"),
+                    "contrast": perception.get("contrast"),
+                }
+                for perception in vision_context.get("perceptions", [])
+            )
+            # The adapter is a grounded-memory responder, not an external
+            # dictionary. Give it only operator-authored text: generated
+            # instructions and context wrappers otherwise become bogus unknown
+            # words in its exact-vocabulary fallback.
             explain_targets = symbolic_unknown or tokens
             if symbolic_unknown or (symbolic is None and explain_targets):
-                prompt = (
-                    "Please explain the following word(s) for Ina using simple meanings "
-                    "and one short example each: "
-                    + ", ".join(sorted(set(explain_targets))[:8])
-                )
                 reply_text = adapter.handle_prompt(
-                    prompt,
+                    user_text,
                     speaker=msg.sender.display_name or msg.sender.internal_id,
                     tags=["discord", "text", "lexicon_explain"],
                     entity_links=entity_links,
@@ -822,7 +1131,7 @@ def process_inbound_message(msg) -> CommsResponse:
                     reply_text = f"{symbolic_text}\n\n{reply_text}" if reply_text else symbolic_text
             else:
                 reply_text = adapter.handle_prompt(
-                    prompt_text,
+                    user_text,
                     speaker=msg.sender.display_name or msg.sender.internal_id,
                     tags=["discord", "text"],
                     entity_links=entity_links,
@@ -842,6 +1151,11 @@ def process_inbound_message(msg) -> CommsResponse:
 
     if not reply_text and symbolic_text:
         reply_text = symbolic_text
+
+    if not reply_text and attachments and not user_text.strip():
+        reply_text = _format_image_perception_ack(attachments, vision_context)
+        metadata["adapter"] = "image_acknowledgement"
+        metadata["vision_context"] = vision_context
 
     if not reply_text:
         reply_text = f"{INA_INSTANCE_NAME}: {prompt_text}"
@@ -1225,7 +1539,7 @@ class InaDiscordClient(discord.Client):
         if max_images == 0:
             return []
 
-        can_process = Image is not None and np is not None and FractalTransformer is not None
+        can_process = True  # Native fallback supports PNG/BMP/PNM without optional media packages.
         saved: list[dict] = []
         attachment_dir.mkdir(parents=True, exist_ok=True)
         for idx, attachment in enumerate(attachments):
@@ -1310,7 +1624,7 @@ class InaDiscordClient(discord.Client):
                     source_context=source_context,
                     rel_path=rel_path,
                 )
-            if fragment:
+            if fragment and fragment.get("stored"):
                 logger.info("Discord image stored as fragment %s (%s).", fragment.get("id"), dest_path.name)
             saved.append(
                 {
@@ -1320,7 +1634,9 @@ class InaDiscordClient(discord.Client):
                     "size_bytes": len(data),
                     "saved_path": str(dest_path),
                     "relative_path": rel_path,
-                    "fragment_id": fragment.get("id") if fragment else None,
+                    "fragment_id": fragment.get("id") if fragment and fragment.get("stored") else None,
+                    "vision_perception": fragment.get("vision_perception") if fragment else None,
+                    "vision_fragment_stored": bool(fragment and fragment.get("stored")),
                 }
             )
 
