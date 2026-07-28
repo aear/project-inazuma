@@ -27,6 +27,11 @@ from io_utils import atomic_write_json, file_lock, flush_for_durability, load_js
 from storage_layout import fast_runtime_path
 
 try:
+    import native_vector as _native_vector
+except Exception:  # pragma: no cover - optional acceleration
+    _native_vector = None
+
+try:
     from memory_mirror_db import (
         experience_catalog_candidates as _experience_catalog_candidates,
         mirror_json_file as _mirror_json_file_on_access,
@@ -2414,23 +2419,54 @@ def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict
                     continue
                 words_index.setdefault(word.lower(), set()).add(node["id"])
 
+    # Build candidate pairs from inverted indexes. This preserves the prior
+    # edge order while avoiding an exhaustive comparison of unrelated events.
+    tag_postings: Dict[str, List[int]] = {}
+    entity_postings: Dict[str, List[int]] = {}
+    node_tags: List[Set[str]] = []
+    node_entities: List[Set[str]] = []
+    for index, node in enumerate(nodes):
+        tags = set(node.get("situation_tags", []))
+        entities = set(node.get("entities", []))
+        node_tags.append(tags)
+        node_entities.append(entities)
+        for tag in tags:
+            tag_postings.setdefault(tag, []).append(index)
+        for entity in entities:
+            entity_postings.setdefault(entity, []).append(index)
+
+    all_postings = (*tag_postings.values(), *entity_postings.values())
+    candidate_work = sum(len(postings) * (len(postings) - 1) // 2 for postings in all_postings)
+    possible_pairs = len(nodes) * (len(nodes) - 1) // 2
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    if candidate_work > possible_pairs * 2:
+        # Dense shared labels make index expansion more expensive than one
+        # exhaustive pass; retain the bounded old behavior for that case.
+        candidate_pairs.update(
+            (left, right)
+            for left in range(len(nodes))
+            for right in range(left + 1, len(nodes))
+            if node_tags[left].intersection(node_tags[right])
+            or node_entities[left].intersection(node_entities[right])
+        )
+    else:
+        for postings in all_postings:
+            for offset, left_index in enumerate(postings):
+                for right_index in postings[offset + 1:]:
+                    candidate_pairs.add((left_index, right_index))
+
     edges: List[Dict[str, Any]] = []
-    for i, left in enumerate(nodes):
-        left_tags = set(left.get("situation_tags", []))
-        left_entities = set(left.get("entities", []))
-        for right in nodes[i + 1 :]:
-            shared_tags = left_tags.intersection(right.get("situation_tags", []))
-            shared_entities = left_entities.intersection(right.get("entities", []))
-            if not shared_tags and not shared_entities:
-                continue
-            edges.append(
-                {
-                    "source": left["id"],
-                    "target": right["id"],
-                    "shared_tags": sorted(shared_tags),
-                    "shared_entities": sorted(shared_entities),
-                }
-            )
+    for left_index, right_index in sorted(candidate_pairs):
+        left = nodes[left_index]
+        right = nodes[right_index]
+        edges.append(
+            {
+                "source": left["id"],
+                "target": right["id"],
+                "shared_tags": sorted(node_tags[left_index].intersection(node_tags[right_index])),
+                "shared_entities": sorted(node_entities[left_index].intersection(node_entities[right_index])),
+            }
+        )
 
     graph = {
         "events": nodes,
@@ -2572,6 +2608,7 @@ def load_fragments(child, limit: Optional[int] = None) -> Tuple[List[Dict[str, A
 
 def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
     clusters = []
+    cluster_norms: List[float] = []
     tag_weight = max(0.0, min(1.0, tag_weight))
     for frag in fragments:
         frag_id = frag.get("id")
@@ -2583,21 +2620,26 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
 
         frag_tags = set(frag.get("tags", []))
         best = None
+        best_idx = -1
         best_score = 0.0
+        vec_norm = math.sqrt(sum(value * value for value in vec))
 
-        for node in clusters:
-            vec_score = cosine_similarity(vec, node["centroid"])
+        for node_idx, node in enumerate(clusters):
+            dot = sum(a * b for a, b in zip(vec, node["centroid"]))
+            vec_score = dot / (vec_norm * cluster_norms[node_idx] + 1e-8)
             tag_score = tag_similarity(frag_tags, node["tags"])
             score = ((1 - tag_weight) * vec_score) + (tag_weight * tag_score)
             if score >= threshold and score > best_score:
                 best_score = score
                 best = node
+                best_idx = node_idx
 
         if best:
             count = int(best["count"])
             best["fragments"].append(frag_id)
             best["tags"].update(frag_tags)
             best["centroid"] = _merge_vectors(best["centroid"], count, vec, 1, round_digits=6)
+            cluster_norms[best_idx] = math.sqrt(sum(value * value for value in best["centroid"]))
             best["count"] = count + 1
         else:
             clusters.append({
@@ -2606,6 +2648,7 @@ def cluster_fragments(fragments, cache, threshold=0.92, tag_weight=0.25):
                 "centroid": list(vec),
                 "count": 1
             })
+            cluster_norms.append(vec_norm)
     return clusters
 
 @dataclass(slots=True)
@@ -2833,6 +2876,22 @@ def build_synaptic_links(
     else:
         collector = _BoundedSynapseCollector(edge_cap)
     edge_batch: List[Any] = []
+    native_scores = None
+    possible_pairs = len(neurons) * (len(neurons) - 1) // 2
+    native_safe = possible_pairs <= 5_000_000 or (pair_cap is not None and pair_cap <= 5_000_000)
+    if _native_vector is not None and len(neurons) >= 64 and native_safe:
+        vectors = [node.get("vector") or [] for node in neurons]
+        native_result = _native_vector.cosine_pairs(
+            vectors, threshold, pair_limit=pair_cap, per_source_limit=per_node_cap
+        )
+        if native_result is not None:
+            native_pairs, _, _ = native_result
+            native_scores = {(left, right): score for left, right, score in native_pairs}
+
+    vector_norms = [
+        math.sqrt(sum(value * value for value in (node.get("vector") or [])))
+        for node in neurons
+    ]
 
     for i, source in enumerate(neurons):
         source_edges = 0
@@ -2848,7 +2907,13 @@ def build_synaptic_links(
             vec_a = source.get("vector")
             vec_b = target.get("vector")
             if vec_a and vec_b:
-                sim = cosine_similarity(vec_a, vec_b)
+                if native_scores is not None:
+                    sim = native_scores.get((i, j))
+                    if sim is None:
+                        continue
+                else:
+                    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+                    sim = dot / (vector_norms[i] * vector_norms[j] + 1e-8)
                 if sim >= threshold:
                     direction = None
                     if include_direction:

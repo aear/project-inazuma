@@ -49,6 +49,7 @@ __pycache__/
 *.gz
 dist/
 build/
+.native/
 logs/comms_core.jsonl
 logic_pause.flag
 Project Inazuma.code-workspace

@@ -540,6 +540,7 @@ def _load_fragments_by_ids(
 
 def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Dict[str, Any]]:
     clusters: List[Dict[str, Any]] = []
+    cluster_norms: List[float] = []
     for enc in encoded:
         vec = enc.get("vector")
         if not isinstance(vec, list) or not vec:
@@ -551,8 +552,10 @@ def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Di
         }
         best_idx = -1
         best_score = 0.0
+        vec_norm = math.sqrt(sum(value * value for value in vec))
         for idx, cluster in enumerate(clusters):
-            score = _cosine_similarity(vec, cluster["centroid"])
+            dot = sum(a * b for a, b in zip(vec, cluster["centroid"]))
+            score = dot / (vec_norm * cluster_norms[idx] + 1e-8)
             if score > best_score:
                 best_score = score
                 best_idx = idx
@@ -562,9 +565,11 @@ def _cluster_encoded(encoded: List[Dict[str, Any]], threshold: float) -> List[Di
             centroid = target["centroid"]
             target["members"].append(member)
             target["centroid"] = _merge_vectors(centroid, count, vec, 1)
+            cluster_norms[best_idx] = math.sqrt(sum(value * value for value in target["centroid"]))
             target["count"] = count + 1
         else:
             clusters.append({"members": [member], "centroid": [float(v) for v in vec], "count": 1})
+            cluster_norms.append(vec_norm)
     return clusters
 
 def load_base_model(child):
