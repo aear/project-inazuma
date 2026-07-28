@@ -35,6 +35,58 @@ This repo shares the **runtime, transformers, and GUI**, not the private dataset
 - OBS browser sources can point to `http://localhost:6969/channel/world` (or `/channel/ina`, `/channel/player`, `/channel/tv`).
 - Optional OBS scene switching: `python world_server.py --obs-enabled --obs-scene tv=TVScene`
 
+## Persistent cognitive benchmarks
+
+`benchmark_cognition.py` runs a small, frozen cognitive suite and appends each
+result to `benchmark_results/history.jsonl`. The initial suite covers continuity,
+temporal order, contradiction detection, belief revision, and causal tracking.
+
+Run the GPT-2 baseline (requires optional Hugging Face `transformers` and
+`torch`, plus local or downloadable model weights):
+
+```sh
+python benchmark_cognition.py --model gpt2
+```
+
+For Ina or another local model, provide a command that reads one JSON object
+from stdin (`prompt` and `choices`) and writes `{"scores": [...]}` to stdout:
+
+```sh
+python benchmark_cognition.py --backend command --model ina \
+  --command "python path/to/ina_benchmark_adapter.py"
+```
+
+Add `--monthly` to run only when a calendar month has elapsed since that
+suite/model pair last completed. This is an eligibility check on explicit
+invocation, not a background timer. `--force` bypasses the due check.
+
+HellaSwag, PIQA, WinoGrande, BoolQ, and LAMBADA are recorded as planned suites
+and can be seen with `python benchmark_cognition.py --list-suites`; their
+dataset adapters are intentionally deferred until those datasets are adopted.
+
+For the primary Ina benchmark, generate fresh instances on every run:
+
+```sh
+python benchmark_cognition.py --procedural --monthly --backend command \
+  --model ina --command "python path/to/ina_benchmark_adapter.py"
+```
+
+The generator is intentionally inspectable: learning its continuity, temporal,
+contradiction, revision, and causal rules counts as capability. Entities, values,
+scenarios, and answer positions vary from a one-use random seed. Only a seed
+fingerprint is recorded, and per-case results are withheld.
+
+The checked-in suite is public and therefore only a smoke test for a system
+that can inspect this repository. For a scored Ina run, keep questions in a
+JSONL file without `answer` fields and keep the answers in a separate JSON
+object (`{"case-id": answer_index}`). Ina receives only prompts and choices.
+Real secrecy requires the held-out files to be outside Ina's readable account
+or container, preferably on a separate evaluator machine. The CLI refuses
+public-suite command-model scoring unless `--allow-public-suite` explicitly
+requests a smoke test. Blind reports omit per-case correctness to avoid
+turning persistent result history into a slowly revealed answer key. Rotate the
+held-out questions periodically and keep `--output-dir` evaluator-controlled.
+
 
 # Inazuma Quasi-License (Non-Binding Philosophical Rider)
 
