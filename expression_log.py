@@ -1,4 +1,5 @@
 
+from vector_math import cosine_similarity as shared_cosine_similarity
 import os
 import json
 from pathlib import Path
@@ -50,10 +51,7 @@ def infer_expression_intent(emotions, target, symbolic_link):
     }
 
 def cosine_similarity(v1, v2):
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = sum(a * a for a in v1) ** 0.5
-    norm2 = sum(b * b for b in v2) ** 0.5
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 def load_symbol_words(child):
     path = Path("AI_Children") / child / "memory" / "symbol_words.json"

@@ -12,7 +12,7 @@ from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts, available_symbol_components
 import random
 from text_memory import build_text_symbol_links
-from symbol_word_utils import proto_confidence
+from symbol_word_utils import cosine_similarity as aligned_cosine_similarity, proto_confidence
 
 _CORRUPT_QUEUE_LIMIT = 120
 _CORRUPT_PROMPT_STEP = 5
@@ -244,15 +244,7 @@ def _enforce_word_budget(words: List[Dict[str, Any]], max_words_total: int) -> i
 
 
 def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    if not v1 or not v2:
-        return 0.0
-    length = min(len(v1), len(v2))
-    if length <= 0:
-        return 0.0
-    dot = sum(v1[i] * v2[i] for i in range(length))
-    norm1 = math.sqrt(sum(v1[i] * v1[i] for i in range(length)))
-    norm2 = math.sqrt(sum(v2[i] * v2[i] for i in range(length)))
-    return dot / (norm1 * norm2 + 1e-8)
+    return aligned_cosine_similarity(v1, v2)
 
 
 def _merge_vectors(base: List[float], base_count: int, new: List[float], new_count: int) -> List[float]:

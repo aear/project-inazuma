@@ -1,3 +1,4 @@
+from vector_math import cosine_similarity as shared_cosine_similarity
 import os
 import re
 import json
@@ -955,10 +956,7 @@ def match_sound_symbol_to_input(input_vector, symbol_map, transformer):
     return best_match, best_sim
 
 def cosine_similarity(v1, v2):
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = sum(a * a for a in v1) ** 0.5
-    norm2 = sum(b * b for b in v2) ** 0.5
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 def associate_symbol_with_word(
     child,

@@ -1,5 +1,6 @@
 # === predictive_layer.py (Full Rewrite + Logging) ===
 
+from vector_math import cosine_similarity as shared_cosine_similarity
 import os
 import json
 import math
@@ -18,10 +19,7 @@ from gui_hook import log_to_statusbox
 from symbol_word_utils import score_symbol_word_candidates
 
 def cosine_similarity(v1, v2):
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = math.sqrt(sum(a * a for a in v1))
-    norm2 = math.sqrt(sum(b * b for b in v2))
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 
 def _read_counts(path):

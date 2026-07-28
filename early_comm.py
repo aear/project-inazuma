@@ -2,6 +2,7 @@
 # === early_comm.py (Full Rewrite) ===
 # Symbol-aware communication, language adaptation, and device reasoning based on config.json
 
+from vector_math import cosine_similarity as shared_cosine_similarity
 import json
 import heapq
 import math
@@ -550,10 +551,7 @@ def load_symbol_words(child):
         return []
 
 def cosine_similarity(v1, v2):
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = sum(a * a for a in v1) ** 0.5
-    norm2 = sum(b * b for b in v2) ** 0.5
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 
 def emotion_cosine(d1: Dict[str, float], d2: Dict[str, float]) -> float:

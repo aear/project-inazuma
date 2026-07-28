@@ -1,5 +1,6 @@
 # === logic_map_builder.py (Neural Rewrite) ===
 
+from vector_math import cosine_similarity as shared_cosine_similarity, vector_norm
 import json
 import math
 import random
@@ -23,10 +24,7 @@ DEFAULT_LOGIC_POLICY = {
 }
 
 def cosine_similarity(v1, v2):
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = math.sqrt(sum(a * a for a in v1))
-    norm2 = math.sqrt(sum(b * b for b in v2))
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -196,6 +194,7 @@ def build_logic_neural_map(logic_entries: List[Dict[str, Any]], *, policy: Dict[
         })
 
     pos_map = {n["id"]: n.get("position") for n in neurons}
+    vector_norms = [vector_norm(neuron["vector"]) for neuron in neurons]
     for i, a in enumerate(neurons):
         local: List[Tuple[float, int]] = []
         for j in range(i + 1, len(neurons)):
@@ -208,7 +207,8 @@ def build_logic_neural_map(logic_entries: List[Dict[str, Any]], *, policy: Dict[
                 break
             b = neurons[j]
             pairs_evaluated += 1
-            sim = cosine_similarity(a["vector"], b["vector"])
+            dot = sum(left * right for left, right in zip(a["vector"], b["vector"]))
+            sim = dot / (vector_norms[i] * vector_norms[j] + 1e-8)
             if sim < edge_min_similarity:
                 continue
             local.append((sim, j))

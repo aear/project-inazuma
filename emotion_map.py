@@ -1,5 +1,6 @@
 # === emotion_map.py (Generative Emotional Symbol Map) ===
 
+from vector_math import cosine_similarity as shared_cosine_similarity
 import os
 import json
 import math
@@ -17,10 +18,7 @@ def _map_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "emotion_symbol_map.json"
 
 def cosine_similarity(v1, v2):
-    dot = sum(a*b for a, b in zip(v1, v2))
-    norm1 = math.sqrt(sum(a*a for a in v1))
-    norm2 = math.sqrt(sum(b*b for b in v2))
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2)
 
 
 def _cosine_distance(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
