@@ -187,6 +187,27 @@ def github_bridge_lock_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "github_bridge.lock"
 
 
+def github_delivery_request_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "github_bridge_delivery_request.json"
+
+
+def request_github_delivery(child: str, *, reason: str = "queue_updated", cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Persist a coalescing bridge request; Ina's runtime launches delivery."""
+    policy = get_github_submission_config(cfg)
+    if not policy.get("enabled", False) or policy.get("delivery_mode") != "issues":
+        return False
+    path = github_delivery_request_path(child)
+    payload = {"requested_at": datetime.now(timezone.utc).isoformat(), "reason": str(reason or "queue_updated")}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except OSError:
+        return False
+
+
 def typed_outbox_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "typed_outbox.jsonl"
 
@@ -409,6 +430,7 @@ def report_github_finding(
     meta.update({"source": meta.get("source") or "ina_finding", "component": str(component or "unknown"), "severity": str(severity or "medium").lower(), "confidence": round(score, 3), "finding_fingerprint": fingerprint, "evidence": [str(item).strip() for item in (evidence or []) if str(item).strip()], "touched_files": [str(item).strip() for item in (touched_files or []) if str(item).strip()]})
     entry_id = append_github_issue_entry(child, title_text, "\n".join(lines), kind=normalized_kind, labels=labels_for_kind(normalized_kind, cfg), metadata=meta)
     if not entry_id: return {"queued": False, "reason": "queue_write_failed", "fingerprint": fingerprint}
+    request_github_delivery(child, reason=f"{normalized_kind}_queued", cfg=cfg)
     state[fingerprint] = {"entry_id": entry_id, "kind": normalized_kind, "title": title_text, "last_queued_at": now.isoformat()}
     try: _save_finding_state(child, state)
     except Exception: pass
@@ -711,6 +733,7 @@ __all__ = [
     "github_attachment_dir",
     "github_finding_state_path",
     "github_bridge_lock_path",
+    "github_delivery_request_path",
     "github_outbox_archive_path",
     "github_outbox_history_path",
     "github_outbox_path",
@@ -720,6 +743,7 @@ __all__ = [
     "log_history",
     "maybe_queue_submission_discord_notice",
     "read_pending_entries",
+    "request_github_delivery",
     "report_github_finding",
     "resolve_github_token",
     "submit_issue",

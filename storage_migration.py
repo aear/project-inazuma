@@ -63,8 +63,39 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
+def migration_history_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "storage_migration_history.jsonl"
 
-def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_link: bool = True) -> Dict[str, Any]:
+
+def _record_migration_summary(child: Optional[str], operation: str, report: Dict[str, Any]) -> None:
+    if not child or not bool(report.get("apply")):
+        return
+    summary = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "child": str(child),
+        "operation": str(operation),
+        "status": str(report.get("status") or "unknown"),
+        "failed": int(report.get("failed") or 0),
+        "conflicts": int(report.get("conflicts") or 0),
+        "verified": int(report.get("verified") or 0),
+        "copied": int(report.get("copied") or 0),
+        "moved": int(report.get("moved") or 0),
+        "bytes": int(report.get("bytes") or 0),
+        "cutover": bool(report.get("cutover", False)),
+        "rolled_back": bool(report.get("rolled_back", False)),
+        "manifest": str(report.get("manifest") or "") or None,
+    }
+    path = migration_history_path(str(child))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(summary, ensure_ascii=True) + "\n")
+    except OSError:
+        pass
+
+
+
+def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_link: bool = True, child: Optional[str] = None) -> Dict[str, Any]:
     """Checksum-copy a tree, then retain its old name as a compatibility link."""
     source, target = Path(source).expanduser(), Path(target).expanduser()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -135,6 +166,7 @@ def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_l
     if apply:
         manifest = target / "migration_manifests" / f"tree_migration_{stamp}.json"
         _atomic_write_json(manifest, report); report["manifest"] = str(manifest)
+        _record_migration_summary(child, "tree_migration", report)
     return report
 
 def _resolve_cold_storage_paths(child: str, cfg: Dict[str, Any]) -> tuple[Path, Path]:
@@ -227,6 +259,7 @@ def copy_and_verify_cold_storage(child: str, *, apply: bool) -> Dict[str, Any]:
     if apply:
         _atomic_write_json(manifest, report)
         report["manifest"] = str(manifest)
+        _record_migration_summary(child, "cold_storage_copy", report)
     return report
 
 
@@ -369,6 +402,7 @@ def shard_experience_events(
         )
         _atomic_write_json(manifest, report)
         report["manifest"] = str(manifest)
+        _record_migration_summary(child, "experience_event_sharding", report)
     return report
 
 
@@ -391,7 +425,7 @@ def main() -> int:
     if bool(args.migrate_source) != bool(args.migrate_target):
         parser.error("--migrate-source and --migrate-target must be supplied together")
     if args.migrate_source:
-        report = migrate_tree_and_link(args.migrate_source, args.migrate_target, apply=bool(args.apply), relative_link=not args.absolute_link)
+        report = migrate_tree_and_link(args.migrate_source, args.migrate_target, apply=bool(args.apply), relative_link=not args.absolute_link, child=str(child))
     elif args.shard_experience_events:
         report = shard_experience_events(
             str(child),

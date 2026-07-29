@@ -17,6 +17,7 @@ from github_submission import (
     get_current_child,
     get_github_submission_config,
     github_bridge_lock_path,
+    github_delivery_request_path,
     load_completed_history_ids,
     load_config,
     load_submitted_count_for_day,
@@ -85,6 +86,18 @@ def process_once() -> int:
     cfg = load_config()
     child = get_current_child(cfg)
     policy = get_github_submission_config(cfg)
+    try:
+        github_delivery_request_path(child).unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        from storage_migration_report import maybe_queue_daily_migration_report
+        report = maybe_queue_daily_migration_report(child, cfg)
+        if report.get("queued"):
+            logger.info("Queued Ina's daily storage migration report via %s.", report.get("delivery"))
+    except Exception:
+        logger.exception("Failed to prepare daily storage migration report.")
+
     if not policy.get("enabled", False):
         logger.info("GitHub submission disabled in config.")
         return 0

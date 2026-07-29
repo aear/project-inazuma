@@ -38,7 +38,7 @@ from operator_permissions import (
     OPERATOR_PERMISSION_KEY,
     attach_storage_permission_requests,
 )
-from github_submission import append_github_issue_entry, get_github_submission_config, labels_for_kind, report_github_finding
+from github_submission import append_github_issue_entry, get_github_submission_config, github_delivery_request_path, labels_for_kind, report_github_finding, request_github_delivery
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 
 try:
@@ -3302,6 +3302,7 @@ def append_github_proposal_entry(
         patch_text=patch_text,
     )
     if entry_id:
+        request_github_delivery(CHILD, reason="proposal_queued", cfg=load_config())
         update_inastate(
             "last_github_submission",
             {
@@ -5495,6 +5496,18 @@ def _journal_timestamp_to_seconds(value: Any) -> float:
     return stamp.timestamp()
 
 
+def _maybe_deliver_github_outbox() -> None:
+    request_path = github_delivery_request_path(CHILD)
+    if not request_path.exists():
+        return
+    process = safe_popen(["python", "github_bridge.py", "--once"], description="deliver Ina queued GitHub reports")
+    if process is not None:
+        try:
+            request_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _maybe_generate_reflection_journal() -> None:
     now = time.time()
     state = get_inastate(_REFLECTION_JOURNAL_STATE_KEY) or {}
@@ -5518,6 +5531,23 @@ def _maybe_generate_reflection_journal() -> None:
                 "last_content_preview": content[:240],
             },
         )
+        try:
+            from storage_migration_report import maybe_queue_daily_migration_report
+
+            migration_report = maybe_queue_daily_migration_report(CHILD, load_config())
+            update_inastate(
+                "storage_migration_report",
+                {
+                    "timestamp": timestamp,
+                    "queued": bool(migration_report.get("queued")),
+                    "delivery": migration_report.get("delivery"),
+                    "detail_level": migration_report.get("detail_level"),
+                    "reason": migration_report.get("reason"),
+                    "entry_id": migration_report.get("entry_id"),
+                },
+            )
+        except Exception as report_exc:
+            log_to_statusbox(f"[Manager] Failed to generate daily storage migration report: {report_exc}")
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to generate reflection journal: {exc}")
 
@@ -9123,6 +9153,7 @@ def run_internal_loop():
         defer_spawns=defer_spawns,
     )
     _maybe_generate_reflection_journal()
+    _maybe_deliver_github_outbox()
 
 def schedule_runtime():
     log_to_statusbox("[Manager] Starting main runtime loop...")

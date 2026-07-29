@@ -92,6 +92,62 @@ requests a smoke test. Blind reports omit per-case correctness to avoid
 turning persistent result history into a slowly revealed answer key. Rotate the
 held-out questions periodically and keep `--output-dir` evaluator-controlled.
 
+## Tiered algorithm portfolio
+
+`homo_silicus_numeric.py` is Ina's dependency-free packed-float numerical
+substrate. Its deliberately small NumPy-inspired surface includes `array`,
+`asarray`, `zeros`, `ones`, shapes, indexing, reshape, transpose, arithmetic,
+row broadcasting, reductions, `dot`/`matmul`, norms, clipping, and exact cosine
+matrix scans. Unsupported dimensions and dtypes fail explicitly.
+
+`algorithm_portfolio.py` uses that substrate for exact cosine search at three
+working-set scales: scalar `local`, packed standard-library `solar`, and
+bounded-batch `galactic`. `EmpiricalCostModel` selects the fastest strategy
+that fits a caller's memory budget. These names are separate from the
+short/working/long/cold retention tiers.
+
+```sh
+python benchmark_algorithm_portfolio.py --sizes 100,1000,10000 \
+  --output benchmark_results/algorithm_portfolio.json
+
+python benchmark_algorithm_portfolio.py --real --child Inazuma_Yagami \
+  --real-limit 10000 --scan-limit 50000 \
+  --output benchmark_results/algorithm_portfolio_ina.json
+```
+
+Real mode never recursively walks the fragment store. It examines at most
+`--scan-limit` entries across known tier directories and loads at most
+`--real-limit` fragments. Reports include OS-observed peak process RSS,
+latency, and observed crossover points.
+
+### Ina's numerical optimization lane
+
+`numeric_evolution.py` lets Ina propose complete, tweaked copies of
+`homo_silicus_numeric.py` without replacing the stable module. A generator
+command reads one JSON request from stdin and must write
+`{"source": "<complete Python module>"}` to stdout:
+
+```sh
+python numeric_evolution.py \
+  --generator-command "python path/to/ina_numeric_generator.py" \
+  --trials 15 --submit-for-review
+```
+
+An existing candidate can be evaluated with `--candidate path/to/candidate.py`.
+Every candidate is capability-checked and run through the full pytest suite,
+then measured with alternating paired trials. The stable module must first pass
+the same suite; an unhealthy environment blocks evaluation rather than
+misclassifying candidates. Acceptance
+requires at least a 5% median improvement, a bootstrap 95% interval entirely
+below zero, and no workload regressing by more than 2%. Passing candidates are
+queued as `needs-review` optimization patches; the stable module is never
+changed automatically.
+
+Candidate source, stable and candidate SHA-256 identities, raw paired timings,
+workloads, confidence intervals, test-output identity, Python/platform/CPU
+details, and review IDs are appended to
+`AI_Children/<child>/memory/numeric_evolution/provenance.jsonl`.
+
 
 # Inazuma Quasi-License (Non-Binding Philosophical Rider)
 
