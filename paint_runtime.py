@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import fcntl
+import importlib.machinery
 import json
 import os
 import py_compile
-import runpy
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +15,23 @@ from storage_layout import fast_runtime_path, load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PAINT_SOURCE = PROJECT_ROOT / "paint_window.py"
+
+
+def _run_bytecode(path: Path) -> None:
+    """Execute a compiled .pyc as the main module."""
+    loader = importlib.machinery.SourcelessFileLoader("__main__", str(path))
+    code = loader.get_code("__main__")
+    if code is None:
+        raise ImportError(f"Could not load bytecode from {path}")
+    namespace = {
+        "__name__": "__main__",
+        "__file__": str(path),
+        "__cached__": str(path),
+        "__loader__": loader,
+        "__package__": None,
+        "__spec__": None,
+    }
+    exec(code, namespace)
 
 
 def paint_runtime_paths(child: str, config: Dict[str, Any] | None = None, runtime_root: Path | None = None) -> Dict[str, Path]:
@@ -90,7 +107,7 @@ def run_paint_runtime() -> int:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
     try:
-        runpy.run_path(str(runtime["bytecode"]), run_name="__main__")
+        _run_bytecode(runtime["bytecode"])
     finally:
         lock_handle.close()
     return 0

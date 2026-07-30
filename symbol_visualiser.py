@@ -17,9 +17,10 @@ def render_symbol_to_image(symbol_text, font_size=128, image_size=(256, 256)):
         font = ImageFont.truetype("DejaVuSansMono.ttf", font_size)
     except:
         font = ImageFont.load_default()
-    w, h = draw.textsize(symbol_text, font=font)
-    x = (image_size[0] - w) // 2
-    y = (image_size[1] - h) // 2
+    left, top, right, bottom = draw.textbbox((0, 0), symbol_text, font=font)
+    w, h = right - left, bottom - top
+    x = (image_size[0] - w) // 2 - left
+    y = (image_size[1] - h) // 2 - top
     draw.text((x, y), symbol_text, font=font, fill=0)
     return image
 

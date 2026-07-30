@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from paint_runtime import ensure_paint_runtime
+from paint_runtime import _run_bytecode, ensure_paint_runtime
 
 
 def test_runtime_rebuilds_only_when_source_stamp_changes(tmp_path: Path):
@@ -29,3 +29,16 @@ def test_runtime_detects_size_change_when_mtime_is_restored(tmp_path: Path):
     second = ensure_paint_runtime("Ina", source=source, runtime_root=runtime)
     assert first["source_stamp"]["size"] != second["source_stamp"]["size"]
     assert second["rebuilt"] is True
+
+
+def test_compiled_runtime_can_be_executed(tmp_path: Path):
+    source = tmp_path / "paint.py"
+    runtime = tmp_path / "runtime"
+    marker = tmp_path / "executed"
+    source.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text(__name__)\n",
+        encoding="utf-8",
+    )
+    compiled = ensure_paint_runtime("Ina", source=source, runtime_root=runtime)
+    _run_bytecode(compiled["bytecode"])
+    assert marker.read_text(encoding="utf-8") == "__main__"
