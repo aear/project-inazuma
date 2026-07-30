@@ -5,6 +5,7 @@
 import time
 import json
 import os
+import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import (
@@ -12,6 +13,22 @@ from model_manager import (
     get_sweet_spots, seed_self_question, load_config, request_scheduler_task
 )
 from gui_hook import log_to_statusbox
+
+
+def _meditation_lock(child):
+    lock_path = Path("AI_Children") / child / "memory" / "meditation_state.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def save_log(entry):
@@ -53,7 +70,21 @@ def exit_meditation(reason="natural"):
 
 
 def meditate_loop():
-    enter_meditation()
+    child = load_config().get("current_child", "default_child")
+    lock_handle = _meditation_lock(child)
+    if lock_handle is None:
+        log_to_statusbox("[Meditation] A reflective cycle is already running; duplicate launch skipped.")
+        return
+    try:
+        enter_meditation()
+        _run_meditation_cycles()
+    finally:
+        if get_inastate("meditating", False):
+            exit_meditation("interrupted")
+        lock_handle.close()
+
+
+def _run_meditation_cycles():
     loop_count = 0
     max_loops = 10
 
