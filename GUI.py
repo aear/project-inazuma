@@ -13,6 +13,7 @@ import threading
 import time
 from memory_graph import build_fractal_memory
 import platform
+from runtime_lifecycle import stop_core_runtime
 from birth_system import boot
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
@@ -1660,6 +1661,7 @@ def emergency_shutdown():
         "source": "gui",
         "mode": "emergency",
         "clean": False,
+        "runtime_mode": "bridge_only",
     }
     update_inastate("shutdown_intent", shutdown_payload)
     update_inastate("last_shutdown", shutdown_payload)
@@ -1667,33 +1669,9 @@ def emergency_shutdown():
     update_inastate("runtime_disruption", True)
 
     print("[Emergency] Triggering immediate shutdown...")
-
-    os.system("pkill -f model_manager.py")
-    os.system("pkill -f dreamstate.py")
-    os.system("pkill -f boredom_state.py")
-    os.system("pkill -f meditation_state.py")
-    os.system("pkill -f early_comm.py")
-    os.system("pkill -f audio_listener.py")
-    os.system("pkill -f vision_window.py")
-    os.system("pkill -f birth_system.py")
-    os.system("pkill -f emotion_engine.py")
-    os.system("pkill -f emotion_map.py")
-    os.system("pkill -f expression_log.py")
-    os.system("pkill -f fractal_multidimensional_transformers.py")
-    os.system("pkill -f fragmentation_engine.py")
-    os.system("pkill -f inject_birth_fragment.py")
-    os.system("pkill -f instinct_engine.py")
-    os.system("pkill -f logic_engine.py")
-    os.system("pkill -f meaning_map.py")
-    os.system("pkill -f memory_graph.py")
-    os.system("pkill -f precision_evolution.py")
-    os.system("pkill -f predictive_layer.py")
-    os.system("pkill -f pretrain_logic.py")
-    os.system("pkill -f raw_file_manager.py")
-    os.system("pkill -f train_fragments.py")
-    os.system("pkill -f who_am_i.py")
-
-    print("[Emergency] Core modules halted.")
+    result = stop_core_runtime(Path(__file__).resolve().parent)
+    update_inastate("runtime_mode", "bridge_only")
+    print(f"[Emergency] Core modules halted; bridges preserved: {result}")
 
 
 def tuck_in():

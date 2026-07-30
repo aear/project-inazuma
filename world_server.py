@@ -711,6 +711,8 @@ class WorldServer:
                     await self._send(session, {"type": "error", "error": "invalid_json"})
                     continue
                 await self._handle_message(session, payload)
+        except (ConnectionResetError, BrokenPipeError):
+            LOGGER.info("Client connection closed by peer: %s", remote)
         except Exception as exc:
             LOGGER.warning("Client error (%s): %s", remote, exc)
         finally:

@@ -1,5 +1,7 @@
 import json
 import math
+import os
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -446,6 +448,9 @@ class PaintWindow:
         )
         self.session_dir = Path("AI_Children") / self.child / "memory" / "paint_sessions"
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        fast_staging = str(os.getenv("INA_PAINT_FAST_STAGING") or "").strip()
+        self.fast_session_dir = Path(fast_staging) if fast_staging else self.session_dir
+        self.fast_session_dir.mkdir(parents=True, exist_ok=True)
         self.fragments_dir = Path("AI_Children") / self.child / "memory" / "fragments"
         self.log_path = self.session_dir / "paint_log.json"
 
@@ -641,8 +646,11 @@ class PaintWindow:
         timestamp = datetime.now(timezone.utc).isoformat().replace(":", "-")
         filename = f"ina_paint_{timestamp}.png"
         path = self.session_dir / filename
+        staging_path = self.fast_session_dir / filename
         try:
-            self.image.save(path)
+            self.image.save(staging_path)
+            if staging_path != path:
+                shutil.copy2(staging_path, path)
             self.last_saved_path = path
             self.dirty = False
             self._append_log_entry(path, timestamp)
@@ -1025,8 +1033,8 @@ class PaintWindow:
 
     def _api_close(self, command: dict) -> dict:
         save_before_close = _coerce_bool(command.get("save"), True)
+        self._hide_for_close()
         saved_path = self._save_image(show_errors=False) if save_before_close and self.dirty else None
-        self._api_poll_active = False
         self._set_window_state(False)
         try:
             self.root.destroy()
@@ -1038,6 +1046,15 @@ class PaintWindow:
             "saved": bool(saved_path),
             "path": saved_path,
         }
+
+    def _hide_for_close(self) -> None:
+        """Make close visible before archival or state writes can wait on the HDD."""
+        self._api_poll_active = False
+        try:
+            self.root.withdraw()
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     def _share_image(self) -> None:
         path = self._save_image() if self.dirty or self.last_saved_path is None else str(self.last_saved_path)
@@ -1118,10 +1135,12 @@ class PaintWindow:
             pass
 
     def _on_close(self) -> None:
+        save_before_close = False
         if self.dirty:
-            if messagebox.askyesno("Save", "Save before closing?"):
-                self._save_image()
-        self._api_poll_active = False
+            save_before_close = messagebox.askyesno("Save", "Save before closing?")
+        self._hide_for_close()
+        if save_before_close:
+            self._save_image()
         self._set_window_state(False)
         self.root.destroy()
 

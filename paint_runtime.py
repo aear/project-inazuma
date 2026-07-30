@@ -1,0 +1,100 @@
+"""Compile and run Ina's paint UI from rebuildable fast storage."""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import py_compile
+import runpy
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
+from storage_layout import fast_runtime_path, load_config
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PAINT_SOURCE = PROJECT_ROOT / "paint_window.py"
+
+
+def paint_runtime_paths(child: str, config: Dict[str, Any] | None = None, runtime_root: Path | None = None) -> Dict[str, Path]:
+    fallback = runtime_root or (PROJECT_ROOT / "AI_Children" / child / "memory" / "fast_runtime" / "paint")
+    marker = fallback / "runtime.marker" if runtime_root else fast_runtime_path(
+        child, "runtime.marker", fallback / "runtime.marker", subdir="paint", config=config,
+    )
+    root = marker.parent
+    return {
+        "root": root,
+        "bytecode": root / "paint_window.pyc",
+        "manifest": root / "paint_window.runtime.json",
+        "lock": root / "paint_window.lock",
+        "staging": root / "drawings",
+    }
+
+
+def _source_stamp(source: Path) -> Dict[str, Any]:
+    stat = source.stat()
+    return {"source": str(source), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+def ensure_paint_runtime(child: str, *, source: Path = PAINT_SOURCE, config: Dict[str, Any] | None = None, runtime_root: Path | None = None) -> Dict[str, Any]:
+    paths = paint_runtime_paths(child, config, runtime_root)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    stamp = _source_stamp(source)
+    current = {}
+    try:
+        current = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    rebuilt = current != stamp or not paths["bytecode"].exists()
+    if rebuilt:
+        temporary = paths["bytecode"].with_suffix(".pyc.tmp")
+        py_compile.compile(str(source), cfile=str(temporary), doraise=True)
+        os.replace(temporary, paths["bytecode"])
+        manifest_tmp = paths["manifest"].with_suffix(".json.tmp")
+        manifest_tmp.write_text(json.dumps(stamp, indent=2), encoding="utf-8")
+        os.replace(manifest_tmp, paths["manifest"])
+    return {**paths, "rebuilt": rebuilt, "source_stamp": stamp}
+
+
+def paint_runtime_is_running(child: str, config: Dict[str, Any] | None = None) -> bool:
+    paths = paint_runtime_paths(child, config)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    handle = paths["lock"].open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return True
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+    return False
+
+
+def run_paint_runtime() -> int:
+    config = load_config(PROJECT_ROOT / "config.json")
+    child = str(config.get("current_child") or "default_child")
+    runtime = ensure_paint_runtime(child, config=config)
+    lock_handle = runtime["lock"].open("a+")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_handle.close()
+        return 0
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    os.environ["INA_PAINT_FAST_STAGING"] = str(runtime["staging"])
+    os.environ["INA_PAINT_RUNTIME_REBUILT"] = "1" if runtime["rebuilt"] else "0"
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        runpy.run_path(str(runtime["bytecode"]), run_name="__main__")
+    finally:
+        lock_handle.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_paint_runtime())

@@ -43,7 +43,7 @@ def do_visual_and_audio_exploration():
     _call_local("vision_window.py")
 
 def open_paint_window():
-    _call_local("paint_window.py")
+    _call_local("paint_runtime.py")
     print("[Boredom] Paint window opened.")
 
 def load_impulse_preferences():

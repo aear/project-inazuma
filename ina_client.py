@@ -67,6 +67,7 @@ class InaClient:
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
         self._send_lock = threading.Lock()
+        self._connection_lock = threading.Lock()
         self._motor = MotorController() if MotorController is not None else None
         self._intent_poll_interval = _load_motor_poll_interval()
         self._inastate_path = _resolve_inastate_path()
@@ -126,24 +127,20 @@ class InaClient:
     def close(self) -> None:
         self._stop_event.set()
         self._connected_event.clear()
-        try:
-            if self.sock:
-                self.sock.close()
-        finally:
-            self.sock = None
-            self.file = None
-        self._mark_disconnected()
+        self._handle_disconnect()
 
     def send(self, payload: Dict[str, Any]) -> None:
         data = safe_json_dumps(payload).encode("utf-8") + b"\n"
         with self._send_lock:
-            if not self.file:
+            file_obj = self.file
+            sock = self.sock
+            if not file_obj:
                 return
             try:
-                self.file.write(data)
-                self.file.flush()
+                file_obj.write(data)
+                file_obj.flush()
             except OSError:
-                self._handle_disconnect()
+                self._handle_disconnect(expected_sock=sock)
 
     def move(
         self,
@@ -200,12 +197,14 @@ class InaClient:
         self.send({"type": "comms", "text": text})
 
     def _read_loop(self) -> None:
-        if not self.file:
+        file_obj = self.file
+        sock = self.sock
+        if not file_obj:
             return
         while not self._stop_event.is_set():
             try:
-                line = self.file.readline()
-            except OSError:
+                line = file_obj.readline()
+            except (OSError, ValueError):
                 break
             if not line:
                 break
@@ -218,7 +217,7 @@ class InaClient:
                 if isinstance(state, dict):
                     self._handle_state(state)
             self._print_payload(payload)
-        self._handle_disconnect()
+        self._handle_disconnect(expected_sock=sock)
 
     @staticmethod
     def _print_payload(payload: Dict[str, Any]) -> None:
@@ -284,14 +283,30 @@ class InaClient:
         self._set_inastate("world_connected", False)
         self._set_inastate("last_world_disconnect", _now_iso())
 
-    def _handle_disconnect(self) -> None:
-        if self.sock:
+    def _handle_disconnect(self, *, expected_sock: Optional[socket.socket] = None) -> None:
+        with self._connection_lock:
+            if expected_sock is not None and self.sock is not expected_sock:
+                return
+            sock = self.sock
+            file_obj = self.file
+            self.sock = None
+            self.file = None
+            self._connected_event.clear()
+        if sock:
             try:
-                self.sock.close()
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        self.sock = None
-        self.file = None
+        if file_obj:
+            try:
+                file_obj.close()
+            except OSError:
+                pass
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
         self._mark_disconnected()
 
     def _start_heartbeat(self) -> None:
@@ -530,7 +545,8 @@ class InaClient:
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
             if not self._connected_event.is_set():
-                return
+                self._sleep_with_stop(0.5)
+                continue
             self.send({"type": "ping"})
             self._set_inastate("last_world_heartbeat", _now_iso())
             self._sleep_with_stop(15.0)

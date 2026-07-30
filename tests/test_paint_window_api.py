@@ -182,9 +182,16 @@ class FakeCanvas:
 class FakeRoot:
     def __init__(self):
         self.destroyed = False
+        self.withdrawn = False
 
     def destroy(self):
         self.destroyed = True
+
+    def withdraw(self):
+        self.withdrawn = True
+
+    def update_idletasks(self):
+        pass
 
 
 def _window_stub():
@@ -471,6 +478,7 @@ class PaintWindowApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertTrue(result["closed"])
         self.assertFalse(result["saved"])
+        self.assertTrue(window.root.withdrawn)
         self.assertFalse(window._api_poll_active)
         self.assertTrue(window.root.destroyed)
         self.assertFalse(store["paint_window_open"])

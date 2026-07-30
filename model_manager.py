@@ -33,6 +33,7 @@ from io_utils import atomic_write_json
 from storage_layout import fast_runtime_path
 from storage_vitals import sample_storage_vitals
 from io_pressure import active_pressure
+from movement_drive import calculate_movement_urge
 from operator_permissions import (
     FAST_RUNTIME_PERMISSION_TYPE,
     OPERATOR_PERMISSION_KEY,
@@ -378,7 +379,7 @@ _PROCESS_TASK_PROFILES = {
     },
     "paint_window_open": {
         "kind": "subprocess",
-        "command": ["python", "paint_window.py"],
+        "command": ["python", "paint_runtime.py"],
         "module": "paint_window",
         "priority": 52,
         "memory_class": "low",
@@ -6035,10 +6036,51 @@ def boredom_check():
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
 
+def _queue_autonomous_paint_seed(emotions: Dict[str, Any]) -> None:
+    """Translate a creative urge into an observable first drawing gesture."""
+    queue = get_inastate("paint_command_queue")
+    if queue not in (None, [], ""):
+        return
+    curiosity = _coerce_float(emotions.get("curiosity"), 0.0)
+    joy = _coerce_float(emotions.get("joy"), 0.0)
+    intensity = _coerce_float(emotions.get("intensity"), 0.0)
+    color = "#d35400" if intensity > 0.65 else ("#27ae60" if joy > 0.35 else "#2980b9")
+    pattern = "spiral" if curiosity > 0.75 else ("burst" if intensity > 0.7 else "wave")
+    stamp = int(time.time() * 1000)
+    commands = [
+        {
+            "id": f"ina_seed_{stamp}",
+            "action": "pattern",
+            "pattern": pattern,
+            "center": [0.5, 0.5],
+            "radius": 0.16 + min(0.2, curiosity * 0.18),
+            "turns": 2 + round(curiosity * 2),
+            "rays": 7 + round(intensity * 5),
+            "color": color,
+            "brush_size": 4 + round(intensity * 6),
+            "motivation": {
+                "source": "creative_urge",
+                "curiosity": round(curiosity, 3),
+                "joy": round(joy, 3),
+                "intensity": round(intensity, 3),
+            },
+        },
+        {"id": f"ina_inspect_{stamp}", "action": "inspect"},
+    ]
+    update_inastate("paint_command_queue", commands)
+
+
 def paint_check():
     global _last_paint_launch
     if get_inastate("paint_window_open"):
-        return
+        try:
+            from paint_runtime import paint_runtime_is_running
+            child = str(load_config().get("current_child") or "default_child")
+            if paint_runtime_is_running(child):
+                return
+            update_inastate("paint_window_open", False)
+        except Exception:
+            return
 
     now = time.time()
     if (now - _last_paint_launch) < _PAINT_COOLDOWN:
@@ -6083,6 +6125,7 @@ def paint_check():
     if not creative_trigger:
         return
 
+    _queue_autonomous_paint_seed(emo)
     _last_paint_launch = now
     request_scheduler_task(
         "paint_window_open",
@@ -6700,6 +6743,20 @@ def _resolve_meta_adjusted_level(payload: Any, default: float = 0.0) -> float:
     if adjusted is None:
         return base
     return _clamp01(adjusted, default=base)
+
+
+def _update_movement_urge() -> Dict[str, Any]:
+    """Keep the motor drive available even when the instinct subprocess is deferred."""
+    emotions = get_inastate("emotion_snapshot") or get_inastate("current_emotions") or {}
+    payload = calculate_movement_urge(
+        emotions if isinstance(emotions, dict) else {},
+        boredom=get_inastate("emotion_boredom"),
+        energy=get_inastate("current_energy"),
+        sleep_pressure=get_inastate("sleep_pressure"),
+    )
+    payload["producer"] = "model_manager"
+    update_inastate("urge_to_move", payload)
+    return payload
 
 
 def _best_self_read_invitation(payload: Any) -> Dict[str, Any]:
@@ -9128,6 +9185,7 @@ def run_internal_loop():
             rebuild_maps_if_needed()
     _check_self_adjustment()
     _update_contact_urges()
+    _update_movement_urge()
     _update_stable_pattern_urge()
     _update_self_read_exploration_opportunities()
     _update_meta_arbitration_signal(memory_guard=memory_guard)

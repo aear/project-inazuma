@@ -2874,7 +2874,38 @@ def build_synaptic_links(
     else:
         collector = _BoundedSynapseCollector(edge_cap)
     edge_batch: List[Any] = []
-    native_scores = None
+
+    def append_edge(source: Dict[str, Any], target: Dict[str, Any], sim: float) -> None:
+        direction = None
+        if include_direction:
+            pos_a = source.get("position")
+            pos_b = target.get("position")
+            if pos_a and pos_b:
+                delta = [pos_b[k] - pos_a[k] for k in range(3)]
+                norm = math.sqrt(sum(d * d for d in delta))
+                if norm > 1e-6:
+                    direction = tuple(round(d / norm, 5) for d in delta)
+        if compact_records:
+            payload = _SynapseRecord(
+                source=str(source["id"]),
+                target=str(target["id"]),
+                weight=round(sim, 4),
+                direction=direction,
+            )
+        else:
+            payload = {
+                "source": source["id"],
+                "target": target["id"],
+                "weight": round(sim, 4),
+                "network_type": "memory_graph",
+            }
+            if include_direction:
+                payload["direction"] = list(direction) if direction is not None else None
+        edge_batch.append(payload)
+        if len(edge_batch) >= emit_batch_size:
+            collector.extend(edge_batch)
+            edge_batch.clear()
+
     possible_pairs = len(neurons) * (len(neurons) - 1) // 2
     native_safe = possible_pairs <= 5_000_000 or (pair_cap is not None and pair_cap <= 5_000_000)
     if _native_vector is not None and len(neurons) >= 64 and native_safe:
@@ -2883,9 +2914,25 @@ def build_synaptic_links(
             vectors, threshold, pair_limit=pair_cap, per_source_limit=per_node_cap
         )
         if native_result is not None:
-            native_pairs, _, _ = native_result
-            native_scores = {(left, right): score for left, right, score in native_pairs}
+            native_pairs, pairs_evaluated, truncated = native_result
+            for left, right, sim in native_pairs:
+                append_edge(neurons[left], neurons[right], sim)
+            if edge_batch:
+                collector.extend(edge_batch)
+                edge_batch.clear()
+            synapses = collector.finalize()
+            if edge_cap is not None and collector.pruned_count > 0:
+                truncated = True
+            if return_stats:
+                return synapses, {
+                    "pairs_evaluated": pairs_evaluated,
+                    "edge_count": len(synapses),
+                    "truncated": truncated,
+                    "budget_pruned": collector.pruned_count,
+                }
+            return synapses
 
+    native_scores = None
     vector_norms = [
         math.sqrt(sum(value * value for value in (node.get("vector") or [])))
         for node in neurons
