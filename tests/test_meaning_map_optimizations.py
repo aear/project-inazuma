@@ -5,6 +5,8 @@ import types
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 _state = {}
+_original_model_manager = sys.modules.get("model_manager")
+_original_text_memory = sys.modules.get("text_memory")
 model_manager_stub = types.ModuleType("model_manager")
 model_manager_stub.load_config = lambda: {}
 model_manager_stub.seed_self_question = lambda prompt: None
@@ -17,6 +19,15 @@ text_memory_stub.build_text_symbol_links = lambda child: None
 sys.modules["text_memory"] = text_memory_stub
 
 import meaning_map as mm
+
+if _original_model_manager is None:
+    sys.modules.pop("model_manager", None)
+else:
+    sys.modules["model_manager"] = _original_model_manager
+if _original_text_memory is None:
+    sys.modules.pop("text_memory", None)
+else:
+    sys.modules["text_memory"] = _original_text_memory
 
 
 def test_meaning_policy_includes_new_caps():

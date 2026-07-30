@@ -41,6 +41,7 @@ from gui_hook import log_to_statusbox
 from simple_image_fallback import ImageFallbackError, extract_image_features
 from self_read_reporting import is_broken_pipe_error, report_self_read_broken_pipe
 from text_memory import update_text_vocab
+from github_history_materializer import materialize_commit_history
 
 _VIDEO_IMPORT_ERROR = None
 try:
@@ -91,7 +92,7 @@ ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
 
 SELF_READ_PREF_FILENAME = "self_read_preferences.json"
 SELF_READ_SKIP_REQUESTS = "self_read_skip_requests.json"
-VALID_SOURCE_KEYS = {"code", "music", "books", "venv"}
+VALID_SOURCE_KEYS = {"code", "music", "books", "venv", "github_history"}
 SELF_READ_SOURCE_ENV = "SELF_READ_SOURCE"
 
 DEFAULT_SELF_READ_PREFS = {
@@ -100,6 +101,7 @@ DEFAULT_SELF_READ_PREFS = {
         "music": True,
         "books": True,
         "venv": False,
+        "github_history": True,
     },
     # OS-managed swap files are storage infrastructure, not readable content.
     # Match by filename so the protection follows every configured drive.
@@ -111,6 +113,9 @@ DEFAULT_SELF_READ_PREFS = {
         ".swapfile.*",
     ],
 }
+
+SIGNED_MUSIC_ARTISTS = ("rapidcrest",)
+
 
 SOURCE_ANNOTATIONS = {
     "code": {
@@ -136,6 +141,12 @@ SOURCE_ANNOTATIONS = {
         "flags": ["environment", "external"],
         "provenance": "project_environment",
         "ownership": "environment_dependency",
+    },
+    "github_history": {
+        "tags": ["project_history", "code_evolution", "github"],
+        "flags": ["self_history", "read_only"],
+        "provenance": "local_git_history",
+        "ownership": "project_evolution",
     },
 }
 
@@ -196,6 +207,7 @@ def load_self_read_preferences(child):
                 prefs["source_choices"][key] = value
             else:
                 prefs["source_choices"][key] = default_value
+                needs_save = True
     else:
         needs_save = True
 
@@ -304,6 +316,29 @@ def _derive_book_author_hint(relative_label):
     return stem or None
 
 
+def _signed_music_artist_hint(relative_label):
+    """Return a signed external artist identified by a music-library path."""
+    normalized = str(relative_label or "").replace("\\", "/")
+    parts = [part.strip().casefold() for part in normalized.split("/") if part.strip()]
+    for artist in SIGNED_MUSIC_ARTISTS:
+        artist_key = artist.casefold()
+        if any(part.startswith(artist_key) for part in parts):
+            return artist
+    return None
+
+
+def _source_annotations(source_key, relative_label):
+    artist = _signed_music_artist_hint(relative_label) if source_key == "music" else None
+    if artist:
+        return {
+            "tags": ["music", "external_music", "signed_artist"],
+            "flags": ["music", "external"],
+            "provenance": "signed_artist_catalog",
+            "ownership": "external_artist",
+        }, artist
+    return SOURCE_ANNOTATIONS.get(source_key), None
+
+
 def annotate_fragment_source(fragment, source_key, relative_label, base_root):
     fragment["self_read_origin"] = source_key
     context = fragment.setdefault("source_context", {})
@@ -311,7 +346,7 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
     context.setdefault("relative_path", relative_label)
     context.setdefault("root_path", str(base_root))
 
-    annotations = SOURCE_ANNOTATIONS.get(source_key)
+    annotations, external_artist = _source_annotations(source_key, relative_label)
     if not annotations:
         return
 
@@ -354,6 +389,9 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
         env_file = Path(relative_label).name if relative_label else ""
         if env_file:
             context.setdefault("environment_file", env_file)
+    elif source_key == "music" and external_artist:
+        context.setdefault("external_artist_hint", external_artist)
+        context.setdefault("catalog_relationship", "signed_artist")
     elif source_key == "music":
         context.setdefault("self_voice_hint", "ina_voice_reference")
         voice_name = Path(relative_label).stem if relative_label else ""
@@ -991,7 +1029,14 @@ def fragment_audio(audio_path, transformer):
     analysis = None
     if analyze_audio_clip is not None and ext in {".wav", ".mp3", ".opus"}:
         try:
-            analysis = analyze_audio_clip(audio_path, transformer, child=child, label="self_read")
+            try:
+                analysis = analyze_audio_clip(
+                    audio_path, transformer, child=child, label="self_read"
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                analysis = analyze_audio_clip(audio_path, transformer)
         except Exception as e:
             log_to_statusbox(f"[RawFileManager] Audio digest failed for {audio_path}: {e}")
 
@@ -1354,6 +1399,14 @@ def self_read_and_train():
             elif venv_path:
                 log_to_statusbox(f"[SelfRead] Virtual environment not found: {venv_path}")
 
+        if source_choices.get("github_history", True) and source_override in (None, "github_history"):
+            history_root = Path("AI_Children") / child / "memory" / "github_history"
+            try:
+                materialize_commit_history(default_root, history_root, limit=24)
+                add_root(history_root, audio_only=False, source_key="github_history")
+            except Exception as exc:
+                log_to_statusbox(f"[SelfRead] GitHub history unavailable: {exc}")
+
         return roots
 
     roots = collect_roots(source_override)
@@ -1405,6 +1458,8 @@ def self_read_and_train():
                 relative_path = path.name
 
             rel_str = relative_path.as_posix() if isinstance(relative_path, Path) else str(relative_path)
+            if source_key == "code" and "/memory/github_history/" in f"/{rel_str}":
+                continue
             history_key = f"{base_root.name}/{rel_str}"
 
             log_to_statusbox(f"[SelfRead] Inspecting: {path}")

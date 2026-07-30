@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import Menu, messagebox, filedialog, simpledialog
+from tkinter import Menu, messagebox, filedialog, simpledialog, ttk
 import json
 import os
 import sys
@@ -17,6 +17,7 @@ from runtime_lifecycle import stop_core_runtime
 from birth_system import boot
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
+from monitoring_dashboard import MonitoringWindow
 from collections import deque
 
 STATUS_RETENTION_SEC = float(os.environ.get("INA_STATUS_RETENTION_SEC", "600"))
@@ -155,6 +156,8 @@ book_path_var = None
 music_path_var = None
 model_running = False
 vitals_window = None
+monitoring_window = None
+app_icon = None
 _usage_labels = {}
 energy_var = None
 energy_status_var = None
@@ -180,6 +183,30 @@ operator_permission_detail_var = None
 operator_permission_command_box = None
 operator_permission_feedback_box = None
 operator_permission_last_marker = None
+
+
+def configure_app_icon(window):
+    """Use the Godhunter logo for this Tk application and future child windows."""
+    global app_icon
+    music_root = config.get("music_folder_path", "")
+    candidates = []
+    if music_root:
+        candidates.append(Path(str(music_root)).expanduser() / "Logo.png")
+    candidates.append(Path(__file__).resolve().parent / "Logo.png")
+
+    for logo_path in candidates:
+        try:
+            if not logo_path.is_file():
+                continue
+            source = tk.PhotoImage(file=str(logo_path))
+            largest_side = max(source.width(), source.height())
+            factor = max(1, (largest_side + 127) // 128)
+            app_icon = source.subsample(factor, factor) if factor > 1 else source
+            window.iconphoto(True, app_icon)
+            return str(logo_path)
+        except (OSError, tk.TclError):
+            continue
+    return None
 
 
 def refresh_config():
@@ -1366,6 +1393,14 @@ def _update_usage_labels():
     _refresh_operator_permission_section()
     vitals_window.after(1500, _update_usage_labels)
 
+def open_monitoring_window():
+    global monitoring_window
+    if monitoring_window is not None and monitoring_window.exists():
+        monitoring_window.lift()
+        return
+    monitoring_window = MonitoringWindow(root)
+
+
 def open_vitals_window():
     global vitals_window, _usage_labels, energy_var, energy_status_var, emotion_vars
     global hunger_status_var, fitness_status_var, nutrition_info_var, last_meal_status_var, metabolic_status_var
@@ -1378,53 +1413,67 @@ def open_vitals_window():
         return
 
     vitals_window = tk.Toplevel(root)
-    vitals_window.title('Ina Vitals & Control')
-    vitals_window.geometry('760x760')
-    vitals_window.minsize(640, 520)
+    vitals_window.title('Ina Control Centre')
+    vitals_window.geometry('860x720')
+    vitals_window.minsize(680, 520)
+    vitals_window.transient(root)
 
-    outer = tk.Frame(vitals_window)
-    outer.pack(fill=tk.BOTH, expand=True)
+    header = tk.Frame(vitals_window, padx=16, pady=12)
+    header.pack(fill=tk.X)
+    tk.Label(header, text='Ina Control Centre', font=('Helvetica', 17, 'bold')).pack(anchor='w')
+    tk.Label(
+        header,
+        text='Monitor wellbeing and adjust Ina’s current state.',
+        foreground='#666666',
+    ).pack(anchor='w', pady=(2, 0))
 
-    canvas = tk.Canvas(outer, highlightthickness=0)
-    scrollbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
-    canvas.configure(yscrollcommand=scrollbar.set)
+    notebook = ttk.Notebook(vitals_window, padding=(8, 6))
+    notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+    scroll_bindings = []
 
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    def _make_scrollable_tab(title):
+        tab = tk.Frame(notebook)
+        notebook.add(tab, text=title)
 
-    content = tk.Frame(canvas)
-    canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    def _sync_scroll_region(_event=None):
-        canvas.configure(scrollregion=canvas.bbox('all'))
+        content = tk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
+        content.bind(
+            '<Configure>',
+            lambda _event, c=canvas: c.configure(scrollregion=c.bbox('all')),
+        )
+        canvas.bind(
+            '<Configure>',
+            lambda event, c=canvas, item=canvas_window: c.itemconfigure(item, width=event.width),
+        )
 
-    def _sync_canvas_width(event):
-        canvas.itemconfigure(canvas_window, width=event.width)
+        def _scroll(event, c=canvas):
+            if getattr(event, 'delta', 0):
+                step = -1 if event.delta > 0 else 1
+            elif getattr(event, 'num', None) == 4:
+                step = -1
+            elif getattr(event, 'num', None) == 5:
+                step = 1
+            else:
+                return None
+            c.yview_scroll(step, 'units')
+            return 'break'
 
-    def _scroll_vitals_canvas(event):
-        if getattr(event, 'delta', 0):
-            step = -1 if event.delta > 0 else 1
-        elif getattr(event, 'num', None) == 4:
-            step = -1
-        elif getattr(event, 'num', None) == 5:
-            step = 1
-        else:
-            return None
-        canvas.yview_scroll(step, 'units')
-        return 'break'
+        scroll_bindings.append((tab, _scroll))
+        return content
 
-    def _bind_vitals_mousewheel(widget):
-        widget.bind('<MouseWheel>', _scroll_vitals_canvas, add='+')
-        widget.bind('<Button-4>', _scroll_vitals_canvas, add='+')
-        widget.bind('<Button-5>', _scroll_vitals_canvas, add='+')
-        for child in widget.winfo_children():
-            _bind_vitals_mousewheel(child)
+    performance_content = _make_scrollable_tab('Performance')
+    emotions_content = _make_scrollable_tab('Emotions')
+    permissions_content = _make_scrollable_tab('Permissions')
+    metabolism_content = _make_scrollable_tab('Metabolism')
 
-    content.bind('<Configure>', _sync_scroll_region)
-    canvas.bind('<Configure>', _sync_canvas_width)
-
-    usage_frame = tk.LabelFrame(content, text='Resource usage (Ina process tree)')
-    usage_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+    usage_frame = tk.LabelFrame(performance_content, text='Live resource usage', padx=8, pady=6)
+    usage_frame.pack(fill=tk.X, padx=12, pady=12)
 
     _usage_labels = {
         'ina_cpu': tk.Label(usage_frame, text='Ina CPU (sum): --'),
@@ -1484,8 +1533,8 @@ def open_vitals_window():
     _usage_labels['scheduler_note'].pack(anchor='w', fill=tk.X, pady=(2, 0))
     _usage_labels['scheduler_slots'].pack(anchor='w', fill=tk.X, pady=(2, 0))
 
-    permission_frame = tk.LabelFrame(content, text='Operator permission request')
-    permission_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
+    permission_frame = tk.LabelFrame(permissions_content, text='Operator permission request', padx=8, pady=6)
+    permission_frame.pack(fill=tk.X, padx=12, pady=12)
 
     operator_permission_status_var = tk.StringVar(value='Operator permission: checking...')
     operator_permission_detail_var = tk.StringVar(value='No pending permission request.')
@@ -1521,8 +1570,8 @@ def open_vitals_window():
     tk.Button(permission_buttons, text='Deny', command=lambda: _respond_operator_permission('denied')).pack(side=tk.LEFT, padx=4)
     tk.Button(permission_buttons, text='Reload', command=_refresh_operator_permission_section).pack(side=tk.RIGHT, padx=4)
 
-    energy_frame = tk.LabelFrame(content, text='Energy')
-    energy_frame.pack(fill=tk.X, padx=10, pady=(6, 6))
+    energy_frame = tk.LabelFrame(metabolism_content, text='Energy', padx=8, pady=6)
+    energy_frame.pack(fill=tk.X, padx=12, pady=(12, 6))
 
     energy_var = tk.DoubleVar(value=_clamp_value(get_inastate('current_energy') or 0.5, 0.0, 1.0))
     energy_status_var = tk.StringVar(value='Current energy: --')
@@ -1552,8 +1601,8 @@ def open_vitals_window():
         command=lambda: energy_var.set(_clamp_value(get_inastate('current_energy') or 0.5, 0.0, 1.0)),
     ).pack(side=tk.LEFT, padx=4)
 
-    nutrition_frame = tk.LabelFrame(content, text='Nutrition & Fitness')
-    nutrition_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+    nutrition_frame = tk.LabelFrame(metabolism_content, text='Nutrition & fitness', padx=8, pady=6)
+    nutrition_frame.pack(fill=tk.X, padx=12, pady=(6, 12))
 
     hunger_status_var = tk.StringVar(value='Hunger: --')
     fitness_status_var = tk.StringVar(value='Fitness: --')
@@ -1593,8 +1642,8 @@ def open_vitals_window():
     tk.Button(offer_buttons, text='Offer Meal', command=lambda: _offer_meal_from_gui('meal')).pack(side=tk.LEFT, padx=4)
     tk.Button(offer_buttons, text='Offer Large Meal', command=lambda: _offer_meal_from_gui('large_meal')).pack(side=tk.LEFT, padx=4)
 
-    emotion_frame = tk.LabelFrame(content, text='Emotion sliders (-1 to 1)')
-    emotion_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 10))
+    emotion_frame = tk.LabelFrame(emotions_content, text='Emotional state · −1 to +1', padx=8, pady=6)
+    emotion_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
     emotion_vars = {}
     seed = _current_emotion_seed()
@@ -1622,7 +1671,15 @@ def open_vitals_window():
     tk.Button(controls_row, text='Reload from state', command=_reload_emotion_sliders).pack(side=tk.LEFT, padx=4)
     tk.Button(controls_row, text='Apply to Ina', command=_apply_emotion_sliders).pack(side=tk.LEFT, padx=4)
 
-    _bind_vitals_mousewheel(vitals_window)
+    def _bind_mousewheel_tree(widget, callback):
+        widget.bind('<MouseWheel>', callback, add='+')
+        widget.bind('<Button-4>', callback, add='+')
+        widget.bind('<Button-5>', callback, add='+')
+        for child in widget.winfo_children():
+            _bind_mousewheel_tree(child, callback)
+
+    for tab, callback in scroll_bindings:
+        _bind_mousewheel_tree(tab, callback)
 
     _prime_usage_counters()
     _refresh_energy_label()
@@ -1747,11 +1804,50 @@ root = tk.Tk()
 root.title("Ina")
 
 refresh_config()
+configure_app_icon(root)
 if 'geometry' in config:
     root.geometry(config['geometry'])
 else:
-    root.geometry("500x450")
-root.minsize(500, 450)
+    root.geometry("820x680")
+root.minsize(700, 580)
+
+# A restrained neutral theme keeps dense operational information readable while
+# giving related controls a consistent visual hierarchy.
+PALETTE = {
+    'background': '#f3f5f7',
+    'surface': '#ffffff',
+    'text': '#18212b',
+    'muted': '#66717e',
+    'accent': '#236a5a',
+    'accent_active': '#1b574a',
+    'danger': '#a33a3a',
+    'danger_active': '#842f2f',
+    'border': '#d8dee5',
+}
+root.configure(background=PALETTE['background'])
+root.option_add('*Font', ('Helvetica', 10))
+root.option_add('*Background', PALETTE['background'])
+root.option_add('*Foreground', PALETTE['text'])
+root.option_add('*Entry.Background', PALETTE['surface'])
+root.option_add('*Text.Background', PALETTE['surface'])
+
+ui_style = ttk.Style(root)
+if 'clam' in ui_style.theme_names():
+    ui_style.theme_use('clam')
+ui_style.configure('.', background=PALETTE['background'], foreground=PALETTE['text'])
+ui_style.configure('TFrame', background=PALETTE['background'])
+ui_style.configure('Surface.TFrame', background=PALETTE['surface'])
+ui_style.configure('Title.TLabel', font=('Helvetica', 20, 'bold'))
+ui_style.configure('Subtitle.TLabel', foreground=PALETTE['muted'])
+ui_style.configure('Section.TLabelframe', background=PALETTE['surface'], bordercolor=PALETTE['border'])
+ui_style.configure('Section.TLabelframe.Label', font=('Helvetica', 10, 'bold'), foreground=PALETTE['text'])
+ui_style.configure('Accent.TButton', foreground='#ffffff', background=PALETTE['accent'], padding=(12, 7))
+ui_style.map('Accent.TButton', background=[('active', PALETTE['accent_active'])])
+ui_style.configure('Danger.TButton', foreground='#ffffff', background=PALETTE['danger'], padding=(12, 7))
+ui_style.map('Danger.TButton', background=[('active', PALETTE['danger_active'])])
+ui_style.configure('TButton', padding=(10, 7))
+ui_style.configure('TNotebook', background=PALETTE['background'], borderwidth=0)
+ui_style.configure('TNotebook.Tab', padding=(16, 8), font=('Helvetica', 10, 'bold'))
 
 book_path_var = tk.StringVar(value=config.get("book_folder_path", ""))
 music_path_var = tk.StringVar(value=config.get("music_folder_path", ""))
@@ -1768,74 +1864,115 @@ options_menu.add_command(label="Exceptions List", command=exceptions_list)
 options_menu.add_command(label="Precision Settings", command=precision_settings)
 options_menu.add_command(label="Timers", command=open_timers_config)
 options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
-options_menu.add_command(label="Vitals / Emotions", command=open_vitals_window)
+options_menu.add_command(label="Monitor", command=open_monitoring_window)
+options_menu.add_command(label="Control Centre", command=open_vitals_window)
 options_menu.add_command(label="Signal High Memory", command=lambda: signal_memory_too_high(source="gui_menu"))
 menu_bar.add_cascade(label="Options", menu=options_menu)
 
 root.config(menu=menu_bar)
 
-main_frame = tk.Frame(root)
-main_frame.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+main_frame = ttk.Frame(root, padding=(18, 14))
+main_frame.pack(expand=True, fill=tk.BOTH)
+main_frame.columnconfigure(0, weight=1)
+main_frame.rowconfigure(2, weight=1)
 
-tk.Label(main_frame, text="AIs Online:", font=("Helvetica", 14)).pack(pady=(5, 0))
-canvas = tk.Canvas(main_frame, width=100, height=100, bg="black", highlightthickness=0)
-canvas.pack(pady=10)
-canvas.create_oval(10, 10, 90, 90, outline="green", width=2)
-ai_text_id = canvas.create_text(50, 50, text="0", fill="green", font=("Helvetica", 16, "bold"))
+header_frame = ttk.Frame(main_frame)
+header_frame.grid(row=0, column=0, sticky='ew', pady=(0, 12))
+header_frame.columnconfigure(0, weight=1)
+ttk.Label(header_frame, text='Ina', style='Title.TLabel').grid(row=0, column=0, sticky='w')
+ttk.Label(
+    header_frame,
+    text=f"Current child · {config.get('current_child', 'None')}",
+    style='Subtitle.TLabel',
+).grid(row=1, column=0, sticky='w', pady=(2, 0))
 
-tk.Label(main_frame, text=f"Target: {config.get('current_child', 'None')}", font=("Helvetica", 10, "italic")).pack()
+presence_frame = ttk.Frame(header_frame)
+presence_frame.grid(row=0, column=1, rowspan=2, sticky='e')
+ttk.Label(presence_frame, text='AIs online', style='Subtitle.TLabel').pack(side=tk.LEFT, padx=(0, 8))
+canvas = tk.Canvas(
+    presence_frame,
+    width=54,
+    height=54,
+    bg=PALETTE['surface'],
+    highlightthickness=1,
+    highlightbackground=PALETTE['border'],
+)
+canvas.pack(side=tk.LEFT)
+canvas.create_oval(8, 8, 46, 46, outline=PALETTE['accent'], width=3)
+ai_text_id = canvas.create_text(27, 27, text='0', fill=PALETTE['accent'], font=('Helvetica', 14, 'bold'))
 
-status_frame = tk.Frame(main_frame)
-status_frame.pack(expand=True, fill=tk.BOTH, pady=5)
-scrollbar = tk.Scrollbar(status_frame)
-scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+paths_container = ttk.LabelFrame(main_frame, text='Content folders', style='Section.TLabelframe', padding=10)
+paths_container.grid(row=1, column=0, sticky='ew', pady=(0, 12))
+paths_container.columnconfigure(1, weight=1)
 
-status_box = tk.Text(status_frame, height=6, wrap=tk.WORD, yscrollcommand=scrollbar.set)
-status_box.pack(expand=True, fill=tk.BOTH)
-status_box.tag_config("error", foreground="red")
-scrollbar.config(command=status_box.yview)
+ttk.Label(paths_container, text='Books').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=4)
+book_entry = ttk.Entry(paths_container, textvariable=book_path_var)
+book_entry.grid(row=0, column=1, sticky='ew', pady=4)
+book_entry.bind('<FocusOut>', commit_book_folder)
+book_entry.bind('<Return>', commit_book_folder)
+ttk.Button(paths_container, text='Browse…', command=browse_book_folder).grid(row=0, column=2, padx=(8, 0), pady=4)
 
-paths_container = tk.Frame(main_frame)
-paths_container.pack(fill=tk.X, pady=(5, 10))
+ttk.Label(paths_container, text='Music').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=4)
+music_entry = ttk.Entry(paths_container, textvariable=music_path_var)
+music_entry.grid(row=1, column=1, sticky='ew', pady=4)
+music_entry.bind('<FocusOut>', commit_music_folder)
+music_entry.bind('<Return>', commit_music_folder)
+ttk.Button(paths_container, text='Browse…', command=browse_music_folder).grid(row=1, column=2, padx=(8, 0), pady=4)
 
-book_row = tk.Frame(paths_container)
-book_row.pack(fill=tk.X, pady=2)
-tk.Label(book_row, text="Book Folder:").pack(side=tk.LEFT)
-book_entry = tk.Entry(book_row, textvariable=book_path_var)
-book_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-book_entry.bind("<FocusOut>", commit_book_folder)
-book_entry.bind("<Return>", commit_book_folder)
-tk.Button(book_row, text="Browse...", command=browse_book_folder).pack(side=tk.LEFT, padx=(5, 0))
+status_container = ttk.LabelFrame(main_frame, text='Activity log', style='Section.TLabelframe', padding=8)
+status_container.grid(row=2, column=0, sticky='nsew', pady=(0, 12))
+status_container.columnconfigure(0, weight=1)
+status_container.rowconfigure(0, weight=1)
+status_scrollbar = ttk.Scrollbar(status_container)
+status_scrollbar.grid(row=0, column=1, sticky='ns')
+status_box = tk.Text(
+    status_container,
+    height=8,
+    wrap=tk.WORD,
+    yscrollcommand=status_scrollbar.set,
+    relief=tk.FLAT,
+    padx=8,
+    pady=8,
+    background=PALETTE['surface'],
+)
+status_box.grid(row=0, column=0, sticky='nsew')
+status_box.tag_config('error', foreground=PALETTE['danger'])
+status_scrollbar.config(command=status_box.yview)
 
-music_row = tk.Frame(paths_container)
-music_row.pack(fill=tk.X, pady=2)
-tk.Label(music_row, text="Music Folder:").pack(side=tk.LEFT)
-music_entry = tk.Entry(music_row, textvariable=music_path_var)
-music_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-music_entry.bind("<FocusOut>", commit_music_folder)
-music_entry.bind("<Return>", commit_music_folder)
-tk.Button(music_row, text="Browse...", command=browse_music_folder).pack(side=tk.LEFT, padx=(5, 0))
+controls = ttk.Frame(main_frame)
+controls.grid(row=3, column=0, sticky='ew')
+controls.columnconfigure(0, weight=1)
+controls.columnconfigure(1, weight=1)
 
-button_frame = tk.Frame(root)
-button_frame.pack(side=tk.BOTTOM, pady=10)
-tk.Button(button_frame, text="Start Model", command=start_model, width=15).grid(row=0, column=3, padx=5)
-tk.Button(button_frame, text="Emergency Shutdown", command=emergency_shutdown, width=15).grid(row=0, column=4, padx=5)
-tk.Button(button_frame, text="Quit Program", command=quit_program, width=15).grid(row=0, column=5, padx=5)
+lifecycle_frame = ttk.LabelFrame(controls, text='Lifecycle', style='Section.TLabelframe', padding=8)
+lifecycle_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+tools_frame = ttk.LabelFrame(controls, text='Tools', style='Section.TLabelframe', padding=8)
+tools_frame.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
 
-if config.get("is_root", False):
-    tk.Button(button_frame, text="Pretrain", command=pretrain_mode, width=15).grid(row=0, column=6, padx=5)
-    tk.Button(button_frame, text="EEG", command=open_eeg_view, width=15).grid(row=0, column=7, padx=5)
+for frame in (lifecycle_frame, tools_frame):
+    frame.columnconfigure(0, weight=1)
+    frame.columnconfigure(1, weight=1)
+    frame.columnconfigure(2, weight=1)
 
-button_frame = tk.Frame(root)
-button_frame.pack(side=tk.BOTTOM, pady=10)
+def _action_button(parent, text, command, row, column, style='TButton'):
+    button = ttk.Button(parent, text=text, command=command, style=style)
+    button.grid(row=row, column=column, sticky='ew', padx=3, pady=3)
+    return button
 
-tk.Button(button_frame, text="Reboot", command=reboot_model, width=15).grid(row=0, column=0, padx=5)
-tk.Button(button_frame, text="Tuck In", command=tuck_in, width=15).grid(row=0, column=1, padx=5)
-tk.Button(button_frame, text="Wake Up", command=wake_up, width=15).grid(row=0, column=2, padx=5)
-tk.Button(button_frame, text="Clear Log", command=clear_status_log, width=15).grid(row=0, column=3, padx=5)
-tk.Button(button_frame, text="Vitals + Sliders", command=open_vitals_window, width=17).grid(row=0, column=4, padx=5)
-tk.Button(button_frame, text="View Self Questions", command=open_logs, width=20).grid(row=0, column=5, padx=5)
+_action_button(lifecycle_frame, 'Start model', start_model, 0, 0, 'Accent.TButton')
+_action_button(lifecycle_frame, 'Wake up', wake_up, 0, 1)
+_action_button(lifecycle_frame, 'Tuck in', tuck_in, 0, 2)
+_action_button(lifecycle_frame, 'Reboot', reboot_model, 1, 0)
+_action_button(lifecycle_frame, 'Emergency stop', emergency_shutdown, 1, 1, 'Danger.TButton')
+_action_button(lifecycle_frame, 'Quit', quit_program, 1, 2)
 
+_action_button(tools_frame, 'Monitor', open_monitoring_window, 0, 0)
+_action_button(tools_frame, 'Control centre', open_vitals_window, 0, 1)
+_action_button(tools_frame, 'Self questions', open_logs, 0, 2)
+_action_button(tools_frame, 'Clear log', clear_status_log, 1, 0)
+if config.get('is_root', False):
+    _action_button(tools_frame, 'Pretrain', pretrain_mode, 1, 1)
+    _action_button(tools_frame, 'EEG', open_eeg_view, 1, 2)
 
 
 

@@ -55,3 +55,38 @@ def test_fragment_audio_opus(monkeypatch, tmp_path):
     assert "self_read" in frag["tags"]
     assert "synthetic" in frag["tags"]
     assert frag["importance"] == pytest.approx(0.4322, rel=0, abs=1e-4)
+
+
+def test_rapidcrest_music_is_external_signed_artist(tmp_path):
+    fragment = {"tags": ["self_read"], "metadata": {"flags": []}}
+
+    rfm.annotate_fragment_source(
+        fragment,
+        "music",
+        "Rapidcrest: Da Drums Beat/master.wav",
+        tmp_path,
+    )
+
+    assert "external_music" in fragment["tags"]
+    assert "signed_artist" in fragment["tags"]
+    assert "ina_music" not in fragment["tags"]
+    assert "self_voice" not in fragment["tags"]
+    assert fragment["provenance"] == "signed_artist_catalog"
+    assert fragment["source_context"]["ownership_hint"] == "external_artist"
+    assert fragment["source_context"]["external_artist_hint"] == "rapidcrest"
+
+
+def test_ina_music_keeps_self_voice_ownership(tmp_path):
+    fragment = {"tags": ["self_read"], "metadata": {"flags": []}}
+
+    rfm.annotate_fragment_source(
+        fragment,
+        "music",
+        "Ina Sings: Soft Orbit/master.wav",
+        tmp_path,
+    )
+
+    assert "ina_music" in fragment["tags"]
+    assert "self_voice" in fragment["tags"]
+    assert "external_music" not in fragment["tags"]
+    assert fragment["source_context"]["ownership_hint"] == "self_voice"

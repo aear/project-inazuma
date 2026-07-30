@@ -4163,7 +4163,7 @@ def _apply_neuron_caps(neurons: List[Dict[str, Any]], policy: Dict[str, Any]) ->
             changes += 1
 
         original_tags = [str(tag) for tag in neuron.get("tags", []) if tag]
-        unique_tags = list(dict.fromkeys(original_tags))
+        unique_tags = sorted(set(original_tags))
         clipped_tags = _clip_sequence_with_anchors(unique_tags, tag_limit, int(policy.get("tag_anchor_count", 0)))
         if clipped_tags != original_tags:
             neuron["tags"] = clipped_tags

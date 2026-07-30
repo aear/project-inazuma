@@ -78,6 +78,7 @@ _DEFAULT_SELF_READ_SOURCE_CHOICES = {
     "music": True,
     "books": True,
     "venv": False,
+    "github_history": True,
 }
 
 _MEMORY_GUARD_DEFAULTS = {
@@ -6450,14 +6451,14 @@ def _pick_self_read_source(meta_arbitration: Optional[Dict[str, Any]] = None) ->
             elif source == "venv":
                 weight *= 0.75
         elif top_signal in {"stability", "self_read"}:
-            if source in {"code", "books"}:
+            if source in {"code", "books", "github_history"}:
                 weight *= 1.2
             elif source == "venv":
                 weight *= 1.08
 
-        if discomfort >= 0.7 and source in {"code", "books", "venv"}:
+        if discomfort >= 0.7 and source in {"code", "books", "venv", "github_history"}:
             weight *= 1.0 + (0.16 * discomfort)
-        if "stability" in allowed_set and source in {"code", "books"}:
+        if "stability" in allowed_set and source in {"code", "books", "github_history"}:
             weight *= 1.08
         if "rest" in allowed_set and source == "music":
             weight *= 1.12
@@ -8568,6 +8569,27 @@ def _update_self_read_exploration_opportunities():
         code_cues,
     )
 
+    history_score = (
+        0.35 * curiosity
+        + 0.25 * clarity
+        + 0.2 * familiarity
+        + 0.1 * attention
+        + 0.1 * calm
+    )
+    history_cues = []
+    if curiosity >= 0.5:
+        history_cues.append(f"curiosity {curiosity:.2f}")
+    if familiarity >= 0.5:
+        history_cues.append(f"continuity {familiarity:.2f}")
+    if clarity >= 0.5:
+        history_cues.append(f"clarity {clarity:.2f}")
+    add_option(
+        "github_history",
+        history_score,
+        "Optional: trace how the project changed through its commit history.",
+        history_cues,
+    )
+
     books_score = (
         0.3 * curiosity
         + 0.2 * calm
@@ -8639,6 +8661,7 @@ def _update_self_read_exploration_opportunities():
                 "music": "music/voice",
                 "books": "book library",
                 "venv": "environment files",
+                "github_history": "project commit history",
             }
             label = label_map.get(best["source"], best["source"])
             log_to_statusbox(
