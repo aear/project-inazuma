@@ -8,7 +8,6 @@ import contextlib
 import sys
 import atexit
 import signal
-import itertools
 import io
 import zipfile
 import tarfile
@@ -18,6 +17,8 @@ import lzma
 import uuid
 import fnmatch
 import random
+import re
+import time
 import xml.etree.ElementTree as ET
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
@@ -40,6 +41,11 @@ from transformers.fractal_multidimensional_transformers import FractalTransforme
 from gui_hook import log_to_statusbox
 from simple_image_fallback import ImageFallbackError, extract_image_features
 from self_read_reporting import is_broken_pipe_error, report_self_read_broken_pipe
+from self_read_policy import (
+    SELF_READ_FOCUS_ENV,
+    VALID_SELF_READ_FOCUS,
+    self_read_focus_from_emotions,
+)
 from text_memory import update_text_vocab
 from github_history_materializer import materialize_commit_history
 
@@ -89,11 +95,50 @@ FILE_SIZE_LIMITS = {
 }
 
 ARCHIVE_MEMBER_LIMIT = 50 * 1024 * 1024  # 50 MB per file inside an archive
+ARCHIVE_MEMBER_COUNT_LIMIT = 256
+ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT = 256 * 1024 * 1024
+ARCHIVE_FRAGMENT_LIMIT = 1000
 
 SELF_READ_PREF_FILENAME = "self_read_preferences.json"
 SELF_READ_SKIP_REQUESTS = "self_read_skip_requests.json"
+SELF_READ_HISTORY_FILENAME = "read_history.json"
+SELF_READ_HISTORY_VERSION = 2
 VALID_SOURCE_KEYS = {"code", "music", "books", "venv", "github_history"}
 SELF_READ_SOURCE_ENV = "SELF_READ_SOURCE"
+SELF_READ_REVISIT_LIMIT_ENV = "SELF_READ_REVISIT_LIMIT"
+SELF_READ_INSPECTION_LIMIT_ENV = "SELF_READ_INSPECTION_LIMIT"
+SELF_READ_SCAN_SECONDS_ENV = "SELF_READ_SCAN_SECONDS"
+DEFAULT_SELF_READ_REVISIT_LIMIT = 3
+DEFAULT_BALANCED_REVISIT_LIMIT = 1
+MAX_SELF_READ_REVISIT_LIMIT = 25
+SELF_READ_REVISIT_MIN_AGE_SECONDS = 6 * 3600
+SEEN_FOCUS_REVISIT_FRAGMENT_RESERVE = 1
+DEFAULT_SELF_READ_INSPECTION_LIMIT = 10_000
+MAX_SELF_READ_INSPECTION_LIMIT = 100_000
+DEFAULT_SELF_READ_SCAN_SECONDS = 45.0
+MAX_SELF_READ_SCAN_SECONDS = 600.0
+DEFAULT_CODE_SCAN_PRUNED_DIRS = frozenset(
+    {
+        "ai_children",
+        ".git",
+        ".hg",
+        ".svn",
+        "venv",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        ".cache",
+        ".eggs",
+        "build",
+        "dist",
+    }
+)
+AUDIO_ONLY_SCAN_EXTENSIONS = frozenset({".wav", ".mp3", ".opus"})
 
 DEFAULT_SELF_READ_PREFS = {
     "source_choices": {
@@ -151,6 +196,57 @@ SOURCE_ANNOTATIONS = {
 }
 
 
+class InvalidChildIdentifierError(ValueError):
+    """Raised before a child-derived path can escape the managed child tree."""
+
+
+_CHILD_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+
+
+def validate_child_identifier(value):
+    if not isinstance(value, str):
+        raise InvalidChildIdentifierError("child identifier must be text")
+    identifier = value.strip()
+    if not _CHILD_IDENTIFIER_PATTERN.fullmatch(identifier):
+        raise InvalidChildIdentifierError(
+            "child identifier must contain only letters, digits, '_' or '-'"
+        )
+    return identifier
+
+
+def _child_root_path(child_name):
+    identifier = validate_child_identifier(child_name)
+    managed_root = Path("AI_Children").resolve()
+    candidate = (managed_root / identifier).resolve()
+    try:
+        candidate.relative_to(managed_root)
+    except ValueError as exc:
+        raise InvalidChildIdentifierError(
+            f"child path escapes managed root: {identifier!r}"
+        ) from exc
+    return candidate
+
+
+def _child_memory_path(child_name, *parts):
+    child_root = _child_root_path(child_name)
+    memory_root = (child_root / "memory").resolve()
+    try:
+        memory_root.relative_to(child_root)
+    except ValueError as exc:
+        raise InvalidChildIdentifierError(
+            "child memory root escapes the managed child directory"
+        ) from exc
+
+    candidate = memory_root.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(memory_root)
+    except ValueError as exc:
+        raise InvalidChildIdentifierError(
+            f"child memory path escapes managed root: {parts!r}"
+        ) from exc
+    return candidate
+
+
 def _default_self_read_prefs():
     return {
         "source_choices": dict(DEFAULT_SELF_READ_PREFS["source_choices"]),
@@ -169,12 +265,107 @@ def _load_self_read_source_override():
     return None
 
 
+def _load_self_read_emotion_values(child):
+    path = _child_memory_path(child, "inastate.json")
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except Exception as exc:
+        log_to_statusbox(f"[SelfRead] Emotion fallback unavailable: {exc}")
+        return {}
+    snapshot = state.get("emotion_snapshot") if isinstance(state, dict) else {}
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def resolve_self_read_focus(child):
+    override = str(os.getenv(SELF_READ_FOCUS_ENV) or "").strip().lower()
+    snapshot = _load_self_read_emotion_values(child)
+    decision = self_read_focus_from_emotions(snapshot or {})
+    if override:
+        if override in VALID_SELF_READ_FOCUS:
+            decision["suggested_focus"] = decision["focus"]
+            decision["focus"] = override
+            decision["source"] = "environment"
+            return decision
+        log_to_statusbox(f"[SelfRead] Ignoring invalid {SELF_READ_FOCUS_ENV} '{override}'.")
+
+    if snapshot:
+        decision["source"] = "emotion_state"
+        return decision
+    decision["focus"] = "balanced"
+    decision["source"] = "default"
+    return decision
+
+
+def _self_read_revisit_limit(focus):
+    default = DEFAULT_SELF_READ_REVISIT_LIMIT
+    raw = os.getenv(SELF_READ_REVISIT_LIMIT_ENV)
+    if raw is not None:
+        try:
+            default = max(0, min(MAX_SELF_READ_REVISIT_LIMIT, int(raw)))
+        except (TypeError, ValueError):
+            log_to_statusbox(
+                f"[SelfRead] Ignoring invalid {SELF_READ_REVISIT_LIMIT_ENV} '{raw}'."
+            )
+    if focus == "new":
+        return 0
+    if focus == "balanced":
+        return min(DEFAULT_BALANCED_REVISIT_LIMIT, default)
+    return default
+
+
+def _bounded_positive_int_env(name, default, maximum):
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        log_to_statusbox(f"[SelfRead] Ignoring invalid {name} '{raw}'.")
+        return int(default)
+    return min(int(maximum), value)
+
+
+def _bounded_positive_float_env(name, default, maximum):
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+        if not value > 0.0:
+            raise ValueError
+    except (TypeError, ValueError):
+        log_to_statusbox(f"[SelfRead] Ignoring invalid {name} '{raw}'.")
+        return float(default)
+    return min(float(maximum), value)
+
+
+def _self_read_inspection_limit():
+    return _bounded_positive_int_env(
+        SELF_READ_INSPECTION_LIMIT_ENV,
+        DEFAULT_SELF_READ_INSPECTION_LIMIT,
+        MAX_SELF_READ_INSPECTION_LIMIT,
+    )
+
+
+def _self_read_scan_seconds():
+    return _bounded_positive_float_env(
+        SELF_READ_SCAN_SECONDS_ENV,
+        DEFAULT_SELF_READ_SCAN_SECONDS,
+        MAX_SELF_READ_SCAN_SECONDS,
+    )
+
+
 def _self_read_pref_path(child):
-    return Path("AI_Children") / child / "memory" / SELF_READ_PREF_FILENAME
+    return _child_memory_path(child, SELF_READ_PREF_FILENAME)
 
 
 def _skip_requests_path(child):
-    return Path("AI_Children") / child / "memory" / SELF_READ_SKIP_REQUESTS
+    return _child_memory_path(child, SELF_READ_SKIP_REQUESTS)
 
 
 def save_self_read_preferences(child, prefs):
@@ -437,37 +628,62 @@ venv_path = _load_path_from_config("venv_path")
 if venv_path is None:
     venv_path = Path("venv")
 
+def _command_line_child():
+    if __name__ != "__main__":
+        return None
+    args = list(sys.argv[1:])
+    if not args:
+        return None
+    if args[0] == "--child":
+        if len(args) < 2:
+            raise InvalidChildIdentifierError("--child requires an identifier")
+        return args[1]
+    if args[0].startswith("-"):
+        return None
+    return args[0]
+
+
 def get_child():
     log_to_statusbox("[RawFileManager] Attempting to retrieve 'child'...")
 
-    # First try to get from environment variable
-    child = os.getenv("CHILD")
-    if child:
-        log_to_statusbox(f"[RawFileManager] Found 'child' in environment: {child}")
-        return child
+    environment_child = os.getenv("CHILD")
+    if environment_child:
+        identifier = validate_child_identifier(environment_child)
+        log_to_statusbox(
+            f"[RawFileManager] Found 'child' in environment: {identifier}"
+        )
+        return identifier
 
-    # If not found, try to get from command line argument
-    if len(sys.argv) > 1:
-        child = sys.argv[1]
-        log_to_statusbox(f"[RawFileManager] Found 'child' in command line args: {child}")
-        return child
+    argument_child = _command_line_child()
+    if argument_child is not None:
+        identifier = validate_child_identifier(argument_child)
+        log_to_statusbox(
+            f"[RawFileManager] Found 'child' in command line args: {identifier}"
+        )
+        return identifier
 
-    # Fallback to config.json if not set by environment or args
     config_path = Path("config.json")
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
-                config = json.load(f)
-                child = config.get("current_child", "Inazuma_Yagami")
-                log_to_statusbox(f"[RawFileManager] Found 'child' in config.json: {child}")
-                return child
-        except Exception as e:
-            log_to_statusbox(f"[RawFileManager] Error loading config.json: {e}")
-            return "Inazuma_Yagami"
+            with open(config_path, "r", encoding="utf-8") as handle:
+                stored_config = json.load(handle)
+        except Exception as exc:
+            log_to_statusbox(f"[RawFileManager] Error loading config.json: {exc}")
+            return validate_child_identifier("Inazuma_Yagami")
+        if not isinstance(stored_config, dict):
+            raise InvalidChildIdentifierError("config.json must contain an object")
+        identifier = validate_child_identifier(
+            stored_config.get("current_child", "Inazuma_Yagami")
+        )
+        log_to_statusbox(
+            f"[RawFileManager] Found 'child' in config.json: {identifier}"
+        )
+        return identifier
 
-    # If nothing works, return the default child
-    log_to_statusbox("[RawFileManager] No valid 'child' found, using default: Inazuma_Yagami")
-    return "Inazuma_Yagami"
+    log_to_statusbox(
+        "[RawFileManager] No 'child' found, using default: Inazuma_Yagami"
+    )
+    return validate_child_identifier("Inazuma_Yagami")
 
 child = get_child()
 
@@ -479,7 +695,7 @@ _SELF_READ_FINALIZED = False
 
 
 def _memory_root(child_name=None):
-    return Path("AI_Children") / (child_name or child) / "memory"
+    return _child_memory_path(child_name or child)
 
 
 def _runtime_lock_path(child_name=None):
@@ -490,10 +706,13 @@ def _runtime_state_path(child_name=None):
     return _memory_root(child_name) / "raw_file_manager_state.json"
 
 
-def _atomic_write_json(path, payload):
+def _atomic_write_json(path, payload, *, sort_keys=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=sort_keys) + "\n",
+        encoding="utf-8",
+    )
     os.replace(tmp_path, path)
 
 
@@ -668,20 +887,577 @@ def is_readable_file(path):
     except FileNotFoundError:
         return False
 
+
+def _should_prune_default_code_scan(base_root, default_root, source_key):
+    """Only the broad project-root scan excludes managed/generated trees."""
+    if source_key != "code":
+        return False
+    try:
+        return Path(base_root).resolve() == Path(default_root).resolve()
+    except (OSError, RuntimeError):
+        return Path(base_root) == Path(default_root)
+
+
+def _iter_self_read_files_streaming(
+    root,
+    *,
+    audio_only,
+    prune_generated,
+    stop_requested,
+):
+    """Depth-first scandir traversal that can stop between individual entries."""
+    iterators = []
+    try:
+        if stop_requested():
+            return
+        try:
+            iterators.append(os.scandir(root))
+        except OSError:
+            return
+
+        while iterators:
+            if stop_requested():
+                return
+            try:
+                entry = next(iterators[-1])
+            except StopIteration:
+                iterators.pop().close()
+                continue
+            except OSError:
+                iterators.pop().close()
+                continue
+
+            if stop_requested():
+                return
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+
+            if is_directory:
+                if (
+                    prune_generated
+                    and entry.name.casefold() in DEFAULT_CODE_SCAN_PRUNED_DIRS
+                ):
+                    continue
+                try:
+                    iterators.append(os.scandir(entry.path))
+                except OSError:
+                    continue
+                continue
+
+            path = Path(entry.path)
+            if (
+                audio_only
+                and path.suffix.casefold() not in AUDIO_ONLY_SCAN_EXTENSIONS
+            ):
+                continue
+            yield path
+    finally:
+        for iterator in reversed(iterators):
+            try:
+                iterator.close()
+            except Exception:
+                pass
+
+
+def _iter_self_read_files(
+    base_root,
+    *,
+    audio_only=False,
+    prune_generated=False,
+    stop_requested=None,
+):
+    """Yield files with deterministic legacy or entry-streaming bounded traversal."""
+    root = Path(base_root)
+    if stop_requested is not None:
+        yield from _iter_self_read_files_streaming(
+            root,
+            audio_only=audio_only,
+            prune_generated=prune_generated,
+            stop_requested=stop_requested,
+        )
+        return
+
+    for directory, dirnames, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        if prune_generated:
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name.casefold() not in DEFAULT_CODE_SCAN_PRUNED_DIRS
+            ]
+        dirnames.sort(key=str.casefold)
+        filenames.sort(key=str.casefold)
+        directory_path = Path(directory)
+        for filename in filenames:
+            path = directory_path / filename
+            if audio_only and path.suffix.casefold() not in AUDIO_ONLY_SCAN_EXTENSIONS:
+                continue
+            yield path
+
+
+class SelfReadHistoryLoadError(RuntimeError):
+    """Raised when an existing history ledger cannot be trusted safely."""
+
+
+def _empty_read_history():
+    return {
+        "version": SELF_READ_HISTORY_VERSION,
+        "updated_at": None,
+        "files": {},
+    }
+
+
+def _legacy_history_record():
+    return {
+        "read_count": 1,
+        "first_read_at": None,
+        "last_read_at": None,
+        "last_read_reason": "legacy",
+        "mtime_ns": None,
+        "size_bytes": None,
+        "legacy_migrated": True,
+    }
+
+
+def _validate_history_fingerprint(record, key, path):
+    mtime = record.get("mtime_ns")
+    size = record.get("size_bytes")
+    if mtime is None and size is None:
+        return
+    if (
+        isinstance(mtime, bool)
+        or not isinstance(mtime, int)
+        or mtime < 0
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+    ):
+        raise SelfReadHistoryLoadError(
+            f"invalid fingerprint for {key!r} in {path}"
+        )
+
+
+def _validate_history_continuation(record, key, path):
+    if "continuation" not in record:
+        return
+    continuation = record.get("continuation")
+    if not isinstance(continuation, dict):
+        raise SelfReadHistoryLoadError(
+            f"invalid continuation for {key!r} in {path}"
+        )
+    offset = continuation.get("offset")
+    total = continuation.get("total_fragments")
+    fingerprint = continuation.get("fingerprint")
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total <= 0
+        or offset >= total
+        or not isinstance(fingerprint, dict)
+    ):
+        raise SelfReadHistoryLoadError(
+            f"invalid continuation for {key!r} in {path}"
+        )
+    continuation_mtime = fingerprint.get("mtime_ns")
+    continuation_size = fingerprint.get("size_bytes")
+    if (
+        isinstance(continuation_mtime, bool)
+        or not isinstance(continuation_mtime, int)
+        or continuation_mtime < 0
+        or isinstance(continuation_size, bool)
+        or not isinstance(continuation_size, int)
+        or continuation_size < 0
+        or continuation_mtime != record.get("mtime_ns")
+        or continuation_size != record.get("size_bytes")
+    ):
+        raise SelfReadHistoryLoadError(
+            f"invalid continuation fingerprint for {key!r} in {path}"
+        )
+
+
 def load_history(child):
-    path = Path("AI_Children") / child / "memory" / "read_history.json"
+    """Load the inspectable v2 per-file ledger, accepting the legacy string list."""
+    path = _child_memory_path(child, SELF_READ_HISTORY_FILENAME)
     if not path.exists():
-        return []
-    with open(path, "r") as f:
-        return json.load(f)
+        return _empty_read_history()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except Exception as exc:
+        raise SelfReadHistoryLoadError(
+            f"cannot read {path}: {exc}"
+        ) from exc
+
+    ledger = _empty_read_history()
+    files = ledger["files"]
+    if isinstance(raw, list):
+        for value in raw:
+            if not isinstance(value, str) or not value.strip():
+                raise SelfReadHistoryLoadError(
+                    f"invalid legacy entry in {path}"
+                )
+            files.setdefault(value.strip(), _legacy_history_record())
+        ledger["migration"] = {
+            "from": "legacy_string_list",
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return ledger
+
+    if not isinstance(raw, dict):
+        raise SelfReadHistoryLoadError(f"invalid top-level format in {path}")
+
+    version = raw.get("version")
+    if version is not None and version != SELF_READ_HISTORY_VERSION:
+        raise SelfReadHistoryLoadError(
+            f"unsupported history version {version!r} in {path}"
+        )
+
+    if "files" in raw:
+        raw_files = raw.get("files")
+        if not isinstance(raw_files, dict):
+            raise SelfReadHistoryLoadError(f"invalid files map in {path}")
+    elif "entries" in raw:
+        # Tolerate an early map-only ledger shape if one was written by a prototype.
+        raw_files = raw.get("entries")
+        if not isinstance(raw_files, dict):
+            raise SelfReadHistoryLoadError(f"invalid entries map in {path}")
+    else:
+        raise SelfReadHistoryLoadError(f"missing files map in {path}")
+
+    if "migration" in raw and not isinstance(raw.get("migration"), dict):
+        raise SelfReadHistoryLoadError(f"invalid migration metadata in {path}")
+    if "last_pass" in raw and not isinstance(raw.get("last_pass"), dict):
+        raise SelfReadHistoryLoadError(f"invalid last-pass metadata in {path}")
+
+    for raw_key, raw_record in raw_files.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise SelfReadHistoryLoadError(f"invalid file key in {path}")
+        key = raw_key.strip()
+        if not isinstance(raw_record, dict):
+            raise SelfReadHistoryLoadError(
+                f"invalid record for {key!r} in {path}"
+            )
+        record = dict(raw_record)
+        try:
+            record["read_count"] = max(1, int(record.get("read_count") or 1))
+        except (TypeError, ValueError):
+            record["read_count"] = 1
+        record.setdefault("first_read_at", record.get("last_read_at"))
+        record.setdefault("last_read_at", None)
+        record.setdefault("last_read_reason", "legacy")
+        record.setdefault("mtime_ns", None)
+        record.setdefault("size_bytes", None)
+        _validate_history_fingerprint(record, key, path)
+        _validate_history_continuation(record, key, path)
+        files[key] = record
+
+    ledger["updated_at"] = raw.get("updated_at")
+    if isinstance(raw.get("migration"), dict):
+        ledger["migration"] = raw["migration"]
+    if isinstance(raw.get("last_pass"), dict):
+        ledger["last_pass"] = raw["last_pass"]
+    return ledger
+
 
 def save_history(child, history):
-    path = Path("AI_Children") / child / "memory" / "read_history.json"
-    with open(path, "w") as f:
-        json.dump(history[-250:], f, indent=4)
+    """Atomically save a deterministic, non-truncated per-file read ledger."""
+    path = _child_memory_path(child, SELF_READ_HISTORY_FILENAME)
+    files = history.get("files") if isinstance(history, dict) else {}
+    files = files if isinstance(files, dict) else {}
+    payload = {
+        "version": SELF_READ_HISTORY_VERSION,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "files": files,
+    }
+    if isinstance(history, dict) and isinstance(history.get("migration"), dict):
+        payload["migration"] = history["migration"]
+    if isinstance(history, dict) and isinstance(history.get("last_pass"), dict):
+        payload["last_pass"] = history["last_pass"]
+    _atomic_write_json(path, payload, sort_keys=True)
+
+
+def self_read_history_key(source_key, base_root, relative_path):
+    """Build a collision-resistant key while keeping the source/path inspectable."""
+    try:
+        root_identity = str(Path(base_root).resolve())
+    except OSError:
+        root_identity = str(base_root)
+    relative = str(relative_path or "").replace("\\", "/")
+    return f"{source_key}|{root_identity}|{relative}"
+
+
+def _old_self_read_history_key(base_root, relative_path):
+    return f"{Path(base_root).name}/{relative_path}"
+
+
+def _resolve_history_record(
+    history_files,
+    *,
+    source_key,
+    base_root,
+    relative_path,
+    allow_legacy_basename=False,
+):
+    """
+    Find a canonical or legacy entry and migrate old keys without rereading.
+    """
+    canonical = self_read_history_key(source_key, base_root, relative_path)
+    candidates = [canonical, _old_self_read_history_key(base_root, relative_path)]
+    if allow_legacy_basename:
+        candidates.append(Path(relative_path).name)
+
+    for candidate_key in candidates:
+        prior = history_files.get(candidate_key)
+        if not isinstance(prior, dict):
+            continue
+        if candidate_key != canonical:
+            migrated = dict(prior)
+            migrated["migrated_from_key"] = candidate_key
+            existing = history_files.get(canonical)
+            if not isinstance(existing, dict):
+                history_files[canonical] = migrated
+                prior = migrated
+            else:
+                prior = existing
+            history_files.pop(candidate_key, None)
+        return canonical, prior
+    return canonical, None
+
+
+def _file_stamp(path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    return {
+        "mtime_ns": max(0, int(stat.st_mtime_ns)),
+        "size_bytes": max(0, int(stat.st_size)),
+    }
+
+
+def classify_self_read_file(prior, stamp):
+    """Return new/updated/resume, or None for an unchanged legacy/seen file."""
+    if not isinstance(prior, dict):
+        return "new"
+    if not isinstance(stamp, dict) or not stamp:
+        return None
+    old_mtime = prior.get("mtime_ns")
+    old_size = prior.get("size_bytes")
+    if old_mtime is None or old_size is None:
+        return None
+    try:
+        changed = (
+            int(old_mtime) != int(stamp.get("mtime_ns"))
+            or int(old_size) != int(stamp.get("size_bytes"))
+        )
+    except (TypeError, ValueError):
+        return "updated"
+    if changed:
+        return "updated"
+    return "resume" if _self_read_resume_offset(prior, stamp) > 0 else None
+
+
+def _fingerprint_matches(fingerprint, stamp):
+    if not isinstance(fingerprint, dict) or not isinstance(stamp, dict):
+        return False
+    try:
+        return (
+            int(fingerprint.get("mtime_ns")) == int(stamp.get("mtime_ns"))
+            and int(fingerprint.get("size_bytes")) == int(stamp.get("size_bytes"))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _self_read_resume_offset(prior, stamp):
+    """Return a continuation cursor only when it belongs to this fingerprint."""
+    continuation = prior.get("continuation") if isinstance(prior, dict) else None
+    if not isinstance(continuation, dict):
+        return 0
+    if not _fingerprint_matches(continuation.get("fingerprint"), stamp):
+        return 0
+    try:
+        offset = int(continuation.get("offset") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, offset)
+
+
+def _self_read_fragment_window(result, prior, stamp, budget):
+    """Slice the next unsaved fragment window for a fingerprint-bound cursor."""
+    fragments = list(result or [])
+    start = min(_self_read_resume_offset(prior, stamp), len(fragments))
+    try:
+        capacity = max(0, int(budget))
+    except (TypeError, ValueError):
+        capacity = 0
+    end = min(len(fragments), start + capacity)
+    return fragments[start:end], start, end, len(fragments)
+
+
+def _set_self_read_continuation(record, stamp, *, next_offset, total_fragments):
+    """Persist or clear the compact continuation cursor for a processed file."""
+    try:
+        next_value = max(0, int(next_offset))
+        total_value = max(0, int(total_fragments))
+    except (TypeError, ValueError):
+        next_value = 0
+        total_value = 0
+    record.pop("continuation", None)
+    if next_value < total_value:
+        record["continuation"] = {
+            "offset": next_value,
+            "total_fragments": total_value,
+            "fingerprint": {
+                "mtime_ns": stamp.get("mtime_ns"),
+                "size_bytes": stamp.get("size_bytes"),
+            },
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return record
+
+
+def _primary_fragment_ceiling(focus, fragment_limit=FRAG_LIMIT):
+    """Keep one fragment slot for a due revisit only when seen focus asks for it."""
+    try:
+        limit = max(0, int(fragment_limit))
+    except (TypeError, ValueError):
+        limit = 0
+    reserve = SEEN_FOCUS_REVISIT_FRAGMENT_RESERVE if focus == "seen" else 0
+    return max(0, limit - min(limit, reserve))
+
+
+def _parse_history_timestamp(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _revisit_is_due(record, *, now_ts, min_age_seconds):
+    last_ts = _parse_history_timestamp(record.get("last_read_at")) if isinstance(record, dict) else None
+    if last_ts is None:
+        return True
+    return (now_ts - last_ts) >= max(0.0, float(min_age_seconds))
+
+
+def select_revisit_candidates(
+    candidates,
+    focus,
+    *,
+    limit=None,
+    now_ts=None,
+    min_age_seconds=SELF_READ_REVISIT_MIN_AGE_SECONDS,
+):
+    """Choose oldest unchanged files deterministically and within the pass quota."""
+    if focus == "new":
+        return []
+    capacity = _self_read_revisit_limit(focus) if limit is None else max(0, int(limit))
+    if focus == "balanced":
+        capacity = min(DEFAULT_BALANCED_REVISIT_LIMIT, capacity)
+    if capacity <= 0:
+        return []
+
+    now_value = datetime.now(timezone.utc).timestamp() if now_ts is None else float(now_ts)
+    eligible = [
+        item
+        for item in candidates
+        if isinstance(item, dict)
+        and _revisit_is_due(
+            item.get("prior") or {},
+            now_ts=now_value,
+            min_age_seconds=min_age_seconds,
+        )
+    ]
+    eligible.sort(
+        key=lambda item: (
+            _parse_history_timestamp((item.get("prior") or {}).get("last_read_at"))
+            if _parse_history_timestamp((item.get("prior") or {}).get("last_read_at")) is not None
+            else float("-inf"),
+            str(item.get("history_key") or ""),
+        )
+    )
+    return eligible[:capacity]
+
+
+def _backfill_legacy_stamp(prior, stamp):
+    record = dict(prior or {})
+    if record.get("mtime_ns") is None:
+        record["mtime_ns"] = stamp.get("mtime_ns")
+    if record.get("size_bytes") is None:
+        record["size_bytes"] = stamp.get("size_bytes")
+    record["last_observed_at"] = datetime.now(timezone.utc).isoformat()
+    record["legacy_migrated"] = True
+    return record
+
+
+def _next_history_record(prior, stamp, *, read_reason, source_key, relative_path, base_root):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prior = prior if isinstance(prior, dict) else {}
+    try:
+        prior_count = max(0, int(prior.get("read_count") or 0))
+    except (TypeError, ValueError):
+        prior_count = 0
+    record = {
+        "source": source_key,
+        "relative_path": relative_path,
+        "root_path": str(base_root),
+        "mtime_ns": stamp.get("mtime_ns"),
+        "size_bytes": stamp.get("size_bytes"),
+        "first_read_at": prior.get("first_read_at") or prior.get("last_read_at") or now_iso,
+        "last_read_at": now_iso,
+        "read_count": prior_count + 1,
+        "last_read_reason": read_reason,
+    }
+    if prior:
+        record["previous_read"] = {
+            "last_read_at": prior.get("last_read_at"),
+            "read_count": prior_count,
+            "last_read_reason": prior.get("last_read_reason"),
+            "mtime_ns": prior.get("mtime_ns"),
+            "size_bytes": prior.get("size_bytes"),
+            "fragment_ids": list(prior.get("last_fragment_ids") or [])[:5],
+        }
+    return record
+
+
+def annotate_fragment_read_lineage(fragment, *, read_reason, prior, record, focus):
+    tags = fragment.setdefault("tags", [])
+    reason_tag = f"self_read_{read_reason}"
+    if reason_tag not in tags:
+        tags.append(reason_tag)
+    context = fragment.setdefault("source_context", {})
+    context["read_reason"] = read_reason
+    context["read_focus"] = focus
+    context["read_count"] = int(record.get("read_count") or 1)
+    context["source_fingerprint"] = {
+        "mtime_ns": record.get("mtime_ns"),
+        "size_bytes": record.get("size_bytes"),
+    }
+    if isinstance(prior, dict):
+        context["prior_read"] = {
+            "last_read_at": prior.get("last_read_at"),
+            "read_count": int(prior.get("read_count") or 1),
+            "last_read_reason": prior.get("last_read_reason"),
+            "mtime_ns": prior.get("mtime_ns"),
+            "size_bytes": prior.get("size_bytes"),
+            "fragment_ids": list(prior.get("last_fragment_ids") or [])[:5],
+        }
+    return fragment
 
 def log_reflection(child, fragment):
-    path = Path("AI_Children") / child / "identity" / "self_reflection.json"
+    path = _child_root_path(child) / "identity" / "self_reflection.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(path, "r") as f:
@@ -1256,45 +2032,147 @@ def _fragments_from_data_buffer(data, inner_path, container_path, category, tran
     return []
 
 
-def process_archive(path, transformer):
+def _zip_declared_entry_count(path):
+    """Read ZIP end metadata without loading the complete central directory."""
+    try:
+        with open(path, "rb") as handle:
+            end_record = zipfile._EndRecData(handle)
+        if end_record is None:
+            return None
+        return int(end_record[zipfile._ECD_ENTRIES_TOTAL])
+    except (AttributeError, IndexError, OSError, TypeError, ValueError):
+        return None
+
+
+def process_archive(
+    path,
+    transformer,
+    *,
+    member_limit=ARCHIVE_MEMBER_COUNT_LIMIT,
+    aggregate_limit=ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT,
+    fragment_limit=ARCHIVE_FRAGMENT_LIMIT,
+):
+    """Process a bounded archive sample without materializing an unbounded result."""
     fragments = []
+    entries_inspected = 0
+    decompressed_bytes = 0
+    member_limit = max(1, min(ARCHIVE_MEMBER_COUNT_LIMIT, int(member_limit)))
+    aggregate_limit = max(
+        1,
+        min(ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT, int(aggregate_limit)),
+    )
+    fragment_limit = max(1, min(ARCHIVE_FRAGMENT_LIMIT, int(fragment_limit)))
+    budget_notice = None
+
+    def note_budget(reason):
+        nonlocal budget_notice
+        if budget_notice is None:
+            budget_notice = reason
+            log_to_statusbox(
+                f"[RawFileManager] Archive budget reached for {path.name}: {reason}."
+            )
+
+    def append_member(data, inner_path, category):
+        generated = list(
+            _fragments_from_data_buffer(
+                data,
+                inner_path,
+                path,
+                category,
+                transformer,
+            )
+            or []
+        )
+        remaining = max(0, fragment_limit - len(fragments))
+        fragments.extend(generated[:remaining])
+        if len(generated) > remaining or len(fragments) >= fragment_limit:
+            note_budget(f"{fragment_limit} fragments")
+            return False
+        return True
+
+    def entry_allowed(declared_size):
+        nonlocal entries_inspected
+        if entries_inspected >= member_limit:
+            note_budget(f"{member_limit} members")
+            return False
+        entries_inspected += 1
+        if declared_size < 0 or declared_size > ARCHIVE_MEMBER_LIMIT:
+            return None
+        if decompressed_bytes + declared_size > aggregate_limit:
+            note_budget(f"{aggregate_limit} decompressed bytes")
+            return None
+        return True
 
     try:
         if zipfile.is_zipfile(path):
+            declared_entries = _zip_declared_entry_count(path)
+            if (
+                declared_entries is None
+                or declared_entries > ARCHIVE_MEMBER_COUNT_LIMIT
+            ):
+                note_budget(
+                    f"ZIP central directory exceeds "
+                    f"{ARCHIVE_MEMBER_COUNT_LIMIT} entries"
+                )
+                return fragments
             with zipfile.ZipFile(path) as archive:
                 for info in archive.infolist():
-                    if info.is_dir() or info.file_size > ARCHIVE_MEMBER_LIMIT:
+                    allowed = entry_allowed(int(info.file_size or 0))
+                    if allowed is False:
+                        break
+                    if info.is_dir() or allowed is None:
                         continue
                     inner_path = Path(info.filename)
-                    category = classify_suffixes([s.lower() for s in inner_path.suffixes])
+                    category = classify_suffixes(
+                        [suffix.lower() for suffix in inner_path.suffixes]
+                    )
                     if not category or category == "archive":
                         continue
-                    with archive.open(info, "r") as member:
-                        data = member.read()
-                    fragments.extend(
-                        _fragments_from_data_buffer(
-                            data, inner_path, path, category, transformer
-                        )
-                    )
+                    remaining_bytes = aggregate_limit - decompressed_bytes
+                    try:
+                        with archive.open(info, "r") as member:
+                            data = _read_limited(
+                                member,
+                                min(ARCHIVE_MEMBER_LIMIT, remaining_bytes),
+                            )
+                    except ValueError:
+                        note_budget(f"{aggregate_limit} decompressed bytes")
+                        continue
+                    decompressed_bytes += len(data)
+                    if not append_member(data, inner_path, category):
+                        break
 
         elif tarfile.is_tarfile(path):
             with tarfile.open(path, "r:*") as archive:
-                for member in archive.getmembers():
-                    if not member.isfile() or member.size > ARCHIVE_MEMBER_LIMIT:
+                for member in archive:
+                    allowed = entry_allowed(int(member.size or 0))
+                    if allowed is False:
+                        break
+                    if not member.isfile() or allowed is None:
                         continue
                     inner_path = Path(member.name)
-                    category = classify_suffixes([s.lower() for s in inner_path.suffixes])
+                    category = classify_suffixes(
+                        [suffix.lower() for suffix in inner_path.suffixes]
+                    )
                     if not category or category == "archive":
                         continue
                     extracted = archive.extractfile(member)
                     if extracted is None:
                         continue
-                    data = extracted.read()
-                    fragments.extend(
-                        _fragments_from_data_buffer(
-                            data, inner_path, path, category, transformer
+                    remaining_bytes = aggregate_limit - decompressed_bytes
+                    try:
+                        data = _read_limited(
+                            extracted,
+                            min(ARCHIVE_MEMBER_LIMIT, remaining_bytes),
                         )
-                    )
+                    except ValueError:
+                        note_budget(f"{aggregate_limit} decompressed bytes")
+                        continue
+                    finally:
+                        extracted.close()
+                    decompressed_bytes += len(data)
+                    if not append_member(data, inner_path, category):
+                        break
 
         else:
             ext = path.suffix.lower()
@@ -1306,44 +2184,75 @@ def process_archive(path, transformer):
             opener = opener_map.get(ext)
             if opener:
                 inner_name = Path(path.name).with_suffix("")
-                category = classify_suffixes([s.lower() for s in inner_name.suffixes])
+                category = classify_suffixes(
+                    [suffix.lower() for suffix in inner_name.suffixes]
+                )
                 if category and category != "archive":
                     try:
                         with opener(path, "rb") as compressed:
-                            data = _read_limited(compressed, ARCHIVE_MEMBER_LIMIT)
+                            data = _read_limited(
+                                compressed,
+                                min(ARCHIVE_MEMBER_LIMIT, aggregate_limit),
+                            )
                     except ValueError:
-                        log_to_statusbox(
-                            f"[RawFileManager] Skipping {path} because the decompressed size exceeds the per-file limit"
+                        note_budget(
+                            f"{min(ARCHIVE_MEMBER_LIMIT, aggregate_limit)} "
+                            "decompressed bytes"
                         )
                     else:
-                        fragments.extend(
-                            _fragments_from_data_buffer(
-                                data, inner_name, path, category, transformer
-                            )
-                        )
-    except Exception as e:
-        log_to_statusbox(f"[RawFileManager] Failed to process archive {path}: {e}")
+                        decompressed_bytes = len(data)
+                        append_member(data, inner_name, category)
+    except Exception as exc:
+        log_to_statusbox(f"[RawFileManager] Failed to process archive {path}: {exc}")
 
     return fragments
 
 def self_read_and_train():
     child = get_child()
     default_root = Path(__file__).resolve().parent
+    try:
+        history_ledger = load_history(child)
+    except SelfReadHistoryLoadError as exc:
+        log_to_statusbox(
+            f"[SelfRead] History load failed closed; no files will be read: {exc}"
+        )
+        if _SELF_READ_LOCK_HELD:
+            _release_runtime_lock("failed", error=f"history_load_failed: {exc}")
+        return False
+
     prefs = load_self_read_preferences(child)
     prefs = _apply_skip_requests(child, prefs)
     source_choices = prefs.get("source_choices", DEFAULT_SELF_READ_PREFS["source_choices"])
     skip_patterns = prefs.get("skip_files", [])
     source_override = _load_self_read_source_override()
+    focus_decision = resolve_self_read_focus(child)
+    read_focus = focus_decision["focus"]
+    revisit_limit = _self_read_revisit_limit(read_focus)
     if source_override and not source_choices.get(source_override, False):
         log_to_statusbox(f"[SelfRead] Source override '{source_override}' ignored by preference.")
         source_override = None
     if _SELF_READ_LOCK_HELD:
-        _write_runtime_state("running", source=source_override or "all", phase="collect_roots")
+        _write_runtime_state(
+            "running",
+            source=source_override or "all",
+            phase="collect_roots",
+            read_focus=read_focus,
+            read_focus_source=focus_decision.get("source"),
+            read_focus_scores={
+                "new": focus_decision.get("new_score"),
+                "seen": focus_decision.get("seen_score"),
+            },
+            read_focus_drivers=focus_decision.get("drivers") or {},
+        )
 
-    raw_history = load_history(child)
-    history = {entry for entry in raw_history if "/" in entry}
-    legacy_history = {entry for entry in raw_history if "/" not in entry}
-    new_fragments = []
+    history_files = history_ledger["files"]
+    read_reason_counts = {"new": 0, "updated": 0, "resume": 0, "revisit": 0}
+    primary_fragment_ceiling = (
+        _primary_fragment_ceiling(read_focus, FRAG_LIMIT)
+        if revisit_limit > 0
+        else FRAG_LIMIT
+    )
+    primary_fallback = None
 
     def collect_roots(override):
         roots = []
@@ -1400,7 +2309,7 @@ def self_read_and_train():
                 log_to_statusbox(f"[SelfRead] Virtual environment not found: {venv_path}")
 
         if source_choices.get("github_history", True) and source_override in (None, "github_history"):
-            history_root = Path("AI_Children") / child / "memory" / "github_history"
+            history_root = _child_memory_path(child, "github_history")
             try:
                 materialize_commit_history(default_root, history_root, limit=24)
                 add_root(history_root, audio_only=False, source_key="github_history")
@@ -1419,6 +2328,10 @@ def self_read_and_train():
             roots = collect_roots(None)
 
     log_to_statusbox(f"[SelfRead] Child set to: {child}")
+    log_to_statusbox(
+        f"[SelfRead] File focus: {read_focus} "
+        f"({focus_decision.get('source', 'unknown')}; revisit limit {revisit_limit})."
+    )
     if roots:
         root_descriptions = ", ".join(
             f"{str(path)} [{source_key}]" for path, _, source_key in roots
@@ -1426,29 +2339,219 @@ def self_read_and_train():
         log_to_statusbox("[SelfRead] Roots to scan: " + root_descriptions)
     else:
         log_to_statusbox("[SelfRead] No available roots to scan.")
+        save_history(child, history_ledger)
         return
-    log_to_statusbox(f"[SelfRead] Loaded {len(history) + len(legacy_history)} previously seen files.")
-
-    # Resolve roots once for provenance tagging
-    def _safe_resolve(p):
-        try:
-            return p.resolve()
-        except Exception:
-            return None
+    log_to_statusbox(f"[SelfRead] Loaded {len(history_files)} previously seen files.")
 
     transformer = FractalTransformer()
     count = 0
+    revisit_candidates = []
+    unchanged_seen_count = 0
+    scan_now_ts = datetime.now(timezone.utc).timestamp()
+    inspection_limit = _self_read_inspection_limit()
+    scan_seconds = _self_read_scan_seconds()
+    scan_started_monotonic = time.monotonic()
+    files_inspected = 0
+    scan_stop_reason = None
 
-    audio_patterns = ("*.wav", "*.mp3", "*.opus")
+    def _scan_time_stop_requested():
+        nonlocal scan_stop_reason
+        if (time.monotonic() - scan_started_monotonic) >= scan_seconds:
+            scan_stop_reason = scan_stop_reason or "time_budget"
+            return True
+        return False
+
+    seen_revisit_satisfied = False
+
+    def _process_candidate(candidate, read_reason, *, fragment_ceiling=None):
+        nonlocal count
+        ceiling = FRAG_LIMIT if fragment_ceiling is None else fragment_ceiling
+        ceiling = max(0, min(FRAG_LIMIT, int(ceiling)))
+        if count >= ceiling:
+            return False
+
+        path = candidate["path"]
+        category = candidate["category"]
+        base_root = candidate["base_root"]
+        source_key = candidate["source_key"]
+        rel_str = candidate["relative_path"]
+        history_key = candidate["history_key"]
+        prior = candidate.get("prior")
+        current_prior = history_files.get(history_key)
+        if isinstance(current_prior, dict):
+            prior = current_prior
+            candidate["prior"] = prior
+        stamp = candidate["stamp"]
+
+        log_to_statusbox(
+            f"[SelfRead] PROCESSING {path.name} [{category}; {read_reason}]"
+        )
+
+        try:
+            if category == "text":
+                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read()
+                result = fragment_text(text, path.name, transformer)
+
+            elif category == "document":
+                result = fragment_document(path, transformer)
+
+            elif category == "image":
+                result = fragment_image(path, transformer)
+
+            elif category == "audio":
+                result = fragment_audio(path, transformer)
+
+            elif category == "video":
+                result = fragment_video(path, transformer)
+
+            elif category == "archive":
+                result = process_archive(path, transformer)
+
+            else:
+                log_to_statusbox(
+                    f"[SelfRead] SKIP {path.name} — unsupported processing category {category}."
+                )
+                return False
+
+            result = list(result or [])
+            if not result:
+                return False
+
+            remaining = max(0, ceiling - count)
+            fragments_to_save, start_offset, next_offset, total_fragments = (
+                _self_read_fragment_window(result, prior, stamp, remaining)
+            )
+            if not fragments_to_save:
+                if read_reason == "resume" and start_offset >= total_fragments:
+                    completed = dict(prior or {})
+                    completed.pop("continuation", None)
+                    completed["continuation_cleared_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    history_files[history_key] = completed
+                return False
+
+            record = _next_history_record(
+                prior,
+                stamp,
+                read_reason=read_reason,
+                source_key=source_key,
+                relative_path=rel_str,
+                base_root=base_root,
+            )
+            saved_ids = []
+            for frag in fragments_to_save:
+                frag_id = frag.get("id") or f"frag_text_{uuid.uuid4().hex[:10]}"
+                frag["id"] = frag_id
+
+                annotate_fragment_source(frag, source_key, rel_str, base_root)
+                annotate_fragment_read_lineage(
+                    frag,
+                    read_reason=read_reason,
+                    prior=prior,
+                    record=record,
+                    focus=read_focus,
+                )
+
+                frag_path = _child_memory_path(
+                    child,
+                    "fragments",
+                    f"{frag_id}.json",
+                )
+                frag_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(frag_path, "w", encoding="utf-8") as handle:
+                    json.dump(frag, handle, indent=4)
+
+                log_to_statusbox(
+                    f"[SelfRead] + Fragment saved: {frag_id} from {path.name} "
+                    f"({read_reason}, read #{record['read_count']})"
+                )
+                log_reflection(child, frag)
+                saved_ids.append(frag_id)
+                count += 1
+
+            record["last_fragment_ids"] = saved_ids[:5]
+            record["last_fragment_range"] = {
+                "start": start_offset,
+                "end_exclusive": next_offset,
+            }
+            record["fragment_count_seen"] = total_fragments
+            record["fragment_count_saved"] = len(fragments_to_save)
+            _set_self_read_continuation(
+                record,
+                stamp,
+                next_offset=next_offset,
+                total_fragments=total_fragments,
+            )
+            if next_offset < total_fragments:
+                record["fragment_limit_truncated"] = True
+                log_to_statusbox(
+                    f"[SelfRead] Fragment limit saved range {start_offset}:{next_offset} "
+                    f"of {total_fragments} from {path.name}; continuation recorded."
+                )
+            history_files[history_key] = record
+            read_reason_counts[read_reason] += 1
+            return True
+
+        except Exception as exc:
+            if is_broken_pipe_error(exc):
+                report = report_self_read_broken_pipe(
+                    child=child,
+                    component="self_read",
+                    operation=f"process_{category}",
+                    error=exc,
+                    source_message=(
+                        f"[SelfRead] PROCESSING {path.name} "
+                        f"[{category}; {read_reason}]"
+                    ),
+                    path_text=str(path),
+                )
+                note = (
+                    "[SelfRead] Broken pipe explanation: "
+                    f"{report.get('explanation') or str(exc)}"
+                )
+                issue_entry_id = str(report.get("issue_entry_id") or "").strip()
+                if issue_entry_id:
+                    note += f" GitHub queue entry: {issue_entry_id}."
+                elif report.get("duplicate_within_cooldown"):
+                    note += " Existing cooldown report reused."
+                log_to_statusbox(note)
+                return False
+            log_to_statusbox(f"[SelfRead] ERROR processing {path.name}: {exc}")
+            return False
 
     for base_root, audio_only, source_key in roots:
+        if count >= FRAG_LIMIT:
+            break
+        if files_inspected >= inspection_limit:
+            scan_stop_reason = scan_stop_reason or "file_budget"
+            break
+        if _scan_time_stop_requested():
+            break
         log_to_statusbox(f"[SelfRead] Scanning: {base_root}")
-        if audio_only:
-            file_iter = itertools.chain.from_iterable(base_root.rglob(pattern) for pattern in audio_patterns)
-        else:
-            file_iter = base_root.rglob("*")
+        prune_generated = _should_prune_default_code_scan(
+            base_root,
+            default_root,
+            source_key,
+        )
+        file_iter = _iter_self_read_files(
+            base_root,
+            audio_only=audio_only,
+            prune_generated=prune_generated,
+            stop_requested=_scan_time_stop_requested,
+        )
 
         for path in file_iter:
+            if count >= FRAG_LIMIT:
+                break
+            if files_inspected >= inspection_limit:
+                scan_stop_reason = scan_stop_reason or "file_budget"
+                break
+            if _scan_time_stop_requested():
+                break
+            files_inspected += 1
             if not path.is_file():
                 continue
 
@@ -1457,16 +2560,15 @@ def self_read_and_train():
             except ValueError:
                 relative_path = path.name
 
-            rel_str = relative_path.as_posix() if isinstance(relative_path, Path) else str(relative_path)
+            rel_str = (
+                relative_path.as_posix()
+                if isinstance(relative_path, Path)
+                else str(relative_path)
+            )
             if source_key == "code" and "/memory/github_history/" in f"/{rel_str}":
                 continue
-            history_key = f"{base_root.name}/{rel_str}"
 
             log_to_statusbox(f"[SelfRead] Inspecting: {path}")
-
-            if history_key in history or (base_root == default_root and path.name in legacy_history):
-                log_to_statusbox(f"[SelfRead] SKIP {path.name} — already seen.")
-                continue
 
             skip_match = _match_skip_pattern(path, rel_str, skip_patterns)
             if skip_match:
@@ -1486,100 +2588,191 @@ def self_read_and_train():
                 )
                 continue
 
-            log_to_statusbox(f"[SelfRead] PROCESSING {path.name} [{category}]")
+            stamp = _file_stamp(path)
+            if not stamp:
+                log_to_statusbox(f"[SelfRead] SKIP {path.name} — file disappeared.")
+                continue
 
-            try:
-                if category == "text":
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        text = f.read()
-                    result = fragment_text(text, path.name, transformer)
+            history_key, prior = _resolve_history_record(
+                history_files,
+                source_key=source_key,
+                base_root=base_root,
+                relative_path=rel_str,
+                allow_legacy_basename=(base_root == default_root),
+            )
+            read_reason = classify_self_read_file(prior, stamp)
+            candidate = {
+                "path": path,
+                "category": category,
+                "base_root": base_root,
+                "source_key": source_key,
+                "relative_path": rel_str,
+                "history_key": history_key,
+                "prior": prior,
+                "stamp": stamp,
+            }
 
-                elif category == "document":
-                    result = fragment_document(path, transformer)
-
-                elif category == "image":
-                    result = fragment_image(path, transformer)
-
-                elif category == "audio":
-                    result = fragment_audio(path, transformer)
-
-                elif category == "video":
-                    result = fragment_video(path, transformer)
-
-                elif category == "archive":
-                    result = process_archive(path, transformer)
-
-                else:
-                    log_to_statusbox(
-                        f"[SelfRead] SKIP {path.name} — unsupported processing category {category}."
+            if read_reason in {"new", "updated", "resume"}:
+                if count < primary_fragment_ceiling:
+                    processed = _process_candidate(
+                        candidate,
+                        read_reason,
+                        fragment_ceiling=primary_fragment_ceiling,
                     )
-                    continue
+                    current = history_files.get(history_key) or {}
+                    if processed and current.get("continuation") and primary_fallback is None:
+                        primary_fallback = (candidate, "resume")
+                elif primary_fallback is None:
+                    primary_fallback = (candidate, read_reason)
+                continue
 
-                if result:
-                    for frag in result:
-                        frag_id = frag.get("id") or f"frag_text_{uuid.uuid4().hex[:10]}"
-                        frag["id"] = frag_id
+            unchanged_seen_count += 1
+            if prior.get("mtime_ns") is None or prior.get("size_bytes") is None:
+                prior = _backfill_legacy_stamp(prior, stamp)
+                prior.setdefault("source", source_key)
+                prior.setdefault("relative_path", rel_str)
+                prior.setdefault("root_path", str(base_root))
+                history_files[history_key] = prior
+                candidate["prior"] = prior
 
-                        annotate_fragment_source(frag, source_key, rel_str, base_root)
+            if revisit_limit <= 0:
+                log_to_statusbox(f"[SelfRead] SKIP {path.name} — already seen.")
+                continue
 
-                        frag_path = Path("AI_Children") / child / "memory" / "fragments" / f"{frag_id}.json"
-                        frag_path.parent.mkdir(parents=True, exist_ok=True)
+            revisit_candidates = select_revisit_candidates(
+                revisit_candidates + [candidate],
+                read_focus,
+                limit=revisit_limit,
+                now_ts=scan_now_ts,
+            )
 
-                        with open(frag_path, "w", encoding="utf-8") as f:
-                            json.dump(frag, f, indent=4)
-
-                        log_to_statusbox(f"[SelfRead] + Fragment saved: {frag_id} from {path.name}")
-                        log_reflection(child, frag)
-                        new_fragments.append(frag)
-
-                    if base_root == default_root:
-                        legacy_history.discard(path.name)
-                    history.add(history_key)
-                    count += len(result)
-
-            except Exception as e:
-                if is_broken_pipe_error(e):
-                    report = report_self_read_broken_pipe(
-                        child=child,
-                        component="self_read",
-                        operation=f"process_{category}",
-                        error=e,
-                        source_message=f"[SelfRead] PROCESSING {path.name} [{category}]",
-                        path_text=str(path),
-                    )
-                    note = f"[SelfRead] Broken pipe explanation: {report.get('explanation') or str(e)}"
-                    issue_entry_id = str(report.get("issue_entry_id") or "").strip()
-                    if issue_entry_id:
-                        note += f" GitHub queue entry: {issue_entry_id}."
-                    elif report.get("duplicate_within_cooldown"):
-                        note += " Existing cooldown report reused."
-                    log_to_statusbox(note)
-                    continue
-                log_to_statusbox(f"[SelfRead] ERROR processing {path.name}: {e}")
-
-            if count >= FRAG_LIMIT:
-                log_to_statusbox("[SelfRead] Fragment limit reached — stopping scan.")
-                break
-
-        if count >= FRAG_LIMIT:
+        close_file_iter = getattr(file_iter, "close", None)
+        if callable(close_file_iter):
+            close_file_iter()
+        if scan_stop_reason is not None:
             break
 
-    combined_history = list(history.union(legacy_history))
-    save_history(child, combined_history)
+    if scan_stop_reason is not None:
+        log_to_statusbox(
+            f"[SelfRead] Inspection {scan_stop_reason.replace('_', ' ')} reached "
+            f"after {files_inspected} file(s); ending this bounded pass."
+        )
+
+    if count < FRAG_LIMIT and revisit_candidates:
+        selected_revisits = select_revisit_candidates(
+            revisit_candidates,
+            read_focus,
+            limit=revisit_limit,
+            now_ts=scan_now_ts,
+        )
+        log_to_statusbox(
+            f"[SelfRead] Selected {len(selected_revisits)} unchanged file(s) "
+            f"for a bounded {read_focus} revisit."
+        )
+        for candidate in selected_revisits:
+            if count >= FRAG_LIMIT:
+                break
+            latest_stamp = _file_stamp(candidate["path"])
+            if not latest_stamp:
+                continue
+            candidate["stamp"] = latest_stamp
+            deferred_reason = classify_self_read_file(
+                candidate.get("prior"),
+                latest_stamp,
+            )
+            if deferred_reason in {"new", "updated", "resume"}:
+                if primary_fallback is None:
+                    primary_fallback = (candidate, deferred_reason)
+                continue
+            if _process_candidate(
+                candidate,
+                "revisit",
+                fragment_ceiling=FRAG_LIMIT,
+            ):
+                seen_revisit_satisfied = True
+
+    if count < FRAG_LIMIT and primary_fallback is not None:
+        candidate, fallback_reason = primary_fallback
+        latest_stamp = _file_stamp(candidate["path"])
+        if latest_stamp:
+            candidate["stamp"] = latest_stamp
+            current_prior = history_files.get(candidate["history_key"])
+            candidate["prior"] = current_prior
+            current_reason = classify_self_read_file(current_prior, latest_stamp)
+            if current_reason in {"new", "updated", "resume"}:
+                fallback_reason = current_reason
+            _process_candidate(
+                candidate,
+                fallback_reason,
+                fragment_ceiling=FRAG_LIMIT,
+            )
+
+    if count >= FRAG_LIMIT:
+        log_to_statusbox("[SelfRead] Fragment limit reached — stopping scan.")
+
+    history_ledger["last_pass"] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": source_override or "all",
+        "read_focus": read_focus,
+        "read_focus_source": focus_decision.get("source"),
+        "read_focus_scores": {
+            "new": focus_decision.get("new_score"),
+            "seen": focus_decision.get("seen_score"),
+        },
+        "read_focus_drivers": focus_decision.get("drivers") or {},
+        "primary_fragment_ceiling": primary_fragment_ceiling,
+        "seen_revisit_fragment_reserve": FRAG_LIMIT - primary_fragment_ceiling,
+        "seen_revisit_satisfied": seen_revisit_satisfied,
+        "read_reason_counts": dict(read_reason_counts),
+        "unchanged_seen_count": unchanged_seen_count,
+        "fragments_saved": count,
+        "files_inspected": files_inspected,
+        "inspection_file_budget": inspection_limit,
+        "inspection_time_budget_seconds": scan_seconds,
+        "inspection_elapsed_seconds": round(
+            max(0.0, time.monotonic() - scan_started_monotonic),
+            3,
+        ),
+        "inspection_stop_reason": scan_stop_reason,
+    }
+    save_history(child, history_ledger)
     if _SELF_READ_LOCK_HELD:
         _write_runtime_state(
             "running",
             source=source_override or "all",
+            read_focus_scores={
+                "new": focus_decision.get("new_score"),
+                "seen": focus_decision.get("seen_score"),
+            },
+            read_focus_drivers=focus_decision.get("drivers") or {},
+            unchanged_seen_count=unchanged_seen_count,
             phase="training" if count > 0 else "complete",
             fragments_saved=count,
+            files_processed=sum(read_reason_counts.values()),
+            primary_fragment_ceiling=primary_fragment_ceiling,
+            seen_revisit_fragment_reserve=FRAG_LIMIT - primary_fragment_ceiling,
+            seen_revisit_satisfied=seen_revisit_satisfied,
+            read_focus=read_focus,
+            read_focus_source=focus_decision.get("source"),
+            read_reason_counts=dict(read_reason_counts),
+            files_inspected=files_inspected,
+            inspection_file_budget=inspection_limit,
+            inspection_time_budget_seconds=scan_seconds,
+            inspection_stop_reason=scan_stop_reason,
         )
-    log_to_statusbox(f"[SelfRead] Done. {count} new fragments saved.")
+    log_to_statusbox(
+        f"[SelfRead] Done. {count} fragments saved from "
+        f"{read_reason_counts['new']} new, "
+        f"{read_reason_counts['updated']} updated, "
+        f"{read_reason_counts['resume']} resumed, and "
+        f"{read_reason_counts['revisit']} revisited file(s)."
+    )
 
     if count > 0:
         log_to_statusbox("[SelfRead] Calling training pipeline...")
         os.system("python train_fragments.py")
     else:
-        log_to_statusbox("[SelfRead] No new fragments to train on.")
+        log_to_statusbox("[SelfRead] No self-read fragments to train on.")
 
 
 def pretrain_audio_digest(paths, child):
@@ -1615,14 +2808,21 @@ def pretrain_audio_digest(paths, child):
             log_to_statusbox(f"[PretrainDigest] ERROR on {path.name}: {e}")
 
 
-if __name__ == "__main__":
+def main():
     if not _acquire_runtime_lock():
-        sys.exit(0)
+        return 0
     _install_runtime_signal_handlers()
     try:
-        self_read_and_train()
+        outcome = self_read_and_train()
     except Exception as exc:
         _release_runtime_lock("failed", error=exc)
         raise
-    else:
-        _release_runtime_lock("completed")
+    if outcome is False:
+        _release_runtime_lock("failed", error="self_read_failed")
+        return 1
+    _release_runtime_lock("completed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -30,6 +30,8 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
+from self_read_policy import SELF_READ_FOCUS_ENV, self_read_focus_from_emotions
+from runtime_state import append_inastate_queue
 from storage_layout import fast_runtime_path
 from storage_vitals import sample_storage_vitals
 from io_pressure import active_pressure
@@ -385,6 +387,16 @@ _PROCESS_TASK_PROFILES = {
         "priority": 52,
         "memory_class": "low",
         "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "creative_ui",
+    },
+    "daw_window_open": {
+        "kind": "subprocess",
+        "command": ["python", "daw_window.py", "--child", str(CHILD)],
+        "module": "daw_window",
+        "priority": 53,
+        "memory_class": "low",
+        "cpu_class": "medium",
         "gpu_class": "none",
         "exclusive_group": "creative_ui",
     },
@@ -2579,6 +2591,9 @@ _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
 _last_paint_launch = 0.0
 _PAINT_COOLDOWN = 600  # seconds
+_last_music_studio_launch = 0.0
+_MUSIC_STUDIO_COOLDOWN = 600  # seconds
+_DAW_COMMAND_QUEUE_LIMIT = 32
 _last_self_read_launch = 0.0
 _SELF_READ_COOLDOWN = 300  # seconds
 _last_self_read_hold_log = 0.0
@@ -6037,6 +6052,203 @@ def boredom_check():
         log_to_statusbox("[Manager] Boredom triggered curiosity loop.")
 
 
+def _music_studio_request_active(value: Any) -> bool:
+    if isinstance(value, dict):
+        return _coerce_bool(value.get("requested", value.get("open", True)), True)
+    return _coerce_bool(value, False)
+
+
+def _daw_command_targets_child(command: Any, child: str) -> bool:
+    if not isinstance(command, (list, tuple)):
+        return False
+    arguments = [str(item) for item in command]
+    if not any(Path(item).name == "daw_window.py" for item in arguments):
+        return False
+    for index, item in enumerate(arguments[:-1]):
+        if item == "--child" and arguments[index + 1] == str(child):
+            return True
+    return False
+
+
+def _music_studio_process_running(child: str) -> bool:
+    """Check the exact child's lock first, then exact process arguments."""
+    identifier = str(child)
+    lock_path = (
+        Path("AI_Children")
+        / identifier
+        / "memory"
+        / "music_studio"
+        / "daw_window.lock"
+    )
+    if lock_path.exists():
+        try:
+            import fcntl
+
+            with lock_path.open("a+", encoding="utf-8") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    return True
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+
+    if psutil is None:
+        return False
+    try:
+        for process in psutil.process_iter(["cmdline"]):
+            command = process.info.get("cmdline") or []
+            if _daw_command_targets_child(command, identifier):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _queue_autonomous_music_seed(emotions: Dict[str, Any]) -> int:
+    """Queue one bounded, audible first gesture without replacing pending work."""
+    if get_inastate("daw_command_queue") not in (None, [], ""):
+        return 0
+
+    values = emotions.get("values") if isinstance(emotions, dict) else {}
+    if not isinstance(values, dict):
+        values = emotions if isinstance(emotions, dict) else {}
+    curiosity = _clamp01(values.get("curiosity"), default=0.0)
+    joy = _clamp01(values.get("joy"), default=0.0)
+    intensity = _clamp01(values.get("intensity"), default=0.0)
+    calm = max(
+        _clamp01(values.get("calm"), default=0.0),
+        _clamp01(values.get("serenity"), default=0.0),
+    )
+
+    if calm >= 0.62 and calm >= intensity:
+        waveform = "triangle"
+    elif intensity >= 0.68:
+        waveform = "saw"
+    elif joy >= 0.62:
+        waveform = "square"
+    else:
+        waveform = "sine"
+    note = max(48, min(76, 55 + round(joy * 8) + round(curiosity * 5) + round(intensity * 4)))
+    gain = round(min(0.8, 0.45 + intensity * 0.25), 3)
+    position = max(0, min(15, round(curiosity * 15)))
+    stamp = int(time.time() * 1000)
+    motivation = {
+        "source": "music_self_read",
+        "curiosity": round(curiosity, 3),
+        "joy": round(joy, 3),
+        "intensity": round(intensity, 3),
+        "calm": round(calm, 3),
+    }
+    commands = [
+        {
+            "id": f"ina_music_track_{stamp}",
+            "action": "set_track",
+            "track": 0,
+            "waveform": waveform,
+            "note": note,
+            "gain": gain,
+            "motivation": motivation,
+        },
+        {
+            "id": f"ina_music_step_{stamp}",
+            "action": "set_step",
+            "track": 0,
+            "position": position,
+            "enabled": True,
+            "note": note,
+        },
+        {
+            "id": f"ina_music_preview_{stamp}",
+            "action": "preview_note",
+            "note": note,
+            "waveform": waveform,
+        },
+        {"id": f"ina_music_inspect_{stamp}", "action": "inspect"},
+    ]
+
+    queued = 0
+    for command in commands:
+        outcome = append_inastate_queue(
+            "daw_command_queue",
+            command,
+            queue_limit=_DAW_COMMAND_QUEUE_LIMIT,
+            child=str(CHILD),
+        )
+        if not isinstance(outcome, dict) or not outcome.get("queued"):
+            break
+        queued += 1
+    return queued
+
+
+def music_studio_check() -> Optional[str]:
+    """Consume a chosen music-practice request and open one bounded studio."""
+    global _last_music_studio_launch
+    request = get_inastate("music_studio_request")
+    if not _music_studio_request_active(request):
+        return None
+
+    now = time.time()
+    if (now - _last_music_studio_launch) < _MUSIC_STUDIO_COOLDOWN:
+        return None
+    if get_inastate("dreaming") or get_inastate("meditating"):
+        return None
+
+    window_open = bool(get_inastate("daw_window_open"))
+    window_running = _music_studio_process_running(str(CHILD))
+    if window_open and not window_running:
+        update_inastate("daw_window_open", False)
+
+    existing_queue = get_inastate("daw_command_queue")
+    snapshot = get_inastate("emotion_snapshot") or {}
+    try:
+        seeded_commands = _queue_autonomous_music_seed(snapshot)
+    except Exception as exc:
+        seeded_commands = 0
+        log_to_statusbox(f"[Manager] Could not seed music studio controls: {exc}")
+
+    request_payload = request if isinstance(request, dict) else {}
+    source = str(request_payload.get("source") or "music_studio_request").strip() or "music_studio_request"
+    reason = str(request_payload.get("reason") or source).strip() or source
+    timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    trigger = {
+        "timestamp": timestamp,
+        "child": str(CHILD),
+        "reason": reason,
+        "source": source,
+        "seeded_commands": seeded_commands,
+        "existing_queue_preserved": existing_queue not in (None, [], ""),
+    }
+
+    if window_running:
+        _last_music_studio_launch = now
+        update_inastate("music_studio_request", False)
+        trigger["status"] = "already_open"
+        update_inastate("last_music_studio_trigger", trigger)
+        log_to_statusbox("[Manager] Music practice request sent to the open studio.")
+        return "already_running"
+
+    task_id = request_scheduler_task(
+        "daw_window_open",
+        reason="music_practice",
+        metadata={
+            "child": str(CHILD),
+            "source": source,
+            "seeded_commands": seeded_commands,
+        },
+    )
+    if not task_id:
+        return None
+
+    _last_music_studio_launch = now
+    update_inastate("music_studio_request", False)
+    trigger.update({"status": "queued", "task_id": task_id})
+    update_inastate("last_music_studio_trigger", trigger)
+    log_to_statusbox("[Manager] Music exploration opened a bounded studio practice.")
+    return task_id
+
+
 def _queue_autonomous_paint_seed(emotions: Dict[str, Any]) -> None:
     """Translate a creative urge into an observable first drawing gesture."""
     queue = get_inastate("paint_command_queue")
@@ -6275,10 +6487,15 @@ def _wait_for_raw_file_manager(process, *, source: Optional[str], reason: str) -
 
     finished_at = datetime.now(timezone.utc).isoformat()
     state = _load_raw_file_manager_state()
-    if _coerce_int(state.get("pid"), 0) == int(getattr(process, "pid", 0) or 0):
+    process_pid = int(getattr(process, "pid", 0) or 0)
+    final_status = "completed" if returncode == 0 else "failed"
+    if _coerce_int(state.get("pid"), 0) == process_pid:
+        current_status = str(state.get("status") or "").strip().lower()
+        if returncode == 0 and current_status in {"failed", "cancelled"}:
+            final_status = current_status
         state.update(
             {
-                "status": "completed" if returncode == 0 else "failed",
+                "status": final_status,
                 "returncode": int(returncode),
                 "source": state.get("source") or source or "all",
                 "reason": state.get("reason") or reason,
@@ -6292,8 +6509,9 @@ def _wait_for_raw_file_manager(process, *, source: Optional[str], reason: str) -
         "last_raw_file_manager_exit",
         {
             "timestamp": finished_at,
-            "pid": int(getattr(process, "pid", 0) or 0),
+            "pid": process_pid,
             "returncode": int(returncode),
+            "status": final_status,
             "source": source or state.get("source") or "all",
         },
     )
@@ -6489,6 +6707,7 @@ def _maybe_self_read():
     emo = snapshot.get("values") or snapshot
 
     curiosity = max(emo.get("curiosity", 0.0), 0.0)
+    novelty = max(emo.get("novelty", 0.0), 0.0)
     attention = max(emo.get("attention", 0.0), 0.0)
     clarity = emo.get("clarity", 0.5)
     fuzziness = max(emo.get("fuzziness", emo.get("fuzz_level", 0.0)), 0.0)
@@ -6542,11 +6761,19 @@ def _maybe_self_read():
         return
 
     _last_self_read_launch = now
+    focus_hint = self_read_focus_from_emotions(snapshot)
     trigger = {
         "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
         "reason": reason,
+        "read_focus": focus_hint["focus"],
+        "read_focus_scores": {
+            "new": focus_hint["new_score"],
+            "seen": focus_hint["seen_score"],
+        },
+        "read_focus_drivers": focus_hint["drivers"],
         "drivers": {
             "curiosity": round(curiosity, 3),
+            "novelty": round(novelty, 3),
             "attention": round(attention, 3),
             "clarity": round(clarity, 3) if clarity is not None else None,
             "fuzziness": round(fuzziness, 3),
@@ -6554,7 +6781,9 @@ def _maybe_self_read():
         },
     }
     source_pick = _pick_self_read_source(meta_arbitration=arbitration if isinstance(arbitration, dict) else None)
-    popen_kwargs = {}
+    env = dict(os.environ)
+    env[SELF_READ_FOCUS_ENV] = focus_hint["focus"]
+    popen_kwargs = {"env": env}
     if source_pick:
         trigger["source_pick"] = source_pick
     if isinstance(arbitration, dict):
@@ -6577,13 +6806,16 @@ def _maybe_self_read():
                 "reason": reason,
             },
         )
-        env = dict(os.environ)
         env["SELF_READ_SOURCE"] = source_pick
         popen_kwargs["env"] = env
         log_to_statusbox(f"[Manager] Self-read source pick: {source_pick}.")
     update_inastate("last_self_read_trigger", trigger)
+    log_to_statusbox(f"[Manager] Self-read file focus: {focus_hint['focus']}.")
     log_to_statusbox(f"[Manager] Self-read triggered ({reason}).")
-    process = safe_popen(["python", "raw_file_manager.py"], **popen_kwargs)
+    process = safe_popen(
+        ["python", "raw_file_manager.py", "--child", str(CHILD)],
+        **popen_kwargs,
+    )
     if process is None:
         trigger["launch_failed"] = True
         update_inastate("last_self_read_trigger", trigger)
@@ -6591,6 +6823,20 @@ def _maybe_self_read():
 
     _record_raw_file_manager_launch(process, source=source_pick, reason=reason, now=now)
     _record_exploration_nudge("self_read", source_pick or "all", now=now)
+    if source_pick == "music" and not _music_studio_request_active(
+        get_inastate("music_studio_request")
+    ):
+        update_inastate(
+            "music_studio_request",
+            {
+                "requested": True,
+                "source": "music_self_read",
+                "reason": reason,
+                "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "read_focus": focus_hint["focus"],
+                "drivers": trigger["drivers"],
+            },
+        )
     threading.Thread(
         target=_wait_for_raw_file_manager,
         kwargs={"process": process, "source": source_pick, "reason": reason},
@@ -9203,6 +9449,7 @@ def run_internal_loop():
         boredom_check()
         paint_check()
         _maybe_self_read()
+        music_studio_check()
         if not ground_fault_active:
             _maybe_run_deferred_memory_graph_build(memory_guard=memory_guard)
             rebuild_maps_if_needed()

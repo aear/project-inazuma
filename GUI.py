@@ -379,6 +379,17 @@ def open_audio_devices_window():
     safe_popen([sys.executable, "audio_device_window.py"], verbose=True)
 
 
+def open_music_studio():
+    child = str(config.get("current_child", "Inazuma_Yagami") or "Inazuma_Yagami")
+    status_box.insert(tk.END, "Opening Ina Music Studio.\n")
+    status_box.see(tk.END)
+    safe_popen(
+        [sys.executable, "daw_window.py", "--child", child],
+        label="Music Studio",
+        verbose=True,
+    )
+
+
 def pretrain_mode():
     append_status("Entering Pretrain mode...\n")
 
@@ -1864,6 +1875,7 @@ options_menu.add_command(label="Exceptions List", command=exceptions_list)
 options_menu.add_command(label="Precision Settings", command=precision_settings)
 options_menu.add_command(label="Timers", command=open_timers_config)
 options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
+options_menu.add_command(label="Music Studio", command=open_music_studio)
 options_menu.add_command(label="Monitor", command=open_monitoring_window)
 options_menu.add_command(label="Control Centre", command=open_vitals_window)
 options_menu.add_command(label="Signal High Memory", command=lambda: signal_memory_too_high(source="gui_menu"))
@@ -1970,6 +1982,7 @@ _action_button(tools_frame, 'Monitor', open_monitoring_window, 0, 0)
 _action_button(tools_frame, 'Control centre', open_vitals_window, 0, 1)
 _action_button(tools_frame, 'Self questions', open_logs, 0, 2)
 _action_button(tools_frame, 'Clear log', clear_status_log, 1, 0)
+_action_button(tools_frame, 'Music studio', open_music_studio, 2, 0)
 if config.get('is_root', False):
     _action_button(tools_frame, 'Pretrain', pretrain_mode, 1, 1)
     _action_button(tools_frame, 'EEG', open_eeg_view, 1, 2)

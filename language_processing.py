@@ -41,6 +41,39 @@ NEUTRAL_SOUND_FINGERPRINT = {
     "volume_db": -22,
     "silence_ratio": 0.1,
 }
+SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE = 22050
+SYMBOLIC_VOICE_MIN_SAMPLE_RATE = 8000
+SYMBOLIC_VOICE_MAX_SAMPLE_RATE = 96000
+MAX_SYMBOLIC_FREQUENCY_LAYERS = 32
+MAX_SYMBOLIC_FREQUENCY_RATIOS = 16
+MAX_SYMBOLIC_REPLICAS_PER_LAYER = 8
+MAX_SYMBOLIC_FREQUENCY_HZ = 48000.0
+MAX_SYMBOLIC_FREQUENCY_RATIO = 64.0
+MAX_SYMBOLIC_DETUNE_CENTS = 2400.0
+MAX_SYMBOLIC_RENDER_SAMPLES = 4_000_000
+MAX_SYMBOLIC_RENDER_WORK = 32_000_000
+
+
+def _bounded_symbolic_sample_rate(value: Any, *, default: Optional[int] = None) -> int:
+    """Return a finite, device-safe symbolic voice sample rate."""
+    invalid = isinstance(value, bool)
+    try:
+        numeric = float(value) if not invalid else math.nan
+    except (TypeError, ValueError, OverflowError):
+        numeric = math.nan
+    if not math.isfinite(numeric) or numeric <= 0:
+        if default is None:
+            raise ValueError("Symbolic voice sample rate must be a positive finite number.")
+        try:
+            numeric = float(default)
+        except (TypeError, ValueError, OverflowError):
+            numeric = float(SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE)
+        if not math.isfinite(numeric) or numeric <= 0:
+            numeric = float(SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE)
+    return max(
+        SYMBOLIC_VOICE_MIN_SAMPLE_RATE,
+        min(SYMBOLIC_VOICE_MAX_SAMPLE_RATE, int(numeric)),
+    )
 
 
 def text_length_profile(text: str) -> Dict[str, Any]:
@@ -104,6 +137,7 @@ def _mel_to_hz(mel: float) -> float:
 def _mel_bin_frequencies(n_mels: int, sr: int) -> List[float]:
     if n_mels <= 0:
         return []
+    sr = _bounded_symbolic_sample_rate(sr, default=44100)
     mel_min = _hz_to_mel(0.0)
     mel_max = _hz_to_mel(sr / 2.0)
     mel_points = [
@@ -1038,15 +1072,22 @@ def speak_symbolically(
     record_format: str = "wav",
 ):
     import numpy as np
-    import sounddevice as sd
     from gui_hook import log_to_statusbox
+
+    try:
+        import sounddevice as sd
+    except Exception:  # pragma: no cover - optional for file-only rendering
+        sd = None
 
     if isinstance(symbols, str):
         symbols = [symbols]
 
     config = load_config()
     polyphonic = bool(config.get("allow_polyphonic_voice", True))
-    sample_rate = int(config.get("voice_sample_rate", 22050))
+    sample_rate = _bounded_symbolic_sample_rate(
+        config.get("voice_sample_rate", SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE),
+        default=SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE,
+    )
     feedback_heard_voice = bool(config.get("feedback_heard_voice", True))
     freq_rep_cfg = config.get("voice_frequency_replication")
     if not isinstance(freq_rep_cfg, dict):
@@ -1067,7 +1108,9 @@ def speak_symbolically(
         ]
 
     symbol_map = load_sound_symbol_map(child)
-    waveform = []
+    render_plans = []
+    total_render_samples = 0
+    total_render_work = 0
 
     for sid in symbols:
         entry = symbol_map.get(sid) or {}
@@ -1081,14 +1124,13 @@ def speak_symbolically(
             if fingerprint:
                 log_to_statusbox(f"[Voice] Reconstructed sound features from summary for {sid}.")
         if not fingerprint:
-            sample_rate = entry.get("sample_rate") or 44100
-            try:
-                sample_rate = int(sample_rate)
-            except (TypeError, ValueError):
-                sample_rate = 44100
+            analysis_sample_rate = _bounded_symbolic_sample_rate(
+                entry.get("sample_rate") or sample_rate,
+                default=sample_rate,
+            )
             inferred, inferred_conf = _infer_sound_features_from_centroid(
                 entry.get("centroid"),
-                sample_rate=sample_rate,
+                sample_rate=analysis_sample_rate,
                 texture=entry.get("texture"),
                 uses=entry.get("uses"),
             )
@@ -1137,14 +1179,30 @@ def speak_symbolically(
                 evidence_increment=1,
             )
 
-        chunk = synthesize_from_fingerprint(
+        plan = _build_symbolic_synthesis_plan(
             playback_fingerprint,
-            sr=sample_rate,
+            1500,
+            sample_rate,
             symbol_id=sid,
             replication_cfg=freq_rep_cfg,
         )
-        waveform.append(chunk)
+        next_sample_total = total_render_samples + plan["sample_count"]
+        if next_sample_total > MAX_SYMBOLIC_RENDER_SAMPLES:
+            raise ValueError(
+                "Symbolic voice request exceeds the total rendered-sample budget "
+                f"of {MAX_SYMBOLIC_RENDER_SAMPLES:,}."
+            )
+        next_work_total = total_render_work + plan["work_units"]
+        if next_work_total > MAX_SYMBOLIC_RENDER_WORK:
+            raise ValueError(
+                "Symbolic voice request exceeds the total synthesis-work budget "
+                f"of {MAX_SYMBOLIC_RENDER_WORK:,}."
+            )
+        total_render_samples = next_sample_total
+        total_render_work = next_work_total
+        render_plans.append(plan)
 
+    waveform = [_render_symbolic_synthesis_plan(plan) for plan in render_plans]
     if waveform:
         if len(waveform) == 1 or not polyphonic:
             audio = np.concatenate(waveform)
@@ -1196,9 +1254,18 @@ def speak_symbolically(
             except Exception as exc:
                 log_to_statusbox(f"[Voice] Failed to save synthesized audio: {exc}")
 
+        playback_started = False
         if playback:
-            sd.play(audio, samplerate=sample_rate)
-        if feedback_heard_voice:
+            if sd is None:
+                log_to_statusbox("[Voice] Playback unavailable; sounddevice is not installed.")
+            else:
+                try:
+                    sd.play(audio, samplerate=sample_rate)
+                except Exception as exc:
+                    log_to_statusbox(f"[Voice] Playback unavailable; audio device failed to start: {exc}")
+                else:
+                    playback_started = True
+        if feedback_heard_voice and playback_started:
             try:
                 logger = ExperienceLogger(child=child)
                 harmonic_profile = _harmonic_summary(audio, sample_rate)
@@ -1264,14 +1331,27 @@ def train_from_symbol_images(child):
         vec = transformer.encode_image_fragment(fragment)
         print(f"[LangTrain] Trained on symbol image: {symbol} | Importance: {vec['importance']}")
 
+
+def _finite_symbolic_float(value: Any, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return numeric if math.isfinite(numeric) else float(default)
+
+
 def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id):
-    freq_seq = fingerprint.get("frequency_layers")
+    source = fingerprint if isinstance(fingerprint, dict) else {}
+    base_freq = _finite_symbolic_float(base_freq, 440.0)
+    base_freq = min(MAX_SYMBOLIC_FREQUENCY_HZ, max(1.0, base_freq))
+
+    freq_seq = source.get("frequency_layers")
     if not isinstance(freq_seq, list):
-        freq_seq = fingerprint.get("partials")
+        freq_seq = source.get("partials")
 
     layers = []
     if isinstance(freq_seq, list):
-        for idx, entry in enumerate(freq_seq):
+        for idx, entry in enumerate(freq_seq[:MAX_SYMBOLIC_FREQUENCY_LAYERS]):
             freq_val = None
             gain = None
             if isinstance(entry, dict):
@@ -1283,20 +1363,14 @@ def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id
 
             if freq_val is None:
                 continue
-            try:
-                freq_val = float(freq_val)
-            except (TypeError, ValueError):
+            freq_val = _finite_symbolic_float(freq_val, math.nan)
+            if not math.isfinite(freq_val) or freq_val <= 0:
                 continue
-            if freq_val <= 0:
-                continue
+            freq_val = min(MAX_SYMBOLIC_FREQUENCY_HZ, max(1.0, freq_val))
 
             if gain is None:
                 gain = 1.0 / (idx + 1)
-            try:
-                gain = float(gain)
-            except (TypeError, ValueError):
-                gain = 1.0 / (idx + 1)
-
+            gain = _finite_symbolic_float(gain, 1.0 / (idx + 1))
             layers.append((freq_val, max(0.05, min(1.0, gain))))
 
     if layers:
@@ -1309,36 +1383,24 @@ def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id
     ratios = cfg.get("ratios")
     if not isinstance(ratios, list) or not ratios:
         ratios = [1.0]
+    ratios = ratios[:MAX_SYMBOLIC_FREQUENCY_RATIOS]
 
-    try:
-        amp_decay = float(cfg.get("amplitude_decay", 0.8))
-    except (TypeError, ValueError):
-        amp_decay = 0.8
+    amp_decay = _finite_symbolic_float(cfg.get("amplitude_decay", 0.8), 0.8)
     amp_decay = min(0.95, max(0.3, amp_decay))
 
     try:
         replicas = int(cfg.get("replicas_per_layer", 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         replicas = 1
-    replicas = max(1, replicas)
+    replicas = max(1, min(MAX_SYMBOLIC_REPLICAS_PER_LAYER, replicas))
 
-    detune_cents = cfg.get("detune_cents", 0.0)
-    try:
-        detune_cents = float(detune_cents)
-    except (TypeError, ValueError):
-        detune_cents = 0.0
-    detune_cents = max(0.0, detune_cents)
+    detune_cents = _finite_symbolic_float(cfg.get("detune_cents", 0.0), 0.0)
+    detune_cents = min(MAX_SYMBOLIC_DETUNE_CENTS, max(0.0, detune_cents))
 
-    min_freq = cfg.get("min_frequency", 55.0)
-    max_freq = cfg.get("max_frequency", 12000.0)
-    try:
-        min_freq = float(min_freq)
-    except (TypeError, ValueError):
-        min_freq = 55.0
-    try:
-        max_freq = float(max_freq)
-    except (TypeError, ValueError):
-        max_freq = 12000.0
+    min_freq = _finite_symbolic_float(cfg.get("min_frequency", 55.0), 55.0)
+    max_freq = _finite_symbolic_float(cfg.get("max_frequency", 12000.0), 12000.0)
+    min_freq = min(MAX_SYMBOLIC_FREQUENCY_HZ, max(1.0, min_freq))
+    max_freq = min(MAX_SYMBOLIC_FREQUENCY_HZ, max(min_freq, max_freq))
 
     seed = _stable_symbol_seed(symbol_id) if symbol_id else 0
 
@@ -1347,15 +1409,15 @@ def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id
 
     layers = []
     for idx, raw_ratio in enumerate(ratios):
-        try:
-            ratio = float(raw_ratio)
-        except (TypeError, ValueError):
-            ratio = 1.0
+        ratio = _finite_symbolic_float(raw_ratio, 1.0)
         if ratio == 0:
             ratio = 1.0
+        ratio = max(-MAX_SYMBOLIC_FREQUENCY_RATIO, min(MAX_SYMBOLIC_FREQUENCY_RATIO, ratio))
         freq_val = _clamp(base_freq * ratio)
         gain = 1.0 if idx == 0 else pow(amp_decay, idx)
         layers.append((freq_val, gain))
+        if len(layers) >= MAX_SYMBOLIC_FREQUENCY_LAYERS:
+            break
 
         if replicas > 1 and detune_cents > 0:
             for rep in range(1, replicas):
@@ -1365,8 +1427,84 @@ def _resolve_frequency_layers(fingerprint, base_freq, replication_cfg, symbol_id
                 detune_ratio = pow(2.0, (sign * cents) / 1200.0)
                 freq_detuned = _clamp(freq_val * detune_ratio)
                 layers.append((freq_detuned, gain * pow(amp_decay, rep * 0.5)))
+                if len(layers) >= MAX_SYMBOLIC_FREQUENCY_LAYERS:
+                    break
+        if len(layers) >= MAX_SYMBOLIC_FREQUENCY_LAYERS:
+            break
 
-    return layers
+    return layers or [(base_freq, 1.0)]
+
+
+def _build_symbolic_synthesis_plan(
+    fingerprint,
+    duration_ms,
+    sr,
+    *,
+    symbol_id: Optional[str],
+    replication_cfg: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Validate synthesis inputs and budgets without allocating audio arrays."""
+    if not isinstance(fingerprint, dict):
+        raise TypeError("Symbolic sound fingerprint must be a mapping.")
+
+    sample_rate = _bounded_symbolic_sample_rate(sr)
+    duration = _finite_symbolic_float(duration_ms, math.nan)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Symbolic voice duration must be a positive finite number.")
+
+    max_duration_ms = (MAX_SYMBOLIC_RENDER_SAMPLES * 1000.0) / sample_rate
+    if duration > max_duration_ms:
+        raise ValueError(
+            f"Symbolic voice render exceeds the {MAX_SYMBOLIC_RENDER_SAMPLES:,}-sample budget."
+        )
+    duration_s = duration / 1000.0
+    sample_count = int(sample_rate * duration_s)
+    if sample_count <= 0:
+        raise ValueError("Symbolic voice duration is shorter than one sample.")
+
+    pitch = _finite_symbolic_float(fingerprint.get("pitch_mean", 440), 440.0)
+    freq = _finite_symbolic_float(fingerprint.get("dominant_freq", pitch), pitch)
+    volume_db = _finite_symbolic_float(fingerprint.get("volume_db", -40), -40.0)
+    volume = min(1.0, max(0.1, (volume_db + 60.0) / 60.0))
+    silence = _finite_symbolic_float(fingerprint.get("silence_ratio", 0.1), 0.1)
+    silence = min(1.0, max(0.0, silence))
+    layers = _resolve_frequency_layers(fingerprint, freq, replication_cfg, symbol_id)
+    work_units = sample_count * max(1, len(layers))
+    if work_units > MAX_SYMBOLIC_RENDER_WORK:
+        raise ValueError(
+            f"Symbolic voice render exceeds the {MAX_SYMBOLIC_RENDER_WORK:,}-unit work budget."
+        )
+
+    return {
+        "duration_s": duration_s,
+        "sample_count": sample_count,
+        "sample_rate": sample_rate,
+        "frequency_layers": layers,
+        "volume": volume,
+        "silence_ratio": silence,
+        "work_units": work_units,
+    }
+
+
+def _render_symbolic_synthesis_plan(plan: Dict[str, Any]):
+    """Allocate audio only after the complete plan has passed its budgets."""
+    import numpy as np
+
+    sample_count = plan["sample_count"]
+    t = np.linspace(0, plan["duration_s"], sample_count, False)
+    waveform = np.zeros_like(t)
+    for layer_freq, layer_gain in plan["frequency_layers"]:
+        waveform += np.sin(2 * np.pi * layer_freq * t) * layer_gain
+
+    peak = np.max(np.abs(waveform)) or 1.0
+    waveform = (waveform / peak) * plan["volume"]
+
+    envelope = np.linspace(0, 1, sample_count)
+    waveform = waveform * envelope
+
+    silence_len = int(sample_count * plan["silence_ratio"])
+    waveform[:silence_len] = 0.0
+    return waveform.astype(np.float32)
 
 
 def synthesize_from_fingerprint(
@@ -1377,33 +1515,14 @@ def synthesize_from_fingerprint(
     symbol_id: Optional[str] = None,
     replication_cfg: Optional[Dict[str, Any]] = None,
 ):
-    import numpy as np
-
-    pitch = fingerprint.get("pitch_mean", 440)
-    freq = fingerprint.get("dominant_freq", pitch)
-    volume = min(1.0, max(0.1, (fingerprint.get("volume_db", -40) + 60) / 60))
-    silence = fingerprint.get("silence_ratio", 0.1)
-
-    duration_s = duration_ms / 1000
-    t = np.linspace(0, duration_s, int(sr * duration_s), False)
-    freq_layers = _resolve_frequency_layers(fingerprint, freq, replication_cfg, symbol_id)
-
-    waveform = np.zeros_like(t)
-    for layer_freq, layer_gain in freq_layers:
-        waveform += np.sin(2 * np.pi * layer_freq * t) * layer_gain
-
-    peak = np.max(np.abs(waveform)) or 1.0
-    waveform = (waveform / peak) * volume
-
-    # Optional: shape with envelope
-    envelope = np.linspace(0, 1, len(t))
-    waveform = waveform * envelope
-
-    # Simulate silence
-    silence_len = int(len(waveform) * silence)
-    waveform[:silence_len] = 0.0
-
-    return waveform.astype(np.float32)
+    plan = _build_symbolic_synthesis_plan(
+        fingerprint,
+        duration_ms,
+        sr,
+        symbol_id=symbol_id,
+        replication_cfg=replication_cfg,
+    )
+    return _render_symbolic_synthesis_plan(plan)
 
 
 # === New: Book Text Training ===
@@ -1572,6 +1691,9 @@ def generate_symbolic_reply_from_text(
     base_path: Optional[Path] = None,
     max_symbols: int = 4,
     context: Optional[Dict[str, Any]] = None,
+    playback: bool = True,
+    record_path: Optional[str | Path] = None,
+    record_format: str = "wav",
 ) -> Optional[Dict[str, Any]]:
     """
     Try to reply to a text prompt using Ina's known symbol vocabulary.
@@ -1661,7 +1783,13 @@ def generate_symbolic_reply_from_text(
     )
     symbols_to_speak = matched[:symbol_limit]
     try:
-        speak_symbolically(symbols_to_speak, child=child)
+        speak_symbolically(
+            symbols_to_speak,
+            child=child,
+            playback=playback,
+            record_path=record_path,
+            record_format=record_format,
+        )
     except Exception:
         pass
 

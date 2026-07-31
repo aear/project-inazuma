@@ -1,5 +1,9 @@
 import os
 import sys
+import types
+
+import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -219,3 +223,337 @@ def test_generate_symbolic_reply_uses_text_vocab_links_without_symbol_to_token(t
     assert payload["symbols"] == ["sym_ina", "sym_heart"]
     assert payload["native_text"] == "glyph_ina glyph_heart"
     assert payload["gloss_text"] == "ina 3"
+
+
+def test_generate_symbolic_reply_forwards_file_only_render_options(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        lp,
+        "load_text_vocab_links",
+        lambda child, base_path=None: {"links": [{"word": "ina", "symbol": "sym_ina"}]},
+    )
+    monkeypatch.setattr(
+        lp,
+        "_build_text_vocab_word_symbol_index",
+        lambda _payload: {"ina": "sym_ina"},
+    )
+    monkeypatch.setattr(
+        lp,
+        "speak_symbolically",
+        lambda symbols, **kwargs: calls.append((symbols, kwargs)),
+    )
+    monkeypatch.setattr(lp, "build_dual_symbolic_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lp, "_build_reply_transformer_insights", lambda *args, **kwargs: None)
+    destination = tmp_path / "local_symbols.wav"
+
+    payload = lp.generate_symbolic_reply_from_text(
+        "Ina",
+        child="TestChild",
+        base_path=tmp_path,
+        playback=False,
+        record_path=destination,
+        record_format="wav",
+    )
+
+    assert payload is not None
+    assert calls == [
+        (
+            ["sym_ina"],
+            {
+                "child": "TestChild",
+                "playback": False,
+                "record_path": destination,
+                "record_format": "wav",
+            },
+        )
+    ]
+
+
+def test_speak_symbolically_logs_heard_voice_only_after_playback_starts(tmp_path, monkeypatch):
+    status_lines = []
+    playback_attempts = []
+    logger_instances = []
+    playback_state = {"fail": False}
+
+    sounddevice = types.ModuleType("sounddevice")
+
+    def fake_play(audio, *, samplerate):
+        playback_attempts.append((len(audio), samplerate))
+        if playback_state["fail"]:
+            raise RuntimeError("no output device")
+
+    sounddevice.play = fake_play
+    monkeypatch.setitem(sys.modules, "sounddevice", sounddevice)
+    monkeypatch.setattr(
+        lp,
+        "load_config",
+        lambda: {
+            "allow_polyphonic_voice": False,
+            "voice_sample_rate": 8_000,
+            "feedback_heard_voice": True,
+        },
+    )
+    monkeypatch.setattr(
+        lp,
+        "load_sound_symbol_map",
+        lambda _child: {"sym_test": {"sound_features": {"pitch_mean": 440.0}}},
+    )
+    monkeypatch.setattr(
+        lp,
+        "_render_symbolic_synthesis_plan",
+        lambda _plan: np.linspace(-0.2, 0.2, 64, dtype=np.float32),
+    )
+    monkeypatch.setattr(sys.modules["gui_hook"], "log_to_statusbox", status_lines.append)
+
+    class FakeExperienceLogger:
+        def __init__(self, *, child):
+            self.child = child
+            self.events = []
+            self.word_usage = []
+            logger_instances.append(self)
+
+        def log_event(self, **payload):
+            self.events.append(payload)
+            return "voice-event"
+
+        def attach_word_usage(self, event_id, **payload):
+            self.word_usage.append((event_id, payload))
+
+    monkeypatch.setattr(lp, "ExperienceLogger", FakeExperienceLogger)
+
+    file_only = tmp_path / "file_only.wav"
+    lp.speak_symbolically("sym_test", child="TestChild", playback=False, record_path=file_only)
+
+    assert file_only.read_bytes().startswith(b"RIFF")
+    assert playback_attempts == []
+    assert logger_instances == []
+
+    playback_state["fail"] = True
+    unavailable_device = tmp_path / "unavailable_device.wav"
+    lp.speak_symbolically(
+        "sym_test",
+        child="TestChild",
+        playback=True,
+        record_path=unavailable_device,
+    )
+
+    assert unavailable_device.read_bytes().startswith(b"RIFF")
+    assert len(playback_attempts) == 1
+    assert logger_instances == []
+    assert any("failed to start" in line for line in status_lines)
+
+    playback_state["fail"] = False
+    lp.speak_symbolically("sym_test", child="TestChild", playback=True)
+
+    assert len(playback_attempts) == 2
+    assert len(logger_instances) == 1
+    assert logger_instances[0].events[0]["narrative"] == "Ina listened to her own synthesized voice."
+    assert logger_instances[0].word_usage[0][0] == "voice-event"
+
+
+def test_synthesize_clamps_finite_sample_rates_to_safe_bounds():
+    fingerprint = {"pitch_mean": 440.0}
+    low_rate = lp.synthesize_from_fingerprint(fingerprint, duration_ms=1, sr=1)
+    high_rate = lp.synthesize_from_fingerprint(
+        fingerprint,
+        duration_ms=1,
+        sr=lp.SYMBOLIC_VOICE_MAX_SAMPLE_RATE * 10,
+    )
+
+    assert low_rate.shape == (lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE // 1000,)
+    assert high_rate.shape == (lp.SYMBOLIC_VOICE_MAX_SAMPLE_RATE // 1000,)
+
+
+@pytest.mark.parametrize("sample_rate", [float("nan"), float("inf"), float("-inf"), True])
+def test_synthesize_rejects_non_finite_or_boolean_sample_rates(sample_rate):
+    with pytest.raises(ValueError, match="sample rate"):
+        lp.synthesize_from_fingerprint({"pitch_mean": 440.0}, sr=sample_rate)
+
+
+def test_frequency_replication_inputs_are_bounded():
+    explicit = lp._resolve_frequency_layers(
+        {"frequency_layers": [{"freq": 220.0 + idx} for idx in range(100)]},
+        440.0,
+        {},
+        "sym_explicit",
+    )
+    ratios = lp._resolve_frequency_layers(
+        {},
+        440.0,
+        {
+            "enabled": True,
+            "ratios": [1.0 + idx / 100.0 for idx in range(100)],
+            "replicas_per_layer": 100,
+            "detune_cents": 0,
+        },
+        "sym_ratios",
+    )
+    replicas = lp._resolve_frequency_layers(
+        {},
+        440.0,
+        {
+            "enabled": True,
+            "ratios": [1.0],
+            "replicas_per_layer": 100,
+            "detune_cents": 6,
+        },
+        "sym_replicas",
+    )
+    combined = lp._resolve_frequency_layers(
+        {},
+        440.0,
+        {
+            "enabled": True,
+            "ratios": [1.0] * 100,
+            "replicas_per_layer": 100,
+            "detune_cents": 6,
+        },
+        "sym_combined",
+    )
+
+    assert len(explicit) == lp.MAX_SYMBOLIC_FREQUENCY_LAYERS
+    assert len(ratios) == lp.MAX_SYMBOLIC_FREQUENCY_RATIOS
+    assert len(replicas) == lp.MAX_SYMBOLIC_REPLICAS_PER_LAYER
+    assert len(combined) == lp.MAX_SYMBOLIC_FREQUENCY_LAYERS
+
+
+def test_render_sample_budget_is_checked_before_audio_allocation(monkeypatch):
+    monkeypatch.setattr(
+        lp,
+        "_render_symbolic_synthesis_plan",
+        lambda _plan: pytest.fail("audio allocation started before sample-budget validation"),
+    )
+    excessive_duration_ms = (
+        (lp.MAX_SYMBOLIC_RENDER_SAMPLES + 1)
+        * 1000
+        / lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE
+    )
+
+    with pytest.raises(ValueError, match="sample budget"):
+        lp.synthesize_from_fingerprint(
+            {"pitch_mean": 440.0},
+            duration_ms=excessive_duration_ms,
+            sr=lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE,
+        )
+
+
+def test_render_work_budget_is_checked_before_audio_allocation(monkeypatch):
+    monkeypatch.setattr(
+        lp,
+        "_render_symbolic_synthesis_plan",
+        lambda _plan: pytest.fail("audio allocation started before work-budget validation"),
+    )
+    target_samples = (
+        lp.MAX_SYMBOLIC_RENDER_WORK // lp.MAX_SYMBOLIC_FREQUENCY_LAYERS
+    ) + 10
+    duration_ms = target_samples * 1000 / lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE
+    fingerprint = {
+        "frequency_layers": [
+            {"freq": 220.0 + idx}
+            for idx in range(lp.MAX_SYMBOLIC_FREQUENCY_LAYERS)
+        ]
+    }
+
+    with pytest.raises(ValueError, match="work budget"):
+        lp.synthesize_from_fingerprint(
+            fingerprint,
+            duration_ms=duration_ms,
+            sr=lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE,
+        )
+
+
+def test_speak_preflights_total_sample_budget_before_rendering(monkeypatch):
+    samples_per_symbol = int(lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE * 1.5)
+    symbol_count = lp.MAX_SYMBOLIC_RENDER_SAMPLES // samples_per_symbol + 1
+    symbols = [f"sym_{idx}" for idx in range(symbol_count)]
+    symbol_map = {
+        symbol: {"sound_features": {"pitch_mean": 440.0}}
+        for symbol in symbols
+    }
+    monkeypatch.setattr(
+        lp,
+        "load_config",
+        lambda: {
+            "allow_polyphonic_voice": False,
+            "voice_sample_rate": lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE,
+            "feedback_heard_voice": False,
+        },
+    )
+    monkeypatch.setattr(lp, "load_sound_symbol_map", lambda _child: symbol_map)
+    monkeypatch.setattr(
+        lp,
+        "_render_symbolic_synthesis_plan",
+        lambda _plan: pytest.fail("audio rendering began before aggregate preflight"),
+    )
+
+    with pytest.raises(ValueError, match="total rendered-sample budget"):
+        lp.speak_symbolically(symbols, child="TestChild", playback=False)
+
+
+def test_speak_preflights_total_work_budget_before_rendering(monkeypatch):
+    samples_per_symbol = int(lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE * 1.5)
+    work_per_symbol = samples_per_symbol * lp.MAX_SYMBOLIC_FREQUENCY_LAYERS
+    symbol_count = lp.MAX_SYMBOLIC_RENDER_WORK // work_per_symbol + 1
+    symbols = [f"sym_work_{idx}" for idx in range(symbol_count)]
+    fingerprint = {
+        "frequency_layers": [
+            {"freq": 220.0 + layer_idx}
+            for layer_idx in range(lp.MAX_SYMBOLIC_FREQUENCY_LAYERS)
+        ]
+    }
+    symbol_map = {
+        symbol: {"sound_features": fingerprint}
+        for symbol in symbols
+    }
+    monkeypatch.setattr(
+        lp,
+        "load_config",
+        lambda: {
+            "allow_polyphonic_voice": False,
+            "voice_sample_rate": lp.SYMBOLIC_VOICE_MIN_SAMPLE_RATE,
+            "feedback_heard_voice": False,
+        },
+    )
+    monkeypatch.setattr(lp, "load_sound_symbol_map", lambda _child: symbol_map)
+    monkeypatch.setattr(
+        lp,
+        "_render_symbolic_synthesis_plan",
+        lambda _plan: pytest.fail("audio rendering began before aggregate preflight"),
+    )
+
+    with pytest.raises(ValueError, match="total synthesis-work budget"):
+        lp.speak_symbolically(symbols, child="TestChild", playback=False)
+
+
+def test_non_finite_config_sample_rate_falls_back_for_file_only_wav(
+    tmp_path,
+    monkeypatch,
+):
+    import wave
+
+    monkeypatch.setattr(
+        lp,
+        "load_config",
+        lambda: {
+            "allow_polyphonic_voice": False,
+            "voice_sample_rate": float("nan"),
+            "feedback_heard_voice": False,
+        },
+    )
+    monkeypatch.setattr(
+        lp,
+        "load_sound_symbol_map",
+        lambda _child: {"sym_test": {"sound_features": {"pitch_mean": 440.0}}},
+    )
+    destination = tmp_path / "bounded_file_only.wav"
+
+    lp.speak_symbolically(
+        "sym_test",
+        child="TestChild",
+        playback=False,
+        record_path=destination,
+    )
+
+    with wave.open(str(destination), "rb") as wav_file:
+        assert wav_file.getframerate() == lp.SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE
+        assert wav_file.getnframes() == int(lp.SYMBOLIC_VOICE_DEFAULT_SAMPLE_RATE * 1.5)

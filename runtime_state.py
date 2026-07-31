@@ -56,19 +56,117 @@ def _load_inastate_state(child: Optional[str] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def get_inastate(key: str, default: Any = None) -> Any:
-    state = _load_inastate_state()
+def get_inastate(key: str, default: Any = None, *, child: Optional[str] = None) -> Any:
+    """Read one runtime-state value, optionally for a child other than the active one."""
+    state = _load_inastate_state(child)
     if not isinstance(state, dict):
         return default
     return state.get(key, default)
 
 
-def update_inastate(key: str, value: Any) -> None:
-    child = _current_child()
-    with file_lock(_inastate_lock_path(child)):
-        state = _load_inastate_state(child)
+def update_inastate(key: str, value: Any, *, child: Optional[str] = None) -> None:
+    """Atomically replace one runtime-state value for the selected child."""
+    target_child = child or _current_child()
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
         state[key] = value
-        atomic_write_json(_inastate_path(child), state, indent=4)
+        atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+
+def _positive_queue_limit(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _normalize_inastate_queue(raw: Any) -> tuple[List[Any], bool]:
+    """Return a mutable FIFO plus whether malformed stored state was discarded."""
+    if raw is None or raw == "":
+        return [], False
+    if isinstance(raw, dict):
+        return [raw], False
+    if isinstance(raw, list):
+        return list(raw), False
+    return [], True
+
+
+def drain_inastate_queue(
+    key: str,
+    *,
+    batch_limit: int,
+    queue_limit: int,
+    child: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Atomically claim the oldest bounded batch from a runtime-state queue.
+
+    Legacy single-object queues remain supported. If older code left more than
+    ``queue_limit`` entries, the oldest bounded prefix is preserved and newer
+    overflow is reported as dropped. Malformed queue state is cleared and
+    reported through ``invalid``.
+    """
+    batch_limit = _positive_queue_limit(batch_limit, "batch_limit")
+    queue_limit = _positive_queue_limit(queue_limit, "queue_limit")
+    target_child = child or _current_child()
+
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
+        raw = state.get(key)
+        queue, invalid = _normalize_inastate_queue(raw)
+        dropped = max(0, len(queue) - queue_limit)
+        queue = queue[:queue_limit]
+        batch = queue[:batch_limit]
+        remaining = queue[batch_limit:]
+
+        if invalid or batch or dropped:
+            state[key] = remaining
+            atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+    return {
+        "batch": batch,
+        "remaining": len(remaining),
+        "dropped": dropped,
+        "invalid": invalid,
+    }
+
+
+def append_inastate_queue(
+    key: str,
+    item: Any,
+    *,
+    queue_limit: int,
+    child: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Atomically append one item while preserving a bounded FIFO.
+
+    Pending entries are never displaced by a newer item. An enqueue attempted
+    against a full queue is rejected and counted in ``dropped``. Any legacy
+    overflow beyond the bound is truncated before that decision.
+    """
+    queue_limit = _positive_queue_limit(queue_limit, "queue_limit")
+    target_child = child or _current_child()
+
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
+        raw = state.get(key)
+        queue, invalid = _normalize_inastate_queue(raw)
+        dropped = max(0, len(queue) - queue_limit)
+        queue = queue[:queue_limit]
+        queued = len(queue) < queue_limit
+        if queued:
+            queue.append(item)
+        else:
+            dropped += 1
+
+        if invalid or queued or dropped:
+            state[key] = queue
+            atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+    return {
+        "queued": queued,
+        "remaining": len(queue),
+        "dropped": dropped,
+        "invalid": invalid,
+    }
 
 
 def _load_self_question_entries(child: Optional[str] = None) -> List[Dict[str, Any]]:
