@@ -121,6 +121,7 @@ class TypedGraphBuilder:
             self.metadata.update(data["metadata"])
 
     def save(self) -> None:
+        self._ensure_edge_endpoints()
         payload = {
             "metadata": {
                 **self.metadata,
@@ -134,6 +135,27 @@ class TypedGraphBuilder:
         self.graph_path.parent.mkdir(parents=True, exist_ok=True)
         with self.graph_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
+
+    def _ensure_edge_endpoints(self) -> int:
+        """Repair legacy or partially ingested edges without discarding them."""
+        recovered = 0
+        for edge in self.edges.values():
+            for endpoint in (edge.get("source"), edge.get("target")):
+                if not endpoint or endpoint in self.nodes:
+                    continue
+                endpoint_text = str(endpoint)
+                node_type = endpoint_text.split(":", 1)[0] if ":" in endpoint_text else "unknown"
+                self._upsert_node(
+                    endpoint_text,
+                    node_type,
+                    label=endpoint_text.split(":", 1)[-1],
+                    source="recovered_edge_endpoint",
+                    inferred=True,
+                )
+                recovered += 1
+        if recovered:
+            self.metadata["recovered_edge_endpoints"] = recovered
+        return recovered
 
     def _counts(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -234,6 +256,7 @@ class TypedGraphBuilder:
                 last_seen=entry.get("last_seen"),
                 embedding_hint=emb,
                 source="sound_symbol_map",
+                inferred=False,
             )
 
     def ingest_symbol_words(self) -> None:
@@ -309,6 +332,15 @@ class TypedGraphBuilder:
                 self._upsert_edge(word_id, tok_id, "word->token", weight=tok_weight, source_tag="symbol_to_token")
 
             sound_id = f"sound:{sym_id}"
+            if sound_id not in self.nodes:
+                self._upsert_node(
+                    sound_id,
+                    "sound",
+                    label=sym_id,
+                    uses=uses,
+                    source="symbol_to_token",
+                    inferred=True,
+                )
             edge_weight = _weight_from_uses(conf, uses, bias=0.3)
             self._upsert_edge(sound_id, word_id, "sound->word", weight=edge_weight, source_tag="symbol_to_token")
 

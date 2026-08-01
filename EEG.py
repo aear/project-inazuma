@@ -11,6 +11,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph.opengl as gl
 
+from eeg_rendering import RENDER_PROFILES, dangling_endpoint_ids, pack_edges, pack_nodes
 from gui_hook import log_to_statusbox
 from model_manager import (
     get_inastate,
@@ -31,6 +32,7 @@ DETAIL_LEVELS = {
     "Low": {"max_nodes": 4000, "max_edges": 8000, "show_edges": True},
     "Medium": {"max_nodes": 12000, "max_edges": 50000, "show_edges": True},
     "High": {"max_nodes": 20000, "max_edges": 100000, "show_edges": True},
+    "Full": {"max_nodes": None, "max_edges": None, "show_edges": True},
 }
 
 NETWORK_COLORS: Dict[str, Tuple[float, float, float]] = {
@@ -188,7 +190,51 @@ class BrainDataLoader:
         neurons.extend(typed_nodes)
         synapses.extend(typed_edges)
 
+        recovered_nodes = self._recover_dangling_endpoints(neurons, synapses)
+        if recovered_nodes:
+            neurons.extend(recovered_nodes)
+        state["recovered_endpoints"] = len(recovered_nodes)
         return {"neurons": neurons, "synapses": synapses, "state": state}
+
+    def _recover_dangling_endpoints(
+        self,
+        neurons: List[Dict[str, Any]],
+        synapses: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Materialize referenced nodes so Full mode can draw every synapse."""
+        recovered: List[Dict[str, Any]] = []
+        network_by_endpoint: Dict[Any, str] = {}
+        for edge in synapses:
+            network = str(edge.get("network_type") or "memory_graph")
+            for field in ("source", "target"):
+                endpoint = edge.get(field)
+                if endpoint is not None:
+                    network_by_endpoint.setdefault(endpoint, network)
+
+        for endpoint in dangling_endpoint_ids(neurons, synapses):
+            endpoint_text = str(endpoint)
+            node_type = endpoint_text.split(":", 1)[0].lower() if ":" in endpoint_text else ""
+            if node_type == "sound":
+                network = "audio"
+            elif node_type in TYPE_COLORS:
+                network = "meaning_map"
+            else:
+                network = network_by_endpoint.get(endpoint, "memory_graph")
+            node = self._coerce_neuron(
+                {
+                    "id": endpoint,
+                    "type": node_type,
+                    "label": endpoint_text,
+                    "activation": 0.08,
+                    "tags": ["recovered_synapse_endpoint"],
+                },
+                network,
+                seed_hint="recovered_synapse_endpoint",
+            )
+            if node:
+                node["recovered_endpoint"] = True
+                recovered.append(node)
+        return recovered
 
     def _load_state_snapshot(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {"running_modules": get_running_modules(), "dreaming": is_dreaming()}
@@ -408,6 +454,9 @@ class EEGWindow(QtWidgets.QWidget):
         self.detail_level = self.config.get("eeg_detail_level", "Medium")
         if self.detail_level not in DETAIL_LEVELS:
             self.detail_level = "Medium"
+        self.render_profile = self.config.get("eeg_render_profile", "Balanced")
+        if self.render_profile not in RENDER_PROFILES:
+            self.render_profile = "Balanced"
         self.last_render = 0.0
         self.loader = BrainDataLoader(self.current_child)
         extra_offset = self.config.get("eeg_position_offset") or self.config.get("eeg_body_offset")
@@ -425,7 +474,9 @@ class EEGWindow(QtWidgets.QWidget):
             except Exception:
                 self.loader.manual_rotation = np.zeros(3, dtype=float)
         self.node_item: Optional[gl.GLScatterPlotItem] = None
+        self.node_glow_item: Optional[gl.GLScatterPlotItem] = None
         self.edge_item: Optional[gl.GLLinePlotItem] = None
+        self.last_prepare_ms = 0.0
         self.type_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self.network_buttons: Dict[str, QtWidgets.QPushButton] = {}
 
@@ -447,6 +498,18 @@ class EEGWindow(QtWidgets.QWidget):
         self.detail_combo.setCurrentText(self.detail_level)
         self.detail_combo.currentTextChanged.connect(self._on_detail_changed)
 
+        profile_label = QtWidgets.QLabel("Render:")
+        self.profile_combo = QtWidgets.QComboBox()
+        for name, settings in RENDER_PROFILES.items():
+            self.profile_combo.addItem(name)
+            self.profile_combo.setItemData(
+                self.profile_combo.count() - 1,
+                settings["description"],
+                QtCore.Qt.ToolTipRole,
+            )
+        self.profile_combo.setCurrentText(self.render_profile)
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+
         self.reset_button = QtWidgets.QPushButton("Reset view")
         self.reset_button.clicked.connect(self._reset_view)
 
@@ -455,6 +518,9 @@ class EEGWindow(QtWidgets.QWidget):
 
         controls.addWidget(detail_label)
         controls.addWidget(self.detail_combo)
+        controls.addSpacing(12)
+        controls.addWidget(profile_label)
+        controls.addWidget(self.profile_combo)
         controls.addSpacing(12)
         controls.addWidget(self.reset_button)
         controls.addStretch()
@@ -479,6 +545,7 @@ class EEGWindow(QtWidgets.QWidget):
         self.grid.scale(2, 2, 1)
         self.grid.setSize(30, 30)
         self.grid.setDepthValue(10)
+        self.grid.setColor(QtGui.QColor(42, 63, 79, 90))
         self.view.addItem(self.grid)
 
         container = QtWidgets.QWidget()
@@ -645,7 +712,13 @@ class EEGWindow(QtWidgets.QWidget):
     def _persist_geometry(self) -> None:
         g = self.geometry()
         geom_str = f"{g.width()}x{g.height()}x{g.x()}x{g.y()}"
-        save_config({"eeg_window_geometry": geom_str, "eeg_detail_level": self.detail_level})
+        save_config(
+            {
+                "eeg_window_geometry": geom_str,
+                "eeg_detail_level": self.detail_level,
+                "eeg_render_profile": self.render_profile,
+            }
+        )
 
     def _persist_alignment(self) -> None:
         save_config(
@@ -657,6 +730,10 @@ class EEGWindow(QtWidgets.QWidget):
 
     def _on_detail_changed(self, value: str) -> None:
         self.detail_level = value if value in DETAIL_LEVELS else "Medium"
+        self.refresh_scene(force=True)
+
+    def _on_profile_changed(self, value: str) -> None:
+        self.render_profile = value if value in RENDER_PROFILES else "Balanced"
         self.refresh_scene(force=True)
 
     def _reset_view(self) -> None:
@@ -678,6 +755,7 @@ class EEGWindow(QtWidgets.QWidget):
         self.refresh_scene(force=True)
 
     def _render_payload(self, payload: Dict[str, Any]) -> None:
+        prepare_started = time.perf_counter()
         neurons = payload.get("neurons") or []
         edges = payload.get("synapses") or []
         state = payload.get("state") or {}
@@ -704,7 +782,9 @@ class EEGWindow(QtWidgets.QWidget):
 
         visible_node_ids = {n["id"] for n in neurons}
         edges = self._apply_edge_filters(edges, visible_node_ids)
-        edge_node_scores = self._edge_node_scores(edges)
+        edge_node_scores = (
+            {} if settings["max_nodes"] is None else self._edge_node_scores(edges)
+        )
         sampled_neurons = self._sample_neurons(neurons, settings["max_nodes"], edge_node_scores)
         sampled_edges = self._sample_edges(edges, settings["max_edges"], sampled_neurons, settings["show_edges"])
 
@@ -712,6 +792,7 @@ class EEGWindow(QtWidgets.QWidget):
 
         self._draw_nodes(sampled_neurons, state)
         self._draw_edges(sampled_edges, pos_map)
+        self.last_prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
         self._update_overlay(
             sampled_neurons,
             neurons,
@@ -725,10 +806,10 @@ class EEGWindow(QtWidgets.QWidget):
     def _sample_neurons(
         self,
         neurons: List[Dict[str, Any]],
-        limit: int,
+        limit: Optional[int],
         edge_node_scores: Optional[Dict[Any, float]] = None,
     ) -> List[Dict[str, Any]]:
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             return []
         edge_node_scores = edge_node_scores or {}
 
@@ -742,6 +823,8 @@ class EEGWindow(QtWidgets.QWidget):
                 self._safe_float(node.get("strength"), 0.0),
             )
 
+        if limit is None:
+            return neurons
         ranked = sorted(neurons, key=rank_key, reverse=True)
         if len(ranked) <= limit:
             return ranked
@@ -772,15 +855,15 @@ class EEGWindow(QtWidgets.QWidget):
     def _sample_edges(
         self,
         edges: List[Dict[str, Any]],
-        limit: int,
+        limit: Optional[int],
         neurons: List[Dict[str, Any]],
         allow_edges: bool,
     ) -> List[Dict[str, Any]]:
-        if not allow_edges or limit <= 0:
+        if not allow_edges or (limit is not None and limit <= 0):
             return []
         ids = {n["id"] for n in neurons}
         filtered = [e for e in edges if e.get("source") in ids and e.get("target") in ids]
-        if len(filtered) <= limit:
+        if limit is None or len(filtered) <= limit:
             return filtered
 
         by_network: Dict[str, List[Dict[str, Any]]] = {}
@@ -864,36 +947,39 @@ class EEGWindow(QtWidgets.QWidget):
         if self.node_item:
             self.view.removeItem(self.node_item)
             self.node_item = None
-
-        positions = np.array([n["pos"] for n in neurons])
-        sizes = []
-        colors = []
+        if self.node_glow_item:
+            self.view.removeItem(self.node_glow_item)
+            self.node_glow_item = None
 
         emotion_intensity = state.get("emotion_intensity", 0.0)
         pulse = 1.0 + 0.25 * emotion_intensity * math.sin(time.time() * 2.0)
+        packed = pack_nodes(
+            neurons,
+            lambda node: self._color_for_node(dict(node))[0],
+            profile=self.render_profile,
+            emotion_pulse=pulse,
+        )
+        positions = np.frombuffer(packed["positions"], dtype=np.float32).reshape((-1, 3))
+        sizes = np.frombuffer(packed["sizes"], dtype=np.float32)
+        colors = np.frombuffer(packed["colors"], dtype=np.float32).reshape((-1, 4))
+        profile = RENDER_PROFILES[self.render_profile]
 
-        for n in neurons:
-            activation = clamp(float(n.get("activation", 0.0)))
-            base_color, _, _ = self._color_for_node(n)
-            network = n.get("network_type", "memory_graph")
-            base_r, base_g, base_b = base_color
-            tint = pulse if network == "emotion" else 1.0
-            alpha = clamp(0.35 + 0.55 * activation)
-            color = (
-                clamp(base_r * (0.65 + 0.45 * activation) * tint),
-                clamp(base_g * (0.65 + 0.45 * activation) * tint),
-                clamp(base_b * (0.65 + 0.45 * activation) * tint),
-                alpha,
+        if profile["glow"] and len(positions):
+            glow_colors = colors.copy()
+            glow_colors[:, 3] *= 0.16
+            self.node_glow_item = gl.GLScatterPlotItem(
+                pos=positions,
+                size=sizes * 2.6,
+                color=glow_colors,
+                pxMode=profile["px_mode"],
             )
-            size = 0.5 + 1.8 * activation
-            sizes.append(size)
-            colors.append(color)
+            self.view.addItem(self.node_glow_item)
 
         self.node_item = gl.GLScatterPlotItem(
             pos=positions,
-            size=np.array(sizes),
-            color=np.array(colors),
-            pxMode=False,
+            size=sizes,
+            color=colors,
+            pxMode=profile["px_mode"],
         )
         self.view.addItem(self.node_item)
 
@@ -904,28 +990,23 @@ class EEGWindow(QtWidgets.QWidget):
         if not edges:
             return
 
-        segments = []
-        colors = []
-        for edge in edges:
-            src = pos_map.get(edge.get("source"))
-            dst = pos_map.get(edge.get("target"))
-            if src is None or dst is None:
-                continue
-            color_base = self._color_for_network(edge.get("network_type", "memory_graph"))
-            alpha = 0.22 + 0.4 * clamp(float(edge.get("weight", 0.0)))
-            color = (color_base[0], color_base[1], color_base[2], alpha)
-            segments.extend([src, dst])
-            colors.extend([color, color])
-
-        if not segments:
+        packed = pack_edges(
+            edges,
+            pos_map,
+            lambda edge: self._color_for_network(str(edge.get("network_type", "memory_graph"))),
+        )
+        if not packed["count"]:
             return
+        segments = np.frombuffer(packed["positions"], dtype=np.float32).reshape((-1, 3))
+        colors = np.frombuffer(packed["colors"], dtype=np.float32).reshape((-1, 4))
+        profile = RENDER_PROFILES[self.render_profile]
 
         self.edge_item = gl.GLLinePlotItem(
-            pos=np.array(segments),
-            color=np.array(colors),
-            width=1.2,
+            pos=segments,
+            color=colors,
+            width=profile["edge_width"],
             mode="lines",
-            antialias=True,
+            antialias=profile["antialias"],
         )
         self.view.addItem(self.edge_item)
 
@@ -951,8 +1032,10 @@ class EEGWindow(QtWidgets.QWidget):
         status_parts = [
             f"Mode: {mode}" + (" (dreaming)" if dreaming else ""),
             f"Detail: {self.detail_level}",
+            f"Render: {self.render_profile}",
             f"Rendering {neuron_count} neurons",
             f"{edge_count} synapses",
+            f"Prep {self.last_prepare_ms:.1f} ms",
         ]
 
         self.status_label.setText(" | ".join(status_parts))
@@ -960,11 +1043,17 @@ class EEGWindow(QtWidgets.QWidget):
         info_lines = [
             f"<b>Mode:</b> {mode}{' (dream)' if dreaming else ''}",
             f"<b>Detail:</b> {self.detail_level}",
+            f"<b>Render:</b> {self.render_profile} — {RENDER_PROFILES[self.render_profile]['description']}",
             f"<b>Neurons:</b> {neuron_count}",
             f"<b>Synapses:</b> {edge_count}",
         ]
         if len(sampled_edges) < len(all_edges):
             info_lines.append("<b>Synapse sample:</b> network-balanced by weight and evidence")
+        recovered_endpoints = int(state.get("recovered_endpoints") or 0)
+        if recovered_endpoints:
+            info_lines.append(
+                f"<b>Recovered endpoints:</b> {recovered_endpoints} referenced nodes were absent from the source graph"
+            )
 
         # Alignment readout
         offset = getattr(self.loader, "manual_offset", np.zeros(3, dtype=float))
@@ -1023,6 +1112,9 @@ class EEGWindow(QtWidgets.QWidget):
         if self.edge_item:
             self.view.removeItem(self.edge_item)
             self.edge_item = None
+        if self.node_glow_item:
+            self.view.removeItem(self.node_glow_item)
+            self.node_glow_item = None
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         self._persist_geometry()

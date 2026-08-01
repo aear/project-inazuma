@@ -6,6 +6,15 @@ from gui_hook import log_to_statusbox
 
 Command = Union[str, Sequence[str]]
 
+_WAYLAND_ACTIVATION_WARNING = "Wayland does not support QWindow::requestActivate()"
+
+
+def _stderr_tag(line: str) -> str:
+    """Keep known compositor limitations from masquerading as app failures."""
+    if _WAYLAND_ACTIVATION_WARNING in line:
+        return "WARN"
+    return "ERROR"
+
 
 def safe_popen(command: Command, *, label: Optional[str] = None, verbose: bool = False,
                timeout: Optional[float] = None, **popen_kwargs) -> Optional[subprocess.Popen]:
@@ -39,11 +48,16 @@ def safe_popen(command: Command, *, label: Optional[str] = None, verbose: bool =
 
     if verbose:
         def _stream(stream, is_err=False):
-            tag = f"ERROR" if is_err else (label or "LOG")
+            reported_once = set()
             for line in iter(stream.readline, ''):
                 if line:
+                    tag = _stderr_tag(line) if is_err else (label or "LOG")
+                    normalized = line.rstrip()
+                    if tag == "WARN" and normalized in reported_once:
+                        continue
+                    reported_once.add(normalized)
                     prefix = f"[{tag}] "
-                    log_to_statusbox(prefix + line.rstrip() + "\n")
+                    log_to_statusbox(prefix + normalized + "\n")
             stream.close()
 
         threading.Thread(target=_stream, args=(process.stdout, False), daemon=True).start()
