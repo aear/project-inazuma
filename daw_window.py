@@ -1242,12 +1242,68 @@ class DawWindow(tk.Tk):
     def _play_audio(self, audio: np.ndarray, sample_rate: int, *, loop: bool = False) -> None:
         if _sounddevice is None:
             raise RuntimeError("Playback needs the optional sounddevice package.")
+        output = np.asarray(audio, dtype=np.float32)
+        if output.ndim == 1:
+            channels = 1
+        elif output.ndim == 2 and output.shape[1] > 0:
+            channels = output.shape[1]
+        else:
+            raise ValueError("Playback audio must be a mono vector or a sample-by-channel matrix.")
+
+        query_devices = getattr(_sounddevice, "query_devices", None)
+        if callable(query_devices):
+            device_label = (
+                f"configured output device {self.output_device}"
+                if self.output_device is not None
+                else "the default output device"
+            )
+            try:
+                device_info = query_devices(self.output_device, "output")
+                max_output_channels = int(device_info.get("max_output_channels", 0))
+            except Exception as exc:
+                raise RuntimeError(f"Could not use {device_label}: {exc}") from exc
+            if max_output_channels < 1:
+                raise RuntimeError(f"{device_label.capitalize()} has no output channels.")
+            if channels > max_output_channels:
+                raise RuntimeError(
+                    f"{device_label.capitalize()} supports {max_output_channels} output "
+                    f"channel(s), but the audio has {channels}."
+                )
+            # Some ALSA/PipeWire stereo endpoints reject a one-channel PortAudio
+            # stream even though the source material itself is mono.
+            if channels == 1 and max_output_channels >= 2:
+                mono = output if output.ndim == 1 else output[:, 0]
+                output = np.repeat(mono[:, np.newaxis], 2, axis=1)
+                channels = 2
+
+        check_output_settings = getattr(_sounddevice, "check_output_settings", None)
+        if callable(check_output_settings):
+            settings: dict[str, Any] = {
+                "samplerate": sample_rate,
+                "channels": channels,
+                "dtype": output.dtype.name,
+            }
+            if self.output_device is not None:
+                settings["device"] = self.output_device
+            try:
+                check_output_settings(**settings)
+            except Exception as exc:
+                device_label = (
+                    f"configured output device {self.output_device}"
+                    if self.output_device is not None
+                    else "default output device"
+                )
+                raise RuntimeError(
+                    f"The {device_label} cannot play {channels}-channel audio at "
+                    f"{sample_rate} Hz: {exc}"
+                ) from exc
+
         options: dict[str, Any] = {"samplerate": sample_rate}
         if loop:
             options["loop"] = True
         if self.output_device is not None:
             options["device"] = self.output_device
-        _sounddevice.play(audio, **options)
+        _sounddevice.play(output, **options)
 
     def _stop_audio_device(self) -> Optional[str]:
         if _sounddevice is None:

@@ -1,5 +1,9 @@
 # agents.md  
 Project Inazuma
+
+At the start of work in this repository, read `agent_notes.txt` if it exists.
+It contains local-only context and must never be committed or quoted into public artifacts.
+
 ## Scope and Intent
 
 This document defines **development-time constraints and design guidance**

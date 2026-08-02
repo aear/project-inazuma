@@ -302,6 +302,24 @@ class _PlaybackDevice:
         self.play_calls.append((audio, options))
 
 
+class _StereoOnlyPlaybackDevice(_PlaybackDevice):
+    def __init__(self, *, max_output_channels=2, settings_error=None):
+        super().__init__()
+        self.max_output_channels = max_output_channels
+        self.settings_error = settings_error
+        self.query_calls = []
+        self.settings_calls = []
+
+    def query_devices(self, device, kind):
+        self.query_calls.append((device, kind))
+        return {"name": "Test output", "max_output_channels": self.max_output_channels}
+
+    def check_output_settings(self, **settings):
+        self.settings_calls.append(settings)
+        if self.settings_error is not None:
+            raise self.settings_error
+
+
 def _bare_transport_window(monkeypatch):
     device = _PlaybackDevice()
     monkeypatch.setattr(daw_module, "_sounddevice", device)
@@ -313,6 +331,50 @@ def _bare_transport_window(monkeypatch):
     window._publish_workspace = lambda _event, **_extra: {}
     window._show_error = lambda _title, _error: None
     return window, device
+
+
+def test_play_audio_expands_mono_for_stereo_output(monkeypatch):
+    device = _StereoOnlyPlaybackDevice()
+    monkeypatch.setattr(daw_module, "_sounddevice", device)
+    window = object.__new__(DawWindow)
+    window.output_device = 11
+    mono = np.array([0.25, -0.5, 0.75], dtype=np.float32)
+
+    DawWindow._play_audio(window, mono, 44_100)
+
+    assert device.query_calls == [(11, "output")]
+    assert device.settings_calls == [
+        {"samplerate": 44_100, "channels": 2, "dtype": "float32", "device": 11}
+    ]
+    played, options = device.play_calls[0]
+    assert played.shape == (3, 2)
+    np.testing.assert_array_equal(played[:, 0], mono)
+    np.testing.assert_array_equal(played[:, 1], mono)
+    assert options == {"samplerate": 44_100, "device": 11}
+
+
+def test_play_audio_rejects_input_only_configured_device(monkeypatch):
+    device = _StereoOnlyPlaybackDevice(max_output_channels=0)
+    monkeypatch.setattr(daw_module, "_sounddevice", device)
+    window = object.__new__(DawWindow)
+    window.output_device = 11
+
+    with pytest.raises(RuntimeError, match="Configured output device 11 has no output channels"):
+        DawWindow._play_audio(window, np.zeros(4, dtype=np.float32), 44_100)
+
+    assert device.play_calls == []
+
+
+def test_play_audio_reports_unsupported_device_settings(monkeypatch):
+    device = _StereoOnlyPlaybackDevice(settings_error=ValueError("unsupported rate"))
+    monkeypatch.setattr(daw_module, "_sounddevice", device)
+    window = object.__new__(DawWindow)
+    window.output_device = 11
+
+    with pytest.raises(RuntimeError, match="cannot play 2-channel audio at 44100 Hz"):
+        DawWindow._play_audio(window, np.zeros(4, dtype=np.float32), 44_100)
+
+    assert device.play_calls == []
 
 
 def test_microphone_close_during_construction_prevents_stream_start():
