@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+from audio_device_resolution import AudioDeviceResolution, resolve_audio_device
 from daw_engine import (
     DawProject,
     InstrumentTrack,
@@ -825,14 +826,6 @@ class DawWindow(tk.Tk):
         )
         super().__init__()
         self.child = resolved_child
-        self.input_device = configured_device_index(config, "mic_headset_index")
-        self.output_device = configured_device_index(
-            config,
-            "output_headset_index",
-            "ouput_headset_index",
-            "output_TV_index",
-            "ouput_TV_index",
-        )
         self.paths = studio_paths(self.child).ensure()
         self._instance_lock = StudioInstanceLock(self.paths.root / "daw_window.lock")
         if not self._instance_lock.acquire():
@@ -843,6 +836,46 @@ class DawWindow(tk.Tk):
             raise StudioAlreadyRunningError(f"Ina Music Studio is already open for {self.child}.")
 
         self.project = create_default_project()
+        self.input_device_resolution = resolve_audio_device(
+            config,
+            label="mic_headset",
+            role="input",
+            index_keys=("mic_headset_index",),
+            name_keys=("mic_headset_name",),
+            sounddevice_module=_sounddevice,
+            sample_rate=self.project.sample_rate,
+            channels=1,
+        )
+        self.output_device_resolution = resolve_audio_device(
+            config,
+            label="output_headset",
+            role="output",
+            index_keys=(
+                "output_headset_index",
+                "ouput_headset_index",
+                "output_TV_index",
+                "ouput_TV_index",
+            ),
+            name_keys=(
+                "output_headset_name",
+                "ouput_headset_name",
+                "output_TV_name",
+                "ouput_TV_name",
+            ),
+            sounddevice_module=_sounddevice,
+            sample_rate=self.project.sample_rate,
+            channels=2,
+        )
+        self.input_device = (
+            self.input_device_resolution.device
+            if self.input_device_resolution.available
+            else None
+        )
+        self.output_device = (
+            self.output_device_resolution.device
+            if self.output_device_resolution.available
+            else None
+        )
         self.project_path: Optional[Path] = None
         self.last_render_path: Optional[Path] = None
         self.track_rows: list[dict[str, Any]] = []
@@ -869,7 +902,10 @@ class DawWindow(tk.Tk):
         self.preview_waveform_var = tk.StringVar(value="sine")
         self.vocal_offset_var = tk.DoubleVar(value=0.0)
         self.symbolic_prompt_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Ready — local/offline studio; no Suno or network generation.")
+        self.audio_device_var = tk.StringVar(
+            value=self._audio_resolution_label(self.output_device_resolution)
+        )
+        self.status_var = tk.StringVar(value=self._audio_startup_status())
 
         self._configure_style()
         self._build_ui()
@@ -889,6 +925,44 @@ class DawWindow(tk.Tk):
         style.configure("StudioNote.TLabel", foreground="#555f70")
         style.configure("StudioAccent.TButton", font=("Helvetica", 10, "bold"))
 
+    @staticmethod
+    def _audio_resolution_label(resolution: AudioDeviceResolution) -> str:
+        if not resolution.available:
+            return "Output unavailable · offline render works"
+        device_label = (
+            "System default"
+            if resolution.device is None
+            else str(resolution.device)
+        )
+        if len(device_label) > 28:
+            device_label = device_label[:25] + "..."
+        name = str(resolution.name or "").strip()
+        if len(name) > 44:
+            name = name[:41] + "..."
+        suffix = (
+            f" · {name}"
+            if name and name.casefold() != device_label.casefold()
+            else ""
+        )
+        return f"Output: {device_label}{suffix}"
+
+    def _audio_startup_status(self) -> str:
+        output = self.output_device_resolution
+        microphone = self.input_device_resolution
+        if output.warning:
+            if not output.available:
+                return "Live output unavailable; offline render/export still work. Config unchanged."
+            if output.source == "configured_name":
+                return "Saved output index changed; matched the output by name. Config unchanged."
+            return "Configured output unavailable; using the system default. Config unchanged."
+        if microphone.warning:
+            if not microphone.available:
+                return "Microphone unavailable; playback and offline work remain available."
+            if microphone.source == "configured_name":
+                return "Saved mic index changed; matched the microphone by name. Config unchanged."
+            return "Configured microphone unavailable; using the system default. Config unchanged."
+        return "Ready — audio checked; local/offline studio; no Suno or network generation."
+
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -904,6 +978,11 @@ class DawWindow(tk.Tk):
             text="A small local step sequencer and symbolic vocal sketchpad",
             style="StudioNote.TLabel",
         ).grid(row=0, column=1, sticky="w", padx=14)
+        ttk.Label(
+            header,
+            textvariable=self.audio_device_var,
+            style="StudioNote.TLabel",
+        ).grid(row=0, column=2, sticky="e", padx=(14, 0))
 
         toolbar = ttk.LabelFrame(outer, text="Project and transport", padding=8)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1853,6 +1932,10 @@ class DawWindow(tk.Tk):
             "audio_devices": {
                 "input": self.input_device,
                 "output": self.output_device,
+                "launch_check": {
+                    "input": self.input_device_resolution.to_payload(),
+                    "output": self.output_device_resolution.to_payload(),
+                },
             },
             "control_api": daw_control_api_payload(),
             "tracks": [self._track_payload(index) for index in range(len(self.project.tracks))],

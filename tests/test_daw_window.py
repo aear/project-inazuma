@@ -161,6 +161,42 @@ def test_configured_audio_device_uses_first_valid_alias():
     assert configured_device_index(config, "output_headset_index", "ouput_headset_index") == 11
     assert configured_device_index({"mic_headset_index": -1}, "mic_headset_index") is None
 
+
+def test_audio_launch_status_is_concise_while_full_warning_stays_in_state():
+    window = object.__new__(DawWindow)
+    window.output_device_resolution = SimpleNamespace(
+        warning="backend detail " * 100,
+        available=True,
+        source="system_default",
+    )
+    window.input_device_resolution = SimpleNamespace(
+        warning=None,
+        available=True,
+        source="system_default",
+    )
+
+    status = DawWindow._audio_startup_status(window)
+
+    assert status == (
+        "Configured output unavailable; using the system default. "
+        "Config unchanged."
+    )
+    assert len(status) < 100
+
+
+def test_audio_header_label_bounds_override_and_device_name_text():
+    resolution = SimpleNamespace(
+        available=True,
+        device="override-" + ("x" * 100),
+        name="device-" + ("y" * 100),
+    )
+
+    label = DawWindow._audio_resolution_label(resolution)
+
+    assert label.startswith("Output: override-")
+    assert len(label) < 90
+    assert label.count("...") == 2
+
 @pytest.mark.parametrize("child", ["", ".", "..", "../escape", "Ina/escape", r"Ina\\escape", "/tmp/escape"])
 def test_studio_paths_reject_unsafe_child_identifiers(tmp_path, child):
     with pytest.raises(ValueError, match="child identifier"):
@@ -351,6 +387,24 @@ def test_play_audio_expands_mono_for_stereo_output(monkeypatch):
     np.testing.assert_array_equal(played[:, 0], mono)
     np.testing.assert_array_equal(played[:, 1], mono)
     assert options == {"samplerate": 44_100, "device": 11}
+
+
+def test_play_audio_uses_resolved_system_default_without_stale_index(monkeypatch):
+    device = _StereoOnlyPlaybackDevice()
+    monkeypatch.setattr(daw_module, "_sounddevice", device)
+    window = object.__new__(DawWindow)
+    window.output_device = None
+    mono = np.array([0.25, -0.5], dtype=np.float32)
+
+    DawWindow._play_audio(window, mono, 44_100)
+
+    assert device.query_calls == [(None, "output")]
+    assert device.settings_calls == [
+        {"samplerate": 44_100, "channels": 2, "dtype": "float32"}
+    ]
+    played, options = device.play_calls[0]
+    assert played.shape == (2, 2)
+    assert options == {"samplerate": 44_100}
 
 
 def test_play_audio_rejects_input_only_configured_device(monkeypatch):
