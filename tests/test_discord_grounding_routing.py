@@ -1,3 +1,5 @@
+import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import discord_bridge as db
@@ -63,6 +65,111 @@ def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch,
     assert result.metadata["effective_language_mode"] == "english"
     assert result.metadata["symbolic_native_text"] == "glyph_wave"
     assert adapter.calls == []
+
+
+def test_history_parser_recovers_native_english_pairs():
+    assert db.extract_symbolic_history_alignments(
+        "Native: glyph_wave glyph_calm\nHuman guess: hello calm"
+    ) == [("glyph_wave glyph_calm", "hello calm")]
+    assert db.extract_symbolic_history_alignments("Just English this time.") == []
+
+
+def test_language_review_policy_is_bounded(monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "get_discord_config",
+        lambda: {
+            "language_review": {
+                "pressure_messages": 0,
+                "history_limit": 2,
+                "mapping_batch": 0,
+                "revisit_mappings": 0,
+                "cooldown_seconds": -1,
+            }
+        },
+    )
+
+    policy = db.get_language_review_policy()
+
+    assert policy["pressure_messages"] == 4
+    assert policy["history_limit"] == 10
+    assert policy["mapping_batch"] == 1
+    assert policy["revisit_mappings"] == 1
+    assert policy["cooldown_seconds"] == 0.0
+
+
+def test_history_review_learns_old_text_and_deduplicates_live_text(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(db, "get_memory_guard_level", lambda: "normal")
+    monkeypatch.setattr(
+        db,
+        "get_inastate",
+        lambda key: {
+            "history_cursors": {},
+            "live_vocab_message_ids": ["10"],
+        } if key == "discord_language_review" else None,
+    )
+
+    def review(observations, alignments, **kwargs):
+        captured["observations"] = observations
+        captured["alignments"] = alignments
+        return {"pairs": [{"native": "glyph_wave", "english": "hello"}]}
+
+    monkeypatch.setattr(db, "review_text_evidence", review)
+    monkeypatch.setattr(db, "build_text_symbol_links", lambda *args, **kwargs: True)
+    stamp = datetime.now(timezone.utc)
+    human = SimpleNamespace(id=1, bot=False, display_name="Human")
+    ina = SimpleNamespace(id=999, bot=True, display_name="Ina")
+    messages = [
+        SimpleNamespace(id=9, author=human, content="older word", created_at=stamp),
+        SimpleNamespace(id=10, author=human, content="already live", created_at=stamp),
+        SimpleNamespace(
+            id=11,
+            author=ina,
+            content="Native: glyph_wave\nHuman guess: hello",
+            created_at=stamp,
+        ),
+    ]
+
+    class Channel:
+        id = 5
+
+        async def history(self, **kwargs):
+            for message in messages:
+                yield message
+
+    class HistoryBridge:
+        def __init__(self):
+            self.turns = []
+
+        def log_conversation_turn(self, text, **kwargs):
+            self.turns.append(text)
+
+    class Client:
+        text_channel = Channel()
+        user = SimpleNamespace(id=999)
+        child = "TestChild"
+        history_bridge = HistoryBridge()
+
+        def get_user(self, user_id):
+            return None
+
+        async def fetch_user(self, user_id):
+            return None
+
+    client = Client()
+    result = asyncio.run(
+        db.InaDiscordClient._ingest_message_history(
+            client, limit=10, mapping_batch=3, revisit_mappings=1
+        )
+    )
+
+    assert captured["observations"] == [
+        {"text": "older word", "tags": ["discord", "history", "human"]}
+    ]
+    assert captured["alignments"] == [("glyph_wave", "hello")]
+    assert client.history_bridge.turns == ["older word"]
+    assert result["history_cursors"] == {"5": "11"}
 
 
 def test_attachment_does_not_override_complete_symbolic_reply(monkeypatch):

@@ -1,0 +1,86 @@
+import json
+
+import text_memory as tm
+
+
+def _disable_runtime_metrics(monkeypatch):
+    monkeypatch.setattr(tm, "increment_inastate_metric", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tm, "set_inastate_metric", lambda *args, **kwargs: None)
+
+
+class _MutableEmbedder:
+    def __init__(self):
+        self.prefer_b = False
+
+    def embed_text(self, text, language=None):
+        return ["word", str(text)]
+
+    def cosine(self, word_embedding, symbol_embedding):
+        marker = symbol_embedding[0]
+        if marker == "a":
+            return 0.8 if not self.prefer_b else 0.6
+        if marker == "b":
+            return 0.7 if not self.prefer_b else 0.95
+        return 0.0
+
+
+def test_history_evidence_records_aligned_native_words_in_one_batch(tmp_path, monkeypatch):
+    _disable_runtime_metrics(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    memory = tmp_path / "AI_Children" / "TestChild" / "memory"
+    memory.mkdir(parents=True)
+
+    result = tm.review_text_evidence(
+        [{"text": "A fresh thought", "tags": ["discord", "history"]}],
+        [("glyph_wave glyph_calm", "hello calm")],
+        child="TestChild",
+        source="test_review",
+    )
+
+    vocab = tm.load_text_vocab("TestChild")["vocab"]
+    assert result["observed_messages"] == 2
+    assert result["pairs"] == [
+        {"native": "glyph_wave", "english": "hello"},
+        {"native": "glyph_calm", "english": "calm"},
+    ]
+    assert vocab["hello"]["symbols"] == {"glyph_wave": 1}
+    assert vocab["calm"]["symbols"] == {"glyph_calm": 1}
+
+
+def test_existing_mapping_can_be_revisited_without_new_vocabulary(tmp_path, monkeypatch):
+    _disable_runtime_metrics(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    memory = tmp_path / "AI_Children" / "TestChild" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "symbol_to_token.json").write_text(
+        json.dumps(
+            {
+                "sym_a": {
+                    "word": "glyph_a",
+                    "embedding": ["a"],
+                    "confidence": 0.6,
+                },
+                "sym_b": {
+                    "word": "glyph_b",
+                    "embedding": ["b"],
+                    "confidence": 0.6,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tm.update_text_vocab("hello", child="TestChild", source="test")
+    embedder = _MutableEmbedder()
+    monkeypatch.setattr(tm, "_EMBEDDER", embedder)
+
+    assert tm.build_text_symbol_links("TestChild", mapping_batch=4)
+    first = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
+    assert first["links"][0]["symbol"] == "sym_a"
+    assert isinstance(first["evaluated"]["hello"], dict)
+
+    embedder.prefer_b = True
+    assert tm.build_text_symbol_links(
+        "TestChild", mapping_batch=4, revisit_existing=1
+    )
+    revised = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
+    assert revised["links"][0]["symbol"] == "sym_b"

@@ -58,6 +58,10 @@ from visual_token_learning import observe_image as observe_visual_tokens
 from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
 from model_manager import get_inastate, update_inastate
+from text_memory import (
+    build_text_symbol_links,
+    review_text_evidence,
+)
 from io_pressure import pressure_signal
 from discord_runtime import (
     typed_outbox_path,
@@ -243,6 +247,50 @@ def get_discord_config() -> dict:
     cfg = load_root_config()
     section = cfg.get("discord") if isinstance(cfg, dict) else None
     return section if isinstance(section, dict) else {}
+
+
+def get_language_review_policy() -> dict:
+    """Return bounded, event-driven Discord language review settings."""
+    raw = get_discord_config().get("language_review") or {}
+    raw = raw if isinstance(raw, dict) else {}
+
+    def positive_int(key: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(minimum, int(raw.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def nonnegative_float(key: str, default: float) -> float:
+        try:
+            return max(0.0, float(raw.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": raw.get("enabled", True) is not False,
+        "pressure_messages": positive_int("pressure_messages", 24, 4),
+        "history_limit": positive_int("history_limit", 75, 10),
+        "mapping_batch": positive_int("mapping_batch", 160, 1),
+        "revisit_mappings": positive_int("revisit_mappings", 24, 1),
+        "cooldown_seconds": nonnegative_float("cooldown_seconds", 900.0),
+    }
+
+
+_NATIVE_HISTORY_LINE = re.compile(r"(?im)^\s*Native:\s*(.+?)\s*$")
+_ENGLISH_HISTORY_LINE = re.compile(
+    r"(?im)^\s*(?:Human guess|English|Translation):\s*(.+?)\s*$"
+)
+
+
+def extract_symbolic_history_alignments(text: str) -> list[tuple[str, str]]:
+    """Extract labelled native/English pairs from Ina's prior messages."""
+    native_lines = _NATIVE_HISTORY_LINE.findall(text or "")
+    english_lines = _ENGLISH_HISTORY_LINE.findall(text or "")
+    return [
+        (native.strip(), english.strip())
+        for native, english in zip(native_lines, english_lines)
+        if native.strip() and english.strip()
+    ]
 
 
 def get_voice_io_config() -> dict:
@@ -1235,6 +1283,7 @@ class InaDiscordClient(discord.Client):
         self._voice_playback_lock = asyncio.Lock()
         self._load_outbox_history()
         self._typed_outbox_task = None
+        self._language_review_task = None
 
     def _roleplay_mode(self, message: discord.Message) -> Optional[str]:
         """Return read_only/respond for configured RP spaces (Umani-compatible)."""
@@ -1312,6 +1361,7 @@ class InaDiscordClient(discord.Client):
             self._typed_outbox_task = asyncio.create_task(self._watch_typed_outbox())
         if getattr(self, "_io_pressure_task", None) is None:
             self._io_pressure_task = asyncio.create_task(self._watch_io_pressure())
+        await self._start_language_review_if_ready()
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         """Record and process meaningful Discord message edits."""
@@ -1438,6 +1488,7 @@ class InaDiscordClient(discord.Client):
                 image_attachments=image_attachments,
                 conversation_context=recent_context,
             )
+            await self._note_language_review_stimulus(message)
             return
 
         # Guild messages: configured bridge channel or a compatible RP space.
@@ -1460,9 +1511,13 @@ class InaDiscordClient(discord.Client):
             await self._handle_voice_leave(message)
             return
         if lower in {"/ina learn history", "/ina history learn"} and message.author.id == SAKURA_USER_ID:
-            await message.channel.send("Scanning recent history for language training...")
-            await self._ingest_message_history()
-            await message.channel.send("History scan complete.")
+            await message.channel.send("Scanning recent history and revisiting language mappings...")
+            result = await self._run_language_review(force=True)
+            await message.channel.send(
+                "History review complete: "
+                f"{result.get('new_messages', 0)} new messages, "
+                f"{result.get('alignments', 0)} native/English alignments."
+            )
             return
         if lower in {"/ina status", "/ina ping"}:
             await message.channel.send("Ina is listening here.")
@@ -1474,6 +1529,7 @@ class InaDiscordClient(discord.Client):
             message, is_dm=False, image_attachments=image_attachments,
             conversation_context=recent_context, roleplay=bool(roleplay_mode),
         )
+        await self._note_language_review_stimulus(message)
 
     async def _handle_voice_join(self, message: discord.Message) -> None:
         target_channel = self.voice_channel
@@ -2308,14 +2364,183 @@ class InaDiscordClient(discord.Client):
                 logger.exception("Typed outbox dispatch loop failed.")
             await asyncio.sleep(sleep_sec)
 
-    async def _ingest_message_history(self, limit: int = 50) -> None:
-        """
-        Backfill recent Discord text + owner DMs into Ina's experience log for language training.
-        """
+    async def _note_language_review_stimulus(self, message: discord.Message) -> None:
+        """Raise review pressure from meaningful new conversation evidence."""
+        policy = get_language_review_policy()
+        if not policy["enabled"] or not (message.content or "").strip():
+            return
+        raw = await asyncio.to_thread(get_inastate, "discord_language_review")
+        state = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            pending = max(0, int(state.get("pending_messages", 0) or 0)) + 1
+        except (TypeError, ValueError):
+            pending = 1
+        threshold = policy["pressure_messages"]
+        live_ids = [
+            str(message_id)
+            for message_id in state.get("live_vocab_message_ids", [])
+            if message_id
+        ] if isinstance(state.get("live_vocab_message_ids"), list) else []
+        message_id = str(message.id)
+        if message_id not in live_ids:
+            live_ids.append(message_id)
+        live_ids = live_ids[-(policy["history_limit"] * 2):]
+        state.update(
+            {
+                "pending_messages": pending,
+                "live_vocab_message_ids": live_ids,
+                "pressure": round(min(1.0, pending / threshold), 3),
+                "threshold_messages": threshold,
+                "last_stimulus_at": datetime.now(timezone.utc).isoformat(),
+                "last_message_id": str(message.id),
+                "status": "ready" if pending >= threshold else "accumulating",
+            }
+        )
+        await asyncio.to_thread(update_inastate, "discord_language_review", state)
+        if pending >= threshold:
+            await self._start_language_review_if_ready()
+
+    async def _start_language_review_if_ready(self) -> bool:
+        """Start one review only when evidence pressure crosses its threshold."""
+        policy = get_language_review_policy()
+        if not policy["enabled"]:
+            return False
+        if self._language_review_task and not self._language_review_task.done():
+            return False
+
+        raw = await asyncio.to_thread(get_inastate, "discord_language_review")
+        state = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            pending = max(0, int(state.get("pending_messages", 0) or 0))
+        except (TypeError, ValueError):
+            pending = 0
+        if pending < policy["pressure_messages"]:
+            return False
+        now = time.time()
+        last_review = float(state.get("last_review_epoch", 0.0) or 0.0)
+        if last_review and now - last_review < policy["cooldown_seconds"]:
+            state["status"] = "cooldown"
+            await asyncio.to_thread(update_inastate, "discord_language_review", state)
+            return False
+
+        self._language_review_task = asyncio.create_task(self._run_language_review())
+        return True
+
+    async def _run_language_review(self, *, force: bool = False) -> dict:
+        """Run one bounded history and mapping review pass."""
+        current = asyncio.current_task()
+        if (
+            self._language_review_task
+            and not self._language_review_task.done()
+            and self._language_review_task is not current
+        ):
+            return {"status": "already_running", "new_messages": 0, "alignments": 0}
+
+        policy = get_language_review_policy()
+        raw = await asyncio.to_thread(get_inastate, "discord_language_review")
+        state = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            starting_pending = max(0, int(state.get("pending_messages", 0) or 0))
+        except (TypeError, ValueError):
+            starting_pending = 0
+        state.update(
+            {
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await asyncio.to_thread(update_inastate, "discord_language_review", state)
+        try:
+            result = await self._ingest_message_history(
+                limit=policy["history_limit"],
+                mapping_batch=policy["mapping_batch"],
+                revisit_mappings=policy["revisit_mappings"],
+            )
+        except Exception as exc:
+            logger.exception("Discord language review failed.")
+            failed_raw = await asyncio.to_thread(get_inastate, "discord_language_review")
+            failed = dict(failed_raw) if isinstance(failed_raw, dict) else state
+            failed.update(
+                {
+                    "status": "failed",
+                    "last_error": type(exc).__name__,
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await asyncio.to_thread(update_inastate, "discord_language_review", failed)
+            return {"status": "failed", "new_messages": 0, "alignments": 0}
+
+        latest_raw = await asyncio.to_thread(get_inastate, "discord_language_review")
+        latest = dict(latest_raw) if isinstance(latest_raw, dict) else state
+        if result.get("status") == "deferred_memory_pressure":
+            latest["status"] = "deferred_memory_pressure"
+        else:
+            now = time.time()
+            try:
+                latest_pending = max(0, int(latest.get("pending_messages", 0) or 0))
+            except (TypeError, ValueError):
+                latest_pending = starting_pending
+            remaining_pending = max(0, latest_pending - starting_pending)
+            reviewed_ids = {
+                str(message_id)
+                for message_id in result.get("reviewed_message_ids", [])
+                if message_id
+            }
+            live_ids = latest.get("live_vocab_message_ids")
+            if isinstance(live_ids, list):
+                latest["live_vocab_message_ids"] = [
+                    str(message_id)
+                    for message_id in live_ids
+                    if str(message_id) not in reviewed_ids
+                ]
+            latest.update(
+                {
+                    "status": "accumulating" if remaining_pending else "complete",
+                    "pending_messages": remaining_pending,
+                    "pressure": round(
+                        min(1.0, remaining_pending / policy["pressure_messages"]), 3
+                    ),
+                    "last_review_epoch": now,
+                    "last_review_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                    "history_cursors": result.get("history_cursors") or latest.get("history_cursors") or {},
+                    "last_result": result,
+                    "forced": bool(force),
+                }
+            )
+        await asyncio.to_thread(update_inastate, "discord_language_review", latest)
+        return result
+
+    async def _ingest_message_history(
+        self,
+        *,
+        limit: int = 75,
+        mapping_batch: int = 160,
+        revisit_mappings: int = 24,
+    ) -> dict:
+        """Review a bounded, deduplicated slice of Discord history."""
         level = get_memory_guard_level()
         if level in {"soft", "hard"}:
-            logger.info("Skipping Discord history ingest due to memory guard (%s).", level)
-            return
+            logger.info("Skipping Discord language review due to memory guard (%s).", level)
+            return {
+                "status": "deferred_memory_pressure",
+                "new_messages": 0,
+                "alignments": 0,
+            }
+
+        raw_state = await asyncio.to_thread(get_inastate, "discord_language_review")
+        review_state = dict(raw_state) if isinstance(raw_state, dict) else {}
+        cursors = review_state.get("history_cursors")
+        cursors = dict(cursors) if isinstance(cursors, dict) else {}
+        next_cursors = dict(cursors)
+        live_vocab_ids = {
+            str(message_id)
+            for message_id in review_state.get("live_vocab_message_ids", [])
+            if message_id
+        } if isinstance(review_state.get("live_vocab_message_ids"), list) else set()
+        reviewed_message_ids = []
+        observations = []
+        alignments = []
+        new_messages = 0
         targets = []
         if self.text_channel:
             targets.append(("guild_text", self.text_channel))
@@ -2326,37 +2551,101 @@ class InaDiscordClient(discord.Client):
                 dm = owner.dm_channel or await owner.create_dm()
                 targets.append(("owner_dm", dm))
         except Exception:
-            logger.exception("Failed to resolve owner DM channel for history ingest.")
+            logger.exception("Failed to resolve owner DM channel for history review.")
 
         for label, channel in targets:
+            channel_id = str(channel.id)
+            try:
+                cursor = int(cursors.get(channel_id, 0) or 0)
+            except (TypeError, ValueError):
+                cursor = 0
+            newest_seen = cursor
+            channel_messages = 0
             try:
                 async for msg in channel.history(limit=limit, oldest_first=True):
-                    if msg.author.bot:
+                    try:
+                        message_id = int(msg.id)
+                    except (TypeError, ValueError):
                         continue
+                    if message_id <= cursor:
+                        continue
+                    newest_seen = max(newest_seen, message_id)
                     content = (msg.content or "").strip()
                     if not content:
                         continue
+                    is_ina = bool(self.user and msg.author.id == self.user.id)
+                    if msg.author.bot and not is_ina:
+                        continue
+                    if content.lower().startswith("/ina "):
+                        continue
+
+                    new_messages += 1
+                    channel_messages += 1
+                    reviewed_message_ids.append(str(msg.id))
                     is_dm = label == "owner_dm"
-                    tags = ["discord", "history"]
+                    tags = ["discord", "history", "ina" if is_ina else "human"]
                     if is_dm:
                         tags.append("dm")
-                    self.history_bridge.log_conversation_turn(
+                    if is_ina:
+                        extracted = extract_symbolic_history_alignments(content)
+                        if extracted:
+                            alignments.extend(extracted)
+                        else:
+                            observations.append({"text": content, "tags": tags})
+                        continue
+
+                    if str(msg.id) in live_vocab_ids:
+                        continue
+                    observations.append({"text": content, "tags": tags})
+                    await asyncio.to_thread(
+                        self.history_bridge.log_conversation_turn,
                         content,
                         speaker=msg.author.display_name or str(msg.author),
                         tags=tags,
                         entity_links=[
                             {
                                 "type": "discord_message",
+                                "message_id": str(msg.id),
                                 "author_id": str(msg.author.id),
-                                "channel_id": str(channel.id),
+                                "channel_id": channel_id,
                                 "is_dm": is_dm,
                             }
                         ],
                         timestamp=msg.created_at.replace(tzinfo=timezone.utc).isoformat(),
                     )
-                logger.info("Ingested %s messages from %s", limit, label)
+                if newest_seen > cursor:
+                    next_cursors[channel_id] = str(newest_seen)
+                logger.info(
+                    "Reviewed %s new Discord message(s) from %s.",
+                    channel_messages,
+                    label,
+                )
             except Exception:
-                logger.exception("Failed to ingest history for %s", label)
+                logger.exception("Failed to review Discord history for %s", label)
+
+        evidence_result = await asyncio.to_thread(
+            review_text_evidence,
+            observations,
+            alignments,
+            child=self.child,
+            source="discord_history_review",
+        )
+        mapping_updated = await asyncio.to_thread(
+            build_text_symbol_links,
+            self.child,
+            mapping_batch=mapping_batch,
+            revisit_existing=revisit_mappings,
+        )
+        return {
+            "status": "complete",
+            "new_messages": new_messages,
+            "observations": len(observations),
+            "alignments": len(evidence_result.get("pairs") or []),
+            "mapping_updated": bool(mapping_updated),
+            "revisited_budget": revisit_mappings,
+            "history_cursors": next_cursors,
+            "reviewed_message_ids": reviewed_message_ids,
+        }
 
     def _guild_voice_client(self, guild: Optional[discord.Guild]) -> Optional[discord.VoiceClient]:
         if guild is None:

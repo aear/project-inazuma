@@ -217,6 +217,102 @@ def update_text_vocab(
     return True
 
 
+def review_text_evidence(
+    observations: List[Dict[str, Any]],
+    alignments: List[tuple[str, str]],
+    *,
+    child: Optional[str] = None,
+    source: str = "language_review",
+) -> Dict[str, Any]:
+    """Apply a bounded batch of chat observations and explicit alignments once."""
+    vocab_state = load_text_vocab(child)
+    vocab = vocab_state.get("vocab", {})
+    now = _now_iso()
+    observed_messages = 0
+    pairs: List[Dict[str, str]] = []
+
+    def observe(text: str, tags: Optional[List[str]] = None) -> List[str]:
+        nonlocal observed_messages
+        words = tokenize_text(text)
+        if not words:
+            return []
+        observed_messages += 1
+        tag_list = [str(tag) for tag in tags or [] if tag]
+        for word in words:
+            entry = vocab.setdefault(
+                word, {"count": 0, "last_seen": now, "emotion_samples": 0}
+            )
+            entry["count"] = int(entry.get("count", 0)) + 1
+            entry["last_seen"] = now
+            if tag_list:
+                existing = [str(tag) for tag in entry.get("tags", []) if tag]
+                for tag in tag_list:
+                    if tag not in existing:
+                        existing.append(tag)
+                entry["tags"] = existing[-6:]
+            vocab[word] = entry
+        return words
+
+    for observation in observations or []:
+        if not isinstance(observation, dict):
+            continue
+        observe(str(observation.get("text") or ""), observation.get("tags"))
+
+    for native_text, english_text in alignments or []:
+        native_tokens = [
+            token.strip() for token in str(native_text or "").split() if token.strip()
+        ]
+        english_words = observe(
+            str(english_text or ""), ["discord", "history", "symbolic_alignment"]
+        )
+        if len(native_tokens) != len(english_words):
+            continue
+        for native_token, english_word in zip(native_tokens, english_words):
+            entry = vocab.get(english_word)
+            if not isinstance(entry, dict):
+                continue
+            symbol_counts = entry.setdefault("symbols", {})
+            symbol_counts[native_token] = int(symbol_counts.get(native_token, 0)) + 1
+            top = sorted(
+                symbol_counts.items(), key=lambda item: (-int(item[1]), item[0])
+            )[:MAX_SYMBOL_LINKS]
+            entry["symbols"] = {symbol: count for symbol, count in top}
+            vocab[english_word] = entry
+            pairs.append({"native": native_token, "english": english_word})
+
+    if observed_messages:
+        vocab_state["vocab"] = vocab
+        vocab_state["updated"] = now
+        save_text_vocab(child, vocab_state, source=source)
+    return {
+        "updated": observed_messages > 0,
+        "observed_messages": observed_messages,
+        "pairs": pairs,
+    }
+
+
+def observe_text_symbol_alignment(
+    native_text: str,
+    english_text: str,
+    *,
+    child: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    source: str = "symbolic_alignment",
+) -> Dict[str, Any]:
+    """Retain a one-to-one native/English alignment as revisable evidence."""
+    result = review_text_evidence(
+        [],
+        [(native_text, english_text)],
+        child=child,
+        source=source,
+    )
+    if result["observed_messages"] and not result["pairs"]:
+        result["reason"] = "unaligned_lengths"
+    else:
+        result["reason"] = "aligned" if result["pairs"] else "empty_alignment"
+    return result
+
+
 def create_text_fragment(
     text: str,
     *,
@@ -294,14 +390,31 @@ def record_text_observation(
         return None
 
 
+def _word_evidence_revision(meta: Any) -> str:
+    evidence = meta if isinstance(meta, dict) else {}
+    payload = {
+        "count": int(evidence.get("count", 0) or 0),
+        "tags": sorted(str(tag) for tag in evidence.get("tags", []) if tag),
+        "symbols": {
+            str(symbol): int(count)
+            for symbol, count in (evidence.get("symbols") or {}).items()
+            if symbol
+        } if isinstance(evidence.get("symbols"), dict) else {},
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def build_text_symbol_links(
     child: Optional[str] = None,
     *,
     top_words: Optional[int] = None,
     similarity_threshold: float = 0.42,
     mapping_batch: Optional[int] = None,
+    revisit_existing: int = 0,
 ) -> bool:
-    """Incrementally map every retained vocabulary word to known symbols."""
+    """Incrementally map retained words and bounded existing links to symbols."""
     child_name = _safe_child(child)
     vocab_state = load_text_vocab(child_name)
     vocab = vocab_state.get("vocab", {})
@@ -352,16 +465,56 @@ def build_text_symbol_links(
         str(link.get("word")): link for link in (prior.get("links") or [])
         if isinstance(link, dict) and link.get("word") and str(link.get("word")) in vocab_words
     }
-    evaluated = {str(word): True for word in evaluated if str(word) in vocab_words}
+    evaluated = {
+        str(word): value for word, value in evaluated.items()
+        if str(word) in vocab_words
+    }
 
     ranked_words = sorted(
         vocab.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[1].get("last_seen", ""))
     )
     if top_words is not None:
         ranked_words = ranked_words[:max(0, int(top_words))]
-    pending_words = [(word, meta) for word, meta in ranked_words if word not in evaluated]
+    pending_words = []
+    for word, meta in ranked_words:
+        evidence_revision = _word_evidence_revision(meta)
+        prior_evaluation = evaluated.get(word)
+        if prior_evaluation is True:
+            # Migrate the legacy boolean ledger without forcing a full-vocab pass.
+            evaluated[word] = {
+                "evidence_revision": evidence_revision,
+                "evaluated_at": prior.get("generated") or _now_iso(),
+                "migrated": True,
+            }
+            continue
+        prior_revision = (
+            str(prior_evaluation.get("evidence_revision") or "")
+            if isinstance(prior_evaluation, dict)
+            else ""
+        )
+        if prior_revision != evidence_revision:
+            pending_words.append((word, meta))
+
     batch_limit = _text_memory_policy()["link_batch_size"] if mapping_batch is None else max(1, int(mapping_batch))
     batch = pending_words[:batch_limit]
+    if revisit_existing > 0 and len(batch) < batch_limit:
+        pending_names = {word for word, _meta in pending_words}
+        links_by_priority = sorted(
+            links_by_word.values(),
+            key=lambda link: (
+                float(link.get("similarity", 0.0) or 0.0),
+                float(link.get("symbol_confidence", 0.0) or 0.0),
+                int(link.get("count", 0) or 0),
+                str(link.get("word") or ""),
+            ),
+        )
+        revisit_names = [
+            str(link.get("word"))
+            for link in links_by_priority
+            if link.get("word") in vocab and str(link.get("word")) not in pending_names
+        ][:max(0, int(revisit_existing))]
+        room = max(0, batch_limit - len(batch))
+        batch.extend((word, vocab[word]) for word in revisit_names[:room])
 
     for word, meta in batch:
         lang = guess_language_code(word)
@@ -370,14 +523,23 @@ def build_text_symbol_links(
         best_sim = 0.0
         best_word = None
         best_conf = None
+        best_score = 0.0
+        symbol_evidence = meta.get("symbols") if isinstance(meta, dict) else {}
+        symbol_evidence = symbol_evidence if isinstance(symbol_evidence, dict) else {}
         for sid, emb, symbol_word, symbol_confidence in sym_entries:
             sim = _get_embedder().cosine(w_emb, emb)
-            if sim > best_sim:
+            evidence_count = int(
+                symbol_evidence.get(sid, symbol_evidence.get(symbol_word, 0)) or 0
+            )
+            evidence_bonus = min(0.35, 0.12 * evidence_count)
+            score = sim + evidence_bonus
+            if score > best_score:
                 best_sim = sim
+                best_score = score
                 best = sid
                 best_word = symbol_word
                 best_conf = symbol_confidence
-        if best and best_sim >= similarity_threshold:
+        if best and best_score >= similarity_threshold:
             links_by_word[word] = {
                 "word": word,
                 "count": int(meta.get("count", 0)),
@@ -386,10 +548,17 @@ def build_text_symbol_links(
                 "symbol_word": best_word,
                 "symbol_confidence": best_conf,
                 "similarity": round(best_sim, 4),
+                "mapping_score": round(best_score, 4),
+                "evidence_count": int(
+                    symbol_evidence.get(best, symbol_evidence.get(best_word, 0)) or 0
+                ),
             }
         else:
             links_by_word.pop(word, None)
-        evaluated[word] = True
+        evaluated[word] = {
+            "evidence_revision": _word_evidence_revision(meta),
+            "evaluated_at": _now_iso(),
+        }
 
     rank = {word: index for index, (word, _meta) in enumerate(ranked_words)}
     links = sorted(links_by_word.values(), key=lambda link: rank.get(str(link.get("word")), len(rank)))
@@ -417,6 +586,8 @@ __all__ = [
     "load_text_vocab",
     "save_text_vocab",
     "update_text_vocab",
+    "review_text_evidence",
+    "observe_text_symbol_alignment",
     "create_text_fragment",
     "record_text_observation",
     "build_text_symbol_links",
