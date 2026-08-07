@@ -7,9 +7,12 @@ import pytest
 import daw_engine as daw
 from daw_engine import (
     PROJECT_SCHEMA_VERSION,
+    SUPPORTED_PROJECT_SCHEMA_VERSIONS,
+    AudioStem,
     DawProject,
     DawValidationError,
     InstrumentTrack,
+    MAX_AUDIO_STEMS,
     Step,
     VocalClip,
     export_project_wav,
@@ -157,6 +160,119 @@ def test_vocal_clip_can_extend_project_render(tmp_path: Path):
     assert rendered.shape == (5_600,)
     assert rendered[-2] == pytest.approx(0.1, abs=1e-4)
 
+
+
+def test_stem_bus_mixes_gain_and_solo_without_changing_alignment(tmp_path: Path):
+    drums = write_wav(
+        tmp_path / "Drums.wav",
+        np.full(800, 0.2, dtype=np.float32),
+        8_000,
+    )
+    bass = write_wav(
+        tmp_path / "Bass.wav",
+        np.full(800, 0.3, dtype=np.float32),
+        8_000,
+    )
+    project = _short_project(
+        audio_stems=[
+            AudioStem(path=str(drums), name="Drums", role="drums"),
+            AudioStem(path=str(bass), name="Bass", role="bass", gain=0.5),
+        ]
+    )
+
+    mixed = render_project(project, normalize=False)
+    assert mixed[100] == pytest.approx(0.35, abs=1e-4)
+    assert np.count_nonzero(render_project(project, include_stems=False)) == 0
+
+    project.audio_stems[0].solo = True
+    project.vocal_clips = [VocalClip(path=str(bass), gain=1.0)]
+    project.tracks = [
+        InstrumentTrack(
+            waveform="sine",
+            gain=1.0,
+            attack_seconds=0,
+            release_seconds=0,
+            steps=[Step(position=0, note=69, velocity=1.0)],
+        )
+    ]
+    soloed = render_project(project, normalize=False)
+    drum_audio, _rate = read_wav(drums)
+    np.testing.assert_allclose(soloed[: len(drum_audio)], drum_audio, atol=1e-7)
+    assert np.count_nonzero(soloed[len(drum_audio):]) == 0
+
+
+def test_stem_resamples_at_fractional_beat_and_extends_project(tmp_path: Path):
+    stem_path = write_wav(
+        tmp_path / "Keys.wav",
+        np.full(4_000, 0.25, dtype=np.float32),
+        4_000,
+    )
+    project = _short_project(
+        bpm=60,
+        beats_per_bar=1,
+        steps_per_beat=4,
+        audio_stems=[AudioStem(path=str(stem_path), offset_beats=0.5)],
+    )
+
+    rendered = render_project(project, normalize=False)
+
+    assert rendered.shape == (12_000,)
+    assert np.count_nonzero(rendered[:4_000]) == 0
+    assert rendered[4_100] == pytest.approx(0.25, abs=1e-4)
+    assert rendered[-2] == pytest.approx(0.25, abs=1e-4)
+
+
+def test_stem_schema_v2_round_trip_and_v1_migration():
+    legacy = _short_project().to_dict()
+    legacy["schema_version"] = 1
+    legacy.pop("audio_stems")
+    assert DawProject.from_dict(legacy).audio_stems == []
+
+    project = _short_project(
+        audio_stems=[
+            AudioStem(
+                path="stems/song/01_Vocals.wav",
+                name="Lead Vocals",
+                role="vocals",
+                collection="Godhunter's Lullaby",
+                gain=0.8,
+                solo=True,
+            )
+        ]
+    )
+    restored = DawProject.from_dict(project.to_dict())
+
+    assert restored == project
+    assert restored.audio_stems[0].collection == "Godhunter's Lullaby"
+    assert SUPPORTED_PROJECT_SCHEMA_VERSIONS == {1, 2}
+    with pytest.raises(DawValidationError, match="schema version"):
+        DawProject.from_dict({"schema_version": True})
+
+    stem_payload = {"audio_stems": [{"path": "stems/Vocals.wav"}]}
+    with pytest.raises(DawValidationError, match="version 1 cannot contain"):
+        DawProject.from_dict(stem_payload)
+    stem_payload["schema_version"] = 1
+    with pytest.raises(DawValidationError, match="version 1 cannot contain"):
+        DawProject.from_dict(stem_payload)
+
+
+def test_muted_or_excluded_missing_stem_never_opens_wav(tmp_path: Path):
+    project = _short_project(
+        audio_stems=[AudioStem(path=str(tmp_path / "missing.wav"), muted=True)]
+    )
+
+    assert render_project(project, normalize=False).shape == (8_000,)
+    project.audio_stems[0].muted = False
+    assert render_project(project, include_stems=False, normalize=False).shape == (8_000,)
+    with pytest.raises(FileNotFoundError):
+        render_project(project, normalize=False)
+
+
+def test_stem_count_is_bounded_before_render_io():
+    with pytest.raises(DawValidationError, match="audio stems"):
+        _short_project(
+            audio_stems=[AudioStem(path=f"stem_{index}.wav") for index in range(MAX_AUDIO_STEMS + 1)]
+        )
 
 def test_pcm_wav_read_write_and_project_export(tmp_path: Path):
     stereo = np.column_stack(

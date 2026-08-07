@@ -21,7 +21,8 @@ import wave
 import numpy as np
 
 
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
+SUPPORTED_PROJECT_SCHEMA_VERSIONS = frozenset({1, 2})
 SUPPORTED_WAVEFORMS = frozenset({"sine", "square", "triangle", "saw", "noise"})
 
 # These limits are deliberately generous for a small interactive studio while
@@ -37,6 +38,8 @@ MAX_BARS = 4_096
 MAX_TRACKS = 128
 MAX_STEPS = 100_000
 MAX_VOCAL_CLIPS = 256
+MAX_AUDIO_STEMS = 32
+MAX_PLACED_WAVS = 256
 MAX_PROJECT_JSON_BYTES = 32 * 1024 * 1024
 MAX_GAIN = 16.0
 MAX_ENVELOPE_SECONDS = 60.0
@@ -290,36 +293,39 @@ class InstrumentTrack:
 
 
 @dataclass(eq=True)
-class VocalClip:
-    """A WAV clip placed at an offset measured in musical beats."""
+class _PlacedWav:
+    """Shared validated shape for a WAV placed on the project timeline."""
 
     path: str
     offset_beats: float = 0.0
     gain: float = 1.0
     muted: bool = False
-    name: str = "Vocal"
+    name: str = "Clip"
+
+    _kind = "audio clip"
+    _default_name = "Clip"
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> None:
         if not isinstance(self.path, (str, os.PathLike)) or not str(self.path):
-            raise DawValidationError("vocal clip path must not be empty")
+            raise DawValidationError(f"{self._kind} path must not be empty")
         self.path = os.fspath(self.path)
         if not isinstance(self.path, str):
-            raise DawValidationError("vocal clip path must be text")
+            raise DawValidationError(f"{self._kind} path must be text")
         self.offset_beats = _require_float(
             self.offset_beats,
-            "vocal offset",
+            f"{self._kind} offset",
             minimum=0.0,
             maximum=MAX_OFFSET_BEATS,
         )
         self.gain = _require_float(
-            self.gain, "vocal gain", minimum=0.0, maximum=MAX_GAIN
+            self.gain, f"{self._kind} gain", minimum=0.0, maximum=MAX_GAIN
         )
         if not isinstance(self.muted, bool):
-            raise DawValidationError("vocal muted must be a boolean")
-        self.name = str(self.name or "Vocal")
+            raise DawValidationError(f"{self._kind} muted must be a boolean")
+        self.name = str(self.name or self._default_name)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -331,15 +337,69 @@ class VocalClip:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "VocalClip":
+    def from_dict(cls, value: Mapping[str, Any]) -> "_PlacedWav":
         if not isinstance(value, Mapping):
-            raise DawValidationError("vocal clip must be an object")
+            raise DawValidationError(f"{cls._kind} must be an object")
         return cls(
-            name=value.get("name", "Vocal"),
+            name=value.get("name", cls._default_name),
             path=value.get("path"),
             offset_beats=value.get("offset_beats", 0.0),
             gain=value.get("gain", 1.0),
             muted=value.get("muted", False),
+        )
+
+
+@dataclass(eq=True)
+class VocalClip(_PlacedWav):
+    """A vocal WAV placed at an offset measured in musical beats."""
+
+    name: str = "Vocal"
+    _kind = "vocal clip"
+    _default_name = "Vocal"
+
+
+@dataclass(eq=True)
+class AudioStem(_PlacedWav):
+    """A first-class instrumental or vocal stem in an arrangement."""
+
+    name: str = "Stem"
+    role: str = "other"
+    collection: str = ""
+    solo: bool = False
+    _kind = "audio stem"
+    _default_name = "Stem"
+
+    def validate(self) -> None:
+        super().validate()
+        self.role = str(self.role or "other").strip()[:80] or "other"
+        self.collection = str(self.collection or "").strip()[:120]
+        if not isinstance(self.solo, bool):
+            raise DawValidationError("audio stem solo must be a boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(
+            {
+                "role": self.role,
+                "collection": self.collection,
+                "solo": self.solo,
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "AudioStem":
+        if not isinstance(value, Mapping):
+            raise DawValidationError("audio stem must be an object")
+        return cls(
+            name=value.get("name", cls._default_name),
+            path=value.get("path"),
+            offset_beats=value.get("offset_beats", 0.0),
+            gain=value.get("gain", 1.0),
+            muted=value.get("muted", False),
+            role=value.get("role", "other"),
+            collection=value.get("collection", ""),
+            solo=value.get("solo", False),
         )
 
 
@@ -357,6 +417,7 @@ class DawProject:
     vocal_clips: list[VocalClip] = field(default_factory=list)
     master_gain: float = 0.85
     seed: int = 0
+    audio_stems: list[AudioStem] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -423,6 +484,16 @@ class DawProject:
             raise DawValidationError(
                 f"project vocal clips must contain at most {MAX_VOCAL_CLIPS} clips"
             )
+        if not isinstance(self.audio_stems, list):
+            raise DawValidationError("project audio stems must be a list")
+        if len(self.audio_stems) > MAX_AUDIO_STEMS:
+            raise DawValidationError(
+                f"project audio stems must contain at most {MAX_AUDIO_STEMS} stems"
+            )
+        if len(self.vocal_clips) + len(self.audio_stems) > MAX_PLACED_WAVS:
+            raise DawValidationError(
+                f"project must contain at most {MAX_PLACED_WAVS} placed WAV clips"
+            )
 
         validated_tracks: list[InstrumentTrack] = []
         step_count = 0
@@ -448,6 +519,13 @@ class DawProject:
             validated_clips.append(clip)
         self.vocal_clips = validated_clips
 
+        validated_stems: list[AudioStem] = []
+        for item in self.audio_stems:
+            stem = item if isinstance(item, AudioStem) else AudioStem.from_dict(item)
+            stem.validate()
+            validated_stems.append(stem)
+        self.audio_stems = validated_stems
+
         for track in self.tracks:
             for step in track.steps:
                 if step.position >= self.total_steps:
@@ -471,17 +549,28 @@ class DawProject:
             "seed": self.seed,
             "tracks": [track.to_dict() for track in self.tracks],
             "vocal_clips": [clip.to_dict() for clip in self.vocal_clips],
+            "audio_stems": [stem.to_dict() for stem in self.audio_stems],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "DawProject":
         if not isinstance(value, Mapping):
             raise DawValidationError("project must be an object")
-        schema_version = value.get("schema_version", PROJECT_SCHEMA_VERSION)
-        if schema_version != PROJECT_SCHEMA_VERSION:
+        schema_version = value.get("schema_version", 1)
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in SUPPORTED_PROJECT_SCHEMA_VERSIONS
+        ):
             raise DawValidationError(
                 f"unsupported project schema version {schema_version!r}"
             )
+        stored_stems = value.get("audio_stems")
+        if schema_version == 1 and stored_stems is not None:
+            if not isinstance(stored_stems, list) or stored_stems:
+                raise DawValidationError(
+                    "project schema version 1 cannot contain audio stems"
+                )
         return cls(
             name=value.get("name", "Untitled"),
             sample_rate=value.get("sample_rate", 44_100),
@@ -493,6 +582,11 @@ class DawProject:
             seed=value.get("seed", 0),
             tracks=value.get("tracks", []),
             vocal_clips=value.get("vocal_clips", []),
+            audio_stems=(
+                stored_stems
+                if schema_version >= 2 and stored_stems is not None
+                else []
+            ),
         )
 
 
@@ -522,11 +616,19 @@ def _step_sample_bounds(step: Step, project: DawProject) -> tuple[int, int, int]
     return start, duration_samples, end
 
 
-def _vocal_offset_sample(clip: VocalClip, project: DawProject) -> int:
+def _placed_wav_offset_sample(
+    clip: _PlacedWav,
+    project: DawProject,
+    label: str,
+) -> int:
     offset_seconds = clip.offset_beats * 60.0 / project.bpm
     return _samples_for_seconds(
-        offset_seconds, project.sample_rate, "vocal offset"
+        offset_seconds, project.sample_rate, f"{label} offset"
     )
+
+
+def _vocal_offset_sample(clip: VocalClip, project: DawProject) -> int:
+    return _placed_wav_offset_sample(clip, project, "vocal")
 
 
 def _validate_project_timeline(project: DawProject) -> None:
@@ -541,6 +643,8 @@ def _validate_project_timeline(project: DawProject) -> None:
             _step_sample_bounds(step, project)
     for clip in project.vocal_clips:
         _vocal_offset_sample(clip, project)
+    for stem in project.audio_stems:
+        _placed_wav_offset_sample(stem, project, "stem")
 
 
 def midi_note_to_frequency(note: int, *, tuning_hz: float = 440.0) -> float:
@@ -853,23 +957,62 @@ def _extend_audio(audio: np.ndarray, output_samples: int) -> np.ndarray:
     return extended
 
 
+def _mix_placed_wavs(
+    rendered: np.ndarray,
+    clips: Sequence[_PlacedWav],
+    project: DawProject,
+    *,
+    base_path: str | os.PathLike[str] | None,
+    label: str,
+) -> np.ndarray:
+    """Mix one validated bus of placed WAVs into an existing mono buffer."""
+    for clip in clips:
+        if clip.muted:
+            continue
+        offset_samples = _placed_wav_offset_sample(clip, project, label)
+        clip_audio, clip_rate = _read_wav_for_render(
+            _resolve_clip_path(clip.path, base_path),
+            target_sample_rate=project.sample_rate,
+            maximum_target_frames=MAX_RENDER_SAMPLES - offset_samples,
+            source_label=label,
+        )
+        clip_audio = resample_audio(
+            clip_audio, clip_rate, project.sample_rate
+        )
+        if clip_audio.size == 0:
+            continue
+        clip_end = _require_render_sample_count(
+            offset_samples + len(clip_audio), f"{label} end"
+        )
+        rendered = _extend_audio(rendered, clip_end)
+        with np.errstate(over="ignore", invalid="ignore"):
+            rendered[offset_samples:clip_end] += clip_audio * clip.gain
+        _as_finite_float32_vector(rendered, "project mix")
+    return rendered
+
+
 def render_project(
     project: DawProject,
     *,
     include_vocals: bool = True,
+    include_stems: bool = True,
     normalize: bool = True,
     peak: float = 0.98,
     base_path: str | os.PathLike[str] | None = None,
 ) -> np.ndarray:
     """Render a project, extending it to include clip and note tails.
 
-    Relative vocal paths are resolved against ``base_path``. A caller that
-    loaded a project file should pass that project's parent directory.
+    Relative vocal and stem paths are resolved against ``base_path``. A
+    caller that loaded a project file should pass that project's asset root.
     """
 
     project = _validated_project(project)
+    stem_solo_active = bool(
+        include_stems and any(stem.solo for stem in project.audio_stems)
+    )
     rendered = np.zeros(_base_sample_count(project), dtype=np.float32)
-    for track_index, track in enumerate(project.tracks):
+    instrument_tracks = () if stem_solo_active else project.tracks
+    for track_index, track in enumerate(instrument_tracks):
         track_audio = render_instrument_track(
             track, project, track_index=track_index
         )
@@ -878,28 +1021,25 @@ def render_project(
             rendered[: len(track_audio)] += track_audio
         _as_finite_float32_vector(rendered, "project mix")
 
-    if include_vocals:
-        for clip in project.vocal_clips:
-            if clip.muted:
-                continue
-            offset_samples = _vocal_offset_sample(clip, project)
-            clip_audio, clip_rate = _read_wav_for_render(
-                _resolve_clip_path(clip.path, base_path),
-                target_sample_rate=project.sample_rate,
-                maximum_target_frames=MAX_RENDER_SAMPLES - offset_samples,
-            )
-            clip_audio = resample_audio(
-                clip_audio, clip_rate, project.sample_rate
-            )
-            if clip_audio.size == 0:
-                continue
-            clip_end = _require_render_sample_count(
-                offset_samples + len(clip_audio), "vocal clip end"
-            )
-            rendered = _extend_audio(rendered, clip_end)
-            with np.errstate(over="ignore", invalid="ignore"):
-                rendered[offset_samples:clip_end] += clip_audio * clip.gain
-            _as_finite_float32_vector(rendered, "project mix")
+    if include_vocals and not stem_solo_active:
+        rendered = _mix_placed_wavs(
+            rendered,
+            project.vocal_clips,
+            project,
+            base_path=base_path,
+            label="vocal clip",
+        )
+    if include_stems:
+        stem_bus: Sequence[AudioStem] = project.audio_stems
+        if stem_solo_active:
+            stem_bus = tuple(stem for stem in stem_bus if stem.solo)
+        rendered = _mix_placed_wavs(
+            rendered,
+            stem_bus,
+            project,
+            base_path=base_path,
+            label="audio stem",
+        )
 
     with np.errstate(over="ignore", invalid="ignore"):
         rendered *= project.master_gain
@@ -933,6 +1073,7 @@ def _read_wav_for_render(
     *,
     target_sample_rate: int | None = None,
     maximum_target_frames: int | None = None,
+    source_label: str = "audio clip",
 ) -> tuple[np.ndarray, int]:
     wav_path = Path(path)
     with wave.open(str(wav_path), "rb") as source:
@@ -965,14 +1106,14 @@ def _read_wav_for_render(
             if target_sample_rate is None or maximum_target_frames is None:
                 raise DawValidationError("incomplete WAV render limits")
             maximum = _require_render_sample_count(
-                maximum_target_frames, "available vocal render length"
+                maximum_target_frames, f"available {source_label} render length"
             )
             target_frames = _resampled_sample_count(
                 frame_count, sample_rate, target_sample_rate
             )
             if target_frames > maximum:
                 raise DawValidationError(
-                    "vocal clip exceeds the remaining render-sample budget"
+                    f"{source_label} exceeds the remaining render-sample budget"
                 )
         expected_bytes = frame_count * channels * sample_width
         frames = source.readframes(frame_count)
@@ -1107,13 +1248,17 @@ def load_project(path: str | os.PathLike[str]) -> DawProject:
 
 __all__ = [
     "PROJECT_SCHEMA_VERSION",
+    "SUPPORTED_PROJECT_SCHEMA_VERSIONS",
     "SUPPORTED_WAVEFORMS",
     "MAX_RENDER_SAMPLES",
     "MAX_PROJECT_JSON_BYTES",
+    "MAX_AUDIO_STEMS",
+    "MAX_PLACED_WAVS",
     "DawValidationError",
     "Step",
     "InstrumentTrack",
     "VocalClip",
+    "AudioStem",
     "DawProject",
     "Project",
     "midi_note_to_frequency",

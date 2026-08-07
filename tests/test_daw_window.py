@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("tkinter")
 
 import daw_window as daw_module
+from daw_engine import AudioStem, VocalClip
 from daw_window import (
     BoundedExecutor,
     DawWindow,
@@ -34,9 +35,27 @@ def test_studio_paths_and_names_stay_bounded(tmp_path):
     paths = studio_paths("Ina", base_path=tmp_path)
 
     assert paths.projects == tmp_path / "Ina" / "memory" / "music_studio" / "projects"
+    assert paths.stems == tmp_path / "Ina" / "memory" / "music_studio" / "stems"
     assert path_is_within(paths.recordings / "take.wav", paths.root)
     assert not path_is_within(tmp_path / "outside.wav", paths.root)
     assert safe_filename_stem("  Soft orbit / take #1  ") == "Soft_orbit_take_1"
+
+def test_studio_paths_reject_symlinked_managed_stem_folder(tmp_path):
+    paths = studio_paths("Ina", base_path=tmp_path)
+    paths.root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        paths.stems.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        paths.ensure()
+
+    assert list(outside.iterdir()) == []
+
+
 
 
 def test_default_project_is_a_multi_track_sixteen_step_loop():
@@ -495,6 +514,194 @@ def test_executor_keeps_child_lock_until_running_job_drains(tmp_path):
         contender.release()
         executor.shutdown()
 
+
+
+def test_control_api_exposes_mix_only_stem_commands_and_manual_import():
+    payload = daw_control_api_payload()
+    actions = {item["action"] for item in payload["commands"]}
+
+    assert payload["version"] == 2
+    assert {"set_stem", "preview_stem"} <= actions
+    assert "import_stem" not in actions
+    assert payload["stem_import"]["mode"] == "manual_only"
+    assert payload["limits"]["audio_stems_max"] >= 1
+
+
+def _committed_stem_result(tmp_path):
+    paths = studio_paths("Ina", base_path=tmp_path).ensure()
+    collection = paths.stems / "Godhunter_Lullaby"
+    collection.mkdir()
+    stem_path = collection / "01_Lead_Vocals.wav"
+    stem_path.write_bytes(b"RIFF")
+    manifest_path = collection / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    result = SimpleNamespace(
+        collection_dir=collection,
+        collection_name="Godhunter's Lullaby",
+        stems=(
+            SimpleNamespace(
+                path=stem_path,
+                name="Lead Vocals",
+                role="vocals",
+            ),
+        ),
+        companions=(),
+        manifest_path=manifest_path,
+    )
+    return paths, result
+
+
+def test_committed_stem_collection_attaches_only_after_full_validation(tmp_path):
+    paths, result = _committed_stem_result(tmp_path)
+    window = object.__new__(DawWindow)
+    window.paths = paths
+    window.project = create_default_project()
+    window._known_stem_collections = {}
+    events = []
+    window._refresh_stem_list = lambda: events.append("refresh")
+    window._set_status = lambda text: events.append(text)
+    window._publish_workspace = lambda event, **extra: events.append((event, extra))
+
+    DawWindow._add_stem_import_result(window, result)
+
+    assert len(window.project.audio_stems) == 1
+    assert window.project.audio_stems[0].path == (
+        "stems/Godhunter_Lullaby/01_Lead_Vocals.wav"
+    )
+    assert window._known_stem_collections["Godhunter's Lullaby"] == (
+        "stems/Godhunter_Lullaby/manifest.json"
+    )
+    assert events[-1][0] == "stems_imported"
+
+
+def test_committed_stem_collection_remains_library_only_when_project_is_full(tmp_path):
+    paths, result = _committed_stem_result(tmp_path)
+    window = object.__new__(DawWindow)
+    window.paths = paths
+    window.project = create_default_project()
+    window.project.audio_stems = [
+        AudioStem(
+            path=f"stems/existing/{index:02d}.wav",
+            name=f"Existing {index}",
+            collection="Existing",
+        )
+        for index in range(daw_module.MAX_AUDIO_STEMS)
+    ]
+    window.project.validate()
+    window._known_stem_collections = {}
+    before = list(window.project.audio_stems)
+
+    with pytest.raises(daw_module.StemCollectionAttachmentError, match="no longer fits"):
+        DawWindow._add_stem_import_result(window, result)
+
+    assert window.project.audio_stems == before
+    assert "Godhunter's Lullaby" in window._known_stem_collections
+
+
+def test_vocal_completion_cannot_overfill_shared_placed_wav_limit(tmp_path):
+    paths = studio_paths("Ina", base_path=tmp_path).ensure()
+    take = paths.recordings / "late_take.wav"
+    take.write_bytes(b"RIFF")
+    window = object.__new__(DawWindow)
+    window.paths = paths
+    window.project = create_default_project()
+    window.project.audio_stems = [
+        AudioStem(
+            path=f"stems/existing/{index:02d}.wav",
+            name=f"Existing {index}",
+        )
+        for index in range(daw_module.MAX_AUDIO_STEMS)
+    ]
+    vocal_count = daw_module.MAX_PLACED_WAVS - len(window.project.audio_stems)
+    window.project.vocal_clips = [
+        VocalClip(
+            path=f"recordings/existing_{index:03d}.wav",
+            name=f"Existing take {index}",
+        )
+        for index in range(vocal_count)
+    ]
+    window.project.validate()
+    before = list(window.project.vocal_clips)
+    window._refresh_vocal_list = lambda: None
+    window._publish_workspace = lambda _event, **_extra: {}
+
+    with pytest.raises(ValueError, match="placed WAV"):
+        DawWindow._add_vocal_path(window, take, 0.0, "Late take")
+
+    assert window.project.vocal_clips == before
+
+
+def test_stem_import_waits_for_pending_project_load():
+    window = object.__new__(DawWindow)
+    window._stem_import_pending = False
+    window._project_load_pending = True
+    messages = []
+    window._set_status = messages.append
+
+
+def test_set_stem_updates_bounded_mix_fields_without_tk():
+    window = object.__new__(DawWindow)
+    window.project = create_default_project()
+    window.project.audio_stems = [
+        AudioStem(
+            path="stems/Godhunter/01_Vocals.wav",
+            name="Lead Vocals",
+            collection="Godhunter's Lullaby",
+        )
+    ]
+    events = []
+    window._refresh_stem_list = lambda: events.append("refresh")
+    window._publish_workspace = lambda event, **extra: events.append((event, extra))
+
+    payload = DawWindow.set_stem(
+        window,
+        0,
+        {"gain": 0.75, "offset_beats": 0.5, "role": "vocals", "solo": True},
+    )
+
+    assert payload["gain"] == pytest.approx(0.75)
+    assert payload["offset_beats"] == pytest.approx(0.5)
+    assert payload["role"] == "vocals"
+    assert payload["solo"] is True
+    assert payload["collection"] == "Godhunter's Lullaby"
+    assert events[0] == "refresh"
+    with pytest.raises(ValueError, match="stem gain"):
+        DawWindow.set_stem(window, 0, {"gain": 4.1})
+
+
+def test_selected_stem_cannot_start_after_stop(monkeypatch, tmp_path):
+    window, device = _bare_transport_window(monkeypatch)
+    window.project = SimpleNamespace(
+        audio_stems=[
+            SimpleNamespace(
+                path="stems/Godhunter/01_Vocals.wav",
+                gain=0.8,
+                name="Lead Vocals",
+            )
+        ]
+    )
+    window.paths = SimpleNamespace(root=tmp_path, stems=tmp_path / "stems")
+    pending = {}
+
+    def capture(_label, operation, on_success=None, on_error=None):
+        pending.update(operation=operation, success=on_success, error=on_error)
+        return True
+
+    window._background = capture
+    monkeypatch.setattr(
+        daw_module,
+        "read_wav",
+        lambda _path: pytest.fail("stale stem job should not read or play audio"),
+    )
+
+    assert DawWindow._preview_stem_index(window, 0) is True
+    assert device.stop_calls == 1
+
+    DawWindow.stop_playback(window)
+    sample_count, cancelled = pending["operation"]()
+
+    assert (sample_count, cancelled) == (0, True)
+    assert device.play_calls == []
 
 def test_note_preview_cannot_start_after_stop(monkeypatch):
     window, device = _bare_transport_window(monkeypatch)

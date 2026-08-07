@@ -22,7 +22,7 @@ import time
 import xml.etree.ElementTree as ET
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _IMAGE_IMPORT_ERROR = None
 try:
@@ -138,7 +138,11 @@ DEFAULT_CODE_SCAN_PRUNED_DIRS = frozenset(
         "dist",
     }
 )
-AUDIO_ONLY_SCAN_EXTENSIONS = frozenset({".wav", ".mp3", ".opus"})
+MUSIC_SCAN_EXTENSIONS = frozenset(
+    {".wav", ".mp3", ".opus", ".txt", ".md", ".json", ".zip"}
+)
+# Compatibility name for the existing music-root traversal flag.
+AUDIO_ONLY_SCAN_EXTENSIONS = MUSIC_SCAN_EXTENSIONS
 
 DEFAULT_SELF_READ_PREFS = {
     "source_choices": {
@@ -160,6 +164,22 @@ DEFAULT_SELF_READ_PREFS = {
 }
 
 SIGNED_MUSIC_ARTISTS = ("rapidcrest",)
+
+
+INA_MUSIC_TEXT_SOURCE_ANNOTATION = {
+    "tags": ["ina_music", "music_language", "music_context"],
+    "flags": ["music", "reading_context"],
+    "provenance": "ina_music_language_context",
+    "ownership": "self_creation",
+}
+
+
+MUSIC_TEXT_SOURCE_ANNOTATION = {
+    "tags": ["music", "music_language", "music_context"],
+    "flags": ["music", "reading_context"],
+    "provenance": "music_language_context",
+    "ownership": "unattributed",
+}
 
 
 SOURCE_ANNOTATIONS = {
@@ -518,7 +538,40 @@ def _signed_music_artist_hint(relative_label):
     return None
 
 
-def _source_annotations(source_key, relative_label):
+def _ina_owned_music_path(relative_label):
+    """Recognize the explicit Ina-authored namespace in a music library."""
+    normalized = str(relative_label or "").replace("\\", "/")
+    parts = [part.strip().casefold() for part in normalized.split("/") if part.strip()]
+    return any(re.match(r"^ina[\s_-]+sings\b", part) for part in parts)
+
+
+def _is_studio_stem_root(base_root):
+    root_path = Path(base_root)
+    return root_path.name == "stems" and root_path.parent.name == "music_studio"
+
+
+def _studio_collection_context(relative_label):
+    """Return collection and manifest labels for a studio-local relative path."""
+    normalized = str(relative_label or "").replace("\\", "/").strip("/")
+    if not normalized:
+        return "", "manifest.json"
+    parent = PurePosixPath(normalized).parent
+    collection = "" if parent.as_posix() == "." else parent.as_posix()
+    manifest = (
+        (parent / "manifest.json").as_posix()
+        if collection
+        else "manifest.json"
+    )
+    return collection, manifest
+
+
+def _source_annotations(
+    source_key,
+    relative_label,
+    modality=None,
+    *,
+    ina_owned_music=False,
+):
     artist = _signed_music_artist_hint(relative_label) if source_key == "music" else None
     if artist:
         return {
@@ -527,6 +580,13 @@ def _source_annotations(source_key, relative_label):
             "provenance": "signed_artist_catalog",
             "ownership": "external_artist",
         }, artist
+    if source_key == "music" and modality == "text":
+        annotation = (
+            INA_MUSIC_TEXT_SOURCE_ANNOTATION
+            if ina_owned_music
+            else MUSIC_TEXT_SOURCE_ANNOTATION
+        )
+        return annotation, None
     return SOURCE_ANNOTATIONS.get(source_key), None
 
 
@@ -537,7 +597,17 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
     context.setdefault("relative_path", relative_label)
     context.setdefault("root_path", str(base_root))
 
-    annotations, external_artist = _source_annotations(source_key, relative_label)
+    modality = str(fragment.get("modality") or "").casefold() or None
+    studio_stem_root = _is_studio_stem_root(base_root)
+    annotations, external_artist = _source_annotations(
+        source_key,
+        relative_label,
+        modality,
+        ina_owned_music=(
+            source_key == "music"
+            and (studio_stem_root or _ina_owned_music_path(relative_label))
+        ),
+    )
     if not annotations:
         return
 
@@ -580,14 +650,48 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
         env_file = Path(relative_label).name if relative_label else ""
         if env_file:
             context.setdefault("environment_file", env_file)
-    elif source_key == "music" and external_artist:
-        context.setdefault("external_artist_hint", external_artist)
-        context.setdefault("catalog_relationship", "signed_artist")
     elif source_key == "music":
-        context.setdefault("self_voice_hint", "ina_voice_reference")
-        voice_name = Path(relative_label).stem if relative_label else ""
-        if voice_name:
-            context.setdefault("self_voice_reference", voice_name)
+        archive_category = str(context.get("archive_member_category") or "").casefold()
+        archive_member = str(context.get("archive_member_path") or "")
+        if external_artist:
+            context.setdefault("external_artist_hint", external_artist)
+            context.setdefault("catalog_relationship", "signed_artist")
+
+        if modality == "text":
+            context_label = archive_member or relative_label
+            lowered = str(context_label).casefold()
+            asset_kind = (
+                "lyrics_style_context"
+                if any(token in lowered for token in ("lyric", "style", "prompt"))
+                else "music_context"
+            )
+            for tag in ("music_language", "music_context", asset_kind):
+                if tag not in tags:
+                    tags.append(tag)
+            context.setdefault("music_asset_kind", asset_kind)
+            context.setdefault("music_language_reference", Path(context_label).stem)
+        elif not external_artist:
+            context.setdefault("self_voice_hint", "ina_voice_reference")
+            voice_name = Path(relative_label).stem if relative_label else ""
+            if voice_name:
+                context.setdefault("self_voice_reference", voice_name)
+
+        if archive_category == "audio" or (studio_stem_root and modality == "audio"):
+            if "music_stem" not in tags:
+                tags.append("music_stem")
+            stem_source = archive_member or relative_label
+            context.setdefault("music_asset_kind", "stem")
+            context.setdefault("stem_label", Path(stem_source).stem)
+            if archive_member:
+                context.setdefault("stem_container_relative_path", relative_label)
+
+        if studio_stem_root:
+            collection_path, manifest_path = _studio_collection_context(relative_label)
+            if collection_path:
+                context.setdefault("stem_collection_relative_path", collection_path)
+            context.setdefault("stem_manifest_relative_path", manifest_path)
+            if modality == "text":
+                context.setdefault("stem_collection_context", True)
 
 
 def _read_limited(stream, limit):
@@ -2051,6 +2155,7 @@ def process_archive(
     member_limit=ARCHIVE_MEMBER_COUNT_LIMIT,
     aggregate_limit=ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT,
     fragment_limit=ARCHIVE_FRAGMENT_LIMIT,
+    allowed_categories=None,
 ):
     """Process a bounded archive sample without materializing an unbounded result."""
     fragments = []
@@ -2062,6 +2167,11 @@ def process_archive(
         min(ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT, int(aggregate_limit)),
     )
     fragment_limit = max(1, min(ARCHIVE_FRAGMENT_LIMIT, int(fragment_limit)))
+    category_allowlist = (
+        None
+        if allowed_categories is None
+        else frozenset(str(item).strip().casefold() for item in allowed_categories)
+    )
     budget_notice = None
 
     def note_budget(reason):
@@ -2073,6 +2183,8 @@ def process_archive(
             )
 
     def append_member(data, inner_path, category):
+        if category_allowlist is not None and category not in category_allowlist:
+            return True
         generated = list(
             _fragments_from_data_buffer(
                 data,
@@ -2083,6 +2195,18 @@ def process_archive(
             )
             or []
         )
+        member_path = str(inner_path).replace("\\", "/")
+        member_name = member_path.rsplit("/", 1)[-1]
+        for fragment in generated:
+            context = fragment.setdefault("source_context", {})
+            context.setdefault("archive_container_name", path.name)
+            context.setdefault("archive_member_path", member_path)
+            context.setdefault("archive_member_name", member_name)
+            context.setdefault("archive_member_category", category)
+            tags = fragment.setdefault("tags", [])
+            for tag in ("archive_member", f"archive_{category}_member"):
+                if tag not in tags:
+                    tags.append(tag)
         remaining = max(0, fragment_limit - len(fragments))
         fragments.extend(generated[:remaining])
         if len(generated) > remaining or len(fragments) >= fragment_limit:
@@ -2128,6 +2252,8 @@ def process_archive(
                     )
                     if not category or category == "archive":
                         continue
+                    if category_allowlist is not None and category not in category_allowlist:
+                        continue
                     remaining_bytes = aggregate_limit - decompressed_bytes
                     try:
                         with archive.open(info, "r") as member:
@@ -2155,6 +2281,8 @@ def process_archive(
                         [suffix.lower() for suffix in inner_path.suffixes]
                     )
                     if not category or category == "archive":
+                        continue
+                    if category_allowlist is not None and category not in category_allowlist:
                         continue
                     extracted = archive.extractfile(member)
                     if extracted is None:
@@ -2187,7 +2315,14 @@ def process_archive(
                 category = classify_suffixes(
                     [suffix.lower() for suffix in inner_name.suffixes]
                 )
-                if category and category != "archive":
+                if (
+                    category
+                    and category != "archive"
+                    and (
+                        category_allowlist is None
+                        or category in category_allowlist
+                    )
+                ):
                     try:
                         with opener(path, "rb") as compressed:
                             data = _read_limited(
@@ -2289,6 +2424,9 @@ def self_read_and_train():
             log_to_statusbox("[SelfRead] Preference: book folder skipped by choice.")
 
         if source_choices.get("music", True):
+            studio_stems_path = _child_memory_path(child, "music_studio", "stems")
+            if studio_stems_path.exists():
+                add_root(studio_stems_path, audio_only=True, source_key="music")
             if music_folder_path and music_folder_path.exists():
                 add_root(music_folder_path, audio_only=True, source_key="music")
             elif music_folder_path:
@@ -2406,7 +2544,15 @@ def self_read_and_train():
                 result = fragment_video(path, transformer)
 
             elif category == "archive":
-                result = process_archive(path, transformer)
+                result = process_archive(
+                    path,
+                    transformer,
+                    allowed_categories=(
+                        {"audio", "text"}
+                        if candidate.get("audio_only")
+                        else None
+                    ),
+                )
 
             else:
                 log_to_statusbox(
@@ -2610,6 +2756,7 @@ def self_read_and_train():
                 "history_key": history_key,
                 "prior": prior,
                 "stamp": stamp,
+                "audio_only": audio_only,
             }
 
             if read_reason in {"new", "updated", "resume"}:

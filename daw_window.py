@@ -26,8 +26,11 @@ import numpy as np
 
 from audio_device_resolution import AudioDeviceResolution, resolve_audio_device
 from daw_engine import (
+    AudioStem,
     DawProject,
     InstrumentTrack,
+    MAX_AUDIO_STEMS,
+    MAX_PLACED_WAVS,
     MAX_RENDER_SAMPLES,
     Step,
     SUPPORTED_WAVEFORMS,
@@ -41,6 +44,11 @@ from daw_engine import (
     write_wav,
 )
 from runtime_state import drain_inastate_queue, load_config, update_inastate
+from stem_import import (
+    StemImportResult,
+    import_stem_zip,
+    import_wav_stems,
+)
 
 try:  # Audio devices are optional; offline rendering still works without them.
     import sounddevice as _sounddevice
@@ -73,7 +81,7 @@ KEYBOARD_NOTES = tuple(range(60, 73))
 def daw_control_api_payload() -> dict[str, Any]:
     """Describe Ina's bounded, offline DAW command surface without reading state."""
     return {
-        "version": 1,
+        "version": 2,
         "state_keys": {
             "queue": DAW_COMMAND_QUEUE_KEY,
             "last_result": DAW_LAST_COMMAND_RESULT_KEY,
@@ -111,6 +119,26 @@ def daw_control_api_payload() -> dict[str, Any]:
                         "release_seconds",
                     ],
                 },
+            },
+            {
+                "action": "set_stem",
+                "aliases": [],
+                "arguments": {
+                    "stem": "index or exact stem name",
+                    "editable": [
+                        "name",
+                        "role",
+                        "gain",
+                        "offset_beats",
+                        "muted",
+                        "solo",
+                    ],
+                },
+            },
+            {
+                "action": "preview_stem",
+                "aliases": [],
+                "arguments": {"stem": "index or exact stem name"},
             },
             {
                 "action": "preview_note",
@@ -155,6 +183,10 @@ def daw_control_api_payload() -> dict[str, Any]:
             "note_min": 0,
             "note_max": 127,
             "vocal_offset_beats_max": 64.0,
+            "stem_offset_beats_max": 64.0,
+            "stem_gain_max": 4.0,
+            "audio_stems_max": MAX_AUDIO_STEMS,
+            "placed_wavs_max": MAX_PLACED_WAVS,
             "symbolic_prompt_max_characters": 1000,
             "queue_max_pending": DAW_API_QUEUE_LIMIT,
             "queue_max_per_poll": DAW_API_MAX_COMMANDS,
@@ -173,10 +205,20 @@ def daw_control_api_payload() -> dict[str, Any]:
             "commands": [],
             "note": "Microphone start/stop remains a person-operated studio control.",
         },
+        "stem_import": {
+            "mode": "manual_only",
+            "commands": [],
+            "note": (
+                "A person chooses external WAV/ZIP files. Ina may inspect, mix, "
+                "preview, save, and export stems already imported into the studio."
+            ),
+        },
         "examples": [
             {"action": "inspect"},
             {"action": "set_step", "track": 0, "position": 0, "enabled": True, "note": 60},
             {"action": "preview_note", "note": 60, "waveform": "sine"},
+            {"action": "set_stem", "stem": 0, "gain": 0.8, "solo": True},
+            {"action": "preview_stem", "stem": 0},
             {"action": "generate_vocal", "prompt": "soft orbit", "offset_beats": 0.0},
             {"action": "play", "loop": False},
             {"action": "stop"},
@@ -188,6 +230,10 @@ def daw_control_api_payload() -> dict[str, Any]:
 
 class StudioAlreadyRunningError(RuntimeError):
     """Raised when this child's studio already owns the command queue."""
+
+
+class StemCollectionAttachmentError(ValueError):
+    """Raised when a committed local collection cannot join the current project."""
 
 
 class StudioInstanceLock:
@@ -379,10 +425,23 @@ class StudioPaths:
     projects: Path
     recordings: Path
     renders: Path
+    stems: Path
 
     def ensure(self) -> "StudioPaths":
-        for path in (self.root, self.projects, self.recordings, self.renders):
+        self.root.mkdir(parents=True, exist_ok=True)
+        root = self.root.resolve()
+        for path in (self.projects, self.recordings, self.renders, self.stems):
+            if path.is_symlink():
+                raise ValueError(f"Music studio managed folder cannot be a symbolic link: {path.name}")
             path.mkdir(parents=True, exist_ok=True)
+            try:
+                path.resolve().relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Music studio managed folder must stay inside the studio: {path.name}"
+                ) from exc
+            if not path.is_dir():
+                raise ValueError(f"Music studio managed path is not a folder: {path.name}")
         return self
 
 
@@ -408,6 +467,7 @@ def studio_paths(child: str, *, base_path: Path | str = Path("AI_Children")) -> 
         projects=root / "projects",
         recordings=root / "recordings",
         renders=root / "renders",
+        stems=root / "stems",
     )
 
 
@@ -824,9 +884,10 @@ class DawWindow(tk.Tk):
             if child is not None
             else (config.get("current_child", "Inazuma_Yagami") or "Inazuma_Yagami")
         )
+        paths = studio_paths(resolved_child).ensure()
         super().__init__()
         self.child = resolved_child
-        self.paths = studio_paths(self.child).ensure()
+        self.paths = paths
         self._instance_lock = StudioInstanceLock(self.paths.root / "daw_window.lock")
         if not self._instance_lock.acquire():
             try:
@@ -890,6 +951,9 @@ class DawWindow(tk.Tk):
         self._api_poll_active = True
         self._playing = False
         self._recording_pending = False
+        self._stem_import_pending = False
+        self._project_load_pending = False
+        self._known_stem_collections: dict[str, str] = {}
         self._closing = False
         self.title(f"Ina Music Studio — {self.child}")
         self.geometry("1320x820")
@@ -902,6 +966,9 @@ class DawWindow(tk.Tk):
         self.preview_waveform_var = tk.StringVar(value="sine")
         self.vocal_offset_var = tk.DoubleVar(value=0.0)
         self.symbolic_prompt_var = tk.StringVar(value="")
+        self.stem_gain_var = tk.DoubleVar(value=1.0)
+        self.stem_offset_var = tk.DoubleVar(value=0.0)
+        self.stem_role_var = tk.StringVar(value="other")
         self.audio_device_var = tk.StringVar(
             value=self._audio_resolution_label(self.output_device_resolution)
         )
@@ -911,6 +978,7 @@ class DawWindow(tk.Tk):
         self._build_ui()
         self._rebuild_track_grid()
         self._refresh_vocal_list()
+        self._refresh_stem_list()
         self._publish_workspace("opened")
         self._set_window_open(True)
         self.after(DAW_API_POLL_MS, self._poll_api_commands)
@@ -975,7 +1043,7 @@ class DawWindow(tk.Tk):
         ttk.Label(header, text="Ina Music Studio", style="StudioTitle.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="A small local step sequencer and symbolic vocal sketchpad",
+            text="A small local sequencer, stem mixer, and symbolic vocal sketchpad",
             style="StudioNote.TLabel",
         ).grid(row=0, column=1, sticky="w", padx=14)
         ttk.Label(
@@ -1004,8 +1072,10 @@ class DawWindow(tk.Tk):
         notebook = ttk.Notebook(outer)
         notebook.grid(row=2, column=0, sticky="nsew")
         sequence_tab = ttk.Frame(notebook, padding=10)
+        stem_tab = ttk.Frame(notebook, padding=10)
         vocal_tab = ttk.Frame(notebook, padding=10)
         notebook.add(sequence_tab, text="Step sequencer")
+        notebook.add(stem_tab, text="Stems")
         notebook.add(vocal_tab, text="Vocals")
 
         sequence_tab.columnconfigure(0, weight=1)
@@ -1044,6 +1114,7 @@ class DawWindow(tk.Tk):
                 command=lambda midi=note: self.preview_note(midi),
             ).pack(side=tk.LEFT, padx=1, pady=2)
 
+        self._build_stem_tab(stem_tab)
         self._build_vocal_tab(vocal_tab)
 
         status = ttk.Frame(outer)
@@ -1126,6 +1197,102 @@ class DawWindow(tk.Tk):
             text="Removing a clip keeps its WAV in the studio recordings folder.",
             style="StudioNote.TLabel",
         ).pack(side=tk.LEFT, padx=12)
+
+    def _build_stem_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        import_box = ttk.LabelFrame(parent, text="Bring in a separated stem collection", padding=8)
+        import_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(
+            import_box,
+            text="Import WAV stem(s)…",
+            command=self.import_wav_stems_dialog,
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            import_box,
+            text="Import stem ZIP…",
+            command=self.import_stem_zip_dialog,
+            style="StudioAccent.TButton",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(
+            import_box,
+            text=(
+                "Imports are copied locally and bounded. ZIP TXT files are retained as "
+                "lyrics/style or general music context; the source ZIP is unchanged."
+            ),
+            style="StudioNote.TLabel",
+        ).pack(side=tk.LEFT)
+
+        stems_box = ttk.LabelFrame(parent, text="Stem mixer", padding=8)
+        stems_box.grid(row=1, column=0, sticky="nsew")
+        stems_box.columnconfigure(0, weight=1)
+        stems_box.rowconfigure(0, weight=1)
+        self.stem_tree = ttk.Treeview(
+            stems_box,
+            columns=("role", "offset", "gain", "state", "source"),
+            show="tree headings",
+            selectmode="browse",
+        )
+        self.stem_tree.heading("#0", text="Stem")
+        self.stem_tree.heading("role", text="Role")
+        self.stem_tree.heading("offset", text="Beat offset")
+        self.stem_tree.heading("gain", text="Gain")
+        self.stem_tree.heading("state", text="Mix state")
+        self.stem_tree.heading("source", text="Studio WAV")
+        self.stem_tree.column("#0", width=210)
+        self.stem_tree.column("role", width=90)
+        self.stem_tree.column("offset", width=90, anchor=tk.CENTER)
+        self.stem_tree.column("gain", width=70, anchor=tk.CENTER)
+        self.stem_tree.column("state", width=90, anchor=tk.CENTER)
+        self.stem_tree.column("source", width=480)
+        self.stem_tree.grid(row=0, column=0, sticky="nsew")
+        stem_scroll = ttk.Scrollbar(stems_box, orient=tk.VERTICAL, command=self.stem_tree.yview)
+        stem_scroll.grid(row=0, column=1, sticky="ns")
+        self.stem_tree.configure(yscrollcommand=stem_scroll.set)
+        self.stem_tree.bind("<<TreeviewSelect>>", self._load_selected_stem_controls)
+
+        controls = ttk.Frame(stems_box)
+        controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(controls, text="Play selected", command=self.play_selected_stem).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(controls, text="Gain").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            controls,
+            from_=0,
+            to=4,
+            increment=0.05,
+            textvariable=self.stem_gain_var,
+            width=6,
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(controls, text="Beat").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            controls,
+            from_=0,
+            to=64,
+            increment=0.25,
+            textvariable=self.stem_offset_var,
+            width=7,
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(controls, text="Role").pack(side=tk.LEFT)
+        ttk.Combobox(
+            controls,
+            textvariable=self.stem_role_var,
+            values=("vocals", "drums", "bass", "guitar", "keys", "other"),
+            width=9,
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(controls, text="Apply mix", command=self.apply_selected_stem_mix).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(controls, text="Mute / unmute", command=self.toggle_selected_stem_mute).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(controls, text="Solo / un-solo", command=self.toggle_selected_stem_solo).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(controls, text="Remove", command=self.remove_selected_stem).pack(side=tk.LEFT)
+
+        ttk.Label(
+            stems_box,
+            text=(
+                "All imported stems begin aligned at beat 0. Gain, mute, solo, and offset "
+                "affect playback and WAV export; removing keeps the local collection."
+            ),
+            style="StudioNote.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(7, 0))
 
     def _rebuild_track_grid(self) -> None:
         for child in self.track_grid.winfo_children():
@@ -1582,6 +1749,12 @@ class DawWindow(tk.Tk):
         return self._background("Saving project…", lambda: save_project(snapshot, path), done)
 
     def load_project_dialog(self) -> None:
+        if self._stem_import_pending:
+            self._set_status("Wait for the stem import to finish before loading another project.")
+            return
+        if self._project_load_pending:
+            self._set_status("A project load is already in progress.")
+            return
         if self.recorder.recording or self._recording_pending:
             self._set_status("Stop the microphone take before loading another project.")
             try:
@@ -1603,21 +1776,39 @@ class DawWindow(tk.Tk):
         if path is None:
             return
 
+        self._project_load_pending = True
+        self._publish_workspace("project_load_scheduled")
+
         def work() -> DawProject:
             loaded = load_project(path)
             if loaded.total_steps != STEP_COUNT:
                 raise ValueError("This first studio window currently supports 16-step projects.")
-            for clip in loaded.vocal_clips:
-                resolved = Path(clip.path)
-                if not resolved.is_absolute():
-                    resolved = self.paths.root / resolved
-                if not path_is_within(resolved, self.paths.root):
-                    raise ValueError(f"Vocal clip lies outside the studio folder: {clip.path}")
+            placed_groups = (
+                ("Vocal clip", loaded.vocal_clips, self.paths.root, False),
+                ("Stem", loaded.audio_stems, self.paths.stems, True),
+            )
+            for label, clips, allowed_root, require_regular_wav in placed_groups:
+                for clip in clips:
+                    resolved = Path(clip.path)
+                    if not resolved.is_absolute():
+                        resolved = self.paths.root / resolved
+                    if not path_is_within(resolved, allowed_root):
+                        raise ValueError(
+                            f"{label} lies outside its studio folder: {clip.path}"
+                        )
+                    if require_regular_wav and (
+                        resolved.is_symlink()
+                        or not resolved.is_file()
+                        or resolved.suffix.casefold() != ".wav"
+                    ):
+                        raise ValueError(f"{label} is not a regular local WAV file: {clip.path}")
             return loaded
 
         def done(loaded: DawProject) -> None:
+            self._project_load_pending = False
             if self.recorder.recording or self._recording_pending:
                 self._set_status("Project load skipped because a microphone take started.")
+                self._publish_workspace("project_load_skipped")
                 return
             self.project = loaded
             self.project_path = path
@@ -1626,10 +1817,20 @@ class DawWindow(tk.Tk):
             self.recorder.sample_rate = loaded.sample_rate
             self._rebuild_track_grid()
             self._refresh_vocal_list()
+            self._refresh_stem_list()
+            for stem in loaded.audio_stems:
+                if stem.collection:
+                    self._known_stem_collections.setdefault(stem.collection, "")
             self._set_status(f"Project loaded: {path.name}")
             self._publish_workspace("loaded")
 
-        self._background("Loading project…", work, done)
+        def failed(exc: BaseException) -> None:
+            self._project_load_pending = False
+            self._show_error("Could not load project", exc)
+
+        accepted = self._background("Loading project…", work, done, failed)
+        if not accepted:
+            self._project_load_pending = False
 
     def export_wav_dialog(self) -> None:
         try:
@@ -1774,12 +1975,23 @@ class DawWindow(tk.Tk):
     def _add_vocal_path(self, path: Path, offset: float, name: str) -> None:
         if not path_is_within(path, self.paths.root):
             raise ValueError("Vocal WAV must stay inside the music studio folder.")
-        relative = path.resolve().relative_to(self.paths.root.resolve()).as_posix()
-        self.project.vocal_clips.append(
-            VocalClip(path=relative, offset_beats=offset, gain=1.0, name=name)
-        )
+        resolved = path.resolve()
+        if path.is_symlink() or not resolved.is_file() or resolved.suffix.casefold() != ".wav":
+            raise ValueError("Vocal clip must be a regular local WAV file.")
+        relative = resolved.relative_to(self.paths.root.resolve()).as_posix()
+        clip = VocalClip(path=relative, offset_beats=offset, gain=1.0, name=name)
+
+        # Validate a detached candidate first so a late stem/vocal completion
+        # cannot leave the live project above its shared placed-WAV ceiling.
+        candidate = DawProject.from_dict(self.project.to_dict())
+        candidate.vocal_clips.append(clip)
+        candidate.validate()
+        self.project.vocal_clips = candidate.vocal_clips
         self._refresh_vocal_list()
-        self._publish_workspace("vocal_added")
+        self._publish_workspace(
+            "vocal_added",
+            vocal_path=relative,
+        )
 
     def _refresh_vocal_list(self) -> None:
         for item in self.vocal_tree.get_children():
@@ -1850,6 +2062,383 @@ class DawWindow(tk.Tk):
         self._set_status(f"Removed {clip.name} from the arrangement; its WAV was kept.")
         self._publish_workspace("vocal_removed")
 
+    def _remaining_stem_slots(self) -> int:
+        return max(
+            0,
+            min(
+                MAX_AUDIO_STEMS - len(self.project.audio_stems),
+                MAX_PLACED_WAVS
+                - len(self.project.vocal_clips)
+                - len(self.project.audio_stems),
+            ),
+        )
+
+    def import_wav_stems_dialog(self) -> None:
+        selected = filedialog.askopenfilenames(
+            parent=self,
+            title="Import aligned WAV stems",
+            filetypes=[("PCM WAV stems", "*.wav")],
+        )
+        if not selected:
+            return
+        paths = tuple(Path(value).expanduser() for value in selected)
+        collection = self.project_name_var.get().strip() or "Stem collection"
+        slots = self._remaining_stem_slots()
+        self._schedule_stem_import(
+            "Importing selected WAV stems…",
+            lambda: import_wav_stems(
+                paths,
+                self.paths.stems,
+                collection_name=collection,
+                maximum_stems=slots,
+                cancelled=self._shutdown_event.is_set,
+            ),
+        )
+
+    def import_stem_zip_dialog(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Import a WAV stem bundle ZIP",
+            filetypes=[("Stem ZIP", "*.zip")],
+        )
+        if not selected:
+            return
+        source = Path(selected).expanduser()
+        slots = self._remaining_stem_slots()
+        self._schedule_stem_import(
+            f"Importing {source.name}…",
+            lambda: import_stem_zip(
+                source,
+                self.paths.stems,
+                collection_name=source.stem,
+                maximum_stems=slots,
+                cancelled=self._shutdown_event.is_set,
+            ),
+        )
+
+    def _schedule_stem_import(
+        self,
+        label: str,
+        operation: Callable[[], StemImportResult],
+    ) -> bool:
+        if self._stem_import_pending:
+            self._set_status("A stem import is already in progress.")
+            return False
+        if self._project_load_pending:
+            self._set_status("Wait for the project load to finish before importing stems.")
+            return False
+        if self._remaining_stem_slots() <= 0:
+            self._show_error(
+                "Cannot import stems",
+                ValueError("This project has reached its placed-WAV stem limit."),
+            )
+            return False
+        self._stem_import_pending = True
+        self._publish_workspace("stem_import_scheduled")
+
+        def done(result: StemImportResult) -> None:
+            self._stem_import_pending = False
+            try:
+                self._add_stem_import_result(result)
+            except StemCollectionAttachmentError as exc:
+                manifest = self._known_stem_collections.get(result.collection_name)
+                self._set_status(
+                    f"Imported {result.collection_name} to the local stem library, "
+                    "but it could not be attached to the current project."
+                )
+                self._publish_workspace(
+                    "stem_collection_imported_unattached",
+                    stem_collection=result.collection_name,
+                    imported_stems=len(result.stems),
+                    stem_manifest=manifest,
+                    attachment_error=str(exc),
+                )
+            except Exception as exc:
+                self._show_error("Could not add imported stems", exc)
+
+        def failed(exc: BaseException) -> None:
+            self._stem_import_pending = False
+            self._show_error("Could not import stem collection", exc)
+
+        accepted = self._background(label, operation, done, failed)
+        if not accepted:
+            self._stem_import_pending = False
+            self._publish_workspace("stem_import_rejected")
+        return accepted
+
+    def _add_stem_import_result(self, result: StemImportResult) -> None:
+        root = self.paths.root.resolve()
+        stems_root = self.paths.stems.resolve()
+        collection = Path(result.collection_dir)
+        if (
+            collection.is_symlink()
+            or not collection.is_dir()
+            or not path_is_within(collection, stems_root)
+        ):
+            raise ValueError("Imported stem collection escaped the studio folder.")
+        collection = collection.resolve()
+
+        manifest_path = Path(result.manifest_path)
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or manifest_path.suffix.casefold() != ".json"
+            or not path_is_within(manifest_path, collection)
+        ):
+            raise ValueError("Imported stem manifest is not a regular file in its collection.")
+        manifest = manifest_path.resolve().relative_to(root).as_posix()
+
+        for companion in result.companions:
+            companion_path = Path(companion.path)
+            if (
+                companion_path.is_symlink()
+                or not companion_path.is_file()
+                or companion_path.suffix.casefold() != ".txt"
+                or not path_is_within(companion_path, collection)
+            ):
+                raise ValueError(
+                    f"Imported music-context file is invalid: {companion.name}"
+                )
+
+        self._known_stem_collections[result.collection_name] = manifest
+        added: list[AudioStem] = []
+        for imported in result.stems:
+            imported_path = Path(imported.path)
+            if (
+                imported_path.is_symlink()
+                or not imported_path.is_file()
+                or imported_path.suffix.casefold() != ".wav"
+                or not path_is_within(imported_path, collection)
+            ):
+                raise ValueError(f"Imported stem escaped the studio folder: {imported.name}")
+            relative = imported_path.resolve().relative_to(root).as_posix()
+            try:
+                added.append(
+                    AudioStem(
+                        path=relative,
+                        name=imported.name,
+                        role=imported.role,
+                        collection=result.collection_name,
+                        offset_beats=0.0,
+                        gain=1.0,
+                    )
+                )
+            except ValueError as exc:
+                raise StemCollectionAttachmentError(str(exc)) from exc
+
+        if len(added) > self._remaining_stem_slots():
+            raise StemCollectionAttachmentError(
+                "The imported collection no longer fits in this project."
+            )
+
+        candidate = DawProject.from_dict(self.project.to_dict())
+        candidate.audio_stems.extend(added)
+        try:
+            candidate.validate()
+        except ValueError as exc:
+            raise StemCollectionAttachmentError(str(exc)) from exc
+        self.project.audio_stems = candidate.audio_stems
+        self._refresh_stem_list()
+        context_note = (
+            f" Retained {len(result.companions)} music-context TXT file(s)."
+            if result.companions
+            else ""
+        )
+        self._set_status(
+            f"Imported {len(added)} aligned stem(s) for {result.collection_name}."
+            f"{context_note}"
+        )
+        self._publish_workspace(
+            "stems_imported",
+            stem_collection=result.collection_name,
+            imported_stems=len(added),
+            retained_context_files=len(result.companions),
+            stem_manifest=manifest,
+        )
+
+    def _stem_payload(self, index: int) -> dict[str, Any]:
+        stem = self.project.audio_stems[index]
+        return {
+            "index": index,
+            "name": stem.name,
+            "role": stem.role,
+            "collection": stem.collection,
+            "path": stem.path,
+            "offset_beats": stem.offset_beats,
+            "gain": stem.gain,
+            "muted": stem.muted,
+            "solo": stem.solo,
+        }
+
+    def _refresh_stem_list(self) -> None:
+        selected = self.stem_tree.selection()
+        selected_iid = selected[0] if selected else None
+        for item in self.stem_tree.get_children():
+            self.stem_tree.delete(item)
+        for index, stem in enumerate(self.project.audio_stems):
+            states = []
+            if stem.muted:
+                states.append("muted")
+            if stem.solo:
+                states.append("solo")
+            self.stem_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                text=stem.name,
+                values=(
+                    stem.role,
+                    f"{stem.offset_beats:g}",
+                    f"{stem.gain:.2f}",
+                    " · ".join(states) or "active",
+                    stem.path,
+                ),
+            )
+        if selected_iid in self.stem_tree.get_children():
+            self.stem_tree.selection_set(selected_iid)
+
+    def _selected_stem_index(self, *, notify: bool = True) -> Optional[int]:
+        selection = self.stem_tree.selection()
+        if not selection:
+            if notify:
+                self._set_status("Select a stem first.")
+            return None
+        try:
+            index = int(selection[0])
+        except (TypeError, ValueError):
+            return None
+        return index if 0 <= index < len(self.project.audio_stems) else None
+
+    def _load_selected_stem_controls(self, _event: Any = None) -> None:
+        index = self._selected_stem_index(notify=False)
+        if index is None:
+            return
+        stem = self.project.audio_stems[index]
+        self.stem_gain_var.set(stem.gain)
+        self.stem_offset_var.set(stem.offset_beats)
+        self.stem_role_var.set(stem.role)
+
+    def set_stem(self, index: int, updates: dict[str, Any]) -> dict[str, Any]:
+        index = _strict_int(index, "stem", 0, len(self.project.audio_stems) - 1)
+        supported = {"name", "role", "gain", "offset_beats", "muted", "solo"}
+        unknown = set(updates) - supported
+        if unknown:
+            raise ValueError(f"unsupported stem fields: {', '.join(sorted(unknown))}")
+        if not updates:
+            raise ValueError("set_stem needs at least one editable field")
+        values = self.project.audio_stems[index].to_dict()
+        if "name" in updates:
+            name = str(updates["name"] or "").strip()
+            if not name:
+                raise ValueError("stem name must not be empty")
+            values["name"] = name[:120]
+        if "role" in updates:
+            role = str(updates["role"] or "").strip()
+            if not role:
+                raise ValueError("stem role must not be empty")
+            values["role"] = role[:80]
+        if "gain" in updates:
+            values["gain"] = _strict_float(updates["gain"], "stem gain", 0.0, 4.0)
+        if "offset_beats" in updates:
+            values["offset_beats"] = _strict_float(
+                updates["offset_beats"], "stem beat offset", 0.0, 64.0
+            )
+        if "muted" in updates:
+            values["muted"] = _bool_value(updates["muted"], "stem muted")
+        if "solo" in updates:
+            values["solo"] = _bool_value(updates["solo"], "stem solo")
+        self.project.audio_stems[index] = AudioStem.from_dict(values)
+        self.project.validate()
+        self._refresh_stem_list()
+        self._publish_workspace("set_stem", stem=index)
+        return self._stem_payload(index)
+
+    def apply_selected_stem_mix(self) -> None:
+        index = self._selected_stem_index()
+        if index is None:
+            return
+        try:
+            payload = self.set_stem(
+                index,
+                {
+                    "gain": self.stem_gain_var.get(),
+                    "offset_beats": self.stem_offset_var.get(),
+                    "role": self.stem_role_var.get(),
+                },
+            )
+            self._set_status(f"Updated stem mix: {payload['name']}")
+        except Exception as exc:
+            self._show_error("Could not update stem mix", exc)
+
+    def toggle_selected_stem_mute(self) -> None:
+        index = self._selected_stem_index()
+        if index is None:
+            return
+        stem = self.project.audio_stems[index]
+        payload = self.set_stem(index, {"muted": not stem.muted})
+        self._set_status(f"{payload['name']}: {'muted' if payload['muted'] else 'active'}")
+
+    def toggle_selected_stem_solo(self) -> None:
+        index = self._selected_stem_index()
+        if index is None:
+            return
+        stem = self.project.audio_stems[index]
+        payload = self.set_stem(index, {"solo": not stem.solo})
+        self._set_status(f"{payload['name']}: {'solo' if payload['solo'] else 'normal mix'}")
+
+    def _preview_stem_index(self, index: int) -> bool:
+        index = _strict_int(index, "stem", 0, len(self.project.audio_stems) - 1)
+        stem = self.project.audio_stems[index]
+        path = Path(stem.path)
+        if not path.is_absolute():
+            path = self.paths.root / path
+        if not path_is_within(path, self.paths.stems):
+            raise ValueError("Stem WAV must stay inside the studio stem folder.")
+        generation = self._begin_transport()
+
+        def work() -> tuple[int, bool]:
+            if not self._transport_gate.is_current(generation):
+                return 0, True
+            if _sounddevice is None:
+                raise RuntimeError("Playback needs the optional sounddevice package.")
+            audio, rate = read_wav(path)
+            played, _value = self._transport_gate.run_if_current(
+                generation,
+                lambda: self._play_audio(audio * stem.gain, rate),
+            )
+            return len(audio), not played
+
+        def done(result: tuple[int, bool]) -> None:
+            _sample_count, cancelled = result
+            if cancelled or not self._transport_gate.is_current(generation):
+                return
+            self._set_status(f"Playing stem: {stem.name}")
+
+        def failed(exc: BaseException) -> None:
+            if self._transport_gate.is_current(generation):
+                self._cancel_transport(generation)
+                self._show_error("Could not play stem", exc)
+
+        accepted = self._background(f"Loading {stem.name}…", work, done, failed)
+        if not accepted:
+            self._cancel_transport(generation)
+        return accepted
+
+    def play_selected_stem(self) -> bool:
+        index = self._selected_stem_index()
+        return False if index is None else self._preview_stem_index(index)
+
+    def remove_selected_stem(self) -> None:
+        index = self._selected_stem_index()
+        if index is None:
+            return
+        stem = self.project.audio_stems.pop(index)
+        self._refresh_stem_list()
+        self._set_status(
+            f"Removed {stem.name} from the arrangement; its local collection was kept."
+        )
+        self._publish_workspace("stem_removed", stem=index)
+
     def _background(
         self,
         label: str,
@@ -1868,7 +2457,13 @@ class DawWindow(tk.Tk):
                 self._after_safe(lambda error=exc: (on_error or self._background_error)(error))
             else:
                 if on_success is not None:
-                    self._after_safe(lambda value=result: on_success(value))
+                    def deliver(value: Any = result) -> None:
+                        try:
+                            on_success(value)
+                        except BaseException as exc:
+                            (on_error or self._background_error)(exc)
+
+                    self._after_safe(deliver)
 
         try:
             future = self._jobs.submit(run)
@@ -1910,6 +2505,14 @@ class DawWindow(tk.Tk):
             self._commit_controls()
         except Exception:
             pass
+        known_collections = dict(getattr(self, "_known_stem_collections", {}))
+        for stem in self.project.audio_stems:
+            if stem.collection:
+                known_collections.setdefault(stem.collection, "")
+        stem_library = sorted(
+            known_collections.items(),
+            key=lambda item: item[0].casefold(),
+        )[:128]
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event,
@@ -1924,6 +2527,8 @@ class DawWindow(tk.Tk):
                 "playing": self._playing,
                 "recording": self.recorder.recording,
                 "recording_pending": self._recording_pending,
+                "stem_import_pending": self._stem_import_pending,
+                "project_load_pending": self._project_load_pending,
                 "recording_sample_rate": self.recorder.recording_sample_rate,
                 "recording_limit_seconds": round(self.recorder.max_capture_seconds, 3),
                 "recording_limit_reached": self.recorder.limit_reached,
@@ -1949,6 +2554,18 @@ class DawWindow(tk.Tk):
                     "muted": clip.muted,
                 }
                 for index, clip in enumerate(self.project.vocal_clips)
+            ],
+            "audio_stems": [
+                self._stem_payload(index)
+                for index in range(len(self.project.audio_stems))
+            ],
+            "stem_collections": [name for name, _manifest in stem_library],
+            "stem_library": [
+                {
+                    "collection": name,
+                    "manifest": manifest or None,
+                }
+                for name, manifest in stem_library
             ],
         }
         payload.update(extra)
@@ -2033,6 +2650,20 @@ class DawWindow(tk.Tk):
                 editable = {"name", "waveform", "note", "gain", "muted", "attack_seconds", "release_seconds"}
                 updates = {key: command[key] for key in editable if key in command}
                 result = {"status": "ok", "track": self.set_track(track_index, updates)}
+            elif action == "set_stem":
+                stem_index = self._resolve_command_stem(
+                    command.get("stem", command.get("stem_index", 0))
+                )
+                editable = {"name", "role", "gain", "offset_beats", "muted", "solo"}
+                updates = {key: command[key] for key in editable if key in command}
+                result = {"status": "ok", "stem": self.set_stem(stem_index, updates)}
+            elif action == "preview_stem":
+                stem_index = self._resolve_command_stem(
+                    command.get("stem", command.get("stem_index", 0))
+                )
+                if not self._preview_stem_index(stem_index):
+                    raise RuntimeError("stem preview was not scheduled")
+                result = {"status": "scheduled", "stem": stem_index}
             elif action == "preview_note":
                 if "note" not in command:
                     raise ValueError("preview_note needs a note")
@@ -2092,6 +2723,17 @@ class DawWindow(tk.Tk):
         )
         return result
 
+    def _resolve_command_stem(self, value: Any) -> int:
+        if not self.project.audio_stems:
+            raise ValueError("The project has no imported stems.")
+        if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+            wanted = value.strip().casefold()
+            for index, stem in enumerate(self.project.audio_stems):
+                if stem.name.casefold() == wanted:
+                    return index
+            raise ValueError(f"Stem not found: {value}")
+        return _strict_int(value, "stem", 0, len(self.project.audio_stems) - 1)
+
     def _resolve_command_track(self, value: Any) -> int:
         if not self.project.tracks:
             raise ValueError("The project has no instrument tracks.")
@@ -2109,6 +2751,8 @@ class DawWindow(tk.Tk):
         self._closing = True
         self._api_poll_active = False
         self._recording_pending = False
+        self._stem_import_pending = False
+        self._project_load_pending = False
         self._shutdown_event.set()
         self.recorder.close()
         self._transport_gate.invalidate(self._stop_audio_device)

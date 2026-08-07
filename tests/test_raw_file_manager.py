@@ -815,6 +815,292 @@ def test_invalid_direct_fingerprint_is_treated_as_updated():
     )
 
 
+
+def test_music_iterator_accepts_audio_stem_archives_and_language_context(tmp_path):
+    names = (
+        "master.wav",
+        "preview.mp3",
+        "symbols.opus",
+        "lyrics and style.txt",
+        "notes.md",
+        "manifest.json",
+        "Godhunter Stems.zip",
+        "cover.png",
+        "canvas.mp4",
+    )
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+    expected = sorted(
+        names[:-2],
+        key=str.casefold,
+    )
+
+    legacy = [
+        path.name
+        for path in rfm._iter_self_read_files(tmp_path, audio_only=True)
+    ]
+    streaming = sorted(
+        (
+            path.name
+            for path in rfm._iter_self_read_files(
+                tmp_path,
+                audio_only=True,
+                stop_requested=lambda: False,
+            )
+        ),
+        key=str.casefold,
+    )
+
+    assert legacy == expected
+    assert streaming == expected
+
+
+def test_music_archive_filters_before_fragmenting_and_keeps_member_context(
+    monkeypatch, tmp_path
+):
+    archive_path = tmp_path / "Godhunter's Lullaby Stems.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("stems/0 Lead Vocals.wav", b"audio")
+        archive.writestr("lyrics and style.txt", b"words")
+        archive.writestr("cover.png", b"image")
+
+    calls = []
+
+    def fragments(data, inner_path, container_path, category, _transformer):
+        calls.append((inner_path.as_posix(), category, data))
+        return [
+            {
+                "modality": "audio" if category == "audio" else "text",
+                "source": f"{container_path.name}:{inner_path.as_posix()}",
+                "tags": ["self_read"],
+            }
+        ]
+
+    monkeypatch.setattr(rfm, "_fragments_from_data_buffer", fragments)
+
+    result = rfm.process_archive(
+        archive_path,
+        object(),
+        allowed_categories={"audio", "text"},
+    )
+
+    assert [(name, category) for name, category, _data in calls] == [
+        ("stems/0 Lead Vocals.wav", "audio"),
+        ("lyrics and style.txt", "text"),
+    ]
+    assert len(result) == 2
+    assert result[0]["source_context"]["archive_container_name"] == archive_path.name
+    assert result[0]["source_context"]["archive_member_path"] == "stems/0 Lead Vocals.wav"
+    assert "archive_audio_member" in result[0]["tags"]
+    assert "archive_text_member" in result[1]["tags"]
+
+    for fragment in result:
+        rfm.annotate_fragment_source(
+            fragment,
+            "music",
+            "Ina Sings: Godhunter's Lullaby/Godhunter's Lullaby Stems.zip",
+            tmp_path,
+        )
+
+    audio = result[0]
+    assert "music_stem" in audio["tags"]
+    assert audio["source_context"]["music_asset_kind"] == "stem"
+    assert audio["source_context"]["stem_label"] == "0 Lead Vocals"
+    assert audio["source_context"]["stem_container_relative_path"].endswith("Stems.zip")
+    text = result[1]
+    assert "music_language" in text["tags"]
+    assert "lyrics_style_context" in text["tags"]
+    assert "self_voice" not in text["tags"]
+    assert text["source_context"]["ownership_hint"] == "self_creation"
+    assert text["source_context"]["music_asset_kind"] == "lyrics_style_context"
+
+
+def test_direct_music_lyrics_use_language_not_audio_provenance(tmp_path):
+    fragment = {"modality": "text", "tags": ["self_read"]}
+
+    rfm.annotate_fragment_source(
+        fragment,
+        "music",
+        "Ina Sings: Godhunter's Lullaby/lyrics and style.txt",
+        tmp_path,
+    )
+
+    assert "ina_music" in fragment["tags"]
+    assert "music_language" in fragment["tags"]
+    assert "lyrics_style_context" in fragment["tags"]
+    assert "self_voice" not in fragment["tags"]
+    assert fragment["provenance"] == "ina_music_language_context"
+    assert fragment["source_context"]["ownership_hint"] == "self_creation"
+
+
+def test_generic_music_text_keeps_neutral_attribution(tmp_path):
+    fragment = {"modality": "text", "tags": ["self_read"]}
+
+    rfm.annotate_fragment_source(
+        fragment,
+        "music",
+        "Uncatalogued Collection/notes.md",
+        tmp_path,
+    )
+
+    assert "music_language" in fragment["tags"]
+    assert "music_context" in fragment["tags"]
+    assert "ina_music" not in fragment["tags"]
+    assert "external_music" not in fragment["tags"]
+    assert fragment["provenance"] == "music_language_context"
+    assert fragment["source_context"]["ownership_hint"] == "unattributed"
+    assert fragment["source_context"]["music_asset_kind"] == "music_context"
+
+
+def test_studio_collection_assets_link_to_parent_and_manifest(tmp_path):
+    studio_root = tmp_path / "AI_Children" / "Ina" / "memory" / "music_studio" / "stems"
+    collection = "Godhunter_Lullaby_20260807"
+    audio = {"modality": "audio", "tags": ["self_read"]}
+    lyrics = {"modality": "text", "tags": ["self_read"]}
+
+    rfm.annotate_fragment_source(
+        audio,
+        "music",
+        f"{collection}/01_Lead_Vocals.wav",
+        studio_root,
+    )
+    rfm.annotate_fragment_source(
+        lyrics,
+        "music",
+        f"{collection}/context_01_lyrics_and_style.txt",
+        studio_root,
+    )
+
+    for fragment in (audio, lyrics):
+        context = fragment["source_context"]
+        assert context["stem_collection_relative_path"] == collection
+        assert context["stem_manifest_relative_path"] == f"{collection}/manifest.json"
+
+    assert "music_stem" in audio["tags"]
+    assert audio["source_context"]["music_asset_kind"] == "stem"
+    assert audio["source_context"]["stem_label"] == "01_Lead_Vocals"
+    assert "ina_music" in lyrics["tags"]
+    assert lyrics["provenance"] == "ina_music_language_context"
+    assert lyrics["source_context"]["ownership_hint"] == "self_creation"
+    assert lyrics["source_context"]["stem_collection_context"] is True
+
+
+def test_signed_external_music_retains_asset_classification(tmp_path):
+    stem = {
+        "modality": "audio",
+        "tags": ["self_read"],
+        "source_context": {
+            "archive_member_path": "stems/Lead Guitar.wav",
+            "archive_member_category": "audio",
+        },
+    }
+    lyrics = {"modality": "text", "tags": ["self_read"]}
+    relative_zip = "Rapidcrest: Sunshine Anthem/Sunshine Stems.zip"
+
+    rfm.annotate_fragment_source(stem, "music", relative_zip, tmp_path)
+    rfm.annotate_fragment_source(
+        lyrics,
+        "music",
+        "Rapidcrest: Sunshine Anthem/lyrics and style.txt",
+        tmp_path,
+    )
+
+    for fragment in (stem, lyrics):
+        assert "external_music" in fragment["tags"]
+        assert "signed_artist" in fragment["tags"]
+        assert fragment["provenance"] == "signed_artist_catalog"
+        assert fragment["source_context"]["ownership_hint"] == "external_artist"
+        assert fragment["source_context"]["external_artist_hint"] == "rapidcrest"
+
+    assert "music_stem" in stem["tags"]
+    assert stem["source_context"]["stem_label"] == "Lead Guitar"
+    assert "music_language" in lyrics["tags"]
+    assert "lyrics_style_context" in lyrics["tags"]
+    assert lyrics["source_context"]["music_asset_kind"] == "lyrics_style_context"
+
+
+def test_archive_member_tag_uses_the_actual_category(monkeypatch, tmp_path):
+    archive_path = tmp_path / "artifacts.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("cover.png", b"image")
+
+    monkeypatch.setattr(
+        rfm,
+        "_fragments_from_data_buffer",
+        lambda *_args: [{"modality": "image", "tags": []}],
+    )
+
+    fragments = rfm.process_archive(archive_path, object())
+
+    assert len(fragments) == 1
+    assert "archive_member" in fragments[0]["tags"]
+    assert "archive_image_member" in fragments[0]["tags"]
+    assert "archive_text_member" not in fragments[0]["tags"]
+
+
+def test_child_studio_stems_are_scanned_before_external_music(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    child = "Ina"
+    studio_root = (
+        tmp_path / "AI_Children" / child / "memory" / "music_studio" / "stems"
+    )
+    external_root = tmp_path / "external_music"
+    studio_root.mkdir(parents=True)
+    external_root.mkdir()
+    scanned = []
+
+    monkeypatch.setattr(rfm, "get_child", lambda: child)
+    monkeypatch.setattr(rfm, "load_history", lambda _child: rfm._empty_read_history())
+    monkeypatch.setattr(
+        rfm,
+        "load_self_read_preferences",
+        lambda _child: {
+            "source_choices": {
+                "code": False,
+                "music": True,
+                "books": False,
+                "venv": False,
+                "github_history": False,
+            },
+            "skip_files": [],
+        },
+    )
+    monkeypatch.setattr(rfm, "_apply_skip_requests", lambda _child, prefs: prefs)
+    monkeypatch.setattr(rfm, "_load_self_read_source_override", lambda: "music")
+    monkeypatch.setattr(
+        rfm,
+        "resolve_self_read_focus",
+        lambda _child: {
+            "focus": "new",
+            "source": "test",
+            "new_score": 1.0,
+            "seen_score": 0.0,
+            "drivers": {},
+        },
+    )
+    monkeypatch.setattr(rfm, "music_folder_path", external_root)
+    monkeypatch.setattr(rfm, "book_folder_path", None)
+    monkeypatch.setattr(rfm, "ina_work_path", None)
+    monkeypatch.setattr(rfm, "venv_path", None)
+    monkeypatch.setattr(rfm, "FractalTransformer", lambda: object())
+    monkeypatch.setattr(rfm, "_SELF_READ_LOCK_HELD", False)
+    monkeypatch.setattr(rfm, "save_history", lambda *_args: None)
+    monkeypatch.setattr(rfm, "log_to_statusbox", lambda *_args: None)
+
+    def empty_scan(base_root, **_kwargs):
+        scanned.append(Path(base_root).resolve())
+        return iter(())
+
+    monkeypatch.setattr(rfm, "_iter_self_read_files", empty_scan)
+
+    rfm.self_read_and_train()
+
+    assert scanned == [studio_root.resolve(), external_root.resolve()]
+
+
 def test_archive_member_aggregate_and_fragment_budgets(monkeypatch, tmp_path):
     archive_path = tmp_path / "bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
