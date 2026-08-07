@@ -126,6 +126,33 @@ def adaptive_symbol_limit(
     return max(1, min(ceiling, round((spontaneous_choice + drive_choice) / 2)))
 
 
+def choose_expression_symbols(
+    symbols: List[str],
+    text: str,
+    configured_max: int = 24,
+    *,
+    child: str = "Inazuma_Yagami",
+    context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Choose how much of an available symbolic phrase Ina wants to express.
+
+    configured_max is an attention/safety ceiling, not a target or minimum.
+    The returned length remains drive-sensitive and may be a single symbol even
+    when a much longer phrase is available.
+    """
+    available = [str(symbol) for symbol in symbols if symbol]
+    if not available:
+        return []
+    limit = adaptive_symbol_limit(
+        text,
+        configured_max,
+        child=child,
+        available_symbols=len(available),
+        context=context,
+    )
+    return available[:limit]
+
+
 def _hz_to_mel(hz: float) -> float:
     return 2595.0 * math.log10(1.0 + hz / 700.0)
 

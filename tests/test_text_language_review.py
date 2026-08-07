@@ -24,6 +24,39 @@ class _MutableEmbedder:
         return 0.0
 
 
+def test_contextual_human_guess_maps_only_the_changed_token():
+    diagnostic = tm.diagnose_text_alignment(
+        "°·'φam λ⊙··",
+        "ina λ⊙··",
+    )
+
+    assert diagnostic["native_tokens"] == ["°·'φam", "λ⊙··"]
+    assert diagnostic["gloss_tokens"] == ["ina", "λ⊙··"]
+    assert diagnostic["accepted"] is True
+    assert diagnostic["reason"] == "accepted_contextual"
+    assert diagnostic["candidate_pairs"] == [
+        {"native": "°·'φam", "english": "ina"}
+    ]
+    assert diagnostic["unchanged_context_count"] == 1
+
+
+def test_history_evidence_accepts_contextual_replacement(tmp_path, monkeypatch):
+    _disable_runtime_metrics(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    result = tm.review_text_evidence(
+        [],
+        [("°·'φam λ⊙··", "ina λ⊙··")],
+        child="TestChild",
+        source="test_diagnostics",
+    )
+
+    assert result["alignment_candidates"] == 1
+    assert result["accepted_alignment_candidates"] == 1
+    assert result["pairs"] == [{"native": "°·'φam", "english": "ina"}]
+    assert result["alignment_rejections"] == []
+
+
 def test_history_evidence_records_aligned_native_words_in_one_batch(tmp_path, monkeypatch):
     _disable_runtime_metrics(monkeypatch)
     monkeypatch.chdir(tmp_path)

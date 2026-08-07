@@ -119,8 +119,64 @@ AUDIO_ATTACHMENT_EXTENSIONS = {".wav", ".mp3", ".ogg", ".opus", ".flac", ".m4a",
 DEFAULT_DISCORD_SEND_INTERVAL_SECONDS = 0.35
 DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS = 0.25
 DEFAULT_DISCORD_SEND_RETRIES = 3
+DEFAULT_MAX_REPLY_SYMBOLS = 24  # attention ceiling, not a sentence target
+DISCORD_MESSAGE_CHAR_LIMIT = 2000
 
 _DISCORD_BRIDGE_LOCK_HANDLE = None
+
+
+def split_discord_message(text: str, limit: int = DISCORD_MESSAGE_CHAR_LIMIT) -> list[str]:
+    """Split only for transport, preferring paragraph and sentence boundaries."""
+    payload = "" if text is None else str(text)
+    try:
+        bounded_limit = max(1, min(DISCORD_MESSAGE_CHAR_LIMIT, int(limit)))
+    except (TypeError, ValueError):
+        bounded_limit = DISCORD_MESSAGE_CHAR_LIMIT
+    if len(payload) <= bounded_limit:
+        return [payload]
+
+    chunks = []
+    remaining = payload
+    while len(remaining) > bounded_limit:
+        window = remaining[: bounded_limit + 1]
+        useful_floor = max(1, bounded_limit // 3)
+        cut = 0
+
+        paragraph_break = window.rfind("\n\n", 0, bounded_limit + 1)
+        if paragraph_break >= useful_floor:
+            cut = paragraph_break + 2
+        if not cut:
+            line_break = window.rfind("\n", 0, bounded_limit + 1)
+            if line_break >= useful_floor:
+                cut = line_break + 1
+        if not cut:
+            sentence_breaks = [
+                match.end()
+                for match in re.finditer(r"""[.!?](?:["')\]]*)\s+""", window)
+                if match.end() <= bounded_limit
+            ]
+            if sentence_breaks and sentence_breaks[-1] >= useful_floor:
+                cut = sentence_breaks[-1]
+        if not cut:
+            whitespace = max(
+                window.rfind(" ", 0, bounded_limit + 1),
+                window.rfind("\t", 0, bounded_limit + 1),
+            )
+            if whitespace > 0:
+                cut = whitespace + 1
+        if not cut:
+            cut = bounded_limit
+
+        chunk = remaining[:cut]
+        if not chunk:
+            chunk = remaining[:bounded_limit]
+            cut = bounded_limit
+        chunks.append(chunk)
+        remaining = remaining[cut:]
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _acquire_single_instance_lock() -> bool:
@@ -282,15 +338,64 @@ _ENGLISH_HISTORY_LINE = re.compile(
 )
 
 
+def parse_symbolic_history_message(text: str) -> dict:
+    """Pair each Native line only with its following human-gloss line."""
+    pairs = []
+    rejections = []
+    pending_native = None
+    for line_number, line in enumerate(str(text or "").splitlines(), start=1):
+        native_match = _NATIVE_HISTORY_LINE.match(line)
+        if native_match:
+            if pending_native is not None:
+                rejections.append(
+                    {
+                        "reason": "orphan_native",
+                        "line": pending_native["line"],
+                    }
+                )
+            pending_native = {
+                "text": native_match.group(1).strip(),
+                "line": line_number,
+            }
+            continue
+
+        english_match = _ENGLISH_HISTORY_LINE.match(line)
+        if not english_match:
+            continue
+        if pending_native is None:
+            rejections.append(
+                {
+                    "reason": "orphan_human_guess",
+                    "line": line_number,
+                }
+            )
+            continue
+        english_text = english_match.group(1).strip()
+        if pending_native["text"] and english_text:
+            pairs.append((pending_native["text"], english_text))
+        pending_native = None
+
+    if pending_native is not None:
+        rejections.append(
+            {
+                "reason": "orphan_native",
+                "line": pending_native["line"],
+            }
+        )
+    rejection_counts = {}
+    for rejection in rejections:
+        reason = rejection["reason"]
+        rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
+    return {
+        "pairs": pairs,
+        "rejections": rejections,
+        "rejection_counts": rejection_counts,
+    }
+
+
 def extract_symbolic_history_alignments(text: str) -> list[tuple[str, str]]:
-    """Extract labelled native/English pairs from Ina's prior messages."""
-    native_lines = _NATIVE_HISTORY_LINE.findall(text or "")
-    english_lines = _ENGLISH_HISTORY_LINE.findall(text or "")
-    return [
-        (native.strip(), english.strip())
-        for native, english in zip(native_lines, english_lines)
-        if native.strip() and english.strip()
-    ]
+    """Extract safely paired labelled native/English lines."""
+    return parse_symbolic_history_message(text)["pairs"]
 
 
 def get_voice_io_config() -> dict:
@@ -1072,14 +1177,22 @@ def process_inbound_message(msg) -> CommsResponse:
         symbolic_input,
         child=child,
         base_path=Path("AI_Children"),
-        max_symbols=_coerce_positive_int(cfg.get("max_reply_symbols", 6), 6),
+        max_symbols=_coerce_positive_int(
+            cfg.get("max_reply_symbols", DEFAULT_MAX_REPLY_SYMBOLS),
+            DEFAULT_MAX_REPLY_SYMBOLS,
+        ),
         context=symbolic_context,
     )
     vision_symbols = vision_context.get("recognized_symbols") or []
     if vision_symbols:
         text_symbols = list(symbolic.get("symbols") or []) if symbolic else []
         combined_symbols = list(dict.fromkeys([*text_symbols, *vision_symbols]))
-        combined_symbols = combined_symbols[: _coerce_positive_int(cfg.get("max_reply_symbols", 6), 6)]
+        combined_symbols = combined_symbols[
+            : _coerce_positive_int(
+                cfg.get("max_reply_symbols", DEFAULT_MAX_REPLY_SYMBOLS),
+                DEFAULT_MAX_REPLY_SYMBOLS,
+            )
+        ]
         visual_message = build_dual_symbolic_message(
             combined_symbols,
             child=child,
@@ -1516,7 +1629,9 @@ class InaDiscordClient(discord.Client):
             await message.channel.send(
                 "History review complete: "
                 f"{result.get('new_messages', 0)} new messages, "
-                f"{result.get('alignments', 0)} native/English alignments."
+                f"{result.get('alignment_candidates', 0)} candidates, "
+                f"{result.get('alignments', 0)} accepted token alignments. "
+                f"Rejections: {result.get('alignment_rejection_counts') or 'none'}."
             )
             return
         if lower in {"/ina status", "/ina ping"}:
@@ -2046,6 +2161,10 @@ class InaDiscordClient(discord.Client):
         py-cord already handles ordinary route buckets internally. This wrapper
         adds a small app-level gate for our outbox flushes and honors retry
         headers if Discord still returns a 429 or transient server error.
+
+        The caller's full text remains one outbox/history expression. Splitting
+        here represents Discord's transport limit and does not feed a shorter
+        version back into Ina's language or memory state.
         """
         retries = _coerce_positive_int(
             self._outbox_policy.get("max_send_retries"),
@@ -2056,46 +2175,63 @@ class InaDiscordClient(discord.Client):
             DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS,
         )
         attempts = retries + 1
-        for attempt in range(1, attempts + 1):
-            file = None
-            try:
-                await self._pace_discord_send()
-                file = file_factory() if file_factory else None
-                await destination.send(text, file=file)
-                return True
-            except discord.HTTPException as exc:
-                status = getattr(exc, "status", None)
-                retry_after = _discord_retry_after(exc)
-                retryable = status == 429 or (isinstance(status, int) and 500 <= status < 600)
-                if not retryable or attempt >= attempts:
-                    logger.exception(
-                        "Discord send failed for %s after %s/%s attempts (status=%s).",
+        chunks = split_discord_message(text)
+        for chunk_index, chunk in enumerate(chunks):
+            sent_chunk = False
+            for attempt in range(1, attempts + 1):
+                file = None
+                try:
+                    await self._pace_discord_send()
+                    file = file_factory() if file_factory and chunk_index == 0 else None
+                    await destination.send(chunk, file=file)
+                    sent_chunk = True
+                    break
+                except discord.HTTPException as exc:
+                    status = getattr(exc, "status", None)
+                    retry_after = _discord_retry_after(exc)
+                    retryable = status == 429 or (isinstance(status, int) and 500 <= status < 600)
+                    if not retryable or attempt >= attempts:
+                        logger.exception(
+                            "Discord send failed for %s chunk %s/%s after %s/%s attempts (status=%s).",
+                            reason,
+                            chunk_index + 1,
+                            len(chunks),
+                            attempt,
+                            attempts,
+                            status,
+                        )
+                        return False
+                    delay = (retry_after if retry_after is not None else min(2 ** attempt, 30.0)) + padding
+                    logger.warning(
+                        "Discord send for %s chunk %s/%s hit status %s; retrying in %.2fs (attempt %s/%s).",
                         reason,
+                        chunk_index + 1,
+                        len(chunks),
+                        status,
+                        delay,
                         attempt,
                         attempts,
-                        status,
                     )
+                    await asyncio.sleep(delay)
+                except Exception:
+                    logger.exception("Discord send failed for %s chunk %s/%s.", reason, chunk_index + 1, len(chunks))
                     return False
-                delay = (retry_after if retry_after is not None else min(2 ** attempt, 30.0)) + padding
-                logger.warning(
-                    "Discord send for %s hit status %s; retrying in %.2fs (attempt %s/%s).",
-                    reason,
-                    status,
-                    delay,
-                    attempt,
-                    attempts,
-                )
-                await asyncio.sleep(delay)
-            except Exception:
-                logger.exception("Discord send failed for %s.", reason)
+                finally:
+                    if file is not None:
+                        try:
+                            file.close()
+                        except Exception:
+                            pass
+            if not sent_chunk:
                 return False
-            finally:
-                if file is not None:
-                    try:
-                        file.close()
-                    except Exception:
-                        pass
-        return False
+        if len(chunks) > 1:
+            logger.info(
+                "Delivered full %s-character expression as %s Discord transport chunks (%s).",
+                len(text),
+                len(chunks),
+                reason,
+            )
+        return True
 
     def _entry_wants_voice_playback(self, entry: dict, attachment_path: Optional[str]) -> bool:
         if not _attachment_path_is_audio(attachment_path):
@@ -2455,6 +2591,7 @@ class InaDiscordClient(discord.Client):
                 limit=policy["history_limit"],
                 mapping_batch=policy["mapping_batch"],
                 revisit_mappings=policy["revisit_mappings"],
+                force_history=force,
             )
         except Exception as exc:
             logger.exception("Discord language review failed.")
@@ -2516,6 +2653,7 @@ class InaDiscordClient(discord.Client):
         limit: int = 75,
         mapping_batch: int = 160,
         revisit_mappings: int = 24,
+        force_history: bool = False,
     ) -> dict:
         """Review a bounded, deduplicated slice of Discord history."""
         level = get_memory_guard_level()
@@ -2541,6 +2679,15 @@ class InaDiscordClient(discord.Client):
         observations = []
         alignments = []
         new_messages = 0
+        revisited_messages = 0
+        history_diagnostics = {
+            "self_authored_messages": 0,
+            "human_authored_messages": 0,
+            "other_bot_messages": 0,
+            "structured_candidates_seen": 0,
+            "structured_candidates_nonself": 0,
+            "pairing_rejection_counts": {},
+        }
         targets = []
         if self.text_channel:
             targets.append(("guild_text", self.text_channel))
@@ -2567,31 +2714,55 @@ class InaDiscordClient(discord.Client):
                         message_id = int(msg.id)
                     except (TypeError, ValueError):
                         continue
-                    if message_id <= cursor:
+                    already_reviewed = message_id <= cursor
+                    if already_reviewed and not force_history:
                         continue
-                    newest_seen = max(newest_seen, message_id)
+                    if not already_reviewed:
+                        newest_seen = max(newest_seen, message_id)
                     content = (msg.content or "").strip()
                     if not content:
                         continue
                     is_ina = bool(self.user and msg.author.id == self.user.id)
-                    if msg.author.bot and not is_ina:
+                    parsed_message = parse_symbolic_history_message(content)
+                    extracted = parsed_message["pairs"]
+                    for reason, count in parsed_message["rejection_counts"].items():
+                        pairing_counts = history_diagnostics["pairing_rejection_counts"]
+                        pairing_counts[reason] = int(pairing_counts.get(reason, 0)) + int(count)
+                    history_diagnostics[
+                        "self_authored_messages" if is_ina else
+                        "other_bot_messages" if msg.author.bot else
+                        "human_authored_messages"
+                    ] += 1
+                    history_diagnostics["structured_candidates_seen"] += len(extracted)
+                    if extracted and not is_ina:
+                        history_diagnostics["structured_candidates_nonself"] += len(extracted)
+                    if msg.author.bot and not is_ina and not extracted:
                         continue
                     if content.lower().startswith("/ina "):
                         continue
 
-                    new_messages += 1
-                    channel_messages += 1
+                    if already_reviewed:
+                        revisited_messages += 1
+                    else:
+                        new_messages += 1
+                        channel_messages += 1
                     reviewed_message_ids.append(str(msg.id))
                     is_dm = label == "owner_dm"
-                    tags = ["discord", "history", "ina" if is_ina else "human"]
+                    tags = [
+                        "discord",
+                        "history",
+                        "structured_alignment" if extracted else
+                        "ina" if is_ina else "human",
+                    ]
                     if is_dm:
                         tags.append("dm")
+                    if extracted:
+                        alignments.extend(extracted)
+                        continue
+                    if already_reviewed:
+                        continue
                     if is_ina:
-                        extracted = extract_symbolic_history_alignments(content)
-                        if extracted:
-                            alignments.extend(extracted)
-                        else:
-                            observations.append({"text": content, "tags": tags})
+                        observations.append({"text": content, "tags": tags})
                         continue
 
                     if str(msg.id) in live_vocab_ids:
@@ -2636,11 +2807,23 @@ class InaDiscordClient(discord.Client):
             mapping_batch=mapping_batch,
             revisit_existing=revisit_mappings,
         )
+        rejection_counts = {}
+        for rejection in evidence_result.get("alignment_rejections") or []:
+            reason = str(rejection.get("reason") or "unknown")
+            rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
         return {
             "status": "complete",
             "new_messages": new_messages,
+            "revisited_messages": revisited_messages,
+            "force_history": bool(force_history),
             "observations": len(observations),
+            "alignment_candidates": int(evidence_result.get("alignment_candidates", 0) or 0),
+            "accepted_alignment_candidates": int(
+                evidence_result.get("accepted_alignment_candidates", 0) or 0
+            ),
             "alignments": len(evidence_result.get("pairs") or []),
+            "alignment_rejection_counts": rejection_counts,
+            "history_diagnostics": history_diagnostics,
             "mapping_updated": bool(mapping_updated),
             "revisited_budget": revisit_mappings,
             "history_cursors": next_cursors,

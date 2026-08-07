@@ -30,6 +30,21 @@ def test_ina_expression_length_is_bounded_and_drive_sensitive():
     assert lp.adaptive_symbol_limit("tiny", 6, available_symbols=2) == 2
 
 
+def test_expression_symbol_choice_has_no_legacy_three_or_six_symbol_cut(monkeypatch):
+    monkeypatch.setattr(lp, "_stable_symbol_seed", lambda _value: 23)
+    symbols = [f"sym_{index}" for index in range(24)]
+
+    chosen = lp.choose_expression_symbols(
+        symbols,
+        "Ina has more to say.",
+        24,
+        child="Ina",
+        context={"expression_drive": 1.0},
+    )
+
+    assert chosen == symbols
+
+
 def test_build_dual_symbolic_message_combines_native_and_guess(monkeypatch):
     monkeypatch.setattr(
         lp,

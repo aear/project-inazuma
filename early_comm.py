@@ -22,11 +22,13 @@ from language_processing import (
     associate_symbol_with_word,
     backprop_symbol_confidence,
     build_dual_symbolic_message,
+    choose_expression_symbols,
     load_experience_graph,
     load_symbol_to_token,
     save_symbol_to_token,
     speak_symbolically,
     select_symbolic_message_text,
+    text_length_profile,
 )
 from runtime_state import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
 from social_map import get_high_trust_contacts, get_owner_user_id
@@ -37,6 +39,7 @@ from symbol_word_utils import proto_confidence as shared_proto_confidence, score
 LEGACY_SOUND_SYMBOL_MAP = Path("sound_symbol_map.json")
 WORD_CREATION_URGE_COOLDOWN = 300  # seconds between nudges to coin a new word
 TYPE_CONTACT_COOLDOWN = 180  # seconds between proactive typed contacts
+DEFAULT_MAX_TYPED_SYMBOLS = 24  # ceiling only; Ina still chooses within it
 PATTERN_PROMOTION_COOLDOWN = 300  # seconds between repeated-tone promotion scans
 PATTERN_FRAGMENT_SCAN_LIMIT = 192  # cap pattern mining to recent expression fragments
 RECENT_EVENT_SCAN_LIMIT = 96  # cap recent speech grounding to newest experience event files
@@ -83,6 +86,13 @@ def _resolve_adjusted_urge_level(state: Any) -> float:
     except Exception:
         adjusted = base
     return max(0.0, min(1.0, adjusted))
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _ensure_vocab_embeddings(
@@ -1317,9 +1327,19 @@ def early_communicate():
     )
     clarity = round(sum(pred_vec) / max(1, len(pred_vec)), 4) if pred_vec else 0.0
     speaking_to = predict_target_from_emotion(inferred)
-    recent_heard = load_recent_heard_words(child, limit=12)
+    discord_config = config.get("discord") if isinstance(config.get("discord"), dict) else {}
+    max_typed_symbols = _positive_int(
+        config.get("max_typed_symbols", discord_config.get("max_reply_symbols", DEFAULT_MAX_TYPED_SYMBOLS)),
+        DEFAULT_MAX_TYPED_SYMBOLS,
+    )
+    recent_heard = load_recent_heard_words(child, limit=max_typed_symbols * 3)
     context_language = guess_language_code(" ".join(item.get("word", "") for item in recent_heard))
-    babble_targets = choose_babble_targets(child, language_hint=context_language, heard=recent_heard)
+    babble_targets = choose_babble_targets(
+        child,
+        limit=max_typed_symbols,
+        language_hint=context_language,
+        heard=recent_heard,
+    )
     spoken_words: List[str] = []
     speech_symbols: List[str] = []
     expression_strategy = "emotion_prediction"
@@ -1494,7 +1514,7 @@ def early_communicate():
                     "uses": tone_riff_option.get("uses"),
                     "delivery": voice_delivery,
                 }
-                labels = [label_for_symbol(sid) for sid in speech_symbols[:3]]
+                labels = [label_for_symbol(sid) for sid in speech_symbols]
                 suffix = " via Discord voice" if voice_pref else ""
                 expression = f"Exploring a tone riff{suffix}: " + ", ".join(labels)
                 log_to_statusbox(
@@ -1536,7 +1556,7 @@ def early_communicate():
 
     if expression_strategy not in {"mimic_grounded_speech", "proto_pair_word"} and tone_candidates and speech_symbols:
         labels = []
-        for sid in speech_symbols[:3]:
+        for sid in speech_symbols:
             vw_entry = vocab_map.get(sid, {}) if isinstance(vocab_map, dict) else {}
             vw = vw_entry.get("word")
             labels.append(vw or sid)
@@ -1620,12 +1640,24 @@ def early_communicate():
             last_heard_user_id = str(raw_last_user)
         last_heard_is_dm = bool(last_heard_contact.get("is_dm"))
 
+    # Choose a phrase length rather than imposing the old three-symbol cut.
+    typed_symbols = choose_expression_symbols(
+        speech_symbols,
+        expression,
+        max_typed_symbols,
+        child=child,
+        context={
+            "expression_drive": type_urge_level,
+            "tags": ["typed_contact", expression_strategy],
+        },
+    )
+
     # Prefer human-friendly labels over raw symbol ids when crafting typed text.
-    symbol_labels = [label_for_symbol(sid) for sid in speech_symbols[:3] if sid]
+    symbol_labels = [label_for_symbol(sid) for sid in typed_symbols if sid]
     symbol_text = " ".join(symbol_labels) if symbol_labels else None
     fallback_text = vocab_word or word_id or symbol_text
     dual_symbol_message = None
-    if speech_symbols:
+    if typed_symbols:
         frag_tags = frag.get("tags", []) if isinstance(frag, dict) else []
         dual_context = {
             "source": "early_comm",
@@ -1638,7 +1670,7 @@ def early_communicate():
             ],
         }
         dual_symbol_message = build_dual_symbolic_message(
-            speech_symbols[:3],
+            typed_symbols,
             child=child,
             base_path=Path("AI_Children"),
             fallback_human_text=fallback_text,
@@ -1736,7 +1768,10 @@ def early_communicate():
             "audio_clip_path": str(audio_clip_path) if audio_clip_path else None,
             "last_heard_contact": last_heard_contact if isinstance(last_heard_contact, dict) else None,
             "candidates": {
-                "speech_symbols": speech_symbols[:3] if speech_symbols else None,
+                "speech_symbols": typed_symbols or None,
+                "available_speech_symbols": len(speech_symbols),
+                "chosen_symbol_count": len(typed_symbols),
+                "configured_symbol_ceiling": max_typed_symbols,
                 "vocab_word": vocab_word,
                 "word_id": word_id,
                 "high_trust_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
@@ -1770,9 +1805,15 @@ def early_communicate():
                     "effective_language_mode": (
                         "freeform" if isinstance(payload_text, str) else effective_language_mode
                     ),
+                    "expression_length_profile": text_length_profile(chosen_text),
+                    "expression_stored_in_full": True,
+                    "delivery_chunking": "discord_transport_only",
                     "delivery": voice_delivery,
                     "voice_target": voice_pref,
                     "audio_attachment_kind": "symbolic_voice" if audio_clip_path else None,
+                    "available_symbol_count": len(speech_symbols),
+                    "chosen_symbol_count": len(typed_symbols),
+                    "configured_symbol_ceiling": max_typed_symbols,
                 },
                 allow_empty=payload_allow_empty,
                 attachment_path=str(audio_clip_path) if audio_clip_path else None,
@@ -1799,7 +1840,7 @@ def early_communicate():
                     "urge_level": type_urge_level,
                     "note": "urge high; waiting for volitional text (silence is okay)",
                     "candidates": {
-                        "symbols": speech_symbols[:3] if speech_symbols else None,
+                        "symbols": typed_symbols or None,
                         "word": vocab_word or word_id,
                         "trusted_user_ids": [c.get("user_id") for c in high_trust_contacts] if high_trust_contacts else None,
                     },

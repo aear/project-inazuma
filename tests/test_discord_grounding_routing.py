@@ -5,6 +5,83 @@ from types import SimpleNamespace
 import discord_bridge as db
 
 
+def test_discord_chunking_preserves_full_paragraph_text():
+    text = ("A" * 1200) + "\n\n" + ("B" * 1200) + "\nFinal sentence."
+
+    chunks = db.split_discord_message(text)
+
+    assert len(chunks) == 2
+    assert all(len(chunk) <= db.DISCORD_MESSAGE_CHAR_LIMIT for chunk in chunks)
+    assert "".join(chunks) == text
+    assert chunks[0].endswith("\n\n")
+
+
+def test_chunk_budget_includes_native_and_english_guess():
+    native = "λ" * 1450
+    english = "word " * 180
+    paired = f"Native: {native}\nHuman guess: {english}"
+
+    chunks = db.split_discord_message(paired)
+
+    assert len(paired) > db.DISCORD_MESSAGE_CHAR_LIMIT
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= db.DISCORD_MESSAGE_CHAR_LIMIT for chunk in chunks)
+    assert "".join(chunks) == paired
+
+
+def test_discord_sender_chunks_only_at_delivery_and_attaches_once():
+    sent = []
+    files = []
+
+    class File:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Destination:
+        async def send(self, text, file=None):
+            sent.append(text)
+            files.append(file)
+
+    async def pace():
+        return None
+
+    client = SimpleNamespace(
+        _outbox_policy={
+            "max_send_retries": 1,
+            "rate_limit_padding_seconds": 0,
+        },
+        _pace_discord_send=pace,
+    )
+    original = ("first paragraph. " * 130) + "\n\n" + ("second paragraph. " * 130)
+    made_files = []
+
+    def file_factory():
+        file = File()
+        made_files.append(file)
+        return file
+
+    delivered = asyncio.run(
+        db.InaDiscordClient.send_discord_message(
+            client,
+            Destination(),
+            original,
+            file_factory=file_factory,
+            reason="test-full-expression",
+        )
+    )
+
+    assert delivered is True
+    assert "".join(sent) == original
+    assert all(len(chunk) <= db.DISCORD_MESSAGE_CHAR_LIMIT for chunk in sent)
+    assert len(sent) > 1
+    assert files[0] is made_files[0]
+    assert all(file is None for file in files[1:])
+    assert made_files[0].closed is True
+
+
 class _Adapter:
     def __init__(self, response="adapter reply"):
         self.calls = []
@@ -67,10 +144,18 @@ def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch,
     assert adapter.calls == []
 
 
-def test_history_parser_recovers_native_english_pairs():
+def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(
         "Native: glyph_wave glyph_calm\nHuman guess: hello calm"
     ) == [("glyph_wave glyph_calm", "hello calm")]
+    parsed = db.parse_symbolic_history_message(
+        "Native: orphan\nNative: glyph_calm\nHuman guess: calm\nHuman guess: orphan"
+    )
+    assert parsed["pairs"] == [("glyph_calm", "calm")]
+    assert parsed["rejection_counts"] == {
+        "orphan_native": 1,
+        "orphan_human_guess": 1,
+    }
     assert db.extract_symbolic_history_alignments("Just English this time.") == []
 
 
@@ -170,6 +255,80 @@ def test_history_review_learns_old_text_and_deduplicates_live_text(monkeypatch):
     assert captured["alignments"] == [("glyph_wave", "hello")]
     assert client.history_bridge.turns == ["older word"]
     assert result["history_cursors"] == {"5": "11"}
+
+
+def test_forced_history_review_routes_app_authored_structured_pairs(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(db, "get_memory_guard_level", lambda: "normal")
+    monkeypatch.setattr(
+        db,
+        "get_inastate",
+        lambda key: {"history_cursors": {"5": "11"}} if key == "discord_language_review" else None,
+    )
+
+    def review(observations, alignments, **kwargs):
+        captured["observations"] = observations
+        captured["alignments"] = alignments
+        return {
+            "pairs": [{"native": "°·'φam", "english": "ina"}],
+            "alignment_candidates": 1,
+            "accepted_alignment_candidates": 1,
+            "alignment_rejections": [],
+        }
+
+    mapping_calls = []
+    monkeypatch.setattr(db, "review_text_evidence", review)
+    monkeypatch.setattr(
+        db,
+        "build_text_symbol_links",
+        lambda *args, **kwargs: mapping_calls.append((args, kwargs)) or True,
+    )
+    stamp = datetime.now(timezone.utc)
+    app_author = SimpleNamespace(id=888, bot=False, display_name="Inazuma")
+    message = SimpleNamespace(
+        id=11,
+        author=app_author,
+        content="Native: °·'φam λ⊙··\nHuman guess: ina λ⊙··",
+        created_at=stamp,
+    )
+
+    class Channel:
+        id = 5
+
+        async def history(self, **kwargs):
+            yield message
+
+    class Client:
+        text_channel = Channel()
+        user = SimpleNamespace(id=999)
+        child = "TestChild"
+        history_bridge = SimpleNamespace(log_conversation_turn=lambda *args, **kwargs: None)
+
+        def get_user(self, user_id):
+            return None
+
+        async def fetch_user(self, user_id):
+            return None
+
+    result = asyncio.run(
+        db.InaDiscordClient._ingest_message_history(
+            Client(),
+            limit=10,
+            mapping_batch=7,
+            revisit_mappings=3,
+            force_history=True,
+        )
+    )
+
+    assert captured["observations"] == []
+    assert captured["alignments"] == [("°·'φam λ⊙··", "ina λ⊙··")]
+    assert result["new_messages"] == 0
+    assert result["revisited_messages"] == 1
+    assert result["alignment_candidates"] == 1
+    assert mapping_calls[0][1] == {
+        "mapping_batch": 7,
+        "revisit_existing": 3,
+    }
 
 
 def test_attachment_does_not_override_complete_symbolic_reply(monkeypatch):

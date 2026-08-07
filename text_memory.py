@@ -217,6 +217,82 @@ def update_text_vocab(
     return True
 
 
+def diagnose_text_alignment(native_text: str, english_text: str) -> Dict[str, Any]:
+    """Find unambiguous replacements while preserving shared native context."""
+    native_tokens = [
+        token.strip() for token in str(native_text or "").split() if token.strip()
+    ]
+    gloss_tokens = [
+        token.strip() for token in str(english_text or "").split() if token.strip()
+    ]
+    english_words = tokenize_text(english_text)
+    candidate_pairs: List[Dict[str, str]] = []
+    replacement_rejections = []
+    unchanged_context_count = 0
+    diagnostic = {
+        "native_text": str(native_text or ""),
+        "english_text": str(english_text or ""),
+        "native_tokens": native_tokens,
+        "gloss_tokens": gloss_tokens,
+        "english_words": english_words,
+        "native_token_count": len(native_tokens),
+        "gloss_token_count": len(gloss_tokens),
+        "english_word_count": len(english_words),
+    }
+    if not native_tokens:
+        reason = "empty_native"
+    elif not gloss_tokens:
+        reason = "empty_human_guess"
+    elif len(native_tokens) != len(gloss_tokens):
+        reason = "sequence_length_mismatch"
+    else:
+        for index, (native_token, gloss_token) in enumerate(
+            zip(native_tokens, gloss_tokens)
+        ):
+            if native_token == gloss_token:
+                unchanged_context_count += 1
+                continue
+            replacement_words = tokenize_text(gloss_token)
+            if len(replacement_words) == 1:
+                candidate_pairs.append(
+                    {
+                        "native": native_token,
+                        "english": replacement_words[0],
+                    }
+                )
+            else:
+                replacement_rejections.append(
+                    {
+                        "index": index,
+                        "native": native_token,
+                        "gloss": gloss_token,
+                        "reason": (
+                            "non_english_replacement"
+                            if not replacement_words
+                            else "ambiguous_replacement"
+                        ),
+                        "english_words": replacement_words,
+                    }
+                )
+        if candidate_pairs:
+            reason = "accepted_contextual"
+        elif unchanged_context_count == len(native_tokens):
+            reason = "no_changed_tokens"
+        else:
+            reason = "no_unambiguous_replacements"
+
+    diagnostic.update(
+        {
+            "reason": reason,
+            "accepted": reason == "accepted_contextual",
+            "candidate_pairs": candidate_pairs,
+            "unchanged_context_count": unchanged_context_count,
+            "replacement_rejections": replacement_rejections,
+        }
+    )
+    return diagnostic
+
+
 def review_text_evidence(
     observations: List[Dict[str, Any]],
     alignments: List[tuple[str, str]],
@@ -230,6 +306,7 @@ def review_text_evidence(
     now = _now_iso()
     observed_messages = 0
     pairs: List[Dict[str, str]] = []
+    alignment_diagnostics: List[Dict[str, Any]] = []
 
     def observe(text: str, tags: Optional[List[str]] = None) -> List[str]:
         nonlocal observed_messages
@@ -259,15 +336,17 @@ def review_text_evidence(
         observe(str(observation.get("text") or ""), observation.get("tags"))
 
     for native_text, english_text in alignments or []:
-        native_tokens = [
-            token.strip() for token in str(native_text or "").split() if token.strip()
-        ]
+        diagnostic = diagnose_text_alignment(native_text, english_text)
         english_words = observe(
             str(english_text or ""), ["discord", "history", "symbolic_alignment"]
         )
-        if len(native_tokens) != len(english_words):
+        diagnostic["observed_english_words"] = list(english_words)
+        alignment_diagnostics.append(diagnostic)
+        if not diagnostic["accepted"]:
             continue
-        for native_token, english_word in zip(native_tokens, english_words):
+        for candidate_pair in diagnostic["candidate_pairs"]:
+            native_token = candidate_pair["native"]
+            english_word = candidate_pair["english"]
             entry = vocab.get(english_word)
             if not isinstance(entry, dict):
                 continue
@@ -287,6 +366,15 @@ def review_text_evidence(
     return {
         "updated": observed_messages > 0,
         "observed_messages": observed_messages,
+        "alignment_candidates": len(alignment_diagnostics),
+        "accepted_alignment_candidates": sum(
+            1 for diagnostic in alignment_diagnostics if diagnostic["accepted"]
+        ),
+        "alignment_rejections": [
+            diagnostic for diagnostic in alignment_diagnostics
+            if not diagnostic["accepted"]
+        ],
+        "alignment_diagnostics": alignment_diagnostics,
         "pairs": pairs,
     }
 
@@ -586,6 +674,7 @@ __all__ = [
     "load_text_vocab",
     "save_text_vocab",
     "update_text_vocab",
+    "diagnose_text_alignment",
     "review_text_evidence",
     "observe_text_symbol_alignment",
     "create_text_fragment",
