@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from discord_runtime import discord_log_path
+
 import numpy as np
 
 try:
@@ -32,6 +34,8 @@ try:
     from model_manager import update_inastate
 except Exception:  # pragma: no cover - optional dependency
     update_inastate = None
+
+from world_frame_export import AsyncFrameExporter, resolve_world_frame_path
 
 try:
     from audio_settings_panel import AudioSettingsPanel
@@ -275,7 +279,7 @@ def _tail_lines(path: Path, *, max_lines: int = 200) -> List[str]:
 
 
 def _load_recent_discord_messages(limit: int = 6) -> List[str]:
-    path = Path("logs") / "comms_core.jsonl"
+    path = discord_log_path()
     if not path.exists():
         return []
     lines = _tail_lines(path, max_lines=max(limit * 20, 80))
@@ -325,8 +329,7 @@ class HouseViewerBridge(QtCore.QObject):
         self._door_state_synced = False
         self._pause_dialog: Optional[PauseMenu] = None
         self._pause_active = False
-        self._last_frame_ts = 0.0
-        self._frame_interval = 1.0
+        self._frame_exporter = AsyncFrameExporter(thread_name="player_frame_export")
         self._vision_path = _resolve_player_path()
         self._chat_dock: Optional[ChatDock] = None
         self._chat_seq = 0
@@ -636,41 +639,11 @@ class HouseViewerBridge(QtCore.QObject):
             pass
 
     def _export_frame(self, now: float) -> None:
-        if self._vision_path is None:
-            return
-        if now - self._last_frame_ts < self._frame_interval:
-            return
-        self._last_frame_ts = now
-        try:
-            pixmap = self.viewer.view.grab()
-        except Exception:
-            return
-        if pixmap.isNull():
-            return
-        try:
-            self._vision_path.parent.mkdir(parents=True, exist_ok=True)
-            pixmap.save(str(self._vision_path), "PNG")
-        except Exception:
-            return
-        if update_inastate is None:
-            return
-        try:
-            update_inastate("player_frame_ts", time.time())
-        except Exception:
-            pass
+        self._frame_exporter.export(self.viewer.view, self._vision_path, now)
 
 
 def _resolve_player_path() -> Optional[Path]:
-    config_path = Path("config.json")
-    if not config_path.exists():
-        return None
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    child = config.get("current_child") or "default_child"
-    base = Path("AI_Children") / child / "memory" / "vision_session"
-    return base / "world_view_player.png"
+    return resolve_world_frame_path("world_view_player.png")
 
 
 def run_arch_viewer(*, client, fullscreen: bool = True, borderless: bool = True) -> None:

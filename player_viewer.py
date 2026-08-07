@@ -28,7 +28,7 @@ if QtWidgets is not None:
             client,
             fullscreen: bool = True,
             borderless: bool = True,
-            tick_ms: int = 100,
+            tick_ms: int = 16,
         ) -> None:
             super().__init__()
             self.client = client

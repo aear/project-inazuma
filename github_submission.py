@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from discord_runtime import typed_outbox_path as resolve_typed_outbox_path
+
 DEFAULT_GITHUB_SUBMISSION: Dict[str, Any] = {
     "enabled": False,
     "delivery_mode": "queue_only",  # queue_only | issues
@@ -209,7 +211,7 @@ def request_github_delivery(child: str, *, reason: str = "queue_updated", cfg: O
 
 
 def typed_outbox_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "typed_outbox.jsonl"
+    return resolve_typed_outbox_path(child)
 
 
 def append_typed_outbox_notice(

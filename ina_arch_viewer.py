@@ -8,7 +8,6 @@ import json
 import socket
 import threading
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -34,6 +33,8 @@ try:
     from model_manager import update_inastate
 except Exception:  # pragma: no cover - optional dependency
     update_inastate = None
+
+from world_frame_export import AsyncFrameExporter, resolve_world_frame_path
 
 from world_protocol import DEFAULT_TCP_HOST, DEFAULT_TCP_PORT, safe_json_dumps
 
@@ -157,8 +158,7 @@ class InaVisionBridge(QtCore.QObject):
         self.borderless = borderless
         self.tick_ms = tick_ms
         self._last_sync = 0.0
-        self._last_frame_ts = 0.0
-        self._frame_interval = 1.0
+        self._frame_exporter = AsyncFrameExporter(thread_name="ina_frame_export")
         self._vision_path = _resolve_vision_path()
         self._door_state_synced = False
 
@@ -273,41 +273,11 @@ class InaVisionBridge(QtCore.QObject):
             pass
 
     def _export_frame(self, now: float) -> None:
-        if self._vision_path is None:
-            return
-        if now - self._last_frame_ts < self._frame_interval:
-            return
-        self._last_frame_ts = now
-        try:
-            pixmap = self.viewer.view.grab()
-        except Exception:
-            return
-        if pixmap.isNull():
-            return
-        try:
-            self._vision_path.parent.mkdir(parents=True, exist_ok=True)
-            pixmap.save(str(self._vision_path), "PNG")
-        except Exception:
-            return
-        if update_inastate is None:
-            return
-        try:
-            update_inastate("vision_frame_ts", time.time())
-        except Exception:
-            pass
+        self._frame_exporter.export(self.viewer.view, self._vision_path, now)
 
 
-def _resolve_vision_path() -> Optional[Path]:
-    config_path = Path("config.json")
-    if not config_path.exists():
-        return None
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    child = config.get("current_child") or "default_child"
-    base = Path("AI_Children") / child / "memory" / "vision_session"
-    return base / "world_view_ina.png"
+def _resolve_vision_path():
+    return resolve_world_frame_path("world_view_ina.png")
 
 
 def run_ina_viewer(

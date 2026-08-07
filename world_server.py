@@ -11,6 +11,7 @@ import math
 import os
 import re
 import signal
+import socket
 import threading
 import time
 import uuid
@@ -553,6 +554,8 @@ class WorldServer:
         obs_capture_fps: float = 0.0,
         position_store: Optional[PositionStore] = None,
         spawn_points: Optional[Dict[str, Tuple[float, float, float]]] = None,
+        simulation_hz: float = 20.0,
+        state_hz: float = 10.0,
     ) -> None:
         self._unix_socket = unix_socket
         self._tcp_host = tcp_host
@@ -569,7 +572,8 @@ class WorldServer:
         self._scene_map = scene_map
         self._obs_bridge = obs_bridge
         self._simulation_task: Optional[asyncio.Task] = None
-        self._state_interval = 0.5
+        self._simulation_interval = 1.0 / max(1.0, float(simulation_hz))
+        self._state_interval = 1.0 / max(1.0, float(state_hz))
         self._stream_enabled = stream_enabled
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._http_thread: Optional[threading.Thread] = None
@@ -690,6 +694,12 @@ class WorldServer:
             return self._obs_frame_version, self._obs_frame_bytes
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer_socket = writer.get_extra_info("socket")
+        if peer_socket is not None and peer_socket.family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                peer_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
         remote = self._format_remote(writer)
         session_id = uuid.uuid4().hex
         session = ClientSession(writer=writer, remote=remote)
@@ -1023,7 +1033,7 @@ class WorldServer:
         self._simulation_task = asyncio.create_task(self._simulation_loop())
 
     async def _simulation_loop(self) -> None:
-        tick_interval = 0.1
+        tick_interval = self._simulation_interval
         last_ts = time.monotonic()
         while True:
             await asyncio.sleep(tick_interval)
@@ -1538,6 +1548,15 @@ async def _run(args: argparse.Namespace) -> None:
         spawn_points.update(_load_spawn_points_from_plan(str(plan_path)))
     spawn_points.update(_parse_spawn_points(world_cfg.get("spawn_points")))
 
+    try:
+        simulation_hz = float(world_cfg.get("simulation_hz", 20.0))
+    except (TypeError, ValueError):
+        simulation_hz = 20.0
+    try:
+        state_hz = float(world_cfg.get("state_hz", 10.0))
+    except (TypeError, ValueError):
+        state_hz = 10.0
+
     obs_bridge = None
     obs_capture_fps = 0.0
     if OBSWebSocketBridge and args.obs_enabled:
@@ -1586,6 +1605,8 @@ async def _run(args: argparse.Namespace) -> None:
         obs_capture_fps=obs_capture_fps,
         position_store=position_store,
         spawn_points=spawn_points,
+        simulation_hz=simulation_hz,
+        state_hz=state_hz,
     )
 
     loop = asyncio.get_running_loop()

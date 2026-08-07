@@ -1,6 +1,7 @@
 # house_viewer.py
 
 import copy
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from datetime import date, datetime, timedelta, timezone
 import math
@@ -901,6 +902,8 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.exterior_model = None
         self._interaction_highlight = None
         self._interaction_target = None
+        self._interaction_scan_interval = 0.1
+        self._interaction_scan_last = 0.0
         self._player_anim_phase = 0.0
         self._player_anim_last_pos = None
         self._player_anim_last_ts = time.perf_counter()
@@ -916,6 +919,11 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._tv_stream_config_mtime = None
         self._tv_stream_items = {}
         self._tv_stream_size = (320, 180)
+        self._tv_capture_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="house_tv_capture",
+        )
+        self._tv_capture_future: Optional[Future] = None
         self.radial_menu = RadialMenu(self)
         self._radial_menu_active = False
         self._radial_menu_target = None
@@ -6292,11 +6300,16 @@ class HouseViewer(QtWidgets.QMainWindow):
             return
         self._interaction_highlight.setVisible(False)
 
-    def _update_interaction_target(self):
+    def _update_interaction_target(self, *, force: bool = False):
         if not self.first_person_enabled or self.player_pos is None or self._radial_menu_active:
             self._interaction_target = None
             self._clear_interaction_highlight()
             return
+
+        now = time.perf_counter()
+        if not force and (now - self._interaction_scan_last) < self._interaction_scan_interval:
+            return
+        self._interaction_scan_last = now
 
         target = self._pick_interaction_target()
         self._interaction_target = target
@@ -7311,19 +7324,41 @@ class HouseViewer(QtWidgets.QMainWindow):
     def _update_tv_stream(self):
         if not self.furniture_instances:
             return
-        self._refresh_tv_stream_config()
-        if not self._tv_stream_bounds:
-            return
+
+        future = self._tv_capture_future
+        if future is not None:
+            if not future.done():
+                return
+            self._tv_capture_future = None
+            try:
+                data = future.result()
+            except Exception:
+                data = None
+            if data is not None:
+                self._apply_tv_stream_frame(data)
+
         now = time.perf_counter()
         if (now - self._tv_stream_last_update) < self._tv_stream_interval:
             return
         self._tv_stream_last_update = now
+        self._refresh_tv_stream_config()
+        if not self._tv_stream_bounds:
+            return
+        bounds = dict(self._tv_stream_bounds)
+        self._tv_capture_future = self._tv_capture_executor.submit(
+            self._capture_tv_stream_frame,
+            bounds,
+            self._tv_stream_size,
+        )
+
+    @staticmethod
+    def _capture_tv_stream_frame(bounds: dict, target_size: Tuple[int, int]):
         frame = None
         try:
             import mss  # type: ignore
 
             with mss.mss() as grabber:
-                raw = grabber.grab(self._tv_stream_bounds)
+                raw = grabber.grab(bounds)
             if raw is not None:
                 frame = np.array(raw)
                 if frame.shape[-1] == 4:
@@ -7334,7 +7369,6 @@ class HouseViewer(QtWidgets.QMainWindow):
             try:
                 import pyautogui  # type: ignore
 
-                bounds = self._tv_stream_bounds
                 image = pyautogui.screenshot(
                     region=(
                         bounds["left"],
@@ -7350,8 +7384,8 @@ class HouseViewer(QtWidgets.QMainWindow):
             except Exception:
                 return
         if frame is None or frame.ndim < 3 or frame.shape[2] < 3:
-            return
-        target_w, target_h = self._tv_stream_size
+            return None
+        target_w, target_h = target_size
         try:
             import cv2  # type: ignore
 
@@ -7362,12 +7396,15 @@ class HouseViewer(QtWidgets.QMainWindow):
             frame = frame[::step_y, ::step_x]
             frame = frame[:target_h, :target_w]
         if frame.shape[0] != target_h or frame.shape[1] != target_w:
-            return
+            return None
         if frame.shape[2] == 3:
             alpha = np.full(frame.shape[:2] + (1,), 255, dtype=frame.dtype)
             frame = np.concatenate([frame, alpha], axis=2)
         frame = frame.astype(np.uint8, copy=False)
-        data = np.ascontiguousarray(np.transpose(frame, (1, 0, 2)))
+        return np.ascontiguousarray(np.transpose(frame, (1, 0, 2)))
+
+    def _apply_tv_stream_frame(self, data: np.ndarray):
+        target_w, target_h = self._tv_stream_size
         for instance in self.furniture_instances:
             if not self._is_tv_instance(instance):
                 continue

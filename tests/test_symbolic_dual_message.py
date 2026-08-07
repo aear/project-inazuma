@@ -68,6 +68,32 @@ def test_build_dual_symbolic_message_prefers_supplied_human_text(monkeypatch):
     assert payload["text"] == "Native: sym_wave\nHuman guess: hello there"
 
 
+def test_symbolic_message_language_choice_keeps_native_translation():
+    payload = {
+        "text": "Native: glyph_wave\nHuman guess: hello there",
+        "native_text": "glyph_wave",
+        "gloss_text": "hello there",
+    }
+
+    assert lp.select_symbolic_message_text(payload, "english") == ("hello there", "english")
+    assert lp.select_symbolic_message_text(payload, "native") == (payload["text"], "native")
+    assert lp.select_symbolic_message_text(payload, "mixed") == (payload["text"], "mixed")
+    assert lp.select_symbolic_message_text(payload, "auto") == (payload["text"], "mixed")
+
+
+def test_english_choice_does_not_hide_an_untranslated_native_message():
+    payload = {
+        "text": "Native: glyph_private\nHuman guess: glyph_private",
+        "native_text": "glyph_private",
+        "gloss_text": "glyph_private",
+    }
+
+    assert lp.select_symbolic_message_text(payload, {"mode": "english"}) == (
+        payload["text"],
+        "mixed",
+    )
+
+
 def test_build_dual_symbolic_message_uses_contextual_text_vocab_links(tmp_path, monkeypatch):
     monkeypatch.setattr(lp, "load_symbol_to_token", lambda child, base_path=None: {})
     memory_root = tmp_path / "TestChild" / "memory"

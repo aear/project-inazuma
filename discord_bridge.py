@@ -50,6 +50,7 @@ from language_processing import (
     build_dual_symbolic_message,
     generate_symbolic_reply_from_text,
     load_generated_symbols,
+    select_symbolic_message_text,
 )
 from simple_image_fallback import ImageFallbackError, extract_image_features
 from vector_math import cosine_similarity as visual_cosine_similarity
@@ -58,6 +59,11 @@ from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
 from model_manager import get_inastate, update_inastate
 from io_pressure import pressure_signal
+from discord_runtime import (
+    typed_outbox_path,
+    typed_outbox_history_path,
+    typed_outbox_archive_path,
+)
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -911,6 +917,12 @@ def process_inbound_message(msg) -> CommsResponse:
     except Exception:
         state = {}
     urge_state = state.get("urge_to_type") or state.get("urge_to_communicate") or {}
+    language_preference = (
+        state.get("discord_language_preference")
+        or state.get("communication_language_preference")
+        or cfg.get("language_mode")
+        or "auto"
+    )
     urge_level = _resolve_adjusted_urge_level(urge_state)
     ignore_urge = bool(root_cfg.get("ignore_urge_for_typing", False)) if isinstance(root_cfg, dict) else False
     if not ignore_urge and urge_level < min_urge:
@@ -1051,7 +1063,9 @@ def process_inbound_message(msg) -> CommsResponse:
             }
 
     symbolic_unknown: list[str] = symbolic.get("unknown") if symbolic else []
-    symbolic_text = symbolic.get("text") if symbolic else None
+    symbolic_text, effective_language_mode = select_symbolic_message_text(
+        symbolic, language_preference
+    )
     symbolic_native_text = symbolic.get("native_text") if symbolic else None
     symbolic_gloss_text = symbolic.get("gloss_text") if symbolic else None
     if symbolic:
@@ -1064,6 +1078,8 @@ def process_inbound_message(msg) -> CommsResponse:
                 "symbolic_gloss_text": symbolic_gloss_text,
                 "symbolic_native_sources": symbolic.get("native_sources"),
                 "symbolic_gloss_sources": symbolic.get("gloss_sources"),
+                "requested_language_mode": language_preference,
+                "effective_language_mode": effective_language_mode,
                 "vision_context": vision_context,
                 "visual_inference_words": visual_inference_words,
             }
@@ -1126,7 +1142,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 )
                 metadata["adapter"] = "lm_explain"
                 metadata["unknown_words"] = explain_targets
-                if symbolic_text:
+                if symbolic_text and effective_language_mode != "english":
                     metadata["symbolic_hint"] = symbolic_text
                     reply_text = f"{symbolic_text}\n\n{reply_text}" if reply_text else symbolic_text
             else:
@@ -1203,12 +1219,15 @@ class InaDiscordClient(discord.Client):
         self._recording_active = False
         self._active_sink = None
         self.history_bridge = LiveExperienceBridge(child=self.child)
-        child_memory = Path("AI_Children") / self.child / "memory"
-        self._typed_outbox_path = child_memory / "typed_outbox.jsonl"
-        self._typed_outbox_history_path = child_memory / "typed_outbox_history.jsonl"
+        self._typed_outbox_path = typed_outbox_path(self.child)
+        self._typed_outbox_history_path = typed_outbox_history_path(self.child)
         self._outbox_policy = get_outbox_policy()
         archive_override = self._outbox_policy.get("archive_path")
-        self._typed_archive_path = Path(archive_override) if archive_override else child_memory / "typed_outbox_archive.jsonl"
+        self._typed_archive_path = (
+            Path(archive_override)
+            if archive_override
+            else typed_outbox_archive_path(self.child)
+        )
         self._typed_outbox_seen = set()
         self._typed_outbox_history_offset = 0
         self._discord_send_lock = asyncio.Lock()
@@ -2530,6 +2549,10 @@ def get_discord_token() -> str:
 
 
 def main() -> None:
+    discord_cfg = get_discord_config()
+    if not bool(discord_cfg.get("enabled", True)):
+        logger.info("Discord bridge disabled in config; exiting.")
+        return
     if not _acquire_single_instance_lock():
         logger.error("discord_bridge already running; exiting duplicate instance.")
         return
@@ -2539,10 +2562,16 @@ def main() -> None:
 
     _install_voice_debug_hooks()
     # Create CommsCore with our custom process_inbound hook
+    runtime_log_dir = (
+        Path(discord_cfg["runtime_log_dir"])
+        if discord_cfg.get("runtime_log_dir")
+        else None
+    )
     comms = CommsCore(
         instance_name=INA_INSTANCE_NAME,
         process_inbound=process_inbound_message,
         raw_fallback=_log_raw_outbound,
+        log_dir=runtime_log_dir,
     )
 
     # Create Discord client

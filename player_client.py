@@ -116,6 +116,9 @@ class PlayerClient:
 
     def _connect_server(self) -> None:
         sock = socket.create_connection((self.tcp_host, self.tcp_port), timeout=5)
+        # Player input is made of tiny, latency-sensitive messages. Do not let
+        # Nagle's algorithm hold one while waiting for another packet/ACK.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(None)
         self.server_sock = sock
         self.server_file = sock.makefile("rwb")

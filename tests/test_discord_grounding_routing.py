@@ -35,6 +35,36 @@ def _enable_replying(monkeypatch):
     monkeypatch.setattr(db, "get_current_child", lambda: "TestChild")
 
 
+def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        '{"discord_language_preference": "english"}', encoding="utf-8"
+    )
+    adapter = _Adapter()
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(
+        db,
+        "generate_symbolic_reply_from_text",
+        lambda *args, **kwargs: {
+            "text": "Native: glyph_wave\nHuman guess: hello",
+            "native_text": "glyph_wave",
+            "gloss_text": "hello",
+            "symbols": ["sym_wave"],
+            "unknown": [],
+        },
+    )
+
+    result = db.process_inbound_message(_message("hello"))
+
+    assert result.text == "hello"
+    assert result.metadata["effective_language_mode"] == "english"
+    assert result.metadata["symbolic_native_text"] == "glyph_wave"
+    assert adapter.calls == []
+
+
 def test_attachment_does_not_override_complete_symbolic_reply(monkeypatch):
     _enable_replying(monkeypatch)
     adapter = _Adapter()

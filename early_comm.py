@@ -26,6 +26,7 @@ from language_processing import (
     load_symbol_to_token,
     save_symbol_to_token,
     speak_symbolically,
+    select_symbolic_message_text,
 )
 from runtime_state import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
 from social_map import get_high_trust_contacts, get_owner_user_id
@@ -1596,6 +1597,14 @@ def early_communicate():
     typed_payload = get_inastate("typed_contact_payload") or {}
     payload_text = typed_payload.get("text") if isinstance(typed_payload, dict) else None
     payload_kind = typed_payload.get("kind") if isinstance(typed_payload, dict) else None
+    payload_language_mode = typed_payload.get("language_mode") if isinstance(typed_payload, dict) else None
+    language_preference = (
+        payload_language_mode
+        or get_inastate("discord_language_preference")
+        or get_inastate("communication_language_preference")
+        or (config.get("discord") or {}).get("language_mode")
+        or "auto"
+    )
     payload_allow_empty = bool(typed_payload.get("allow_empty")) if isinstance(typed_payload, dict) else False
     ready_to_type = type_urge_level >= min_urge_to_type or bool(config.get("ignore_urge_for_typing", False))
     cooled_down = since_last_typed is None or since_last_typed >= type_contact_cooldown
@@ -1639,7 +1648,13 @@ def early_communicate():
             symbol_to_token_vocab=vocab_map,
         )
         if dual_symbol_message and dual_symbol_message.get("text"):
-            fallback_text = str(dual_symbol_message.get("text"))
+            fallback_text, effective_language_mode = select_symbolic_message_text(
+                dual_symbol_message, language_preference
+            )
+        else:
+            effective_language_mode = "none"
+    else:
+        effective_language_mode = "none"
     queued_id = None
     audio_clip_path = None
     if allow_symbol_autotype and speech_symbols:
@@ -1751,6 +1766,10 @@ def early_communicate():
                     "symbolic_gloss_text": dual_symbol_message.get("gloss_text") if dual_symbol_message else None,
                     "symbolic_native_sources": dual_symbol_message.get("native_sources") if dual_symbol_message else None,
                     "symbolic_gloss_sources": dual_symbol_message.get("gloss_sources") if dual_symbol_message else None,
+                    "requested_language_mode": language_preference,
+                    "effective_language_mode": (
+                        "freeform" if isinstance(payload_text, str) else effective_language_mode
+                    ),
                     "delivery": voice_delivery,
                     "voice_target": voice_pref,
                     "audio_attachment_kind": "symbolic_voice" if audio_clip_path else None,

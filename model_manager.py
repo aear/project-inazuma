@@ -30,6 +30,7 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
+from discord_runtime import typed_outbox_path
 from self_read_policy import SELF_READ_FOCUS_ENV, self_read_focus_from_emotions
 from runtime_state import append_inastate_queue
 from storage_layout import fast_runtime_path
@@ -68,7 +69,7 @@ RAW_FILE_MANAGER_STATE_PATH = MEMORY_PATH / "raw_file_manager_state.json"
 _REFLECTION_LOG = Path("AI_Children") / CHILD / "identity" / "self_reflection.json"
 RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
-TYPED_OUTBOX_PATH = MEMORY_PATH / "typed_outbox.jsonl"
+TYPED_OUTBOX_PATH = typed_outbox_path(CHILD, config)
 GITHUB_SUBMISSION_STATE_PATH = MEMORY_PATH / "github_submission_state.json"
 _DECISION_PANIC_LOG_PATH = MEMORY_PATH / "decision_panic_log.jsonl"
 _SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"

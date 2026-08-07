@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from discord_runtime import typed_outbox_path
 from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json, file_lock
 
@@ -41,7 +42,7 @@ def _self_questions_path(child: Optional[str] = None) -> Path:
 
 
 def _typed_outbox_path(child: Optional[str] = None) -> Path:
-    return _memory_path(child) / "typed_outbox.jsonl"
+    return typed_outbox_path(child or _current_child(), load_config())
 
 
 def _load_inastate_state(child: Optional[str] = None) -> Dict[str, Any]:

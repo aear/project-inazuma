@@ -956,6 +956,56 @@ def build_dual_symbolic_message(
     }
 
 
+def select_symbolic_message_text(
+    message: Optional[Dict[str, Any]],
+    preference: Any = "auto",
+) -> tuple[Optional[str], str]:
+    """Choose an outward rendering without discarding native translation.
+
+    ``english`` may use the human gloss alone. ``native`` and ``mixed`` always
+    keep the labelled native/gloss pair, because native text must remain
+    understandable to people who do not share Ina's vocabulary. ``auto`` is a
+    conservative mixed default. If no distinct gloss exists, an English request
+    also falls back to the labelled pair instead of presenting native text as if
+    it were English.
+    """
+    if not isinstance(message, dict):
+        return None, "none"
+
+    raw_preference = preference
+    if isinstance(raw_preference, dict):
+        raw_preference = (
+            raw_preference.get("mode")
+            or raw_preference.get("language_mode")
+            or raw_preference.get("preference")
+        )
+    normalized = str(raw_preference or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "en": "english",
+        "english_only": "english",
+        "native_only": "native",
+        "dual": "mixed",
+        "bilingual": "mixed",
+    }
+    requested = aliases.get(normalized, normalized)
+    if requested not in {"auto", "english", "native", "mixed"}:
+        requested = "auto"
+
+    combined = str(message.get("text") or "").strip()
+    native_text = str(message.get("native_text") or "").strip()
+    gloss_text = str(message.get("gloss_text") or "").strip()
+    if requested == "english" and gloss_text and gloss_text != native_text:
+        return gloss_text, "english"
+
+    # Auto, mixed, native, and unresolved English all retain the translation.
+    if combined:
+        effective = "mixed" if requested in {"auto", "english"} else requested
+        return combined, effective
+    if native_text and gloss_text and gloss_text != native_text:
+        return f"Native: {native_text}\nHuman guess: {gloss_text}", "mixed"
+    return native_text or gloss_text or None, "unresolved"
+
+
 def _ensure_vocab_embeddings(vocab: Dict[str, Any], language_hint: Optional[str] = None) -> bool:
     """
     Attach deterministic text embeddings and language hints to vocab entries
