@@ -188,6 +188,15 @@ def _flush_mirror_writes_at_exit() -> None:
 atexit.register(_flush_mirror_writes_at_exit)
 
 
+def _managed_migration_active(child: str) -> bool:
+    path = Path("AI_Children") / child / "memory" / "storage_migration_request.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and str(payload.get("status") or "").lower() in {"requested", "copying", "verifying"}
+
+
 def mirror_json_file(
     child: str,
     kind: str,
@@ -199,6 +208,9 @@ def mirror_json_file(
     remove_original: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Mirror one JSON memory record into SQLite and verify the stored copy."""
+
+    if _managed_migration_active(child):
+        return {"status": "migration_paused", "child": str(child)}
 
     cfg = config if isinstance(config, dict) else load_config()
     policy = mirror_policy(cfg)

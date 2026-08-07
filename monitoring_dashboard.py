@@ -15,6 +15,7 @@ from tkinter import ttk
 from typing import Any, Callable
 
 from model_manager import get_inastate, load_config
+from storage_layout import fast_runtime_path
 
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_LINE_COUNT_BYTES = 32 * 1024 * 1024
@@ -108,7 +109,22 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     neural = base / 'neural'
     rows = []
     total_nodes = total_edges = maps = 0
-    for path in sorted(neural.glob('*.json')) if neural.is_dir() else []:
+    config = load_config()
+    child = str(config.get('current_child', 'Inazuma_Yagami'))
+    durable_primary = neural / 'neural_memory_map.json'
+    fast_primary = fast_runtime_path(
+        child,
+        'neural_memory_map.json',
+        durable_primary,
+        subdir='neural',
+        root_keys=('fast_neural_root', 'fast_runtime_root', 'fast_root'),
+        config=config,
+    )
+    neural_paths = sorted(neural.glob('*.json')) if neural.is_dir() else []
+    if fast_primary != durable_primary and fast_primary.exists():
+        neural_paths = [path for path in neural_paths if path != durable_primary]
+        neural_paths.append(fast_primary)
+    for path in sorted(neural_paths, key=lambda item: item.name):
         data = _safe_json(path, {})
         nodes = data.get('nodes', data.get('neurons', data.get('node_ids', []))) if isinstance(data, dict) else []
         edges = data.get('edges', data.get('synapses', [])) if isinstance(data, dict) else []
@@ -137,9 +153,14 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     word_count = len(vocab) if isinstance(vocab, dict) else 0
     mapped_ratio = (100.0 * len(linked_words) / word_count) if word_count else 0.0
     average_links = (link_count / word_count) if word_count else 0.0
+    text_policy = config.get('text_memory_policy') if isinstance(config.get('text_memory_policy'), dict) else {}
+    vocab_limit = int(text_policy.get('vocab_limit', 25000) or 25000)
+    evaluated_count = int(links_data.get('evaluated_count', len(linked_words)) or 0) if isinstance(links_data, dict) else len(linked_words)
+    remaining = int(links_data.get('remaining', max(0, word_count - evaluated_count)) or 0) if isinstance(links_data, dict) else 0
+    vocab_status = 'cap reached' if word_count >= vocab_limit else f'cap {vocab_limit:,}'
     rows.extend([
-        ('Observed vocabulary', f'{word_count:,} words', 'language', _age(vocab_data.get('updated') if isinstance(vocab_data, dict) else None), str(base / 'text_vocab.json')),
-        ('English mappings', f'{len(linked_words):,} words · {mapped_ratio:.1f}%', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
+        ('Observed vocabulary', f'{word_count:,} words · {vocab_status}', 'language', _age(vocab_data.get('updated') if isinstance(vocab_data, dict) else None), str(base / 'text_vocab.json')),
+        ('English mappings', f'{len(linked_words):,} linked · {evaluated_count:,} evaluated · {remaining:,} queued', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Average links per word', f'{average_links:.2f}', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
     ])
     emotions = get_inastate('emotion_snapshot') or {}
@@ -247,6 +268,34 @@ def _actions() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, st
     return cards, rows
 
 
+def _reports() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    base = _child_memory()
+    experience = _safe_json(base / 'experience_archive_state.json', {})
+    media = _safe_json(base / 'experience_media_archive_state.json', {})
+    run = experience.get('run', {}) if isinstance(experience, dict) else {}
+    cumulative = experience.get('cumulative', {}) if isinstance(experience, dict) else {}
+    source = experience.get('source', {}) if isinstance(experience, dict) else {}
+    history = experience.get('history', []) if isinstance(experience, dict) else []
+    media_cumulative = media.get('cumulative', {}) if isinstance(media, dict) else {}
+    media_source = media.get('source', {}) if isinstance(media, dict) else {}
+    media_history = media.get('history', []) if isinstance(media, dict) else []
+    rows = []
+    rows.append(('Experience condensation · latest run', f"{int(run.get('archived', 0) or 0):,} retired · {_size(run.get('saved_bytes'))} saved", str(experience.get('status') or 'not run') if isinstance(experience, dict) else 'not run', _age(experience.get('updated_at') if isinstance(experience, dict) else None), json.dumps(experience, indent=2, default=str)))
+    rows.append(('Live-media condensation · latest run', f"{int((media.get('run') or {}).get('archived', 0) or 0):,} retired · {_size((media.get('run') or {}).get('saved_bytes'))} saved", str(media.get('status') or 'not run') if isinstance(media, dict) else 'not run', _age(media.get('updated_at') if isinstance(media, dict) else None), json.dumps(media, indent=2, default=str)))
+    for label, path in (
+        ('Memory retention · latest run', base / 'inastate.json'),
+        ('Storage migration', base / 'storage_migration_state.json'),
+        ('Memory reconciliation', base / 'reconciliation_state.json'),
+    ):
+        data = _safe_json(path, {})
+        if label.startswith('Memory retention') and isinstance(data, dict):
+            data = data.get('human_memory_prune_last_run', {})
+        if data:
+            rows.append((label, _state_text(data.get('status') if isinstance(data, dict) else data), 'run report', _age(data.get('timestamp') or data.get('updated_at') if isinstance(data, dict) else None), json.dumps(data, indent=2, default=str)))
+    metadata = int(source.get('directory_metadata_bytes', 0) or 0) + int(media_source.get('directory_metadata_bytes', 0) or 0)
+    cards = [('Files retired', f"{int(cumulative.get('archived', 0) or 0) + int(media_cumulative.get('archived', 0) or 0):,}"), ('Payload saved', _size(int(cumulative.get('saved_bytes', 0) or 0) + int(media_cumulative.get('saved_bytes', 0) or 0))), ('Directory metadata', _size(metadata)), ('Runs retained', str(len(history) + len(media_history)))]
+    return cards, rows
+
 def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     base = _child_memory()
     vitals = get_inastate('resource_vitals') or {}
@@ -268,6 +317,16 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
         for path in sorted(native_dir.iterdir()):
             if path.is_file():
                 rows.append(_file_row(path.name, path, 'native module'))
+    migration = _safe_json(base / 'storage_migration_state.json', {})
+    if isinstance(migration, dict) and migration:
+        progress = 100.0 * float(migration.get('progress', 0.0) or 0.0)
+        rows.append((
+            'Ina storage migration',
+            f"{migration.get('status', 'unknown')} · {progress:.1f}% · {_size(migration.get('bytes_copied'))}",
+            'verified NVMe promotion',
+            _age(migration.get('updated_at')),
+            json.dumps(migration, indent=2, default=str),
+        ))
     rows.extend([_file_row('Runtime state', base / 'inastate.json', 'state store'), _file_row('Scheduler state', base / 'process_scheduler_state.json', 'scheduler')])
     cpu = vitals.get('ina_cpu_percent', 0) if isinstance(vitals, dict) else 0
     memory = vitals.get('ina_ram_bytes', 0) if isinstance(vitals, dict) else 0
@@ -280,6 +339,7 @@ COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, 
     'Mind': _mind,
     'World': _world,
     'Memory': _memory,
+    'Reports': _reports,
     'Communication': _communication,
     'Actions': _actions,
     'System': _system,

@@ -239,6 +239,28 @@ _PROCESS_TASK_PROFILES = {
         "gpu_class": "none",
         "exclusive_group": "conscious_mode",
     },
+    "storage_migration_step": {
+        "kind": "subprocess",
+        "command": ["python", "storage_migration.py", "--resume-managed"],
+        "module": "storage_migration",
+        "priority": 99,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "memory_recall",
+        "max_runtime_sec": 600.0,
+    },
+    "experience_archive_step": {
+        "kind": "subprocess",
+        "command": ["python", "experience_maintenance.py"],
+        "module": "experience_archive",
+        "priority": 61,
+        "memory_class": "low",
+        "cpu_class": "low",
+        "gpu_class": "none",
+        "exclusive_group": "memory_recall",
+        "max_runtime_sec": 150.0,
+    },
     "memory_reconciliation_step": {
         "kind": "subprocess",
         "command": ["python", "memory_reconciliation.py", "--max-new-records", "50000", "--max-seconds", "30"],
@@ -248,6 +270,7 @@ _PROCESS_TASK_PROFILES = {
         "cpu_class": "low",
         "gpu_class": "none",
         "exclusive_group": "memory_recall",
+        "max_runtime_sec": 120.0,
     },
 
     "meditation_state_run": {
@@ -1732,7 +1755,18 @@ def _scheduler_running_counts(state: Dict[str, Any]) -> Dict[str, Any]:
     return counts
 
 
+def _storage_migration_active() -> bool:
+    path = MEMORY_PATH / "storage_migration_request.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and str(payload.get("status") or "").lower() in {"requested", "copying", "verifying"}
+
+
 def _scheduler_can_start_task(entry: Dict[str, Any], state: Dict[str, Any], resources: Dict[str, Any], limits: Dict[str, Any]) -> Tuple[bool, str]:
+    if _storage_migration_active() and str(entry.get("task_key") or "") != "storage_migration_step":
+        return False, "storage_migration_active"
     profile = _scheduler_task_profile(str(entry.get("task_key") or ""))
     if profile is None:
         return False, "unknown_task"
@@ -2010,6 +2044,22 @@ def _reconcile_process_scheduler_running(state: Dict[str, Any], limits: Dict[str
         alive, metrics = _scheduler_pid_metrics(pid)
         if alive:
             entry.update(metrics)
+            profile = _scheduler_task_profile(str(entry.get("task_key") or "")) or {}
+            max_runtime_sec = _coerce_float(profile.get("max_runtime_sec"), 0.0)
+            started_ts = _coerce_float(entry.get("started_ts"), 0.0)
+            if (
+                max_runtime_sec > 0.0
+                and started_ts > 0.0
+                and (time.time() - started_ts) >= max_runtime_sec
+                and str(entry.get("status") or "running").strip().lower() != "stopping"
+            ):
+                _scheduler_request_task_stop(
+                    entry,
+                    state,
+                    limits,
+                    "task_runtime_limit",
+                    force=False,
+                )
             if str(entry.get("status") or "running").strip().lower() == "stopping":
                 stop_requested_ts = _coerce_float(entry.get("stop_requested_ts"), 0.0)
                 grace = max(1.0, _coerce_float(limits.get("terminate_grace_sec"), 10.0))
@@ -4949,6 +4999,42 @@ def _enqueue_deep_recall_task_if_needed(state: Dict[str, Any], limits: Dict[str,
     )
 
 
+def _enqueue_storage_migration_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    if not _storage_migration_active():
+        _remove_process_task(state, "storage_migration_step", limits=limits, reason="migration_inactive")
+        return
+    _enqueue_process_task(
+        state,
+        "storage_migration_step",
+        limits=limits,
+        priority=99,
+        reason="ina_managed_storage_migration",
+        metadata={"request_path": str(MEMORY_PATH / "storage_migration_request.json")},
+    )
+
+
+def _enqueue_experience_archive_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
+    cfg = load_config()
+    policy = cfg.get("experience_archive_policy") if isinstance(cfg, dict) else None
+    if isinstance(policy, dict) and not bool(policy.get("enabled", True)):
+        _remove_process_task(state, "experience_archive_step", limits=limits, reason="experience_archive_disabled")
+        return
+    cooldown = float(policy.get("cooldown_seconds", 300.0) or 0.0) if isinstance(policy, dict) else 300.0
+    state_path = MEMORY_PATH / "experience_archive_state.json"
+    try:
+        age = max(0.0, time.time() - state_path.stat().st_mtime)
+    except OSError:
+        age = cooldown
+    if cooldown > 0 and age < cooldown:
+        _remove_process_task(state, "experience_archive_step", limits=limits, reason="experience_archive_cooldown")
+        return
+    _enqueue_process_task(
+        state, "experience_archive_step", limits=limits,
+        reason="bounded_lossless_experience_condensation",
+        metadata={"state_path": str(state_path)},
+    )
+
+
 def _enqueue_reconciliation_task_if_needed(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
     cfg = load_config()
     policy = cfg.get("memory_reconciliation_policy") if isinstance(cfg, dict) else None
@@ -5089,6 +5175,8 @@ def _process_scheduler_tick(memory_guard: Optional[Dict[str, Any]] = None) -> Di
     limits = _process_scheduler_limits()
     state = _load_process_scheduler_state()
     _reconcile_process_scheduler_running(state, limits)
+    _enqueue_storage_migration_task_if_needed(state, limits)
+    _enqueue_experience_archive_task_if_needed(state, limits)
     _enqueue_reconciliation_task_if_needed(state, limits)
     _enqueue_deep_recall_task_if_needed(state, limits)
     resources = _scheduler_resource_snapshot(memory_guard=memory_guard, limits=limits)

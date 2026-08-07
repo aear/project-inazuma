@@ -13,6 +13,7 @@ import pyqtgraph.opengl as gl
 
 from eeg_rendering import RENDER_PROFILES, dangling_endpoint_ids, pack_edges, pack_nodes
 from gui_hook import log_to_statusbox
+from storage_layout import fast_runtime_path
 from model_manager import (
     get_inastate,
     get_running_modules,
@@ -176,7 +177,14 @@ class BrainDataLoader:
         state = self._load_state_snapshot()
 
         # Primary neural map
-        map_nodes, map_edges = self._load_neural_map(self.neural_root / "neural_memory_map.json", "memory_graph")
+        map_path = fast_runtime_path(
+            self.child,
+            "neural_memory_map.json",
+            self.neural_root / "neural_memory_map.json",
+            subdir="neural",
+            root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+        )
+        map_nodes, map_edges = self._load_neural_map(map_path, "memory_graph")
         neurons.extend(map_nodes)
         synapses.extend(map_edges)
 

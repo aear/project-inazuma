@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     np = None  # type: ignore
 
 from experience_logger import ExperienceLogger
+from experience_storage import sharded_media_dir
 
 try:  # Optional dependency that offers pixel capture utilities.
     import mss  # type: ignore
@@ -222,7 +223,9 @@ class LiveExperienceBridge:
         saved = False
         if np is not None and isinstance(frame, np.ndarray):
             media_meta["shape"] = list(frame.shape)
-        image_path = self._media_dir / f"{event_id}_screen.png"
+        media_dir = sharded_media_dir(self._media_dir, event_id)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        image_path = media_dir / f"{event_id}_screen.png"
         try:
             if np is not None and isinstance(frame, np.ndarray):
                 array = frame.astype(np.uint8)
@@ -242,7 +245,7 @@ class LiveExperienceBridge:
 
         if not saved:
             if np is not None and isinstance(frame, np.ndarray):
-                fallback = self._media_dir / f"{event_id}_screen.npy"
+                fallback = media_dir / f"{event_id}_screen.npy"
                 try:
                     np.save(fallback, frame)
                     media_meta["raw_file"] = fallback.name
@@ -253,7 +256,7 @@ class LiveExperienceBridge:
         else:
             media_meta["image_file"] = image_path.name
 
-        meta_path = self._media_dir / f"{event_id}_screen.json"
+        meta_path = media_dir / f"{event_id}_screen.json"
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(media_meta, fh, indent=2)
 
@@ -298,7 +301,9 @@ class LiveExperienceBridge:
             entity_links=entity_links,
             timestamp=timestamp,
         )
-        meta_path = Path(self._media_dir) / f"{event_id}_dialogue.json"
+        media_dir = sharded_media_dir(self._media_dir, event_id)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = media_dir / f"{event_id}_dialogue.json"
         try:
             if meta_path.exists():
                 with open(meta_path, "r", encoding="utf-8") as fh:
@@ -354,7 +359,9 @@ class LiveExperienceBridge:
                 entity_links=[{"type": "action", "name": action}],
                 timestamp=timestamp,
             )
-        meta_path = self._media_dir / f"{event_id}_motor.json"
+        media_dir = sharded_media_dir(self._media_dir, event_id)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = media_dir / f"{event_id}_motor.json"
         payload = {
             "event_id": event_id,
             "action": action,

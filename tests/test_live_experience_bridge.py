@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experience_logger import ExperienceLogger
-from experience_storage import resolve_event_path, sharded_event_path
+from experience_storage import resolve_event_path, sharded_event_path, sharded_media_dir
 from live_experience_bridge import LiveExperienceBridge
 
 
@@ -46,11 +46,11 @@ def test_log_conversation_turn_creates_event_with_word_usage(bridge):
 
     # Ensure the dialogue metadata file aggregates turns
     meta_path = (
-        base
-        / child
+        sharded_media_dir(
+            base / child
         / "memory"
         / "experiences"
-        / "live_media"
+        / "live_media", event_id)
         / f"{event_id}_dialogue.json"
     )
     assert meta_path.exists()

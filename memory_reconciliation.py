@@ -48,18 +48,37 @@ def _save_state(child: str, state: Dict[str, Any]) -> None:
     atomic_write_json(_state_path(child), state, indent=2)
 
 
-def _sources(child: str) -> Iterator[Tuple[str, Path]]:
+def _reconciliation_policy(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = config.get("memory_reconciliation_policy") if isinstance(config, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        # Flat legacy directories can contain millions of files. They require an
+        # explicit migration/audit pass; walking them in the live cognitive lane
+        # can block in the kernel before a Python time budget can be checked.
+        "include_legacy_events": bool(raw.get("include_legacy_events", True)),
+        # Fragments already have memory_map.json/SQLite as their authoritative
+        # catalogue and are mirrored on access. Avoid a second filesystem walk.
+        "scan_fragments": bool(raw.get("scan_fragments", True)),
+    }
+
+
+def _sources(
+    child: str,
+    *,
+    include_legacy_events: bool = False,
+    scan_fragments: bool = False,
+) -> Iterator[Tuple[str, Path]]:
     memory = _memory_root(child)
     events = memory / "experiences" / "events"
     if events.exists():
-        for path in iter_event_paths(events):
+        for path in iter_event_paths(events, include_legacy=include_legacy_events):
             yield "experience_event", path
     episodes = memory / "experiences" / "episodes"
     if episodes.exists():
         for path in episodes.glob("*.json"):
             yield "experience_episode", path
     fragments = memory / "fragments"
-    if fragments.exists():
+    if scan_fragments and fragments.exists():
         for path in fragments.glob("frag_*.json"):
             yield "fragment", path
         for tier in ("short", "working", "long", "cold"):
@@ -78,6 +97,7 @@ def reconcile_step(
 ) -> Dict[str, Any]:
     """Discover and mirror a bounded number of unknown/changed records."""
     cfg = config if isinstance(config, dict) else load_config()
+    policy = _reconciliation_policy(cfg)
     started = time.monotonic()
     now_iso = datetime.now(timezone.utc).isoformat()
     prior = _load_state(child)
@@ -99,7 +119,7 @@ def reconcile_step(
     }
 
     exhausted = True
-    for kind, path in _sources(child):
+    for kind, path in _sources(child, **policy):
         stats["paths_seen_this_step"] += 1
         if max_seconds > 0 and time.monotonic() - started >= float(max_seconds):
             exhausted = False

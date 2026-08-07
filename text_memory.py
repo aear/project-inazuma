@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,9 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None
 
-TEXT_VOCAB_LIMIT = 800          # keep only the top-K words to stay RAM-light
+DEFAULT_TEXT_VOCAB_LIMIT = 25_000  # realistic active vocabulary; configurable
+DEFAULT_LINK_BATCH_SIZE = 500   # bounded work per meaning-map pass
+TEXT_VOCAB_LIMIT = DEFAULT_TEXT_VOCAB_LIMIT  # compatibility alias
 MAX_FRAGMENT_BODY = 1200        # cap stored text per fragment
 MAX_FRAGMENT_SUMMARY = 240      # short preview for scans
 MAX_SYMBOL_LINKS = 6            # per-word symbol co-occurrence cap
@@ -33,6 +36,25 @@ def _get_embedder() -> MultimodalEmbedder:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _text_memory_policy() -> Dict[str, int]:
+    raw: Dict[str, Any] = {}
+    try:
+        config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        candidate = config.get("text_memory_policy") if isinstance(config, dict) else None
+        raw = candidate if isinstance(candidate, dict) else {}
+    except Exception:
+        raw = {}
+    try:
+        vocab_limit = max(1_000, int(raw.get("vocab_limit", DEFAULT_TEXT_VOCAB_LIMIT)))
+    except (TypeError, ValueError):
+        vocab_limit = DEFAULT_TEXT_VOCAB_LIMIT
+    try:
+        link_batch_size = max(1, int(raw.get("link_batch_size", DEFAULT_LINK_BATCH_SIZE)))
+    except (TypeError, ValueError):
+        link_batch_size = DEFAULT_LINK_BATCH_SIZE
+    return {"vocab_limit": vocab_limit, "link_batch_size": link_batch_size}
 
 
 def _safe_child(child: Optional[str]) -> str:
@@ -117,11 +139,12 @@ def save_text_vocab(
     child: Optional[str],
     data: Dict[str, Any],
     *,
-    limit: int = TEXT_VOCAB_LIMIT,
+    limit: Optional[int] = None,
     source: Optional[str] = None,
 ) -> None:
     vocab = data.get("vocab", {})
-    trimmed = _trim_vocab(vocab, limit)
+    effective_limit = _text_memory_policy()["vocab_limit"] if limit is None else max(1, int(limit))
+    trimmed = _trim_vocab(vocab, effective_limit)
     payload = {"vocab": trimmed, "updated": data.get("updated", _now_iso())}
     path = _memory_root(child) / "text_vocab.json"
     with _json_lock(path):
@@ -140,7 +163,7 @@ def update_text_vocab(
     tags: Optional[List[str]] = None,
     emotions: Optional[Dict[str, float]] = None,
     symbols: Optional[List[str]] = None,
-    limit: int = TEXT_VOCAB_LIMIT,
+    limit: Optional[int] = None,
     source: Optional[str] = None,
 ) -> bool:
     tokens = tokenize_text(text)
@@ -241,7 +264,7 @@ def create_text_fragment(
         tags=frag_tags,
         emotions=emotions,
         symbols=symbols,
-        limit=TEXT_VOCAB_LIMIT,
+        limit=None,
         source=vocab_source,
     )
     return frag
@@ -274,13 +297,11 @@ def record_text_observation(
 def build_text_symbol_links(
     child: Optional[str] = None,
     *,
-    top_words: int = 120,
+    top_words: Optional[int] = None,
     similarity_threshold: float = 0.42,
+    mapping_batch: Optional[int] = None,
 ) -> bool:
-    """
-    Map frequent text words to nearest-known symbols (based on vocab embeddings).
-    Produces memory/text_vocab_links.json for inspection.
-    """
+    """Incrementally map every retained vocabulary word to known symbols."""
     child_name = _safe_child(child)
     vocab_state = load_text_vocab(child_name)
     vocab = vocab_state.get("vocab", {})
@@ -307,47 +328,83 @@ def build_text_symbol_links(
             lang = entry.get("language") or guess_language_code(word)
             emb = _get_embedder().embed_text(word, language=lang)
         sym_entries.append((sid, emb, word, entry.get("confidence")))
-
     if not sym_entries:
         return False
+    symbol_revision = hashlib.sha1(
+        json.dumps(
+            sorted((str(sid), str(word), confidence, emb) for sid, emb, word, confidence in sym_entries),
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    out_path = _memory_root(child_name) / "text_vocab_links.json"
+    try:
+        prior = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
+    except Exception:
+        prior = {}
+    prior = prior if isinstance(prior, dict) else {}
+    evaluated = prior.get("evaluated") if isinstance(prior.get("evaluated"), dict) else {}
+    if str(prior.get("symbol_source_revision") or "") != symbol_revision:
+        evaluated = {}
+    vocab_words = set(str(word) for word in vocab)
+    links_by_word = {
+        str(link.get("word")): link for link in (prior.get("links") or [])
+        if isinstance(link, dict) and link.get("word") and str(link.get("word")) in vocab_words
+    }
+    evaluated = {str(word): True for word in evaluated if str(word) in vocab_words}
 
     ranked_words = sorted(
         vocab.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[1].get("last_seen", ""))
-    )[:top_words]
+    )
+    if top_words is not None:
+        ranked_words = ranked_words[:max(0, int(top_words))]
+    pending_words = [(word, meta) for word, meta in ranked_words if word not in evaluated]
+    batch_limit = _text_memory_policy()["link_batch_size"] if mapping_batch is None else max(1, int(mapping_batch))
+    batch = pending_words[:batch_limit]
 
-    links = []
-    for word, meta in ranked_words:
+    for word, meta in batch:
         lang = guess_language_code(word)
         w_emb = _get_embedder().embed_text(word, language=lang)
         best = None
         best_sim = 0.0
         best_word = None
         best_conf = None
-        for sid, emb, s_word, s_conf in sym_entries:
+        for sid, emb, symbol_word, symbol_confidence in sym_entries:
             sim = _get_embedder().cosine(w_emb, emb)
             if sim > best_sim:
                 best_sim = sim
                 best = sid
-                best_word = s_word
-                best_conf = s_conf
+                best_word = symbol_word
+                best_conf = symbol_confidence
         if best and best_sim >= similarity_threshold:
-            links.append(
-                {
-                    "word": word,
-                    "count": int(meta.get("count", 0)),
-                    "last_seen": meta.get("last_seen"),
-                    "symbol": best,
-                    "symbol_word": best_word,
-                    "symbol_confidence": best_conf,
-                    "similarity": round(best_sim, 4),
-                }
-            )
+            links_by_word[word] = {
+                "word": word,
+                "count": int(meta.get("count", 0)),
+                "last_seen": meta.get("last_seen"),
+                "symbol": best,
+                "symbol_word": best_word,
+                "symbol_confidence": best_conf,
+                "similarity": round(best_sim, 4),
+            }
+        else:
+            links_by_word.pop(word, None)
+        evaluated[word] = True
 
-    out_path = _memory_root(child_name) / "text_vocab_links.json"
-    out_path.write_text(
-        json.dumps({"generated": _now_iso(), "links": links}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    rank = {word: index for index, (word, _meta) in enumerate(ranked_words)}
+    links = sorted(links_by_word.values(), key=lambda link: rank.get(str(link.get("word")), len(rank)))
+    remaining = max(0, len(pending_words) - len(batch))
+    payload = {
+        "generated": _now_iso(),
+        "symbol_source_revision": symbol_revision,
+        "evaluated": evaluated,
+        "evaluated_count": len(evaluated),
+        "remaining": remaining,
+        "complete": remaining == 0,
+        "links": links,
+    }
+    with _json_lock(out_path):
+        _atomic_write_json(out_path, payload, indent=2, ensure_ascii=False)
     try:
         increment_inastate_metric("link_pass_runs")
     except Exception:

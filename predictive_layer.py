@@ -17,6 +17,7 @@ from transformers.fractal_multidimensional_transformers import FractalTransforme
 from precision_requests import precision_request
 from gui_hook import log_to_statusbox
 from symbol_word_utils import score_symbol_word_candidates
+from storage_layout import fast_runtime_path
 
 def cosine_similarity(v1, v2):
     return shared_cosine_similarity(v1, v2)
@@ -38,7 +39,13 @@ def inspect_map_health(child):
     Lightweight check of neural/logic maps to diagnose clarity issues.
     """
     base = Path("AI_Children") / child / "memory" / "neural"
-    neural_map = base / "neural_memory_map.json"
+    neural_map = fast_runtime_path(
+        child,
+        "neural_memory_map.json",
+        base / "neural_memory_map.json",
+        subdir="neural",
+        root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+    )
     logic_map = base / "logic_neural_map.json"
 
     n_neurons, n_synapses = _read_counts(neural_map)

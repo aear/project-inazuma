@@ -84,6 +84,7 @@ DEFAULT_INCREMENTAL_POLICY = {
     "max_edges_per_neuron": 0,
     "max_synapses_total": 0,
     "max_pending_dirty_fragments": 0,
+    "dirty_scan_batch": 2400,
     "compact_save_enabled": True,
     "synapse_spool_enabled": True,
     "spill_to_disk_enabled": False,
@@ -339,6 +340,11 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         max_pending_dirty_fragments = 0
     if max_pending_dirty_fragments < 0:
         max_pending_dirty_fragments = 0
+    try:
+        dirty_scan_batch = int(policy.get("dirty_scan_batch", 2400))
+    except (TypeError, ValueError):
+        dirty_scan_batch = 2400
+    dirty_scan_batch = max(1, dirty_scan_batch)
     compact_save_enabled = bool(policy.get("compact_save_enabled", True))
     synapse_spool_enabled = bool(policy.get("synapse_spool_enabled", True))
     spill_to_disk_enabled = bool(policy.get("spill_to_disk_enabled", False))
@@ -397,6 +403,7 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "max_edges_per_neuron": max_edges_per_neuron,
         "max_synapses_total": max_synapses_total,
         "max_pending_dirty_fragments": max_pending_dirty_fragments,
+        "dirty_scan_batch": dirty_scan_batch,
         "compact_save_enabled": compact_save_enabled,
         "synapse_spool_enabled": synapse_spool_enabled,
         "spill_to_disk_enabled": spill_to_disk_enabled,
@@ -860,9 +867,12 @@ def _run_memory_neural_phase(child: str, mgr: "MemoryManager", *, launch_source:
     build_summary: Dict[str, Any] = {}
     experience_summary: Dict[str, Any] = {}
     try:
-        mgr.fast_reindex(rebalance=False, prune_missing=False)
-        if hasattr(mgr, "human_memory_prune_pass"):
-            mgr.human_memory_prune_pass()
+        if getattr(mgr, "_map_loaded", True):
+            mgr.fast_reindex(rebalance=False, prune_missing=False)
+            if hasattr(mgr, "human_memory_prune_pass"):
+                mgr.human_memory_prune_pass()
+        else:
+            log_to_statusbox("[Memory] Reusing the verified fast index for this bounded neural burst.")
         build_summary = build_fractal_memory(child) or {}
         if build_summary.get("needs_resume"):
             _set_memory_graph_deferred_build(
@@ -3007,12 +3017,33 @@ def build_synaptic_links(
     return synapses
 
 
+def _durable_neural_artifact_path(child: str, filename: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "neural" / filename
+
+
+def _neural_artifact_path(child: str, filename: str) -> Path:
+    fallback = _durable_neural_artifact_path(child, filename)
+    return fast_runtime_path(
+        child,
+        filename,
+        fallback,
+        subdir="neural",
+        root_keys=("fast_neural_root", "fast_runtime_root", "fast_root"),
+    )
+
+
+def _existing_neural_artifact_path(child: str, filename: str) -> Path:
+    preferred = _neural_artifact_path(child, filename)
+    fallback = _durable_neural_artifact_path(child, filename)
+    return preferred if preferred.exists() or preferred == fallback else fallback
+
+
 def _neural_map_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_memory_map.json"
+    return _neural_artifact_path(child, "neural_memory_map.json")
 
 
 def _load_neural_map(child: str) -> Dict[str, Any]:
-    path = _neural_map_path(child)
+    path = _existing_neural_artifact_path(child, "neural_memory_map.json")
     if not path.exists():
         return {"neurons": [], "synapses": [], "converted_from_legacy": False, "updated_at": None}
     try:
@@ -3061,11 +3092,11 @@ def _write_json_array_stream(handle, items: Iterable[Any]) -> None:
 
 
 def _neural_build_state_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_build_state.json"
+    return _neural_artifact_path(child, "neural_build_state.json")
 
 
 def _neural_dirty_index_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "neural_dirty_index.json"
+    return _neural_artifact_path(child, "neural_dirty_index.json")
 
 
 def _neural_snapshot_path(child: str) -> Path:
@@ -3102,7 +3133,7 @@ def _neural_synapse_spool_path(child: str) -> Path:
 
 
 def _custom_transformer_usage_path(child: str) -> Path:
-    return Path("AI_Children") / child / "memory" / "neural" / "custom_transformer_usage.json"
+    return _neural_artifact_path(child, "custom_transformer_usage.json")
 
 
 def _memory_index_db_path(child: str) -> Path:
@@ -3828,7 +3859,7 @@ class _NeuralCustomTransformerRuntime:
 
 
 def _load_neural_build_state(child: str) -> Dict[str, Any]:
-    data = _load_json_dict(_neural_build_state_path(child), {"pending": [], "updated_at": None})
+    data = _load_json_dict(_existing_neural_artifact_path(child, "neural_build_state.json"), {"pending": [], "updated_at": None})
     pending_raw = data.get("pending")
     if isinstance(pending_raw, list):
         data["pending"] = [str(fid) for fid in pending_raw if fid]
@@ -3844,7 +3875,7 @@ def _save_neural_build_state(child: str, state: Dict[str, Any]) -> None:
 
 
 def _load_neural_dirty_index(child: str) -> Dict[str, str]:
-    data = _load_json_dict(_neural_dirty_index_path(child), {"fragments": {}})
+    data = _load_json_dict(_existing_neural_artifact_path(child, "neural_dirty_index.json"), {"fragments": {}})
     fragments = data.get("fragments") if isinstance(data.get("fragments"), dict) else {}
     return {str(fid): str(sig) for fid, sig in fragments.items() if fid and sig}
 
@@ -4005,6 +4036,28 @@ class _MemoryIndexStore:
             if row and row[0]:
                 yield str(row[0])
 
+    def scan_batch(self, after_rowid: int, limit: int) -> Tuple[List[Tuple[str, Dict[str, Any]]], int, bool]:
+        if self.conn is None or limit <= 0:
+            return [], 0, False
+        cursor = self.conn.execute(
+            "SELECT rowid, frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json "
+            "FROM fragments WHERE rowid > ? ORDER BY rowid LIMIT ?",
+            (max(0, int(after_rowid)), max(1, int(limit))),
+        )
+        rows = cursor.fetchall()
+        wrapped = False
+        if not rows and after_rowid:
+            wrapped = True
+            cursor = self.conn.execute(
+                "SELECT rowid, frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json "
+                "FROM fragments ORDER BY rowid LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            rows = cursor.fetchall()
+        items = [(str(row[1]), self._row_to_meta(row[1:])) for row in rows]
+        next_rowid = int(rows[-1][0]) if rows else 0
+        return items, next_rowid, wrapped
+
     def iter_human_prune_candidates(
         self,
         retention: Dict[str, Any],
@@ -4083,19 +4136,24 @@ def _load_memory_index(child: str) -> Any:
 
 
 def _fragment_signature(child: str, frag_id: str, meta: Dict[str, Any]) -> Optional[str]:
-    path = _resolve_index_path(child, frag_id, meta)
-    if path is None:
-        return None
-    try:
-        st = path.stat()
-    except OSError:
-        return None
+    mtime_ns = int(_safe_float(meta.get("mtime_ns"), 0.0))
+    size_bytes = int(_safe_float(meta.get("size_bytes"), 0.0))
+    if mtime_ns <= 0 or size_bytes < 0:
+        path = _resolve_index_path(child, frag_id, meta)
+        if path is None:
+            return None
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        mtime_ns = int(st.st_mtime_ns)
+        size_bytes = int(st.st_size)
     tags = meta.get("tags") if isinstance(meta.get("tags"), list) else []
     tag_text = ",".join(sorted(str(tag).lower() for tag in tags if tag))
     digest = hashlib.sha1(tag_text.encode("utf-8")).hexdigest()[:12]
     return (
         f"{meta.get('tier') or ''}:{meta.get('filename') or ''}:"
-        f"{int(st.st_mtime_ns)}:{int(st.st_size)}:"
+        f"{mtime_ns}:{size_bytes}:"
         f"{_safe_float(meta.get('importance'), 0.0):.6f}:{digest}"
     )
 
@@ -4104,11 +4162,21 @@ def _collect_dirty_fragment_ids(
     child: str,
     index: Any,
     previous_signatures: Dict[str, str],
-) -> Tuple[List[str], Dict[str, str], Set[str]]:
+    *,
+    cursor: int = 0,
+    limit: int = 0,
+) -> Tuple[List[str], Dict[str, str], Set[str], int, bool]:
     dirty: List[str] = []
     changed: Dict[str, str] = {}
     seen: Set[str] = set()
-    for frag_id, meta in index.items():
+    next_cursor = 0
+    wrapped = False
+    bounded_scan = limit > 0 and hasattr(index, "scan_batch")
+    if bounded_scan:
+        items, next_cursor, wrapped = index.scan_batch(cursor, limit)
+    else:
+        items = index.items()
+    for frag_id, meta in items:
         if not frag_id or not isinstance(meta, dict):
             continue
         seen.add(str(frag_id))
@@ -4118,8 +4186,9 @@ def _collect_dirty_fragment_ids(
         if previous_signatures.get(frag_id) != signature:
             dirty.append(frag_id)
             changed[frag_id] = signature
-    removed = {fid for fid in previous_signatures.keys() if fid not in seen}
-    return dirty, changed, removed
+    # Removed IDs can only be established after a complete unbounded scan.
+    removed = set() if bounded_scan else {fid for fid in previous_signatures.keys() if fid not in seen}
+    return dirty, changed, removed, next_cursor, wrapped
 
 
 def _prune_neurons_to_valid_fragments(
@@ -4305,6 +4374,60 @@ def _pending_fragment_sort_key(fragment_id: str, index: Any) -> Tuple[float, flo
     ts = _parse_iso_timestamp(meta.get("last_seen") or meta.get("timestamp")) or 0.0
     importance = _safe_float(meta.get("importance"), 0.0)
     return ts, importance
+
+
+def _select_stratified_dirty_ids(
+    child: str,
+    fragment_ids: Iterable[str],
+    index: Any,
+    limit: int,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    ids = [str(fragment_id) for fragment_id in dict.fromkeys(fragment_ids) if fragment_id]
+    if limit <= 0 or len(ids) <= limit:
+        return sorted(ids, key=lambda fragment_id: _pending_fragment_sort_key(fragment_id, index), reverse=True)
+    selector_cfg = dict(cfg or {})
+    selector_raw = dict(selector_cfg.get("neural_selector") or {})
+    selector_raw["cooldown_seconds"] = 0
+    selector_raw["cooldown_max"] = 0
+    selector_cfg["neural_selector"] = selector_raw
+    raw_tier_weights = selector_raw.get("tier_weights") or {
+        "short": 0.5, "working": 0.15, "long": 0.15, "cold": 0.2,
+    }
+    groups: Dict[str, List[str]] = {}
+    for fragment_id in ids:
+        meta = index.get(fragment_id, {})
+        tier = str(meta.get("tier") or "short").lower()
+        groups.setdefault(tier, []).append(fragment_id)
+    active_weight = sum(max(0.0, _safe_float(raw_tier_weights.get(tier), 0.0)) for tier in groups) or float(len(groups))
+    targets: Dict[str, int] = {}
+    for tier in groups:
+        weight = max(0.0, _safe_float(raw_tier_weights.get(tier), 0.0)) or (1.0 / max(1, len(groups)))
+        targets[tier] = max(1, min(len(groups[tier]), int(round(limit * weight / active_weight))))
+    while sum(targets.values()) > limit:
+        tier = max((name for name in targets if targets[name] > 1), key=lambda name: targets[name], default=None)
+        if tier is None:
+            break
+        targets[tier] -= 1
+    selected: List[str] = []
+    for tier, tier_ids in groups.items():
+        target = min(targets.get(tier, 0), limit - len(selected))
+        if target <= 0:
+            continue
+        subset = {fragment_id: index.get(fragment_id, {}) for fragment_id in tier_ids}
+        fragments, _total, _meta = select_fragments_for_neural_map(
+            child, target, cfg=selector_cfg, known_fragments=None, index=subset,
+        )
+        allowed = set(tier_ids)
+        selected.extend(
+            str(fragment.get("id")) for fragment in fragments
+            if fragment.get("id") and str(fragment.get("id")) in allowed
+        )
+    if len(selected) < limit:
+        remaining = [fragment_id for fragment_id in ids if fragment_id not in set(selected)]
+        remaining.sort(key=lambda fragment_id: _pending_fragment_sort_key(fragment_id, index), reverse=True)
+        selected.extend(remaining[: limit - len(selected)])
+    return selected[:limit]
 
 
 def _trim_pending_fragment_ids(
@@ -5013,7 +5136,16 @@ def build_fractal_memory(child):
 
     if dirty_mode:
         source = "dirty_index"
-        dirty_ids, current_signatures, removed_signatures = _collect_dirty_fragment_ids(child, index, dirty_signatures)
+        scan_cursor = int(queue_state.get("dirty_scan_cursor", 0) or 0)
+        dirty_ids, current_signatures, removed_signatures, next_scan_cursor, scan_wrapped = _collect_dirty_fragment_ids(
+            child,
+            index,
+            dirty_signatures,
+            cursor=scan_cursor,
+            limit=int(policy.get("dirty_scan_batch", 2400)),
+        )
+        queue_state["dirty_scan_cursor"] = next_scan_cursor
+        queue_state["dirty_scan_wrapped"] = bool(scan_wrapped)
         detected_dirty = len(dirty_ids)
         dirty_set = set(dirty_ids)
         if dirty_set:
@@ -5041,11 +5173,10 @@ def build_fractal_memory(child):
                 if frag_id in valid_ids and frag_id not in pending_set:
                     pending_ids.append(frag_id)
                     pending_set.add(frag_id)
-        pending_ids, pending_trimmed = _trim_pending_fragment_ids(
-            pending_ids,
-            index,
-            int(policy.get("max_pending_dirty_fragments", 0) or 0),
-        )
+        pending_limit = int(policy.get("max_pending_dirty_fragments", 0) or 0)
+        pending_before_selection = len(dict.fromkeys(pending_ids))
+        pending_ids = _select_stratified_dirty_ids(child, pending_ids, index, pending_limit, cfg)
+        pending_trimmed = max(0, pending_before_selection - len(pending_ids))
         if pending_trimmed:
             log_to_statusbox(
                 f"[NeuralMap] Trimmed dirty queue by {pending_trimmed} fragment(s) to stay within the pending hard cap."
@@ -5111,7 +5242,7 @@ def build_fractal_memory(child):
             processed_count += len(batch_processed_ids)
             known_fragments.update(batch_processed_ids)
             for frag_id in batch_processed_ids:
-                sig = current_signatures.get(frag_id)
+                sig = current_signatures.get(frag_id) or _fragment_signature(child, frag_id, index.get(frag_id, {}))
                 if sig:
                     dirty_signatures[frag_id] = sig
             custom_runtime.observe(batch_fragments)
@@ -6429,7 +6560,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _memory_graph_phase_args(argv)
     cfg = _load_config()
     child = cfg.get("current_child", "Inazuma_Yagami")
-    mgr = MemoryManager(child)
+    mgr = MemoryManager(child, autoload=args.phase != "neural")
 
     if args.phase == "boot":
         verification = _run_memory_index_verification(child, cfg, mgr)

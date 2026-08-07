@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import language_processing
-from experience_storage import resolve_event_path
+from experience_storage import resolve_event_path, sharded_media_dir
 from experience_logger import ExperienceLogger
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
@@ -115,11 +115,11 @@ def test_experience_logging_and_grounding(temp_child, monkeypatch):
     assert motor_payload["internal_state"]["motor_feedback"] == {"pressure": 0.82}
 
     screen_meta = (
-        base
-        / child
+        sharded_media_dir(
+            base / child
         / "memory"
         / "experiences"
-        / "live_media"
+        / "live_media", screen_event)
         / f"{screen_event}_screen.json"
     )
     assert screen_meta.exists()

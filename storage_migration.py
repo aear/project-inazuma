@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -14,6 +15,7 @@ from experience_storage import sharded_event_path
 
 
 READ_CHUNK_SIZE = 1024 * 1024
+MANAGED_COPY_CHUNK_SIZE = 64 * 1024 * 1024
 
 
 def _load_config() -> Dict[str, Any]:
@@ -406,6 +408,155 @@ def shard_experience_events(
     return report
 
 
+def managed_migration_request_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "storage_migration_request.json"
+
+
+def managed_migration_state_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "storage_migration_state.json"
+
+
+def _load_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def managed_migration_active(child: str) -> bool:
+    request = _load_json_dict(managed_migration_request_path(child))
+    return str(request.get("status") or "").lower() in {"requested", "copying", "verifying"}
+
+
+def _sqlite_quick_check(path: Path) -> tuple[bool, str]:
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, str(exc)
+    result = str(row[0] if row else "missing_result")
+    return result.lower() == "ok", result
+
+
+def _activate_mirror_target(config_path: Path, target: Path) -> None:
+    config = _load_json_dict(config_path)
+    policy = config.get("memory_mirror_policy")
+    policy = dict(policy) if isinstance(policy, dict) else {}
+    policy["db_root"] = str(target.parent)
+    policy["db_filename"] = target.name
+    config["memory_mirror_policy"] = policy
+    _atomic_write_json(config_path, config)
+
+
+def managed_migration_step(child: str, *, chunk_bytes: Optional[int] = None) -> Dict[str, Any]:
+    """Advance an Ina-owned storage migration by one verified copy chunk."""
+    request_path = managed_migration_request_path(child)
+    state_path = managed_migration_state_path(child)
+    request = _load_json_dict(request_path)
+    status = str(request.get("status") or "").lower()
+    if status not in {"requested", "copying", "verifying"}:
+        return {"status": "idle", "request_status": status or "missing"}
+
+    def fail(error: str, **extra: Any) -> Dict[str, Any]:
+        failed_at = datetime.now(timezone.utc).isoformat()
+        payload = _load_json_dict(state_path)
+        payload.update({"status": "failed", "error": str(error), "updated_at": failed_at, **extra})
+        request.update({"status": "failed", "error": str(error), "updated_at": failed_at})
+        _atomic_write_json(state_path, payload)
+        _atomic_write_json(request_path, request)
+        return payload
+    if str(request.get("operation") or "") != "promote_mirror_database":
+        return fail("unsupported_operation")
+
+    source = Path(str(request.get("source") or "")).expanduser()
+    target = Path(str(request.get("target") or "")).expanduser()
+    partial = target.with_suffix(target.suffix + ".partial")
+    if not source.is_file() or source.is_symlink():
+        return fail("source_unavailable", source=str(source))
+    if source.resolve() == target.resolve():
+        return fail("source_equals_target")
+
+    source_stat = source.stat()
+    state = _load_json_dict(state_path)
+    expected_size = int(state.get("source_size") or source_stat.st_size)
+    expected_mtime_ns = int(state.get("source_mtime_ns") or source_stat.st_mtime_ns)
+    if source_stat.st_size != expected_size or source_stat.st_mtime_ns != expected_mtime_ns:
+        state.update({"status": "failed", "error": "source_changed_during_migration", "updated_at": datetime.now(timezone.utc).isoformat()})
+        _atomic_write_json(state_path, state)
+        request.update({"status": "failed", "error": state["error"], "updated_at": state["updated_at"]})
+        _atomic_write_json(request_path, request)
+        return state
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    offset = partial.stat().st_size if partial.exists() else 0
+    if offset > expected_size:
+        return fail("partial_larger_than_source", offset=offset)
+    bounded_chunk = max(1024 * 1024, int(chunk_bytes or request.get("chunk_bytes") or MANAGED_COPY_CHUNK_SIZE))
+    copied = 0
+    if offset < expected_size:
+        with source.open("rb") as source_handle:
+            source_handle.seek(offset)
+            data = source_handle.read(min(bounded_chunk, expected_size - offset))
+        mode = "r+b" if partial.exists() else "wb"
+        with partial.open(mode) as target_handle:
+            target_handle.seek(offset)
+            target_handle.write(data)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        with partial.open("rb") as verify_handle:
+            verify_handle.seek(offset)
+            copied_data = verify_handle.read(len(data))
+        if hashlib.sha256(copied_data).digest() != hashlib.sha256(data).digest():
+            return fail("chunk_verification_failed", offset=offset)
+        copied = len(data)
+        offset += copied
+
+    now = datetime.now(timezone.utc).isoformat()
+    state.update({
+        "child": child,
+        "operation": "promote_mirror_database",
+        "source": str(source),
+        "target": str(target),
+        "partial": str(partial),
+        "source_size": expected_size,
+        "source_mtime_ns": expected_mtime_ns,
+        "bytes_copied": offset,
+        "progress": round(offset / max(1, expected_size), 6),
+        "last_chunk_bytes": copied,
+        "status": "copying" if offset < expected_size else "verifying",
+        "updated_at": now,
+    })
+    request.update({"status": state["status"], "updated_at": now})
+    _atomic_write_json(state_path, state)
+    _atomic_write_json(request_path, request)
+    if offset < expected_size:
+        return state
+
+    ok, detail = _sqlite_quick_check(partial)
+    if not ok:
+        state.update({"status": "failed", "error": "sqlite_quick_check_failed", "verification": detail, "updated_at": datetime.now(timezone.utc).isoformat()})
+        request.update({"status": "failed", "error": state["error"], "updated_at": state["updated_at"]})
+        _atomic_write_json(state_path, state)
+        _atomic_write_json(request_path, request)
+        return state
+
+    os.replace(partial, target)
+    _activate_mirror_target(Path("config.json"), target)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    state.update({"status": "complete", "verification": detail, "completed_at": completed_at, "updated_at": completed_at, "source_retained": True})
+    request.update({"status": "complete", "completed_at": completed_at, "updated_at": completed_at, "source_retained": True})
+    _atomic_write_json(state_path, state)
+    _atomic_write_json(request_path, request)
+    _record_migration_summary(child, "managed_mirror_database_promotion", {
+        "apply": True, "status": "ok", "verified": 1, "copied": 1, "bytes": expected_size, "cutover": True,
+    })
+    return state
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Copy Ina cold storage or shard experience event files with checksum verification.")
     parser.add_argument("--child", default=None, help="Child name; defaults to config current_child.")
@@ -418,13 +569,16 @@ def main() -> int:
     parser.add_argument("--migrate-source", type=Path, help="Tree to move while preserving this path as a symlink.")
     parser.add_argument("--migrate-target", type=Path, help="Destination tree on an NVMe or new-system mount.")
     parser.add_argument("--absolute-link", action="store_true", help="Use an absolute compatibility link; relative is portable by default.")
+    parser.add_argument("--resume-managed", action="store_true", help="Advance Ina owned managed migration by one verified chunk.")
     args = parser.parse_args()
 
     cfg = _load_config()
     child = args.child or cfg.get("current_child") or "Inazuma_Yagami"
     if bool(args.migrate_source) != bool(args.migrate_target):
         parser.error("--migrate-source and --migrate-target must be supplied together")
-    if args.migrate_source:
+    if args.resume_managed:
+        report = managed_migration_step(str(child))
+    elif args.migrate_source:
         report = migrate_tree_and_link(args.migrate_source, args.migrate_target, apply=bool(args.apply), relative_link=not args.absolute_link, child=str(child))
     elif args.shard_experience_events:
         report = shard_experience_events(
@@ -445,7 +599,7 @@ def main() -> int:
         else:
             print_payload["file_count"] = len(report.get("files", []))
     print(json.dumps(print_payload, indent=2, ensure_ascii=True))
-    return 0 if report.get("status") == "ok" else 1
+    return 0 if report.get("status") in {"ok", "idle", "copying", "verifying", "complete"} else 1
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 import json
 
+from experience_archive import load_archived_experience, recent_archived_experiences
 from experience_storage import newest_event_paths, resolve_event_path
 
 
@@ -171,8 +172,22 @@ class ExperienceLogger:
     def list_recent_events(self, limit: int = 5) -> List[EventRecord]:
         """Return the most recent *limit* events for quick inspection."""
 
-        files = newest_event_paths(self._events_dir, limit)
-        return [self._load_event_from_path(path) for path in files]
+        bounded = max(0, int(limit))
+        files = newest_event_paths(self._events_dir, bounded)
+        records = [self._load_event_from_path(path) for path in files]
+        archived = recent_archived_experiences(self.child, bounded)
+        records.extend(EventRecord.from_dict(item) for item in archived)
+        records.sort(key=lambda item: str(item.timestamp or ""), reverse=True)
+        seen = set()
+        result = []
+        for record in records:
+            if record.id in seen:
+                continue
+            seen.add(record.id)
+            result.append(record)
+            if len(result) >= bounded:
+                break
+        return result
 
     # ------------------------------------------------------------------
     # Episode management
@@ -436,7 +451,14 @@ class ExperienceLogger:
             json.dump(record.to_dict(), fh, indent=2)
 
     def _load_event(self, event_id: str) -> EventRecord:
-        return self._load_event_from_path(self._event_path(event_id))
+        path = self._event_path(event_id)
+        try:
+            return self._load_event_from_path(path)
+        except FileNotFoundError:
+            payload = load_archived_experience(self.child, "experience_event", event_id)
+            if payload is None:
+                raise
+            return EventRecord.from_dict(payload)
 
     def _load_event_from_path(self, path: Path) -> EventRecord:
         with open(path, "r", encoding="utf-8") as fh:

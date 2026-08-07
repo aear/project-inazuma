@@ -44,6 +44,16 @@ def sharded_event_path(events_dir: Path, event_id: str) -> Path:
     return events_dir / HASH_SHARD_ROOT / digest[:2] / digest[2:4] / filename
 
 
+def sharded_media_dir(media_dir: Path, event_id: str) -> Path:
+    """Return a deterministic directory for media belonging to an event."""
+    match = _EVENT_TIME_RE.match(str(event_id))
+    if match:
+        year, month, day, hour = match.groups()
+        return media_dir / TIME_SHARD_ROOT / year / month / day / hour
+    digest = hashlib.sha256(str(event_id).encode("utf-8", "replace")).hexdigest()
+    return media_dir / HASH_SHARD_ROOT / digest[:2] / digest[2:4]
+
+
 def candidate_event_paths(events_dir: Path, event_id: str) -> List[Path]:
     sharded = sharded_event_path(events_dir, event_id)
     legacy = legacy_event_path(events_dir, event_id)
