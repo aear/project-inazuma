@@ -261,7 +261,7 @@ def test_expression_arbiter_honours_explicit_code_pointer():
 
 
 
-def test_incomplete_selected_translation_stays_full_english(monkeypatch):
+def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(monkeypatch):
     monkeypatch.setattr(
         db,
         "generate_symbolic_reply_from_text",
@@ -292,8 +292,19 @@ def test_incomplete_selected_translation_stays_full_english(monkeypatch):
         max_symbols=24,
     )
 
-    assert rendered == response
-    assert metadata["effective_language_mode"] == "english_incomplete_native"
+    assert rendered == (
+        "Native signal: glyph_known sym_snd_internal\n"
+        "English expression: I do not have grounding for restart strategies."
+    )
+    assert metadata["effective_language_mode"] == "mixed_partial_native"
+    english_rendered, english_metadata = db.encode_selected_text_expression(
+        response,
+        child="TestChild",
+        language_preference="english",
+        max_symbols=24,
+    )
+    assert english_rendered == response
+    assert english_metadata["effective_language_mode"] == "english_incomplete_native"
     assert metadata["native_translation_complete"] is False
     assert set(metadata["native_translation_rejections"]) == {
         "unknown_response_words",
@@ -340,10 +351,55 @@ def test_complete_selected_translation_can_render_native_and_english(monkeypatch
     assert metadata["native_translation_complete"] is True
     assert metadata["native_translation_rejections"] == []
 
+
+
+def test_unknown_input_uses_expression_signal_not_lexicon_fallback(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        '{"discord_language_preference": "auto", '
+        '"emotion_snapshot": {"values": {"clarity": -0.9, "curiosity": 0.4}}}',
+        encoding="utf-8",
+    )
+    adapter = _Adapter(response="I do not have grounding for 'better'.")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+
+    def symbolic(text, **kwargs):
+        if text == "Better?":
+            return {
+                "text": "Native: λbetter\nHuman guess: better",
+                "native_text": "λbetter",
+                "gloss_text": "better",
+                "symbols": ["sym_better"],
+                "unknown": ["better"],
+            }
+        return None
+
+    monkeypatch.setattr(
+        db,
+        "generate_symbolic_reply_from_text",
+        symbolic,
+    )
+
+    result = db.process_inbound_message(_message("Better?"))
+
+    assert result.text.startswith("State signal")
+    assert adapter.calls == []
+    assert result.metadata["expression_decision"]["strategy"] == "emotion"
+    assert result.metadata["expression_decision"]["adapter_response_available"] is False
+    assert result.metadata["expression_decision"]["adapter_rejection"] == "unmapped_input"
+    assert result.metadata["adapter"] == "emotion_signal"
+
+
 def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(
         "Native: glyph_wave glyph_calm\nHuman guess: hello calm"
     ) == [("glyph_wave glyph_calm", "hello calm")]
+    assert db.extract_symbolic_history_alignments(
+        "Native signal: λstate\nEnglish expression: state uncertain"
+    ) == []
     parsed = db.parse_symbolic_history_message(
         "Native: orphan\nNative: glyph_calm\nHuman guess: calm\nHuman guess: orphan"
     )

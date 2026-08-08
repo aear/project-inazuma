@@ -881,9 +881,21 @@ def encode_selected_text_expression(
         "native_translation_symbol_count": len(symbols),
     }
     if not translation_complete:
-        return selected_text, {
+        _, requested_mode = select_symbolic_message_text(
+            dual, language_preference
+        )
+        if requested_mode == "english" or not native_text:
+            rendered = selected_text
+            effective_mode = "english_incomplete_native"
+        else:
+            rendered = (
+                f"Native signal: {native_text}\n"
+                f"English expression: {selected_text}"
+            )
+            effective_mode = "mixed_partial_native"
+        return rendered, {
             **translation_metadata,
-            "effective_language_mode": "english_incomplete_native",
+            "effective_language_mode": effective_mode,
         }
     rendered, effective_mode = select_symbolic_message_text(dual, language_preference)
     return rendered or selected_text, {
@@ -1581,7 +1593,13 @@ def process_inbound_message(msg) -> CommsResponse:
     emotion_signal = format_emotion_signal(state)
     code_pointer_signal = format_code_pointer_signal(state)
     adapter_can_respond = bool(adapter and (user_text.strip() or not attachments))
-    ordinary_response_available = adapter_can_respond or bool(attachments)
+    has_unmapped_input = bool(tokens) and (
+        symbolic is None or bool(symbolic_unknown)
+    )
+    adapter_has_constructive_reply = (
+        adapter_can_respond and not has_unmapped_input
+    )
+    ordinary_response_available = adapter_has_constructive_reply or bool(attachments)
     expression_decision = choose_text_expression_strategy(
         state,
         mapped_count=len(symbolic.get("symbols") or []) if symbolic else 0,
@@ -1595,6 +1613,12 @@ def process_inbound_message(msg) -> CommsResponse:
         **expression_decision,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbolic_unknown_count": len(symbolic_unknown),
+        "adapter_response_available": adapter_has_constructive_reply,
+        "adapter_rejection": (
+            "unmapped_input"
+            if adapter_can_respond and has_unmapped_input
+            else None
+        ),
     }
     metadata["expression_decision"] = decision_record
     try:
@@ -1641,7 +1665,11 @@ def process_inbound_message(msg) -> CommsResponse:
         metadata["adapter"] = "code_pointer_signal"
         metadata["code_pointer_signal"] = code_pointer_signal
 
-    if not reply_text and selected_strategy == "respond" and adapter_can_respond:
+    if (
+        not reply_text
+        and selected_strategy == "respond"
+        and adapter_has_constructive_reply
+    ):
         try:
             entity_links = [
                 {
