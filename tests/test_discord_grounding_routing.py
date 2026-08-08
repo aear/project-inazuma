@@ -260,6 +260,86 @@ def test_expression_arbiter_honours_explicit_code_pointer():
     assert decision["reason"] == "explicit_intent"
 
 
+
+def test_incomplete_selected_translation_stays_full_english(monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "generate_symbolic_reply_from_text",
+        lambda *args, **kwargs: {
+            "symbols": ["sym_snd_internal"],
+            "unknown": ["grounding", "restart", "strategies"],
+        },
+    )
+    monkeypatch.setattr(
+        db,
+        "build_dual_symbolic_message",
+        lambda *args, **kwargs: {
+            "text": (
+                "Native: glyph_known sym_snd_internal\n"
+                "Human guess: I do not have grounding for restart strategies."
+            ),
+            "native_text": "glyph_known sym_snd_internal",
+            "gloss_text": "I do not have grounding for restart strategies.",
+            "native_sources": {},
+        },
+    )
+    response = "I do not have grounding for restart strategies."
+
+    rendered, metadata = db.encode_selected_text_expression(
+        response,
+        child="TestChild",
+        language_preference="auto",
+        max_symbols=24,
+    )
+
+    assert rendered == response
+    assert metadata["effective_language_mode"] == "english_incomplete_native"
+    assert metadata["native_translation_complete"] is False
+    assert set(metadata["native_translation_rejections"]) == {
+        "unknown_response_words",
+        "incomplete_token_coverage",
+        "unresolved_native_symbols",
+    }
+    assert metadata["native_translation_unresolved_symbols"] == [
+        "sym_snd_internal"
+    ]
+
+
+def test_complete_selected_translation_can_render_native_and_english(monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "generate_symbolic_reply_from_text",
+        lambda *args, **kwargs: {
+            "symbols": ["sym_calm", "sym_here"],
+            "unknown": [],
+        },
+    )
+    monkeypatch.setattr(
+        db,
+        "build_dual_symbolic_message",
+        lambda *args, **kwargs: {
+            "text": "Native: λcalm λhere\nHuman guess: calm here",
+            "native_text": "λcalm λhere",
+            "gloss_text": "calm here",
+            "native_sources": {
+                "sym_calm": "text_vocab_links",
+                "sym_here": "text_vocab_links",
+            },
+        },
+    )
+
+    rendered, metadata = db.encode_selected_text_expression(
+        "calm here",
+        child="TestChild",
+        language_preference="mixed",
+        max_symbols=24,
+    )
+
+    assert rendered == "Native: λcalm λhere\nHuman guess: calm here"
+    assert metadata["effective_language_mode"] == "mixed"
+    assert metadata["native_translation_complete"] is True
+    assert metadata["native_translation_rejections"] == []
+
 def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(
         "Native: glyph_wave glyph_calm\nHuman guess: hello calm"

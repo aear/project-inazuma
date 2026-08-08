@@ -839,6 +839,8 @@ def encode_selected_text_expression(
         return selected_text, {
             "effective_language_mode": "english_unmapped",
             "selected_expression_symbols": [],
+            "native_translation_complete": False,
+            "native_translation_rejections": ["no_mapped_symbols"],
         }
     dual = build_dual_symbolic_message(
         symbols,
@@ -849,13 +851,45 @@ def encode_selected_text_expression(
         fallback_to_symbol_to_token=False,
         native_style="glyphs",
     )
+    response_tokens = _extract_tokens(selected_text)
+    unknown_words = list((encoded or {}).get("unknown") or [])
+    native_sources = (dual or {}).get("native_sources") or {}
+    native_text = str((dual or {}).get("native_text") or "").strip()
+    native_tokens = set(native_text.split())
+    rejection_reasons = []
+    if unknown_words:
+        rejection_reasons.append("unknown_response_words")
+    if len(symbols) < len(response_tokens):
+        rejection_reasons.append("incomplete_token_coverage")
+    unresolved_native_symbols = [
+        symbol
+        for symbol in symbols
+        if symbol not in native_sources or symbol in native_tokens
+    ]
+    if unresolved_native_symbols:
+        rejection_reasons.append("unresolved_native_symbols")
+    translation_complete = bool(dual) and not rejection_reasons
+    translation_metadata = {
+        "selected_expression_symbols": symbols,
+        "selected_expression_native_candidate": native_text or None,
+        "selected_expression_gloss_text": selected_text,
+        "selected_expression_unmapped_words": unknown_words,
+        "native_translation_complete": translation_complete,
+        "native_translation_rejections": rejection_reasons,
+        "native_translation_unresolved_symbols": unresolved_native_symbols,
+        "native_translation_token_count": len(response_tokens),
+        "native_translation_symbol_count": len(symbols),
+    }
+    if not translation_complete:
+        return selected_text, {
+            **translation_metadata,
+            "effective_language_mode": "english_incomplete_native",
+        }
     rendered, effective_mode = select_symbolic_message_text(dual, language_preference)
     return rendered or selected_text, {
+        **translation_metadata,
         "effective_language_mode": effective_mode,
-        "selected_expression_symbols": symbols,
-        "selected_expression_native_text": (dual or {}).get("native_text"),
-        "selected_expression_gloss_text": selected_text,
-        "selected_expression_unmapped_words": (encoded or {}).get("unknown") or [],
+        "selected_expression_native_text": native_text,
     }
 
 
