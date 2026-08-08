@@ -942,6 +942,15 @@ def _build_text_vocab_word_symbol_index(links_payload: Any) -> Dict[str, str]:
     return index
 
 
+def load_text_vocab_word_symbol_index(
+    child: str,
+    base_path: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Return the learned English/native word index used by text translation."""
+    links_payload = load_text_vocab_links(child, base_path=base_path)
+    return _build_text_vocab_word_symbol_index(links_payload)
+
+
 def build_dual_symbolic_message(
     symbols,
     *,

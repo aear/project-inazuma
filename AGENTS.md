@@ -185,6 +185,12 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - If you find yourself re-typing a subsystem that already exists elsewhere in the repo, stop and refactor into a shared module.
 - Avoid “nearly identical” copies; prefer one shared implementation + thin wrappers.
 
+### Reversibility and compatibility paths
+- Prefer reversible changes.
+- Document why strange code exists, especially compatibility paths and non-obvious fallbacks.
+- Instrument a path and observe its real use before deleting it.
+- Assume today's compatibility path becomes tomorrow's haunted basement; keep it inspectable, bounded, and removable.
+
 ## Memory handling (IMPORTANT)
 
 ### Avoid memory tree scans

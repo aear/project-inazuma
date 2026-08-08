@@ -15,6 +15,7 @@ from experience_logger import ExperienceLogger
 from language_processing import (
     describe_word_grounding,
     load_symbol_to_token,
+    load_text_vocab_word_symbol_index,
 )
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
@@ -84,6 +85,7 @@ class LMStudioAdapter:
         tags: Optional[Iterable[str]] = None,
         entity_links: Optional[Iterable[Dict[str, Any]]] = None,
         response_tags: Optional[Iterable[str]] = None,
+        include_clarification: bool = True,
     ) -> str:
         """Process an utterance and craft a grounded reply, logging both turns."""
 
@@ -101,7 +103,9 @@ class LMStudioAdapter:
             tags=inbound_tags,
             entity_links=entity_payload,
         )
-        response = self._compose_reply(prompt)
+        response = self._compose_reply(
+            prompt, include_clarification=include_clarification
+        )
 
         outbound_tags = list(base_tags)
         if response_tags:
@@ -117,13 +121,40 @@ class LMStudioAdapter:
         )
         return response
 
+    def has_constructive_reply(self, prompt: str) -> bool:
+        """Read-only check for grounded recall without canned clarification."""
+        if not self._experience_graph_path().exists():
+            return False
+        return bool(self._compose_reply(
+            prompt,
+            include_clarification=False,
+            seed_questions=False,
+        ))
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _compose_reply(self, prompt: str) -> str:
+    def _experience_graph_path(self) -> Path:
+        return (
+            self._base_path
+            / self.child
+            / "memory"
+            / "experiences"
+            / "experience_graph.json"
+        )
+
+    def _compose_reply(
+        self,
+        prompt: str,
+        *,
+        include_clarification: bool = True,
+        seed_questions: bool = True,
+    ) -> str:
         words = self._tokenize(prompt)
         if not words:
-            return "I did not catch any words. Could you rephrase that for me?"
+            if include_clarification:
+                return "I did not catch any words. Could you rephrase that for me?"
+            return ""
 
         vocab = self._load_known_words()
         grounded_details: List[Tuple[str, Dict[str, Any]]] = []
@@ -143,23 +174,25 @@ class LMStudioAdapter:
                 unknown_words.append(word)
                 seen_unknown.add(word)
 
-        if unknown_words:
+        if unknown_words and seed_questions:
             for word in unknown_words:
                 seed_self_question(
                     f"What experience grounds the word '{word}' mentioned by the operator?"
                 )
 
         if not grounded_details and not unknown_words:
-            return (
-                "I recognise familiar words, but none are grounded yet. "
-                "Could you share an experience that teaches me more?"
-            )
+            if include_clarification:
+                return (
+                    "I recognise familiar words, but none are grounded yet. "
+                    "Could you share an experience that teaches me more?"
+                )
+            return ""
 
         sections: List[str] = []
         if grounded_details:
             sections.append(self._format_grounded_section(grounded_details))
 
-        if unknown_words:
+        if unknown_words and include_clarification:
             unique_unknown = unknown_words
             sections.append(
                 "I do not have grounding for "
@@ -171,20 +204,18 @@ class LMStudioAdapter:
 
     def _load_known_words(self) -> Dict[str, str]:
         vocabulary = load_symbol_to_token(self.child, base_path=self._base_path)
-        return {
+        known = {
             entry.get("word", "").lower(): symbol
             for symbol, entry in vocabulary.items()
             if entry.get("word")
         }
+        known.update(load_text_vocab_word_symbol_index(
+            self.child, base_path=self._base_path
+        ))
+        return known
 
     def _summarise_grounding(self, word: str) -> Optional[Dict[str, Any]]:
-        graph_path = (
-            self._base_path
-            / self.child
-            / "memory"
-            / "experiences"
-            / "experience_graph.json"
-        )
+        graph_path = self._experience_graph_path()
         if not graph_path.exists():
             build_experience_graph(self.child, base_path=self._base_path)
 

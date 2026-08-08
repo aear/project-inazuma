@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import lm_studio_adapter as lmsa
 import discord_bridge as db
 
 
@@ -90,6 +91,52 @@ class _Adapter:
     def handle_prompt(self, prompt, **kwargs):
         self.calls.append((prompt, kwargs))
         return self.response
+
+def test_grounded_adapter_known_words_include_text_vocab_links(monkeypatch):
+    adapter = object.__new__(lmsa.LMStudioAdapter)
+    adapter.child = "TestChild"
+    adapter._base_path = None
+    monkeypatch.setattr(
+        lmsa,
+        "load_symbol_to_token",
+        lambda *args, **kwargs: {"sym_old": {"word": "old"}},
+    )
+    monkeypatch.setattr(
+        lmsa,
+        "load_text_vocab_word_symbol_index",
+        lambda *args, **kwargs: {"take": "sym_take", "shot": "sym_shot"},
+    )
+
+    known = adapter._load_known_words()
+
+    assert known["old"] == "sym_old"
+    assert known["take"] == "sym_take"
+
+
+def test_grounded_adapter_probe_is_nonclarifying_and_side_effect_free(monkeypatch):
+    adapter = object.__new__(lmsa.LMStudioAdapter)
+    adapter.child = "TestChild"
+    adapter._base_path = None
+    monkeypatch.setattr(
+        adapter, "_load_known_words", lambda: {
+            "take": "sym_take", "another": "sym_another", "shot": "sym_shot"
+        }
+    )
+    monkeypatch.setattr(adapter, "_summarise_grounding", lambda word: None)
+    monkeypatch.setattr(
+        adapter, "_experience_graph_path",
+        lambda: SimpleNamespace(exists=lambda: True),
+    )
+    seeded = []
+    monkeypatch.setattr(lmsa, "seed_self_question", seeded.append)
+
+    assert adapter.has_constructive_reply("take another shot") is False
+    assert seeded == []
+    assert adapter._compose_reply(
+        "take another shot",
+        include_clarification=False,
+        seed_questions=False,
+    ) == ""
 
 
 def _message(text, *, attachments=None, context=None):
@@ -392,6 +439,54 @@ def test_unknown_input_uses_expression_signal_not_lexicon_fallback(monkeypatch, 
     assert result.metadata["expression_decision"]["adapter_rejection"] == "unmapped_input"
     assert result.metadata["adapter"] == "emotion_signal"
 
+
+
+def test_fully_mapped_input_rejects_nonconstructive_legacy_adapter(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        '{"discord_language_preference": "auto", '
+        '"emotion_snapshot": {"values": {"clarity": -0.9, "curiosity": 0.4}}}',
+        encoding="utf-8",
+    )
+
+    class MappingAwareAdapter(_Adapter):
+        def __init__(self):
+            super().__init__(response="I do not have grounding for mapped words.")
+            self.probes = []
+
+        def has_constructive_reply(self, prompt):
+            self.probes.append(prompt)
+            return False
+
+    adapter = MappingAwareAdapter()
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+
+    def symbolic(text, **kwargs):
+        if text == "Ok, take another shot.":
+            return {
+                "text": "Native: λok λtake λanother λshot\nHuman guess: ok take another shot",
+                "native_text": "λok λtake λanother λshot",
+                "gloss_text": "ok take another shot",
+                "symbols": ["sym_ok", "sym_take", "sym_another", "sym_shot"],
+                "unknown": [],
+            }
+        return None
+
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", symbolic)
+
+    result = db.process_inbound_message(_message("Ok, take another shot."))
+
+    assert result.text.startswith("State signal")
+    assert adapter.probes == ["Ok, take another shot."]
+    assert adapter.calls == []
+    decision = result.metadata["expression_decision"]
+    assert decision["strategy"] == "emotion"
+    assert decision["adapter_response_available"] is False
+    assert decision["adapter_rejection"] == "no_grounded_reply"
+    assert result.metadata["adapter"] == "emotion_signal"
 
 def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(

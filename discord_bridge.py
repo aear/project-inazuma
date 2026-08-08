@@ -1596,9 +1596,30 @@ def process_inbound_message(msg) -> CommsResponse:
     has_unmapped_input = bool(tokens) and (
         symbolic is None or bool(symbolic_unknown)
     )
-    adapter_has_constructive_reply = (
-        adapter_can_respond and not has_unmapped_input
-    )
+    constructive_probe = getattr(adapter, "has_constructive_reply", None)
+    constructive_probe_used = callable(constructive_probe)
+    constructive_probe_failed = False
+    if adapter_can_respond and constructive_probe_used:
+        try:
+            adapter_has_constructive_reply = bool(constructive_probe(user_text))
+        except Exception:
+            logger.exception("Grounded reply capability probe failed.")
+            adapter_has_constructive_reply = False
+            constructive_probe_failed = True
+    else:
+        adapter_has_constructive_reply = (
+            adapter_can_respond and not has_unmapped_input
+        )
+    adapter_rejection = None
+    if adapter_can_respond and not adapter_has_constructive_reply:
+        if constructive_probe_failed:
+            adapter_rejection = "constructive_probe_failed"
+        elif constructive_probe_used:
+            adapter_rejection = "no_grounded_reply"
+        elif has_unmapped_input:
+            adapter_rejection = "unmapped_input"
+        else:
+            adapter_rejection = "no_constructive_reply"
     ordinary_response_available = adapter_has_constructive_reply or bool(attachments)
     expression_decision = choose_text_expression_strategy(
         state,
@@ -1614,11 +1635,7 @@ def process_inbound_message(msg) -> CommsResponse:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbolic_unknown_count": len(symbolic_unknown),
         "adapter_response_available": adapter_has_constructive_reply,
-        "adapter_rejection": (
-            "unmapped_input"
-            if adapter_can_respond and has_unmapped_input
-            else None
-        ),
+        "adapter_rejection": adapter_rejection,
     }
     metadata["expression_decision"] = decision_record
     try:
@@ -1714,11 +1731,12 @@ def process_inbound_message(msg) -> CommsResponse:
                 reply_text = adapter.handle_prompt(
                     user_text,
                     speaker=msg.sender.display_name or msg.sender.internal_id,
-                    tags=["discord", "text", "lexicon_explain"],
+                    tags=["discord", "text", "grounded_partial"],
                     entity_links=entity_links,
-                    response_tags=["discord", "ina", "lexicon_explain"],
+                    response_tags=["discord", "ina", "grounded_partial"],
+                    include_clarification=False,
                 )
-                metadata["adapter"] = "lm_explain"
+                metadata["adapter"] = "lm_grounded_partial"
                 metadata["unknown_words"] = explain_targets
                 if symbolic_text and effective_language_mode != "english":
                     metadata["symbolic_hint"] = symbolic_text
@@ -1729,6 +1747,7 @@ def process_inbound_message(msg) -> CommsResponse:
                     tags=["discord", "text"],
                     entity_links=entity_links,
                     response_tags=["discord", "ina"],
+                    include_clarification=False,
                 )
                 metadata["adapter"] = "lmstudio"
         except Exception:
