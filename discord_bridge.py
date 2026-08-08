@@ -339,7 +339,7 @@ def get_language_review_policy() -> dict:
 
 _NATIVE_HISTORY_LINE = re.compile(r"(?im)^\s*Native:\s*(.+?)\s*$")
 _ENGLISH_HISTORY_LINE = re.compile(
-    r"(?im)^\s*(?:Human guess|English|Translation):\s*(.+?)\s*$"
+    r"(?im)^\s*(?:Human guess|Word-for-word|English|Translation):\s*(.+?)\s*$"
 )
 
 
@@ -1004,7 +1004,7 @@ def encode_selected_text_expression(
         if index < len(aligned_gloss_tokens) and symbol in gloss_sources:
             literal_gloss_tokens.append(str(aligned_gloss_tokens[index]))
         if index in paralinguistic_indexes:
-            emotion_sound_tokens.append(native_token)
+            emotion_sound_tokens.append(str(symbol))
             continue
         if (
             index < len(aligned_gloss_tokens)
@@ -1070,22 +1070,16 @@ def encode_selected_text_expression(
         )
         layers = []
         if requested_mode == "english":
-            layers.append(f"English expression: {selected_text}")
+            if native_text:
+                layers.append(f"Native: {native_text}")
             layers.append(f"Word-for-word: {word_for_word_text}")
+            layers.append(f"English expression: {selected_text}")
             effective_mode = "english_incomplete_native"
         else:
-            if mapped_native_text and mapped_gloss_text:
-                layers.extend([
-                    f"Native: {mapped_native_text}",
-                    f"Human guess: {mapped_gloss_text}",
-                ])
-            if linguistic_signal_text:
-                layers.append(f"Native signal: {linguistic_signal_text}")
-            if (
-                not mapped_gloss_text
-                or mapped_gloss_text.casefold() != selected_text.casefold()
-            ):
-                layers.append(f"English expression: {selected_text}")
+            if native_text:
+                layers.append(f"Native: {native_text}")
+            layers.append(f"Word-for-word: {word_for_word_text}")
+            layers.append(f"English expression: {selected_text}")
             effective_mode = "mixed_partial_native"
         if emotion_sound_text:
             layers.append(f"Emotion/sound signal: {emotion_sound_text}")
@@ -1099,15 +1093,15 @@ def encode_selected_text_expression(
     )
     layers = []
     if effective_mode == "english":
-        layers.append(f"English expression: {selected_text}")
+        if native_text:
+            layers.append(f"Native: {native_text}")
         layers.append(f"Word-for-word: {word_for_word_text}")
+        layers.append(f"English expression: {selected_text}")
     else:
-        layers.extend([
-            f"Native: {mapped_native_text}",
-            f"Human guess: {mapped_gloss_text}",
-        ])
-        if mapped_gloss_text.casefold() != selected_text.casefold():
-            layers.append(f"English expression: {selected_text}")
+        if native_text:
+            layers.append(f"Native: {native_text}")
+        layers.append(f"Word-for-word: {word_for_word_text}")
+        layers.append(f"English expression: {selected_text}")
     if emotion_sound_text:
         layers.append(f"Emotion/sound signal: {emotion_sound_text}")
     return "\n".join(layers) or selected_text, {
