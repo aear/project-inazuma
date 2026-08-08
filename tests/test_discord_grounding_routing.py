@@ -1,9 +1,11 @@
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import lm_studio_adapter as lmsa
 import discord_bridge as db
+import music_delivery as md
 
 
 def test_discord_chunking_preserves_full_paragraph_text():
@@ -361,7 +363,9 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
         max_symbols=24,
     )
     assert english_rendered == (
-        response + "\nEmotion/sound signal: sym_snd_internal"
+        "English expression: " + response + "\n"
+        "Word-for-word: known\n"
+        "Emotion/sound signal: sym_snd_internal"
     )
     assert english_metadata["effective_language_mode"] == "english_incomplete_native"
     assert metadata["native_translation_complete"] is False
@@ -413,6 +417,74 @@ def test_complete_selected_translation_can_render_native_and_english(monkeypatch
     assert metadata["native_translation_complete"] is True
     assert metadata["native_translation_rejections"] == []
 
+
+
+def test_complete_translation_keeps_word_for_word_line(monkeypatch):
+    symbols = ["one", "two", "three"]
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: {
+        "symbols": symbols, "unknown": [],
+    })
+    monkeypatch.setattr(db, "build_dual_symbolic_message", lambda *a, **k: {
+        "native_text": "n1 n2 n3", "gloss_text": "law but still",
+        "native_tokens": ["n1", "n2", "n3"],
+        "gloss_tokens": ["law", "but", "still"],
+        "native_sources": {symbol: "links" for symbol in symbols},
+        "gloss_sources": {symbol: "links" for symbol in symbols},
+    })
+    rendered, _ = db.encode_selected_text_expression(
+        "better but still", child="TestChild",
+        language_preference="english", max_symbols=24,
+    )
+    assert rendered == (
+        "English expression: better but still\n"
+        "Word-for-word: law but still"
+    )
+
+
+def test_song_candidate_uses_remembered_render(tmp_path):
+    render = tmp_path / "Ina/memory/music_studio/renders/memory.wav"
+    render.parent.mkdir(parents=True)
+    render.write_bytes(b"RIFF remembered")
+    state = {
+        "text_expression_intent": {"song_path": str(tmp_path / "outside.wav")},
+        "daw_workspace_state": {"project": {"last_render": str(render)}},
+    }
+    candidate = db.resolve_song_expression_candidate(
+        state, child="Ina", base_path=tmp_path,
+    )
+    assert candidate["source"] == "daw_workspace_state.project.last_render"
+    assert candidate["opus_path"] == str(render.with_suffix(".opus"))
+    assert candidate["rejections"][0]["reason"] == "outside_music_studio"
+    assert db.inspect_song_opus_sidecar(candidate)["reason"] == "opus_sidecar_missing"
+    render.with_suffix(".opus").write_bytes(b"opus")
+    assert db.inspect_song_opus_sidecar(candidate)["status"] == "ready"
+
+
+def test_song_conversion_creates_persistent_sidecar(tmp_path, monkeypatch):
+    wav_path = tmp_path / "song.wav"
+    opus_path = tmp_path / "song.opus"
+    wav_path.write_bytes(b"original wav")
+    candidate = {
+        "available": True, "wav_path": str(wav_path),
+        "opus_path": str(opus_path),
+    }
+    calls = []
+
+    def convert(command, **kwargs):
+        calls.append(command)
+        Path(command[-1]).write_bytes(b"opus copy")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(md.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(md.subprocess, "run", convert)
+    converted = md.ensure_opus_sidecar(wav_path)
+    reused = md.ensure_opus_sidecar(wav_path)
+
+    assert converted["status"] == "converted"
+    assert reused["status"] == "reused"
+    assert wav_path.read_bytes() == b"original wav"
+    assert opus_path.read_bytes() == b"opus copy"
+    assert len(calls) == 1
 
 
 def test_unknown_input_uses_expression_signal_not_lexicon_fallback(monkeypatch, tmp_path):

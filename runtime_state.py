@@ -78,6 +78,8 @@ def set_text_expression_intent(
     strategy: str,
     *,
     pointers: Optional[List[Any]] = None,
+    song_path: Optional[str] = None,
+    caption: Optional[str] = None,
     max_emotion_sliders: Optional[int] = None,
     max_code_pointers: Optional[int] = None,
     once: bool = True,
@@ -94,11 +96,13 @@ def set_text_expression_intent(
         "module": "code_pointer",
         "modules": "code_pointer",
         "code": "code_pointer",
+        "music": "song",
+        "track": "song",
         "quiet": "silence",
     }
     normalized = str(strategy or "").strip().lower()
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"respond", "mirror", "emotion", "code_pointer", "silence"}:
+    if normalized not in {"respond", "mirror", "emotion", "code_pointer", "song", "silence"}:
         raise ValueError(f"Unsupported text expression strategy: {strategy!r}")
     payload: Dict[str, Any] = {
         "strategy": normalized,
@@ -107,6 +111,10 @@ def set_text_expression_intent(
     }
     if pointers is not None:
         payload["pointers"] = list(pointers)[:24]
+    if song_path is not None:
+        payload["song_path"] = str(song_path)
+    if caption is not None:
+        payload["caption"] = str(caption)[:500]
     if max_emotion_sliders is not None:
         payload["max_emotion_sliders"] = max(1, min(24, int(max_emotion_sliders)))
     if max_code_pointers is not None:

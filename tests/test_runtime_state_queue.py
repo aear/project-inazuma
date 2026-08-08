@@ -156,3 +156,13 @@ def test_text_expression_intent_supports_emotion_and_code_pointers(tmp_path, mon
     assert payload["strategy"] == "code_pointer"
     assert payload["max_code_pointers"] == 2
     assert rs.get_inastate("text_expression_intent", child="Ina") == payload
+
+
+def test_text_expression_intent_supports_song_path_and_caption(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    payload = rs.set_text_expression_intent(
+        "music", song_path="renders/ina-song.wav", caption="This one.", child="Ina",
+    )
+    assert payload["strategy"] == "song"
+    assert payload["song_path"] == "renders/ina-song.wav"
+    assert payload["caption"] == "This one."

@@ -44,6 +44,7 @@ from daw_engine import (
     write_wav,
 )
 from runtime_state import drain_inastate_queue, load_config, update_inastate
+from music_delivery import ensure_opus_sidecar
 from stem_import import (
     StemImportResult,
     import_stem_zip,
@@ -1634,14 +1635,16 @@ class DawWindow(tk.Tk):
             return
         destination = self.paths.renders / f"{safe_filename_stem(snapshot.name)}_{_utc_timestamp()}.wav"
 
-        def work() -> Path:
+        def work() -> tuple[Path, dict]:
             with self._render_lock:
-                return export_project_wav(snapshot, destination, base_path=self.paths.root)
+                path = export_project_wav(snapshot, destination, base_path=self.paths.root)
+                return path, ensure_opus_sidecar(path)
 
-        def done(path: Path) -> None:
+        def done(result: tuple[Path, dict]) -> None:
+            path, opus_sidecar = result
             self.last_render_path = path
             self._set_status(f"Rendered WAV: {path.name}")
-            self._publish_workspace("rendered")
+            self._publish_workspace("rendered", opus_sidecar=opus_sidecar)
 
         self._background("Rendering arrangement…", work, done)
 
@@ -1851,14 +1854,16 @@ class DawWindow(tk.Tk):
             self._export_snapshot(snapshot, path)
 
     def _export_snapshot(self, snapshot: DawProject, path: Path) -> bool:
-        def work() -> Path:
+        def work() -> tuple[Path, dict]:
             with self._render_lock:
-                return export_project_wav(snapshot, path, base_path=self.paths.root)
+                exported = export_project_wav(snapshot, path, base_path=self.paths.root)
+                return exported, ensure_opus_sidecar(exported)
 
-        def done(exported: Path) -> None:
+        def done(result: tuple[Path, dict]) -> None:
+            exported, opus_sidecar = result
             self.last_render_path = exported
             self._set_status(f"Exported WAV: {exported.name}")
-            self._publish_workspace("exported")
+            self._publish_workspace("exported", opus_sidecar=opus_sidecar)
 
         return self._background("Exporting WAV…", work, done)
 

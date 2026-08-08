@@ -66,6 +66,7 @@ from text_memory import (
     review_text_evidence,
 )
 from io_pressure import pressure_signal
+from music_delivery import ensure_opus_sidecar
 from discord_runtime import (
     typed_outbox_path,
     typed_outbox_history_path,
@@ -118,6 +119,7 @@ IMAGE_ATTACHMENT_MIME_MAP = {
 }
 DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT = 4
+DEFAULT_SONG_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 AUDIO_ATTACHMENT_EXTENSIONS = {".wav", ".mp3", ".ogg", ".opus", ".flac", ".m4a", ".aac"}
 DEFAULT_DISCORD_SEND_INTERVAL_SECONDS = 0.35
 DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS = 0.25
@@ -721,6 +723,7 @@ def choose_text_expression_strategy(
     expression_drive: float,
     emotion_available: bool,
     code_pointer_available: bool,
+    song_available: bool = False,
 ) -> dict:
     """Choose response, deliberate mirroring, a fallback signal, or silence."""
     state = state if isinstance(state, dict) else {}
@@ -762,6 +765,10 @@ def choose_text_expression_strategy(
         ) if emotion_available else None,
         "code_pointer": 0.14 + 0.12 * unit("curiosity") + 0.08 * unit("clarity")
         if code_pointer_available else None,
+        "song": (
+            0.12 + 0.16 * unit("connection") + 0.14 * unit("interest")
+            + 0.12 * playfulness + 0.08 * unit("intensity")
+        ) if song_available else None,
         "silence": 0.06 + 0.18 * (1.0 - drive) + 0.10 * unit("isolation") + 0.10 * (1.0 - unit("connection")),
     }
     available = {name: score for name, score in scores.items() if score is not None}
@@ -772,6 +779,7 @@ def choose_text_expression_strategy(
         "reply": "respond", "original": "respond", "practice": "mirror",
         "mimic": "mirror", "state": "emotion", "feelings": "emotion",
         "module": "code_pointer", "modules": "code_pointer", "code": "code_pointer",
+        "music": "song", "track": "song",
         "quiet": "silence",
     }
     normalized_request = str(requested or "").strip().lower()
@@ -805,6 +813,112 @@ def _is_emotion_or_sound_symbol(symbol: object) -> bool:
     return symbol_id.startswith(
         ("sound_symbol_", "sym_snd_", "combo_snd_", "sym_emotion_")
     )
+
+
+def resolve_song_expression_candidate(
+    state: object,
+    *,
+    child: str,
+    base_path: Path = Path("AI_Children"),
+) -> dict:
+    """Resolve a remembered WAV without searching Ina's music directory."""
+    state = state if isinstance(state, dict) else {}
+    intent = state.get("text_expression_intent")
+    intent = intent if isinstance(intent, dict) else {}
+    workspace = state.get("daw_workspace_state")
+    workspace = workspace if isinstance(workspace, dict) else {}
+    project = workspace.get("project")
+    project = project if isinstance(project, dict) else {}
+    remembered = [
+        ("text_expression_intent.song_path", intent.get("song_path")),
+        ("text_expression_intent.path", intent.get("path")),
+        ("daw_workspace_state.project.last_render", project.get("last_render")),
+    ]
+    studio_root = (base_path / child / "memory" / "music_studio").resolve()
+    rejections = []
+    for source, raw_path in remembered:
+        if not raw_path:
+            continue
+        supplied = Path(str(raw_path)).expanduser()
+        direct = supplied if supplied.is_absolute() else Path.cwd() / supplied
+        try:
+            direct.resolve().relative_to(studio_root)
+            unresolved_path = direct
+        except ValueError:
+            unresolved_path = supplied if supplied.is_absolute() else studio_root / supplied
+        if unresolved_path.is_symlink():
+            rejections.append({
+                "source": source, "path": str(raw_path),
+                "reason": "symlink_rejected",
+            })
+            continue
+        path = unresolved_path.resolve()
+        try:
+            path.relative_to(studio_root)
+        except ValueError:
+            rejections.append({
+                "source": source, "path": str(raw_path),
+                "reason": "outside_music_studio",
+            })
+            continue
+        if path.suffix.lower() != ".wav":
+            rejections.append({"source": source, "path": str(raw_path), "reason": "not_wav"})
+            continue
+        if not path.is_file():
+            rejections.append({"source": source, "path": str(raw_path), "reason": "missing_file"})
+            continue
+        opus_path = path.with_suffix(".opus")
+        if opus_path.is_symlink():
+            rejections.append({
+                "source": source, "path": str(opus_path),
+                "reason": "opus_symlink_rejected",
+            })
+            continue
+        return {
+            "available": True,
+            "source": source,
+            "wav_path": str(path),
+            "opus_path": str(opus_path),
+            "rejections": rejections,
+        }
+    return {"available": False, "rejections": rejections}
+
+
+def inspect_song_opus_sidecar(
+    candidate: dict,
+    *,
+    max_bytes: int = DEFAULT_SONG_ATTACHMENT_MAX_BYTES,
+) -> dict:
+    """Accept only a current, already-rendered Opus copy for Discord."""
+    wav_path = Path(str(candidate.get("wav_path") or ""))
+    opus_path = Path(str(candidate.get("opus_path") or ""))
+    if not candidate.get("available") or not wav_path.is_file():
+        return {"status": "rejected", "reason": "candidate_unavailable"}
+    try:
+        if not opus_path.is_file():
+            return {"status": "rejected", "reason": "opus_sidecar_missing"}
+        if opus_path.stat().st_mtime_ns < wav_path.stat().st_mtime_ns:
+            return {"status": "rejected", "reason": "opus_sidecar_stale"}
+        size = opus_path.stat().st_size
+        if size > max(1, int(max_bytes)):
+            return {
+                "status": "rejected",
+                "reason": "opus_exceeds_attachment_limit",
+                "opus_path": str(opus_path),
+                "bytes": size,
+                "max_bytes": int(max_bytes),
+            }
+        return {
+            "status": "ready",
+            "wav_path": str(wav_path),
+            "opus_path": str(opus_path),
+            "bytes": size,
+        }
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "failed", "reason": type(exc).__name__,
+            "detail": str(exc)[:300],
+        }
 
 
 def encode_selected_text_expression(
@@ -904,8 +1018,9 @@ def encode_selected_text_expression(
     emotion_sound_text = " ".join(emotion_sound_tokens).strip()
     complete_dual = {
         **(dual or {}),
-        "text": f"Native: {mapped_native_text}\nHuman guess: {selected_text}",
-        "gloss_text": selected_text,
+        "text": f"Native: {mapped_native_text}\nHuman guess: {mapped_gloss_text}",
+        "native_text": mapped_native_text,
+        "gloss_text": mapped_gloss_text,
     }
     rejection_reasons = []
     if unknown_words:
@@ -949,7 +1064,12 @@ def encode_selected_text_expression(
         )
         layers = []
         if requested_mode == "english":
-            layers.append(selected_text)
+            layers.append(f"English expression: {selected_text}")
+            if (
+                mapped_gloss_text
+                and mapped_gloss_text.casefold() != selected_text.casefold()
+            ):
+                layers.append(f"Word-for-word: {mapped_gloss_text}")
             effective_mode = "english_incomplete_native"
         else:
             if mapped_native_text and mapped_gloss_text:
@@ -972,12 +1092,24 @@ def encode_selected_text_expression(
             **translation_metadata,
             "effective_language_mode": effective_mode,
         }
-    rendered, effective_mode = select_symbolic_message_text(
+    _, effective_mode = select_symbolic_message_text(
         complete_dual, language_preference
     )
+    layers = []
+    if effective_mode == "english":
+        layers.append(f"English expression: {selected_text}")
+        if mapped_gloss_text.casefold() != selected_text.casefold():
+            layers.append(f"Word-for-word: {mapped_gloss_text}")
+    else:
+        layers.extend([
+            f"Native: {mapped_native_text}",
+            f"Human guess: {mapped_gloss_text}",
+        ])
+        if mapped_gloss_text.casefold() != selected_text.casefold():
+            layers.append(f"English expression: {selected_text}")
     if emotion_sound_text:
-        rendered = f"{rendered or selected_text}\nEmotion/sound signal: {emotion_sound_text}"
-    return rendered or selected_text, {
+        layers.append(f"Emotion/sound signal: {emotion_sound_text}")
+    return "\n".join(layers) or selected_text, {
         **translation_metadata,
         "effective_language_mode": effective_mode,
         "selected_expression_native_text": native_text,
@@ -1671,6 +1803,7 @@ def process_inbound_message(msg) -> CommsResponse:
     symbolic_gloss_text = symbolic.get("gloss_text") if symbolic else None
     emotion_signal = format_emotion_signal(state)
     code_pointer_signal = format_code_pointer_signal(state)
+    song_candidate = resolve_song_expression_candidate(state, child=child)
     adapter_can_respond = bool(adapter and (user_text.strip() or not attachments))
     has_unmapped_input = bool(tokens) and (
         symbolic is None or bool(symbolic_unknown)
@@ -1708,6 +1841,7 @@ def process_inbound_message(msg) -> CommsResponse:
         expression_drive=urge_level,
         emotion_available=emotion_signal is not None,
         code_pointer_available=code_pointer_signal is not None,
+        song_available=bool(song_candidate.get("available")),
     )
     decision_record = {
         **expression_decision,
@@ -1717,6 +1851,7 @@ def process_inbound_message(msg) -> CommsResponse:
         "adapter_rejection": adapter_rejection,
     }
     metadata["expression_decision"] = decision_record
+    metadata["song_expression_candidate"] = song_candidate
     try:
         update_inastate("last_text_expression_decision", decision_record)
         raw_intent = state.get("text_expression_intent") if isinstance(state, dict) else None
@@ -1746,6 +1881,33 @@ def process_inbound_message(msg) -> CommsResponse:
             }
         )
     selected_strategy = expression_decision["strategy"]
+    if selected_strategy == "song":
+        try:
+            song_limit = int(float(cfg.get("song_attachment_max_mb", 25)) * 1024 * 1024)
+        except (TypeError, ValueError):
+            song_limit = DEFAULT_SONG_ATTACHMENT_MAX_BYTES
+        sidecar_refresh = ensure_opus_sidecar(song_candidate["wav_path"])
+        metadata["song_sidecar_refresh"] = sidecar_refresh
+        song_result = inspect_song_opus_sidecar(song_candidate, max_bytes=song_limit)
+        metadata["song_expression"] = song_result
+        if song_result.get("status") == "ready":
+            raw_intent = state.get("text_expression_intent") if isinstance(state, dict) else None
+            intent = raw_intent if isinstance(raw_intent, dict) else {}
+            metadata.update({
+                "adapter": "song_expression",
+                "attachment_path": song_result["opus_path"],
+                "attachment_kind": "music_opus",
+                "source_wav_path": song_result["wav_path"],
+            })
+            return CommsResponse(text=str(intent.get("caption") or "♪"), metadata=metadata)
+        logger.warning("Song expression unavailable after selection: %s", song_result)
+        if emotion_signal:
+            selected_strategy = "emotion"
+        elif code_pointer_signal:
+            selected_strategy = "code_pointer"
+        else:
+            selected_strategy = "silence"
+        metadata["song_expression_fallback"] = selected_strategy
     if selected_strategy == "mirror" and symbolic_text:
         metadata["adapter"] = "deliberate_mirror"
         return CommsResponse(text=symbolic_text, metadata=metadata)
@@ -2057,7 +2219,8 @@ class InaDiscordClient(discord.Client):
             logger.exception("Failed to retain Discord edit %s", after.id)
         if roleplay_mode == "read_only":
             return
-        self._route_to_comms(
+        await asyncio.to_thread(
+            self._route_to_comms,
             after, is_dm=is_dm,
             owner_friend=is_owner_friend(after.author.id) if is_dm else False,
             high_trust=is_high_trust(after.author.id) if is_dm else False,
@@ -2129,7 +2292,8 @@ class InaDiscordClient(discord.Client):
                 return
             image_attachments = await self._ingest_image_attachments(message)
             recent_context = await self._recent_message_context(message)
-            self._route_to_comms(
+            await asyncio.to_thread(
+                self._route_to_comms,
                 message,
                 is_dm=True,
                 owner_friend=owner_friend,
@@ -2176,7 +2340,8 @@ class InaDiscordClient(discord.Client):
 
         logger.info("Inbound guild message in text channel %s: %s", message.channel.id, content)
         image_attachments = await self._ingest_image_attachments(message)
-        self._route_to_comms(
+        await asyncio.to_thread(
+            self._route_to_comms,
             message, is_dm=False, image_attachments=image_attachments,
             conversation_context=recent_context, roleplay=bool(roleplay_mode),
         )

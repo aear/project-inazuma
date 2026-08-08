@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Callable
 
 import discord
@@ -97,10 +98,33 @@ def register_discord_backend(
 
             try:
                 sender = getattr(client, "send_discord_message", None)
+                attachment_path = (msg.metadata or {}).get("attachment_path")
+
+                def _build_file():
+                    if not attachment_path:
+                        return None
+                    path = Path(str(attachment_path))
+                    if not path.is_file():
+                        logger.warning(
+                            "Attachment missing for Discord message %s: %s",
+                            msg.id,
+                            attachment_path,
+                        )
+                        return None
+                    return discord.File(str(path), filename=path.name)
+
                 if sender:
-                    await sender(channel, msg.text, reason=f"comms:{msg.id}")
+                    await sender(
+                        channel,
+                        msg.text,
+                        file_factory=_build_file if attachment_path else None,
+                        reason=f"comms:{msg.id}",
+                    )
                 else:
-                    await channel.send(msg.text)
+                    if attachment_path:
+                        await channel.send(msg.text, file=_build_file())
+                    else:
+                        await channel.send(msg.text)
             except Exception:
                 logger.exception(
                     "Failed to send message %s to Discord channel %s",
