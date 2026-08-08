@@ -376,6 +376,45 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
     assert metadata["native_translation_unresolved_symbols"] == []
 
 
+def test_emotion_symbols_keep_their_grounded_word_for_word_gloss(monkeypatch):
+    symbols = ["sym_snd_intensity", "sym_emotion_safety"]
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: {
+        "symbols": symbols, "unknown": ["signal"],
+    })
+    monkeypatch.setattr(db, "build_dual_symbolic_message", lambda *a, **k: {
+        "native_text": "glyph_intensity glyph_safety",
+        "native_tokens": ["glyph_intensity", "glyph_safety"],
+        "gloss_tokens": ["intensity", "safety"],
+        "native_sources": {symbol: "links" for symbol in symbols},
+        "gloss_sources": {symbol: "links" for symbol in symbols},
+    })
+    rendered, metadata = db.encode_selected_text_expression(
+        "State signal", child="TestChild",
+        language_preference="english", max_symbols=24,
+    )
+    assert rendered == (
+        "English expression: State signal\n"
+        "Word-for-word: intensity safety\n"
+        "Emotion/sound signal: glyph_intensity glyph_safety"
+    )
+    assert metadata["selected_expression_word_for_word_text"] == "intensity safety"
+
+
+def test_english_mode_marks_missing_word_for_word_grounding(monkeypatch):
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: {
+        "symbols": ["sym_emotion_unknown"], "unknown": ["signal"],
+    })
+    monkeypatch.setattr(db, "build_dual_symbolic_message", lambda *a, **k: {
+        "native_text": "glyph_unknown", "native_tokens": ["glyph_unknown"],
+        "gloss_tokens": ["glyph_unknown"], "native_sources": {}, "gloss_sources": {},
+    })
+    rendered, _ = db.encode_selected_text_expression(
+        "State signal", child="TestChild",
+        language_preference="english", max_symbols=24,
+    )
+    assert "Word-for-word: [no grounded word mappings]" in rendered
+
+
 def test_complete_selected_translation_can_render_native_and_english(monkeypatch):
     monkeypatch.setattr(
         db,
@@ -416,6 +455,11 @@ def test_complete_selected_translation_can_render_native_and_english(monkeypatch
     assert metadata["effective_language_mode"] == "mixed"
     assert metadata["native_translation_complete"] is True
     assert metadata["native_translation_rejections"] == []
+    english, _ = db.encode_selected_text_expression(
+        "calm here", child="TestChild",
+        language_preference="english", max_symbols=24,
+    )
+    assert english == "English expression: calm here\nWord-for-word: calm here"
 
 
 

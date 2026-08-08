@@ -994,12 +994,15 @@ def encode_selected_text_expression(
     ]
     resolved_native_tokens = []
     resolved_gloss_tokens = []
+    literal_gloss_tokens = []
     unresolved_linguistic_tokens = []
     emotion_sound_tokens = []
     for index, symbol in enumerate(symbols):
         if index >= len(aligned_native_tokens):
             continue
         native_token = str(aligned_native_tokens[index])
+        if index < len(aligned_gloss_tokens) and symbol in gloss_sources:
+            literal_gloss_tokens.append(str(aligned_gloss_tokens[index]))
         if index in paralinguistic_indexes:
             emotion_sound_tokens.append(native_token)
             continue
@@ -1014,13 +1017,15 @@ def encode_selected_text_expression(
             unresolved_linguistic_tokens.append(native_token)
     mapped_native_text = " ".join(resolved_native_tokens).strip()
     mapped_gloss_text = " ".join(resolved_gloss_tokens).strip()
+    literal_gloss_text = " ".join(literal_gloss_tokens).strip()
     linguistic_signal_text = " ".join(unresolved_linguistic_tokens).strip()
     emotion_sound_text = " ".join(emotion_sound_tokens).strip()
+    word_for_word_text = literal_gloss_text or "[no grounded word mappings]"
     complete_dual = {
         **(dual or {}),
-        "text": f"Native: {mapped_native_text}\nHuman guess: {mapped_gloss_text}",
+        "text": f"Native: {mapped_native_text}\nHuman guess: {word_for_word_text}",
         "native_text": mapped_native_text,
-        "gloss_text": mapped_gloss_text,
+        "gloss_text": word_for_word_text,
     }
     rejection_reasons = []
     if unknown_words:
@@ -1053,6 +1058,7 @@ def encode_selected_text_expression(
         "native_translation_unresolved_gloss_symbols": unresolved_gloss_symbols,
         "selected_expression_mapped_native_text": mapped_native_text or None,
         "selected_expression_mapped_gloss_text": mapped_gloss_text or None,
+        "selected_expression_word_for_word_text": literal_gloss_text or None,
         "selected_expression_linguistic_signal": linguistic_signal_text or None,
         "selected_expression_emotion_sound_signal": emotion_sound_text or None,
         "native_translation_token_count": len(response_tokens),
@@ -1065,11 +1071,7 @@ def encode_selected_text_expression(
         layers = []
         if requested_mode == "english":
             layers.append(f"English expression: {selected_text}")
-            if (
-                mapped_gloss_text
-                and mapped_gloss_text.casefold() != selected_text.casefold()
-            ):
-                layers.append(f"Word-for-word: {mapped_gloss_text}")
+            layers.append(f"Word-for-word: {word_for_word_text}")
             effective_mode = "english_incomplete_native"
         else:
             if mapped_native_text and mapped_gloss_text:
@@ -1098,8 +1100,7 @@ def encode_selected_text_expression(
     layers = []
     if effective_mode == "english":
         layers.append(f"English expression: {selected_text}")
-        if mapped_gloss_text.casefold() != selected_text.casefold():
-            layers.append(f"Word-for-word: {mapped_gloss_text}")
+        layers.append(f"Word-for-word: {word_for_word_text}")
     else:
         layers.extend([
             f"Native: {mapped_native_text}",
