@@ -1700,7 +1700,7 @@ def _extract_odt_text(path, *, max_chars=12000):
     return _extract_odt_text_bytes(data, str(path), max_chars=max_chars)
 
 
-def fragment_document_text(text, source, transformer, doc_type=None):
+def fragment_document_text(text, source, transformer, doc_type=None, *, vocab_source=None):
     chunks = _document_chunks(text, source)
     if not chunks:
         return []
@@ -1733,7 +1733,7 @@ def fragment_document_text(text, source, transformer, doc_type=None):
                 child=child,
                 tags=frag["tags"],
                 emotions=frag.get("emotions"),
-                source="raw_file_manager",
+                source=vocab_source or "raw_file_manager",
             )
         except Exception:
             pass
@@ -1741,7 +1741,7 @@ def fragment_document_text(text, source, transformer, doc_type=None):
     return fragments
 
 
-def fragment_document(path, transformer):
+def fragment_document(path, transformer, *, vocab_source=None):
     ext = path.suffix.lower()
     if ext == ".pdf":
         text = _extract_pdf_text(path)
@@ -1755,7 +1755,9 @@ def fragment_document(path, transformer):
     if not text:
         log_to_statusbox(f"[RawFileManager] No text extracted from {path}.")
         return []
-    return fragment_document_text(text, path.name, transformer, doc_type=doc_type)
+    return fragment_document_text(
+        text, path.name, transformer, doc_type=doc_type, vocab_source=vocab_source
+    )
 
 
 def fragment_document_bytes(data, source_label, transformer, suffix):
@@ -1775,7 +1777,7 @@ def fragment_document_bytes(data, source_label, transformer, suffix):
     return fragment_document_text(text, source_label, transformer, doc_type=doc_type)
 
 
-def fragment_text(text, source, transformer):
+def fragment_text(text, source, transformer, *, vocab_source=None):
     chunks = [text[i:i+400] for i in range(0, len(text), 400)]
     fragments = []
     for chunk in chunks[:5]:
@@ -1806,7 +1808,7 @@ def fragment_text(text, source, transformer):
                 child=child,
                 tags=frag["tags"],
                 emotions=frag.get("emotions"),
-                source="raw_file_manager",
+                source=vocab_source or "raw_file_manager",
             )
         except Exception:
             pass
@@ -2529,10 +2531,19 @@ def self_read_and_train():
             if category == "text":
                 with open(path, "r", encoding="utf-8", errors="ignore") as handle:
                     text = handle.read()
-                result = fragment_text(text, path.name, transformer)
+                result = fragment_text(
+                    text,
+                    path.name,
+                    transformer,
+                    vocab_source=f"self_read:{source_key}",
+                )
 
             elif category == "document":
-                result = fragment_document(path, transformer)
+                result = fragment_document(
+                    path,
+                    transformer,
+                    vocab_source=f"self_read:{source_key}",
+                )
 
             elif category == "image":
                 result = fragment_image(path, transformer)

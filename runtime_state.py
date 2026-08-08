@@ -74,6 +74,47 @@ def update_inastate(key: str, value: Any, *, child: Optional[str] = None) -> Non
         atomic_write_json(_inastate_path(target_child), state, indent=4)
 
 
+def set_text_expression_intent(
+    strategy: str,
+    *,
+    pointers: Optional[List[Any]] = None,
+    max_emotion_sliders: Optional[int] = None,
+    max_code_pointers: Optional[int] = None,
+    once: bool = True,
+    child: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Offer Ina's next text turn an explicit, inspectable expression choice."""
+    aliases = {
+        "reply": "respond",
+        "original": "respond",
+        "mimic": "mirror",
+        "practice": "mirror",
+        "state": "emotion",
+        "feelings": "emotion",
+        "module": "code_pointer",
+        "modules": "code_pointer",
+        "code": "code_pointer",
+        "quiet": "silence",
+    }
+    normalized = str(strategy or "").strip().lower()
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"respond", "mirror", "emotion", "code_pointer", "silence"}:
+        raise ValueError(f"Unsupported text expression strategy: {strategy!r}")
+    payload: Dict[str, Any] = {
+        "strategy": normalized,
+        "once": bool(once),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if pointers is not None:
+        payload["pointers"] = list(pointers)[:24]
+    if max_emotion_sliders is not None:
+        payload["max_emotion_sliders"] = max(1, min(24, int(max_emotion_sliders)))
+    if max_code_pointers is not None:
+        payload["max_code_pointers"] = max(1, min(8, int(max_code_pointers)))
+    update_inastate("text_expression_intent", payload, child=child)
+    return payload
+
+
 def _positive_queue_limit(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")

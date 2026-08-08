@@ -126,6 +126,73 @@ def adaptive_symbol_limit(
     return max(1, min(ceiling, round((spontaneous_choice + drive_choice) / 2)))
 
 
+def score_text_mirroring(
+    state: object,
+    *,
+    mapping_coverage: float,
+    expression_drive: float,
+) -> Dict[str, Any]:
+    """Score deliberate imitation practice from Ina's existing internal state."""
+    state = state if isinstance(state, dict) else {}
+    snapshot = state.get("emotion_snapshot")
+    values = snapshot.get("values") if isinstance(snapshot, dict) else {}
+    values = values if isinstance(values, dict) else {}
+
+    def unit(name: str, default: float = 0.0) -> float:
+        try:
+            value = float(values.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, min(1.0, (value + 1.0) / 2.0))
+
+    try:
+        boredom = max(0.0, min(1.0, float(state.get("emotion_boredom", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        boredom = 0.0
+    try:
+        playfulness = max(0.0, min(1.0, float(state.get("emotion_playfulness_level", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        playfulness = 0.0
+    coverage = max(0.0, min(1.0, float(mapping_coverage or 0.0)))
+    drive = max(0.0, min(1.0, float(expression_drive or 0.0)))
+    previous = state.get("last_text_expression_decision")
+    previous = previous if isinstance(previous, dict) else {}
+    if previous.get("strategy") == "mirror":
+        previous_streak = int(previous.get("mirror_streak", 0) or 0)
+    else:
+        grounded_previous = state.get("last_grounded_mirror_decision")
+        grounded_previous = grounded_previous if isinstance(grounded_previous, dict) else {}
+        previous_streak = (
+            int(grounded_previous.get("mirror_streak", 0) or 0)
+            if grounded_previous.get("selected")
+            else 0
+        )
+    score = (
+        0.20
+        + 0.22 * unit("curiosity")
+        + 0.12 * unit("novelty")
+        + 0.10 * playfulness
+        + 0.10 * coverage
+        + 0.05 * drive
+        - 0.22 * boredom
+        - 0.12 * unit("familiarity")
+        - 0.12 * min(2, previous_streak)
+    )
+    return {
+        "score": round(score, 4),
+        "mapping_coverage": round(coverage, 4),
+        "previous_mirror_streak": previous_streak,
+        "signals": {
+            "curiosity": round(unit("curiosity"), 4),
+            "novelty": round(unit("novelty"), 4),
+            "familiarity": round(unit("familiarity"), 4),
+            "boredom": round(boredom, 4),
+            "playfulness": round(playfulness, 4),
+            "expression_drive": round(drive, 4),
+        },
+    }
+
+
 def choose_expression_symbols(
     symbols: List[str],
     text: str,

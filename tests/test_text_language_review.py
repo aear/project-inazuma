@@ -117,3 +117,45 @@ def test_existing_mapping_can_be_revisited_without_new_vocabulary(tmp_path, monk
     )
     revised = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
     assert revised["links"][0]["symbol"] == "sym_b"
+    assert revised["last_batch"] == {
+        "mode": "revisit",
+        "new_mappings": 0,
+        "revisited_mappings": 1,
+    }
+
+
+def test_mapping_queue_reports_source_and_new_batch(tmp_path, monkeypatch):
+    _disable_runtime_metrics(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    memory = tmp_path / "AI_Children" / "TestChild" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "symbol_to_token.json").write_text(
+        json.dumps(
+            {
+                "sym_a": {
+                    "word": "glyph_a",
+                    "embedding": ["a"],
+                    "confidence": 0.6,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    tm.update_text_vocab(
+        "hello world",
+        child="TestChild",
+        tags=["discord", "history"],
+        source="discord_history_review",
+    )
+    monkeypatch.setattr(tm, "_EMBEDDER", _MutableEmbedder())
+
+    assert tm.build_text_symbol_links("TestChild", mapping_batch=1)
+    payload = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
+
+    assert payload["remaining"] == 1
+    assert payload["queue_by_source"] == {"discord": 1}
+    assert payload["last_batch"] == {
+        "mode": "new",
+        "new_mappings": 1,
+        "revisited_mappings": 0,
+    }

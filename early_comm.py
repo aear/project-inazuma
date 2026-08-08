@@ -26,6 +26,7 @@ from language_processing import (
     load_experience_graph,
     load_symbol_to_token,
     save_symbol_to_token,
+    score_text_mirroring,
     speak_symbolically,
     select_symbolic_message_text,
     text_length_profile,
@@ -1477,7 +1478,65 @@ def early_communicate():
         child, prediction, word_id, word_conf, symbol_id, vocab_size
     )
 
-    if babble_targets["words"]:
+    mirror_state = {
+        "emotion_snapshot": get_inastate("emotion_snapshot") or {"values": inferred or {}},
+        "emotion_boredom": get_inastate("emotion_boredom") or 0.0,
+        "emotion_playfulness_level": get_inastate("emotion_playfulness_level") or 0.0,
+        "last_text_expression_decision": get_inastate("last_text_expression_decision") or {},
+        "last_grounded_mirror_decision": get_inastate("last_grounded_mirror_decision") or {},
+        "text_expression_intent": get_inastate("text_expression_intent"),
+    }
+    grounded_words = list(babble_targets.get("words") or [])
+    grounded_symbols = list(babble_targets.get("symbols") or [])
+    mirror_evaluation = score_text_mirroring(
+        mirror_state,
+        mapping_coverage=len(grounded_symbols) / max(1, len(grounded_words)),
+        expression_drive=type_urge_level,
+    )
+    mirror_intent = mirror_state.get("text_expression_intent")
+    if isinstance(mirror_intent, dict):
+        mirror_intent = mirror_intent.get("strategy") or mirror_intent.get("mode")
+    mirror_requested = str(mirror_intent or "").strip().lower() in {"mirror", "mimic", "practice"}
+    try:
+        boredom_for_choice = max(0.0, min(1.0, float(mirror_state["emotion_boredom"] or 0.0)))
+    except (TypeError, ValueError):
+        boredom_for_choice = 0.0
+    try:
+        novelty_for_choice = max(0.0, min(1.0, (float((inferred or {}).get("novelty", 0.0)) + 1.0) / 2.0))
+    except (TypeError, ValueError):
+        novelty_for_choice = 0.5
+    alternative_score = round(
+        0.46 + 0.20 * max(0.0, float(best_sim or 0.0))
+        + 0.12 * boredom_for_choice + 0.08 * novelty_for_choice,
+        4,
+    )
+    grounded_mirror_selected = bool(
+        grounded_words
+        and grounded_symbols
+        and (mirror_requested or mirror_evaluation["score"] >= alternative_score)
+    )
+    grounded_mirror_decision = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "selected": grounded_mirror_selected,
+        "reason": (
+            "explicit_intent" if grounded_mirror_selected and mirror_requested
+            else "mirror_score_won" if grounded_mirror_selected
+            else "no_grounded_candidate" if not grounded_words or not grounded_symbols
+            else "alternative_expression_won"
+        ),
+        "mirror": mirror_evaluation,
+        "mirror_streak": (
+            mirror_evaluation["previous_mirror_streak"] + 1
+            if grounded_mirror_selected
+            else 0
+        ),
+        "alternative_score": alternative_score,
+        "candidate_word_count": len(grounded_words),
+        "candidate_symbol_count": len(grounded_symbols),
+    }
+    update_inastate("last_grounded_mirror_decision", grounded_mirror_decision)
+
+    if grounded_mirror_selected:
         spoken_words = babble_targets["words"]
         expression_strategy = "mimic_grounded_speech"
         expression = " ".join(spoken_words)

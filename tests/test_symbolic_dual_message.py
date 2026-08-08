@@ -45,6 +45,38 @@ def test_expression_symbol_choice_has_no_legacy_three_or_six_symbol_cut(monkeypa
     assert chosen == symbols
 
 
+def test_mirroring_score_drops_with_boredom_and_repeat_streak():
+    open_state = {
+        "emotion_snapshot": {
+            "values": {"curiosity": 0.9, "novelty": 0.8, "familiarity": -0.7}
+        },
+        "emotion_boredom": 0.0,
+        "emotion_playfulness_level": 0.4,
+    }
+    tired_state = {
+        **open_state,
+        "emotion_boredom": 1.0,
+        "last_text_expression_decision": {
+            "strategy": "mirror",
+            "mirror_streak": 2,
+        },
+    }
+
+    open_score = lp.score_text_mirroring(
+        open_state,
+        mapping_coverage=1.0,
+        expression_drive=0.8,
+    )
+    tired_score = lp.score_text_mirroring(
+        tired_state,
+        mapping_coverage=1.0,
+        expression_drive=0.8,
+    )
+
+    assert open_score["score"] > tired_score["score"]
+    assert tired_score["previous_mirror_streak"] == 2
+
+
 def test_build_dual_symbolic_message_combines_native_and_guess(monkeypatch):
     monkeypatch.setattr(
         lp,

@@ -85,6 +85,24 @@ def tokenize_text(text: str) -> List[str]:
     return [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text or "") if tok]
 
 
+def _vocab_source_category(source: Optional[str], tags: Optional[List[str]]) -> str:
+    """Collapse detailed provenance into stable, monitor-friendly categories."""
+    source_name = str(source or "").strip().lower()
+    tag_set = {str(tag).strip().lower() for tag in tags or [] if tag}
+    if "discord" in tag_set or source_name.startswith("discord"):
+        return "discord"
+    if source_name.startswith("self_read:"):
+        source_key = source_name.split(":", 1)[1].strip()
+        return f"self_read_{source_key}" if source_key else "self_read_other"
+    if "self_read" in tag_set:
+        if tag_set & {"code", "self_code", "project_source"}:
+            return "self_read_code"
+        if tag_set & {"book", "books", "book_library"}:
+            return "self_read_books"
+        return "self_read_other"
+    return source_name.replace(":", "_") or "unspecified"
+
+
 @contextmanager
 def _json_lock(path: Path):
     if not fcntl:
@@ -174,11 +192,15 @@ def update_text_vocab(
     vocab = vocab_state.get("vocab", {})
     now = _now_iso()
     tag_list = [str(t) for t in tags or [] if t]
+    source_category = _vocab_source_category(source, tag_list)
 
     for word in tokens:
         entry = vocab.setdefault(word, {"count": 0, "last_seen": now, "emotion_samples": 0})
         entry["count"] = int(entry.get("count", 0)) + 1
         entry["last_seen"] = now
+        source_counts = entry.setdefault("sources", {})
+        if isinstance(source_counts, dict):
+            source_counts[source_category] = int(source_counts.get(source_category, 0)) + 1
 
         if tag_list:
             existing = [str(t) for t in entry.get("tags", []) if t]
@@ -315,12 +337,16 @@ def review_text_evidence(
             return []
         observed_messages += 1
         tag_list = [str(tag) for tag in tags or [] if tag]
+        source_category = _vocab_source_category(source, tag_list)
         for word in words:
             entry = vocab.setdefault(
                 word, {"count": 0, "last_seen": now, "emotion_samples": 0}
             )
             entry["count"] = int(entry.get("count", 0)) + 1
             entry["last_seen"] = now
+            source_counts = entry.setdefault("sources", {})
+            if isinstance(source_counts, dict):
+                source_counts[source_category] = int(source_counts.get(source_category, 0)) + 1
             if tag_list:
                 existing = [str(tag) for tag in entry.get("tags", []) if tag]
                 for tag in tag_list:
@@ -585,6 +611,8 @@ def build_text_symbol_links(
 
     batch_limit = _text_memory_policy()["link_batch_size"] if mapping_batch is None else max(1, int(mapping_batch))
     batch = pending_words[:batch_limit]
+    new_batch_count = len(batch)
+    revisit_batch_count = 0
     if revisit_existing > 0 and len(batch) < batch_limit:
         pending_names = {word for word, _meta in pending_words}
         links_by_priority = sorted(
@@ -602,7 +630,9 @@ def build_text_symbol_links(
             if link.get("word") in vocab and str(link.get("word")) not in pending_names
         ][:max(0, int(revisit_existing))]
         room = max(0, batch_limit - len(batch))
-        batch.extend((word, vocab[word]) for word in revisit_names[:room])
+        revisited = revisit_names[:room]
+        batch.extend((word, vocab[word]) for word in revisited)
+        revisit_batch_count = len(revisited)
 
     for word, meta in batch:
         lang = guess_language_code(word)
@@ -650,13 +680,40 @@ def build_text_symbol_links(
 
     rank = {word: index for index, (word, _meta) in enumerate(ranked_words)}
     links = sorted(links_by_word.values(), key=lambda link: rank.get(str(link.get("word")), len(rank)))
-    remaining = max(0, len(pending_words) - len(batch))
+    remaining_words = pending_words[new_batch_count:]
+    remaining = len(remaining_words)
+    queue_by_source: Dict[str, int] = {}
+    for _word, meta in remaining_words:
+        sources = meta.get("sources") if isinstance(meta, dict) else {}
+        sources = sources if isinstance(sources, dict) else {}
+        ranked_sources = sorted(
+            ((str(name), int(count or 0)) for name, count in sources.items()),
+            key=lambda item: (-item[1], item[0]),
+        )
+        category = ranked_sources[0][0] if ranked_sources else "legacy_unspecified"
+        if len(ranked_sources) > 1 and ranked_sources[0][1] == ranked_sources[1][1]:
+            category = "mixed"
+        queue_by_source[category] = int(queue_by_source.get(category, 0)) + 1
+    if new_batch_count and revisit_batch_count:
+        batch_mode = "new_and_revisit"
+    elif new_batch_count:
+        batch_mode = "new"
+    elif revisit_batch_count:
+        batch_mode = "revisit"
+    else:
+        batch_mode = "idle"
     payload = {
         "generated": _now_iso(),
         "symbol_source_revision": symbol_revision,
         "evaluated": evaluated,
         "evaluated_count": len(evaluated),
         "remaining": remaining,
+        "queue_by_source": dict(sorted(queue_by_source.items())),
+        "last_batch": {
+            "mode": batch_mode,
+            "new_mappings": new_batch_count,
+            "revisited_mappings": revisit_batch_count,
+        },
         "complete": remaining == 0,
         "links": links,
     }

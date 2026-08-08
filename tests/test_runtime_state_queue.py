@@ -140,3 +140,19 @@ def test_concurrent_append_and_claim_are_one_atomic_transition(tmp_path, monkeyp
     assert append_result["queued"]
     assert claim_result["batch"] == list(range(10))
     assert rs.get_inastate("commands", child="Ina") == list(range(10, 21))
+
+
+def test_text_expression_intent_supports_emotion_and_code_pointers(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    payload = rs.set_text_expression_intent(
+        "modules",
+        pointers=["discord_bridge.py:process_inbound_message", "early_comm.py"],
+        max_code_pointers=2,
+        once=True,
+        child="Ina",
+    )
+
+    assert payload["strategy"] == "code_pointer"
+    assert payload["max_code_pointers"] == 2
+    assert rs.get_inastate("text_expression_intent", child="Ina") == payload

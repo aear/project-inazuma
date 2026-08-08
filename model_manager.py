@@ -5563,11 +5563,27 @@ def _run_passive_reflection():
         emotion_snapshot = get_inastate("emotion_snapshot") or {}
         symbol_map = _load_symbol_map()
         memory_sample = _sample_fragment_ids_for_reflection(CHILD, limit=12)
+        scheduler = get_inastate("process_scheduler") or {}
+        scheduler_decisions = scheduler.get("last_decisions", []) if isinstance(scheduler, dict) else []
+        scheduler_history = scheduler.get("history", []) if isinstance(scheduler, dict) else []
+        actions = [item for item in scheduler_history[-6:] if isinstance(item, dict)]
+        motor_status = get_inastate("motor_control_status") or {}
+        if isinstance(motor_status, dict) and motor_status:
+            actions.append({
+                key: motor_status.get(key)
+                for key in (
+                    "timestamp", "source", "decision", "reason",
+                    "standing_by_choice", "intent_issued",
+                )
+                if key in motor_status
+            })
 
         event = reflection_core.reflect(
             emotional_state=emotion_snapshot.get("values") or emotion_snapshot,
             memory_graph=memory_sample,
             symbol_map=symbol_map,
+            actions=actions,
+            decisions=[item for item in scheduler_decisions[-6:] if isinstance(item, dict)],
         )
 
         _persist_reflection_event(event)
@@ -5578,6 +5594,8 @@ def _run_passive_reflection():
                 "timestamp": datetime.fromtimestamp(event.get("timestamp", time.time()), timezone.utc).isoformat(),
                 "identity_hint": event.get("identity_hint", {}),
                 "peek": event.get("memory_peek", []),
+                "action_snapshot": event.get("action_snapshot", {}),
+                "decision_snapshot": event.get("decision_snapshot", {}),
             },
         )
     except Exception as exc:

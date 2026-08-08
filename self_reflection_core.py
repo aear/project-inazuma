@@ -37,7 +37,15 @@ class SelfReflectionCore:
     # ----------------------------------------------------------------------
     # MAIN PUBLIC METHOD – CALLED FROM Ina’s LOOP
     # ----------------------------------------------------------------------
-    def reflect(self, emotional_state, memory_graph, symbol_map):
+    def reflect(
+        self,
+        emotional_state,
+        memory_graph,
+        symbol_map,
+        *,
+        actions=None,
+        decisions=None,
+    ):
         """
         Core reflection step.
         ALWAYS runs in Ina's loop, but what it DOES is NOT prescriptive.
@@ -50,6 +58,8 @@ class SelfReflectionCore:
             "emotional_snapshot": {"vector": emo_vector, "raw": emo_raw},
             "symbolic_snapshot": self._light_symbolic_scan(symbol_map),
             "memory_peek": self._peek_recent_memory(memory_graph),
+            "action_snapshot": self._light_activity_scan(actions),
+            "decision_snapshot": self._light_activity_scan(decisions),
             "identity_hint": self._identity_vector(emo_vector, emo_raw),
             "note": "Reflection occurred. Interpretation belongs to Ina."
         }
@@ -62,6 +72,20 @@ class SelfReflectionCore:
             self.recent_context.pop(0)
 
         return reflection_event  # Ina chooses what this means.
+
+    def _light_activity_scan(self, activity):
+        """Keep a bounded, uninterpreted view of recent actions or decisions."""
+        if isinstance(activity, dict):
+            items = [activity] if activity else []
+        elif isinstance(activity, Iterable) and not isinstance(activity, (str, bytes)):
+            items = list(activity)
+        else:
+            items = []
+        return {
+            "count": len(items),
+            "recent": items[-6:],
+            "note": "Activity scan complete (no interpretation).",
+        }
 
     # ----------------------------------------------------------------------
     # LIGHT SYMBOLIC SCAN

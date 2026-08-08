@@ -1134,3 +1134,15 @@ def test_self_reflection_core_peek_recent_memory_accepts_iterable_ids():
     sample = core._peek_recent_memory(["f1", "f2", "f3"])
     assert len(sample) == 3
     assert set(sample) == {"f1", "f2", "f3"}
+
+
+def test_self_reflection_core_includes_bounded_actions_and_decisions():
+    core = SelfReflectionCore("test")
+    actions = [{"action": f"a{index}"} for index in range(8)]
+    decisions = [{"decision": "started", "task_key": "memory"}]
+
+    event = core.reflect({}, {}, {}, actions=actions, decisions=decisions)
+
+    assert event["action_snapshot"]["count"] == 8
+    assert event["action_snapshot"]["recent"] == actions[-6:]
+    assert event["decision_snapshot"]["recent"] == decisions

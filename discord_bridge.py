@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import ast
+import math
 import os
 import re
 import time
@@ -50,6 +52,7 @@ from language_processing import (
     build_dual_symbolic_message,
     generate_symbolic_reply_from_text,
     load_generated_symbols,
+    score_text_mirroring,
     select_symbolic_message_text,
 )
 from simple_image_fallback import ImageFallbackError, extract_image_features
@@ -544,10 +547,322 @@ def _resolve_adjusted_urge_level(state: object) -> float:
     return max(0.0, min(1.0, adjusted))
 
 
+def _emotion_values_from_state(state: object) -> dict[str, float]:
+    if not isinstance(state, dict):
+        return {}
+    snapshot = state.get("emotion_snapshot")
+    values = snapshot.get("values") if isinstance(snapshot, dict) else None
+    if not isinstance(values, dict):
+        return {}
+    cleaned = {}
+    for key, raw_value in values.items():
+        name = str(key or "").strip()
+        if not name or name.startswith("_"):
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            cleaned[name] = max(-1.0, min(1.0, value))
+    return cleaned
+
+
+def format_emotion_signal(state: object, max_items: Optional[int] = None) -> Optional[dict]:
+    """Render a bounded, inspectable subset of Ina's current emotion sliders."""
+    values = _emotion_values_from_state(state)
+    if not values:
+        return None
+    intent = state.get("text_expression_intent") if isinstance(state, dict) else None
+    intent = intent if isinstance(intent, dict) else {}
+    requested = max_items if max_items is not None else intent.get("max_emotion_sliders")
+    if requested is None and isinstance(state, dict):
+        requested = state.get("emotion_signal_limit", 6)
+    try:
+        limit = max(1, min(24, int(requested or 6)))
+    except (TypeError, ValueError):
+        limit = 6
+    ranked = sorted(values.items(), key=lambda item: (-abs(item[1]), item[0]))
+    selected = ranked[:limit]
+
+    def level(value: float) -> str:
+        if value >= 0.67:
+            return "very high"
+        if value >= 0.25:
+            return "raised"
+        if value > -0.25:
+            return "near neutral"
+        if value > -0.67:
+            return "low"
+        return "very low"
+
+    details = "; ".join(
+        f"{name} {level(value)} ({value:+.2f})"
+        for name, value in selected
+    )
+    return {
+        "text": f"State signal ({len(selected)}/{len(values)} sliders): {details}",
+        "sliders": {name: round(value, 4) for name, value in selected},
+        "shown": len(selected),
+        "available": len(values),
+    }
+
+
+def format_code_pointer_signal(
+    state: object,
+    *,
+    repo_root: Optional[Path] = None,
+    max_items: Optional[int] = None,
+) -> Optional[dict]:
+    """Validate and render bounded module/function pointers without code contents."""
+    if not isinstance(state, dict):
+        return None
+    intent = state.get("text_expression_intent")
+    intent = intent if isinstance(intent, dict) else {}
+    raw_pointers = intent.get("pointers")
+    if raw_pointers is None:
+        raw_pointers = state.get("code_pointer_signal")
+    if isinstance(raw_pointers, (str, dict)):
+        raw_pointers = [raw_pointers]
+    if not isinstance(raw_pointers, list) or not raw_pointers:
+        return None
+    requested = max_items if max_items is not None else intent.get("max_code_pointers", 4)
+    try:
+        limit = max(1, min(8, int(requested or 4)))
+    except (TypeError, ValueError):
+        limit = 4
+    root = (repo_root or Path(".")).resolve()
+    accepted = []
+    rejections = []
+    seen = set()
+
+    for raw in raw_pointers[: limit * 3]:
+        module = ""
+        functions = []
+        if isinstance(raw, str):
+            module, separator, function_text = raw.strip().partition(":")
+            if separator:
+                functions = [part.strip() for part in function_text.split(",") if part.strip()]
+        elif isinstance(raw, dict):
+            module = str(raw.get("module") or raw.get("file") or raw.get("path") or "").strip()
+            raw_functions = raw.get("functions", raw.get("function"))
+            if isinstance(raw_functions, str):
+                functions = [part.strip() for part in raw_functions.split(",") if part.strip()]
+            elif isinstance(raw_functions, list):
+                functions = [str(part).strip() for part in raw_functions if str(part).strip()]
+        module = module.replace("\\", "/")
+        module_parts = Path(module).parts
+        if Path(module).is_absolute() or ".." in module_parts:
+            rejections.append({"pointer": str(raw), "reason": "outside_repository"})
+            continue
+        if module.startswith("./"):
+            module = module[2:]
+        if not module or not module.endswith(".py") or module.startswith("AI_Children/"):
+            rejections.append({"pointer": str(raw), "reason": "invalid_module"})
+            continue
+        path = (root / module).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            rejections.append({"pointer": str(raw), "reason": "outside_repository"})
+            continue
+        if not path.is_file():
+            rejections.append({"pointer": str(raw), "reason": "module_not_found"})
+            continue
+        valid_functions = []
+        if functions:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                available_functions = {
+                    node.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+            except Exception:
+                rejections.append({"pointer": str(raw), "reason": "module_unreadable"})
+                continue
+            missing = [name for name in functions if name not in available_functions]
+            valid_functions = [name for name in functions if name in available_functions]
+            for name in missing:
+                rejections.append({
+                    "pointer": f"{module}:{name}",
+                    "reason": "function_not_found",
+                })
+            if not valid_functions:
+                continue
+        key = (module, tuple(valid_functions))
+        if key in seen:
+            continue
+        seen.add(key)
+        accepted.append({"module": module, "functions": valid_functions})
+        if len(accepted) >= limit:
+            break
+    if not accepted:
+        return None
+    rendered = []
+    for pointer in accepted:
+        functions = pointer["functions"]
+        rendered.append(
+            pointer["module"] + (f" → {', '.join(functions)}" if functions else "")
+        )
+    return {
+        "text": "Code pointer: " + "; ".join(rendered),
+        "pointers": accepted,
+        "rejections": rejections,
+    }
+
+
+def choose_text_expression_strategy(
+    state: object,
+    *,
+    mapped_count: int,
+    token_count: int,
+    adapter_available: bool,
+    expression_drive: float,
+    emotion_available: bool,
+    code_pointer_available: bool,
+) -> dict:
+    """Choose response, deliberate mirroring, a fallback signal, or silence."""
+    state = state if isinstance(state, dict) else {}
+    emotion_values = _emotion_values_from_state(state)
+
+    def unit(name: str, default: float = 0.0) -> float:
+        try:
+            value = float(emotion_values.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, min(1.0, (value + 1.0) / 2.0))
+
+    try:
+        boredom = max(0.0, min(1.0, float(state.get("emotion_boredom", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        boredom = 0.0
+    try:
+        playfulness = max(0.0, min(1.0, float(state.get("emotion_playfulness_level", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        playfulness = 0.0
+    drive = max(0.0, min(1.0, float(expression_drive or 0.0)))
+    tokens = max(0, int(token_count or 0))
+    mapped = max(0, int(mapped_count or 0))
+    coverage = min(1.0, mapped / max(1, tokens))
+    mirror_evaluation = score_text_mirroring(
+        state,
+        mapping_coverage=coverage,
+        expression_drive=drive,
+    )
+    previous_streak = int(mirror_evaluation["previous_mirror_streak"])
+
+    scores = {
+        "respond": 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest")
+        if adapter_available else None,
+        "mirror": mirror_evaluation["score"] if mapped and coverage >= 0.6 else None,
+        "emotion": (
+            0.12 + 0.20 * unit("intensity") + 0.18 * (1.0 - unit("clarity"))
+            + 0.10 * unit("stress") + 0.08 * unit("isolation")
+        ) if emotion_available else None,
+        "code_pointer": 0.14 + 0.12 * unit("curiosity") + 0.08 * unit("clarity")
+        if code_pointer_available else None,
+        "silence": 0.06 + 0.18 * (1.0 - drive) + 0.10 * unit("isolation") + 0.10 * (1.0 - unit("connection")),
+    }
+    available = {name: score for name, score in scores.items() if score is not None}
+    raw_intent = state.get("text_expression_intent")
+    intent_payload = raw_intent if isinstance(raw_intent, dict) else {}
+    requested = intent_payload.get("strategy") or intent_payload.get("mode") or raw_intent
+    aliases = {
+        "reply": "respond", "original": "respond", "practice": "mirror",
+        "mimic": "mirror", "state": "emotion", "feelings": "emotion",
+        "module": "code_pointer", "modules": "code_pointer", "code": "code_pointer",
+        "quiet": "silence",
+    }
+    normalized_request = str(requested or "").strip().lower()
+    requested = aliases.get(normalized_request, normalized_request)
+    if requested in available:
+        strategy = requested
+        reason = "explicit_intent"
+    else:
+        strategy = max(available, key=lambda name: (available[name], name))
+        reason = "internal_state_scores"
+    return {
+        "strategy": strategy,
+        "reason": reason,
+        "requested_strategy": requested or None,
+        "intent_available": requested in available if requested else None,
+        "scores": {name: round(score, 4) if score is not None else None for name, score in scores.items()},
+        "mapping_coverage": round(coverage, 4),
+        "mapped_count": mapped,
+        "token_count": tokens,
+        "mirror_streak": previous_streak + 1 if strategy == "mirror" else 0,
+        "signals": {
+            "expression_drive": round(drive, 4), "boredom": round(boredom, 4),
+            "playfulness": round(playfulness, 4), "curiosity": round(unit("curiosity"), 4),
+            "novelty": round(unit("novelty"), 4), "familiarity": round(unit("familiarity"), 4),
+        },
+    }
+
+
+def encode_selected_text_expression(
+    text: str,
+    *,
+    child: str,
+    language_preference: object,
+    max_symbols: int,
+    context: Optional[dict] = None,
+) -> tuple[str, dict]:
+    """Encode Ina's selected meaning after selection, never the inbound prompt."""
+    selected_text = str(text or "").strip()
+    if not selected_text:
+        return "", {"effective_language_mode": "none"}
+    encoded = generate_symbolic_reply_from_text(
+        selected_text,
+        child=child,
+        base_path=Path("AI_Children"),
+        max_symbols=max_symbols,
+        context={
+            **(context if isinstance(context, dict) else {}),
+            "source": "discord_selected_expression",
+            "source_text": selected_text,
+            "tokens": _extract_tokens(selected_text),
+            "tags": [
+                "discord",
+                "selected_expression",
+                *(
+                    list((context or {}).get("tags") or [])
+                    if isinstance(context, dict)
+                    else []
+                ),
+            ],
+        },
+        playback=False,
+    )
+    symbols = list(encoded.get("symbols") or []) if encoded else []
+    if not symbols:
+        return selected_text, {
+            "effective_language_mode": "english_unmapped",
+            "selected_expression_symbols": [],
+        }
+    dual = build_dual_symbolic_message(
+        symbols,
+        child=child,
+        base_path=Path("AI_Children"),
+        human_text=selected_text,
+        context=context,
+        fallback_to_symbol_to_token=False,
+        native_style="glyphs",
+    )
+    rendered, effective_mode = select_symbolic_message_text(dual, language_preference)
+    return rendered or selected_text, {
+        "effective_language_mode": effective_mode,
+        "selected_expression_symbols": symbols,
+        "selected_expression_native_text": (dual or {}).get("native_text"),
+        "selected_expression_gloss_text": selected_text,
+        "selected_expression_unmapped_words": (encoded or {}).get("unknown") or [],
+    }
+
+
 def get_chat_adapter():
     """
     Lazy-load a simple text responder. Uses LMStudioAdapter if available,
-    otherwise falls back to echo.
+    otherwise leaves the expression arbiter to choose a bounded fallback.
     """
     global _CHAT_ADAPTER
     if _CHAT_ADAPTER is not None:
@@ -557,7 +872,7 @@ def get_chat_adapter():
     try:
         _CHAT_ADAPTER = LMStudioAdapter(child=get_current_child())
     except Exception:
-        logger.exception("Failed to initialise LMStudioAdapter; falling back to echo.")
+        logger.exception("Failed to initialise LMStudioAdapter; using expression fallback.")
         _CHAT_ADAPTER = None
     return _CHAT_ADAPTER
 
@@ -1091,7 +1406,7 @@ def process_inbound_message(msg) -> CommsResponse:
 
     reply_text = None
     adapter = get_chat_adapter()
-    metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "echo"}
+    metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "expression_arbiter"}
     if vision_context.get("perceptions"):
         metadata["vision_context"] = vision_context
 
@@ -1229,10 +1544,41 @@ def process_inbound_message(msg) -> CommsResponse:
     )
     symbolic_native_text = symbolic.get("native_text") if symbolic else None
     symbolic_gloss_text = symbolic.get("gloss_text") if symbolic else None
+    emotion_signal = format_emotion_signal(state)
+    code_pointer_signal = format_code_pointer_signal(state)
+    adapter_can_respond = bool(adapter and (user_text.strip() or not attachments))
+    ordinary_response_available = adapter_can_respond or bool(attachments)
+    expression_decision = choose_text_expression_strategy(
+        state,
+        mapped_count=len(symbolic.get("symbols") or []) if symbolic else 0,
+        token_count=len(set(tokens)),
+        adapter_available=ordinary_response_available,
+        expression_drive=urge_level,
+        emotion_available=emotion_signal is not None,
+        code_pointer_available=code_pointer_signal is not None,
+    )
+    decision_record = {
+        **expression_decision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbolic_unknown_count": len(symbolic_unknown),
+    }
+    metadata["expression_decision"] = decision_record
+    try:
+        update_inastate("last_text_expression_decision", decision_record)
+        raw_intent = state.get("text_expression_intent") if isinstance(state, dict) else None
+        if (
+            expression_decision.get("reason") == "explicit_intent"
+            and isinstance(raw_intent, dict)
+            and raw_intent.get("once", True) is not False
+        ):
+            update_inastate("text_expression_intent", None)
+    except Exception:
+        logger.exception("Failed to persist text expression decision.")
+
     if symbolic:
         metadata.update(
             {
-                "adapter": "language_processing",
+                "comprehension_adapter": "language_processing",
                 "symbols": symbolic.get("symbols"),
                 "unknown_words": symbolic.get("unknown"),
                 "symbolic_native_text": symbolic_native_text,
@@ -1245,14 +1591,23 @@ def process_inbound_message(msg) -> CommsResponse:
                 "visual_inference_words": visual_inference_words,
             }
         )
-        # A successfully composed symbolic reply remains valid when the turn also
-        # contains an image. The attachment has already been stored as memory;
-        # forcing this turn through the text-only LM adapter makes that adapter
-        # tokenize conversation scaffolding and report it as unknown vocabulary.
-        if not symbolic_unknown:
-            return CommsResponse(text=symbolic_text, metadata=metadata)
+    selected_strategy = expression_decision["strategy"]
+    if selected_strategy == "mirror" and symbolic_text:
+        metadata["adapter"] = "deliberate_mirror"
+        return CommsResponse(text=symbolic_text, metadata=metadata)
+    if selected_strategy == "silence":
+        metadata["adapter"] = "expression_silence"
+        return CommsResponse(text=None, metadata=metadata)
+    if selected_strategy == "emotion" and emotion_signal:
+        reply_text = emotion_signal["text"]
+        metadata["adapter"] = "emotion_signal"
+        metadata["emotion_signal"] = emotion_signal
+    elif selected_strategy == "code_pointer" and code_pointer_signal:
+        reply_text = code_pointer_signal["text"]
+        metadata["adapter"] = "code_pointer_signal"
+        metadata["code_pointer_signal"] = code_pointer_signal
 
-    if adapter and (user_text.strip() or not attachments):
+    if not reply_text and selected_strategy == "respond" and adapter_can_respond:
         try:
             entity_links = [
                 {
@@ -1305,7 +1660,6 @@ def process_inbound_message(msg) -> CommsResponse:
                 metadata["unknown_words"] = explain_targets
                 if symbolic_text and effective_language_mode != "english":
                     metadata["symbolic_hint"] = symbolic_text
-                    reply_text = f"{symbolic_text}\n\n{reply_text}" if reply_text else symbolic_text
             else:
                 reply_text = adapter.handle_prompt(
                     user_text,
@@ -1316,7 +1670,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 )
                 metadata["adapter"] = "lmstudio"
         except Exception:
-            logger.exception("LMStudioAdapter failed; falling back to echo.")
+            logger.exception("LMStudioAdapter failed; using expression fallback.")
 
     if attachments:
         metadata["image_attachment_count"] = len(attachments)
@@ -1326,16 +1680,38 @@ def process_inbound_message(msg) -> CommsResponse:
             if name
         ]
 
-    if not reply_text and symbolic_text:
-        reply_text = symbolic_text
-
     if not reply_text and attachments and not user_text.strip():
         reply_text = _format_image_perception_ack(attachments, vision_context)
         metadata["adapter"] = "image_acknowledgement"
         metadata["vision_context"] = vision_context
 
     if not reply_text:
-        reply_text = f"{INA_INSTANCE_NAME}: {prompt_text}"
+        fallback_signal = emotion_signal or code_pointer_signal
+        if fallback_signal:
+            reply_text = fallback_signal["text"]
+            if fallback_signal is emotion_signal:
+                metadata["adapter"] = "emotion_signal_fallback"
+                metadata["emotion_signal"] = emotion_signal
+            else:
+                metadata["adapter"] = "code_pointer_signal_fallback"
+                metadata["code_pointer_signal"] = code_pointer_signal
+
+    if reply_text:
+        reply_text, encoding_metadata = encode_selected_text_expression(
+            reply_text,
+            child=child,
+            language_preference=language_preference,
+            max_symbols=_coerce_positive_int(
+                cfg.get("max_reply_symbols", DEFAULT_MAX_REPLY_SYMBOLS),
+                DEFAULT_MAX_REPLY_SYMBOLS,
+            ),
+            context={
+                "tags": ["discord", "selected_expression", selected_strategy],
+                "channel": msg.channel.name,
+                "expression_drive": urge_level,
+            },
+        )
+        metadata.update(encoding_metadata)
 
     return CommsResponse(
         text=reply_text,

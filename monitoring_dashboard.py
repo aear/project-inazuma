@@ -157,18 +157,38 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     vocab_limit = int(text_policy.get('vocab_limit', 25000) or 25000)
     evaluated_count = int(links_data.get('evaluated_count', len(linked_words)) or 0) if isinstance(links_data, dict) else len(linked_words)
     remaining = int(links_data.get('remaining', max(0, word_count - evaluated_count)) or 0) if isinstance(links_data, dict) else 0
+    queue_by_source = links_data.get('queue_by_source', {}) if isinstance(links_data, dict) else {}
+    queue_by_source = queue_by_source if isinstance(queue_by_source, dict) else {}
+    last_batch = links_data.get('last_batch', {}) if isinstance(links_data, dict) else {}
+    last_batch = last_batch if isinstance(last_batch, dict) else {}
+    raw_batch_mode = str(last_batch.get('mode') or 'not_reported')
+    batch_mode = {
+        'new_and_revisit': 'new + revisit',
+        'not_reported': 'not reported',
+    }.get(raw_batch_mode, raw_batch_mode.replace('_', ' '))
+    queue_detail = ' · '.join(
+        f"{str(name).replace('_', ' ').title()} {int(count or 0):,}"
+        for name, count in sorted(queue_by_source.items(), key=lambda item: (-int(item[1] or 0), str(item[0])))
+    ) or ('none queued' if remaining == 0 else 'source not yet reported')
+    emotion_map_path = base / 'emotion_symbol_map.json'
+    emotion_map_data = _safe_json(emotion_map_path, {})
+    emotion_symbols = emotion_map_data.get('symbols', []) if isinstance(emotion_map_data, dict) else []
+    emotion_map_count = len(emotion_symbols) if isinstance(emotion_symbols, (list, dict)) else 0
     vocab_status = 'cap reached' if word_count >= vocab_limit else f'cap {vocab_limit:,}'
     rows.extend([
         ('Observed vocabulary', f'{word_count:,} words · {vocab_status}', 'language', _age(vocab_data.get('updated') if isinstance(vocab_data, dict) else None), str(base / 'text_vocab.json')),
         ('English mappings', f'{len(linked_words):,} linked · {evaluated_count:,} evaluated · {remaining:,} queued', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
+        ('Mapping queue by source', queue_detail, 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
+        ('Last mapping pass', f"{batch_mode} · {int(last_batch.get('new_mappings', 0) or 0):,} new · {int(last_batch.get('revisited_mappings', 0) or 0):,} revisited", 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Average links per word', f'{average_links:.2f}', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
+        ('Emotion map', f'{emotion_map_count:,} symbols', 'emotion map', _modified(emotion_map_path), str(emotion_map_path)),
     ])
     emotions = get_inastate('emotion_snapshot') or {}
     values = emotions.get('values', {}) if isinstance(emotions, dict) else {}
     strongest = sorted(values.items(), key=lambda item: abs(float(item[1] or 0)), reverse=True)[:5] if isinstance(values, dict) else []
     for name, value in strongest:
         rows.append((str(name).replace('_', ' ').title(), f'{float(value):+.3f}', 'emotion', _age(emotions.get('timestamp')), json.dumps(emotions, indent=2)))
-    cards = [('Neural maps', str(maps)), ('Nodes', f'{total_nodes:,}'), ('Links', f'{total_edges:,}'), ('Vocabulary', f'{word_count:,}')]
+    cards = [('Neural maps', str(maps)), ('Nodes', f'{total_nodes:,}'), ('Links', f'{total_edges:,}'), ('Vocabulary', f'{word_count:,}'), ('Emotion map', f'{emotion_map_count:,}')]
     return cards, rows
 
 

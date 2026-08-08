@@ -112,6 +112,24 @@ def _enable_replying(monkeypatch):
         db, "load_root_config", lambda: {"ignore_urge_for_typing": True}
     )
     monkeypatch.setattr(db, "get_current_child", lambda: "TestChild")
+    monkeypatch.setattr(db, "update_inastate", lambda *args, **kwargs: None)
+
+
+def _force_expression_strategy(monkeypatch, strategy):
+    monkeypatch.setattr(
+        db,
+        "choose_text_expression_strategy",
+        lambda *args, **kwargs: {
+            "strategy": strategy,
+            "reason": "test_selection",
+            "scores": {},
+            "mapping_coverage": 1.0,
+            "mapped_count": kwargs.get("mapped_count", 0),
+            "token_count": kwargs.get("token_count", 0),
+            "mirror_streak": 1 if strategy == "mirror" else 0,
+            "signals": {},
+        },
+    )
 
 
 def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch, tmp_path):
@@ -120,7 +138,9 @@ def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch,
     state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_text(
-        '{"discord_language_preference": "english"}', encoding="utf-8"
+        '{"discord_language_preference": "english", '
+        '"text_expression_intent": {"strategy": "mirror"}}',
+        encoding="utf-8",
     )
     adapter = _Adapter()
     monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
@@ -141,7 +161,103 @@ def test_complete_symbolic_reply_can_be_english_when_ina_prefers_it(monkeypatch,
     assert result.text == "hello"
     assert result.metadata["effective_language_mode"] == "english"
     assert result.metadata["symbolic_native_text"] == "glyph_wave"
+    assert result.metadata["expression_decision"]["reason"] == "explicit_intent"
+    assert result.metadata["adapter"] == "deliberate_mirror"
     assert adapter.calls == []
+
+
+def test_complete_mapping_is_comprehension_not_default_reply(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        '{"discord_language_preference": "english"}',
+        encoding="utf-8",
+    )
+    adapter = _Adapter(response="my selected response")
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+
+    def symbolic(text, **kwargs):
+        if text == "hello":
+            return {
+                "text": "Native: glyph_wave\nHuman guess: hello",
+                "native_text": "glyph_wave",
+                "gloss_text": "hello",
+                "symbols": ["sym_wave"],
+                "unknown": [],
+            }
+        return None
+
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", symbolic)
+
+    result = db.process_inbound_message(_message("hello"))
+
+    assert result.text == "my selected response"
+    assert result.metadata["expression_decision"]["strategy"] == "respond"
+    assert result.metadata["comprehension_adapter"] == "language_processing"
+    assert adapter.calls[0][0] == "hello"
+
+
+def test_emotion_signal_is_bounded_but_can_expose_all_24():
+    values = {f"slider_{index:02d}": (index - 12) / 12 for index in range(24)}
+    state = {"emotion_snapshot": {"values": values}}
+
+    concise = db.format_emotion_signal(state)
+    complete = db.format_emotion_signal(state, max_items=24)
+
+    assert concise["shown"] == 6
+    assert concise["available"] == 24
+    assert complete["shown"] == 24
+    assert len(complete["sliders"]) == 24
+
+
+def test_code_pointer_signal_validates_modules_and_functions(tmp_path):
+    (tmp_path / "signal_target.py").write_text(
+        "def indicate_problem():\n    return True\n",
+        encoding="utf-8",
+    )
+    state = {
+        "text_expression_intent": {
+            "strategy": "code_pointer",
+            "pointers": [
+                "signal_target.py:indicate_problem",
+                "signal_target.py:missing_function",
+                "../outside.py",
+            ],
+        }
+    }
+
+    signal = db.format_code_pointer_signal(state, repo_root=tmp_path)
+
+    assert signal["text"] == "Code pointer: signal_target.py → indicate_problem"
+    assert signal["pointers"] == [
+        {"module": "signal_target.py", "functions": ["indicate_problem"]}
+    ]
+    assert {item["reason"] for item in signal["rejections"]} == {
+        "function_not_found",
+        "outside_repository",
+    }
+
+
+def test_expression_arbiter_honours_explicit_code_pointer():
+    state = {
+        "text_expression_intent": {"strategy": "code_pointer"},
+        "emotion_snapshot": {"values": {"curiosity": 0.8, "clarity": 0.9}},
+    }
+
+    decision = db.choose_text_expression_strategy(
+        state,
+        mapped_count=1,
+        token_count=1,
+        adapter_available=True,
+        expression_drive=0.8,
+        emotion_available=True,
+        code_pointer_available=True,
+    )
+
+    assert decision["strategy"] == "code_pointer"
+    assert decision["reason"] == "explicit_intent"
 
 
 def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
@@ -333,6 +449,7 @@ def test_forced_history_review_routes_app_authored_structured_pairs(monkeypatch)
 
 def test_attachment_does_not_override_complete_symbolic_reply(monkeypatch):
     _enable_replying(monkeypatch)
+    _force_expression_strategy(monkeypatch, "mirror")
     adapter = _Adapter()
     monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
     monkeypatch.setattr(
@@ -465,6 +582,7 @@ def test_image_only_turn_uses_stored_image_acknowledgement(monkeypatch):
 
 def test_recognized_visual_symbol_participates_in_reply(monkeypatch):
     _enable_replying(monkeypatch)
+    _force_expression_strategy(monkeypatch, "mirror")
     adapter = _Adapter("should not be used")
     monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
     monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
@@ -506,6 +624,7 @@ def test_recognized_visual_symbol_participates_in_reply(monkeypatch):
 
 def test_mature_visual_word_hypothesis_enters_symbolic_language(monkeypatch):
     _enable_replying(monkeypatch)
+    _force_expression_strategy(monkeypatch, "mirror")
     adapter = _Adapter("should not be used")
     monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
     seen = {}
