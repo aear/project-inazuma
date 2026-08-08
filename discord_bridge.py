@@ -800,6 +800,13 @@ def choose_text_expression_strategy(
     }
 
 
+def _is_emotion_or_sound_symbol(symbol: object) -> bool:
+    symbol_id = str(symbol or "").strip().lower()
+    return symbol_id.startswith(
+        ("sound_symbol_", "sym_snd_", "combo_snd_", "sym_emotion_")
+    )
+
+
 def encode_selected_text_expression(
     text: str,
     *,
@@ -846,7 +853,6 @@ def encode_selected_text_expression(
         symbols,
         child=child,
         base_path=Path("AI_Children"),
-        human_text=selected_text,
         context=context,
         fallback_to_symbol_to_token=False,
         native_style="glyphs",
@@ -854,21 +860,73 @@ def encode_selected_text_expression(
     response_tokens = _extract_tokens(selected_text)
     unknown_words = list((encoded or {}).get("unknown") or [])
     native_sources = (dual or {}).get("native_sources") or {}
+    gloss_sources = (dual or {}).get("gloss_sources") or {}
     native_text = str((dual or {}).get("native_text") or "").strip()
-    native_tokens = set(native_text.split())
+    aligned_native_tokens = list((dual or {}).get("native_tokens") or native_text.split())
+    aligned_gloss_tokens = list(
+        (dual or {}).get("gloss_tokens")
+        or str((dual or {}).get("gloss_text") or "").split()
+    )
+    native_token_set = set(native_text.split())
+    paralinguistic_indexes = {
+        index
+        for index, symbol in enumerate(symbols)
+        if _is_emotion_or_sound_symbol(symbol)
+    }
+    linguistic_symbols = [
+        symbol
+        for index, symbol in enumerate(symbols)
+        if index not in paralinguistic_indexes
+    ]
+    resolved_native_tokens = []
+    resolved_gloss_tokens = []
+    unresolved_linguistic_tokens = []
+    emotion_sound_tokens = []
+    for index, symbol in enumerate(symbols):
+        if index >= len(aligned_native_tokens):
+            continue
+        native_token = str(aligned_native_tokens[index])
+        if index in paralinguistic_indexes:
+            emotion_sound_tokens.append(native_token)
+            continue
+        if (
+            index < len(aligned_gloss_tokens)
+            and symbol in native_sources
+            and symbol in gloss_sources
+        ):
+            resolved_native_tokens.append(native_token)
+            resolved_gloss_tokens.append(str(aligned_gloss_tokens[index]))
+        else:
+            unresolved_linguistic_tokens.append(native_token)
+    mapped_native_text = " ".join(resolved_native_tokens).strip()
+    mapped_gloss_text = " ".join(resolved_gloss_tokens).strip()
+    linguistic_signal_text = " ".join(unresolved_linguistic_tokens).strip()
+    emotion_sound_text = " ".join(emotion_sound_tokens).strip()
+    complete_dual = {
+        **(dual or {}),
+        "text": f"Native: {mapped_native_text}\nHuman guess: {selected_text}",
+        "gloss_text": selected_text,
+    }
     rejection_reasons = []
     if unknown_words:
         rejection_reasons.append("unknown_response_words")
-    if len(symbols) < len(response_tokens):
+    if len(linguistic_symbols) < len(response_tokens):
         rejection_reasons.append("incomplete_token_coverage")
     unresolved_native_symbols = [
         symbol
-        for symbol in symbols
-        if symbol not in native_sources or symbol in native_tokens
+        for symbol in linguistic_symbols
+        if symbol not in native_sources or symbol in native_token_set
     ]
     if unresolved_native_symbols:
         rejection_reasons.append("unresolved_native_symbols")
-    translation_complete = bool(dual) and not rejection_reasons
+    unresolved_gloss_symbols = [
+        symbol for symbol in linguistic_symbols if symbol not in gloss_sources
+    ]
+    if unresolved_gloss_symbols:
+        rejection_reasons.append("unresolved_gloss_symbols")
+    translation_complete = bool(
+        dual and linguistic_symbols and not rejection_reasons
+    )
     translation_metadata = {
         "selected_expression_symbols": symbols,
         "selected_expression_native_candidate": native_text or None,
@@ -877,27 +935,48 @@ def encode_selected_text_expression(
         "native_translation_complete": translation_complete,
         "native_translation_rejections": rejection_reasons,
         "native_translation_unresolved_symbols": unresolved_native_symbols,
+        "native_translation_unresolved_gloss_symbols": unresolved_gloss_symbols,
+        "selected_expression_mapped_native_text": mapped_native_text or None,
+        "selected_expression_mapped_gloss_text": mapped_gloss_text or None,
+        "selected_expression_linguistic_signal": linguistic_signal_text or None,
+        "selected_expression_emotion_sound_signal": emotion_sound_text or None,
         "native_translation_token_count": len(response_tokens),
         "native_translation_symbol_count": len(symbols),
     }
     if not translation_complete:
         _, requested_mode = select_symbolic_message_text(
-            dual, language_preference
+            complete_dual, language_preference
         )
-        if requested_mode == "english" or not native_text:
-            rendered = selected_text
+        layers = []
+        if requested_mode == "english":
+            layers.append(selected_text)
             effective_mode = "english_incomplete_native"
         else:
-            rendered = (
-                f"Native signal: {native_text}\n"
-                f"English expression: {selected_text}"
-            )
+            if mapped_native_text and mapped_gloss_text:
+                layers.extend([
+                    f"Native: {mapped_native_text}",
+                    f"Human guess: {mapped_gloss_text}",
+                ])
+            if linguistic_signal_text:
+                layers.append(f"Native signal: {linguistic_signal_text}")
+            if (
+                not mapped_gloss_text
+                or mapped_gloss_text.casefold() != selected_text.casefold()
+            ):
+                layers.append(f"English expression: {selected_text}")
             effective_mode = "mixed_partial_native"
+        if emotion_sound_text:
+            layers.append(f"Emotion/sound signal: {emotion_sound_text}")
+        rendered = "\n".join(layers) or selected_text
         return rendered, {
             **translation_metadata,
             "effective_language_mode": effective_mode,
         }
-    rendered, effective_mode = select_symbolic_message_text(dual, language_preference)
+    rendered, effective_mode = select_symbolic_message_text(
+        complete_dual, language_preference
+    )
+    if emotion_sound_text:
+        rendered = f"{rendered or selected_text}\nEmotion/sound signal: {emotion_sound_text}"
     return rendered or selected_text, {
         **translation_metadata,
         "effective_language_mode": effective_mode,

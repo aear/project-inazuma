@@ -1053,6 +1053,8 @@ def build_dual_symbolic_message(
         "text": combined,
         "native_text": native_text,
         "gloss_text": gloss_text,
+        "native_tokens": list(native_tokens),
+        "gloss_tokens": list(guessed_words),
         "unresolved_symbols": unresolved_symbols,
         "native_sources": native_sources,
         "gloss_sources": gloss_sources,

@@ -313,7 +313,7 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
         db,
         "generate_symbolic_reply_from_text",
         lambda *args, **kwargs: {
-            "symbols": ["sym_snd_internal"],
+            "symbols": ["sym_known", "sym_snd_internal"],
             "unknown": ["grounding", "restart", "strategies"],
         },
     )
@@ -326,8 +326,16 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
                 "Human guess: I do not have grounding for restart strategies."
             ),
             "native_text": "glyph_known sym_snd_internal",
-            "gloss_text": "I do not have grounding for restart strategies.",
-            "native_sources": {},
+            "gloss_text": "known sym_snd_internal",
+            "native_tokens": ["glyph_known", "sym_snd_internal"],
+            "gloss_tokens": ["known", "sym_snd_internal"],
+            "native_sources": {
+                "sym_known": "text_vocab_links",
+            },
+            "gloss_sources": {
+                "sym_known": "text_vocab_links",
+            },
+            "unresolved_symbols": ["sym_snd_internal"],
         },
     )
     response = "I do not have grounding for restart strategies."
@@ -340,8 +348,10 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
     )
 
     assert rendered == (
-        "Native signal: glyph_known sym_snd_internal\n"
-        "English expression: I do not have grounding for restart strategies."
+        "Native: glyph_known\n"
+        "Human guess: known\n"
+        "English expression: I do not have grounding for restart strategies.\n"
+        "Emotion/sound signal: sym_snd_internal"
     )
     assert metadata["effective_language_mode"] == "mixed_partial_native"
     english_rendered, english_metadata = db.encode_selected_text_expression(
@@ -350,17 +360,16 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
         language_preference="english",
         max_symbols=24,
     )
-    assert english_rendered == response
+    assert english_rendered == (
+        response + "\nEmotion/sound signal: sym_snd_internal"
+    )
     assert english_metadata["effective_language_mode"] == "english_incomplete_native"
     assert metadata["native_translation_complete"] is False
     assert set(metadata["native_translation_rejections"]) == {
         "unknown_response_words",
         "incomplete_token_coverage",
-        "unresolved_native_symbols",
     }
-    assert metadata["native_translation_unresolved_symbols"] == [
-        "sym_snd_internal"
-    ]
+    assert metadata["native_translation_unresolved_symbols"] == []
 
 
 def test_complete_selected_translation_can_render_native_and_english(monkeypatch):
@@ -379,7 +388,13 @@ def test_complete_selected_translation_can_render_native_and_english(monkeypatch
             "text": "Native: λcalm λhere\nHuman guess: calm here",
             "native_text": "λcalm λhere",
             "gloss_text": "calm here",
+            "native_tokens": ["λcalm", "λhere"],
+            "gloss_tokens": ["calm", "here"],
             "native_sources": {
+                "sym_calm": "text_vocab_links",
+                "sym_here": "text_vocab_links",
+            },
+            "gloss_sources": {
                 "sym_calm": "text_vocab_links",
                 "sym_here": "text_vocab_links",
             },
@@ -492,6 +507,11 @@ def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(
         "Native: glyph_wave glyph_calm\nHuman guess: hello calm"
     ) == [("glyph_wave glyph_calm", "hello calm")]
+    assert db.extract_symbolic_history_alignments(
+        "Native: λstate\nHuman guess: state\n"
+        "English expression: state uncertain\nEmotion/sound signal: sym_emotion_1"
+    ) == [("λstate", "state")]
+
     assert db.extract_symbolic_history_alignments(
         "Native signal: λstate\nEnglish expression: state uncertain"
     ) == []
