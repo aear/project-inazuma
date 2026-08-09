@@ -403,6 +403,25 @@ def extract_symbolic_history_alignments(text: str) -> list[tuple[str, str]]:
     return parse_symbolic_history_message(text)["pairs"]
 
 
+def format_history_review_result(result: dict) -> str:
+    """Summarize reviewed work without making an empty unseen count look idle."""
+    payload = result if isinstance(result, dict) else {}
+    message = (
+        "History review complete: "
+        f"{int(payload.get('revisited_messages', 0) or 0)} revisited, "
+        f"{int(payload.get('new_messages', 0) or 0)} unseen, "
+        f"{int(payload.get('alignment_candidates', 0) or 0)} candidates reconsidered, "
+        f"{int(payload.get('alignments', 0) or 0)} mapping changes."
+    )
+    rejections = payload.get("alignment_rejection_counts")
+    if isinstance(rejections, dict) and rejections:
+        detail = ", ".join(
+            f"{reason}: {int(count or 0)}" for reason, count in sorted(rejections.items())
+        )
+        message += f" Rejections: {detail}."
+    return message
+
+
 def get_voice_io_config() -> dict:
     """
     Return voice input settings with sensible defaults.
@@ -2321,13 +2340,7 @@ class InaDiscordClient(discord.Client):
         if lower in {"/ina learn history", "/ina history learn"} and message.author.id == SAKURA_USER_ID:
             await message.channel.send("Scanning recent history and revisiting language mappings...")
             result = await self._run_language_review(force=True)
-            await message.channel.send(
-                "History review complete: "
-                f"{result.get('new_messages', 0)} new messages, "
-                f"{result.get('alignment_candidates', 0)} candidates, "
-                f"{result.get('alignments', 0)} accepted token alignments. "
-                f"Rejections: {result.get('alignment_rejection_counts') or 'none'}."
-            )
+            await message.channel.send(format_history_review_result(result))
             return
         if lower in {"/ina status", "/ina ping"}:
             await message.channel.send("Ina is listening here.")
@@ -2850,6 +2863,7 @@ class InaDiscordClient(discord.Client):
         *,
         file_factory=None,
         reason: str = "message",
+        reply_to_message_id: Optional[str] = None,
     ) -> bool:
         """
         Send a Discord message with local pacing and 429-aware retries.
@@ -2872,6 +2886,25 @@ class InaDiscordClient(discord.Client):
         )
         attempts = retries + 1
         chunks = split_discord_message(text)
+        reply_reference = None
+        get_partial_message = getattr(destination, "get_partial_message", None)
+        if reply_to_message_id and callable(get_partial_message):
+            try:
+                partial_message = get_partial_message(int(reply_to_message_id))
+                to_reference = getattr(partial_message, "to_reference", None)
+                if callable(to_reference):
+                    try:
+                        reply_reference = to_reference(fail_if_not_exists=False)
+                    except TypeError:
+                        reply_reference = to_reference()
+                else:
+                    reply_reference = partial_message
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid Discord reply target for %s: %r; sending normally.",
+                    reason,
+                    reply_to_message_id,
+                )
         for chunk_index, chunk in enumerate(chunks):
             sent_chunk = False
             for attempt in range(1, attempts + 1):
@@ -2879,7 +2912,11 @@ class InaDiscordClient(discord.Client):
                 try:
                     await self._pace_discord_send()
                     file = file_factory() if file_factory and chunk_index == 0 else None
-                    await destination.send(chunk, file=file)
+                    send_kwargs = {"file": file}
+                    if reply_reference is not None and chunk_index == 0:
+                        send_kwargs["reference"] = reply_reference
+                        send_kwargs["mention_author"] = False
+                    await destination.send(chunk, **send_kwargs)
                     sent_chunk = True
                     break
                 except discord.HTTPException as exc:
@@ -3746,7 +3783,12 @@ def main() -> None:
     client = InaDiscordClient(comms=comms, loop=loop)
 
     # Register Discord backend with CommsCore so outbound messages work
-    register_discord_backend(comms, client, backend_name=BACKEND_NAME)
+    register_discord_backend(
+        comms,
+        client,
+        backend_name=BACKEND_NAME,
+        reply_to_trigger_message=discord_cfg.get("reply_to_trigger_message", True) is not False,
+    )
 
     log_discord_voice_capabilities()
 

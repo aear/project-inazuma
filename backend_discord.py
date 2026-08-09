@@ -58,6 +58,7 @@ def register_discord_backend(
     client: discord.Client,
     *,
     backend_name: str = "discord",
+    reply_to_trigger_message: bool = True,
 ) -> None:
     """
     Register a Discord backend with the given CommsCore instance.
@@ -98,7 +99,13 @@ def register_discord_backend(
 
             try:
                 sender = getattr(client, "send_discord_message", None)
-                attachment_path = (msg.metadata or {}).get("attachment_path")
+                metadata = msg.metadata or {}
+                attachment_path = metadata.get("attachment_path")
+                reply_to_message_id = (
+                    metadata.get("reply_to_backend_id")
+                    if reply_to_trigger_message and metadata.get("discord_native_reply", True) is not False
+                    else None
+                )
 
                 def _build_file():
                     if not attachment_path:
@@ -119,12 +126,24 @@ def register_discord_backend(
                         msg.text,
                         file_factory=_build_file if attachment_path else None,
                         reason=f"comms:{msg.id}",
+                        reply_to_message_id=reply_to_message_id,
                     )
                 else:
-                    if attachment_path:
-                        await channel.send(msg.text, file=_build_file())
-                    else:
-                        await channel.send(msg.text)
+                    send_kwargs = {"file": _build_file()} if attachment_path else {}
+                    get_partial_message = getattr(channel, "get_partial_message", None)
+                    if reply_to_message_id and callable(get_partial_message):
+                        try:
+                            send_kwargs.update(
+                                reference=get_partial_message(int(reply_to_message_id)),
+                                mention_author=False,
+                            )
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Invalid Discord reply target for message %s: %r",
+                                msg.id,
+                                reply_to_message_id,
+                            )
+                    await channel.send(msg.text, **send_kwargs)
             except Exception:
                 logger.exception(
                     "Failed to send message %s to Discord channel %s",

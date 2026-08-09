@@ -85,6 +85,56 @@ def test_discord_sender_chunks_only_at_delivery_and_attaches_once():
     assert made_files[0].closed is True
 
 
+def test_discord_sender_replies_on_first_chunk_without_ping():
+    sent = []
+
+    class PartialMessage:
+        def __init__(self, message_id):
+            self.id = message_id
+
+        def to_reference(self, *, fail_if_not_exists=True):
+            assert fail_if_not_exists is False
+            return {"message_id": self.id, "fail_if_not_exists": False}
+
+    class Destination:
+        def get_partial_message(self, message_id):
+            return PartialMessage(message_id)
+
+        async def send(self, text, **kwargs):
+            sent.append((text, kwargs))
+
+    async def pace():
+        return None
+
+    client = SimpleNamespace(
+        _outbox_policy={
+            "max_send_retries": 1,
+            "rate_limit_padding_seconds": 0,
+        },
+        _pace_discord_send=pace,
+    )
+    destination = Destination()
+    original = ("reply context " * 220) + "done"
+    delivered = asyncio.run(
+        db.InaDiscordClient.send_discord_message(
+            client,
+            destination,
+            original,
+            reason="test-native-reply",
+            reply_to_message_id="12345",
+        )
+    )
+
+    assert delivered is True
+    assert "".join(text for text, _kwargs in sent) == original
+    assert sent[0][1]["reference"] == {
+        "message_id": 12345,
+        "fail_if_not_exists": False,
+    }
+    assert sent[0][1]["mention_author"] is False
+    assert all("reference" not in kwargs for _text, kwargs in sent[1:])
+
+
 class _Adapter:
     def __init__(self, response="adapter reply"):
         self.calls = []
@@ -652,6 +702,23 @@ def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
         "orphan_human_guess": 1,
     }
     assert db.extract_symbolic_history_alignments("Just English this time.") == []
+
+
+def test_history_review_result_reports_revisited_work_clearly():
+    message = db.format_history_review_result(
+        {
+            "revisited_messages": 145,
+            "new_messages": 0,
+            "alignment_candidates": 18,
+            "alignments": 0,
+            "alignment_rejection_counts": {},
+        }
+    )
+
+    assert message == (
+        "History review complete: 145 revisited, 0 unseen, "
+        "18 candidates reconsidered, 0 mapping changes."
+    )
 
 
 def test_language_review_policy_is_bounded(monkeypatch):

@@ -246,6 +246,8 @@ class CommsCore:
         if response is not None:
             response.metadata = dict(response.metadata or {})
             response.metadata.setdefault("trace_id", trace_id)
+            if msg.reply_to_id:
+                response.metadata.setdefault("reply_to_backend_id", msg.reply_to_id)
             if experience_event_id:
                 response.metadata.setdefault("experience_event_id", experience_event_id)
 
