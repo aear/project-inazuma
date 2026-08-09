@@ -20,6 +20,8 @@ import random
 import re
 import time
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from urllib.parse import unquote, urldefrag
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -79,7 +81,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
 
 FRAG_LIMIT = 1000
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
-DOCUMENT_EXTENSIONS = {".pdf", ".odt"}
+DOCUMENT_EXTENSIONS = {".pdf", ".odt", ".epub"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pgm", ".ppm", ".pnm"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".webm"}
@@ -102,6 +104,13 @@ ARCHIVE_FRAGMENT_LIMIT = 1000
 SELF_READ_PREF_FILENAME = "self_read_preferences.json"
 SELF_READ_SKIP_REQUESTS = "self_read_skip_requests.json"
 SELF_READ_HISTORY_FILENAME = "read_history.json"
+# EPUBs are ZIP containers, but they are read as ordered documents rather than
+# generic archives. These limits keep malformed books from turning a sparse
+# self-read pass into an unbounded decompression job.
+EPUB_ENTRY_COUNT_LIMIT = 4096
+EPUB_PACKAGE_SIZE_LIMIT = 2 * 1024 * 1024
+EPUB_SECTION_SIZE_LIMIT = 4 * 1024 * 1024
+
 SELF_READ_HISTORY_VERSION = 2
 VALID_SOURCE_KEYS = {"code", "music", "books", "venv", "github_history"}
 SELF_READ_SOURCE_ENV = "SELF_READ_SOURCE"
@@ -1170,6 +1179,25 @@ def _validate_history_continuation(record, key, path):
         raise SelfReadHistoryLoadError(
             f"invalid continuation for {key!r} in {path}"
         )
+    document = continuation.get("document")
+    if document is not None:
+        cursor = document.get("cursor") if isinstance(document, dict) else None
+        section = cursor.get("section") if isinstance(cursor, dict) else None
+        char = cursor.get("char") if isinstance(cursor, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("format") != "epub"
+            or not isinstance(cursor, dict)
+            or isinstance(section, bool)
+            or not isinstance(section, int)
+            or section < 0
+            or isinstance(char, bool)
+            or not isinstance(char, int)
+            or char < 0
+        ):
+            raise SelfReadHistoryLoadError(
+                f"invalid document continuation for {key!r} in {path}"
+            )
     continuation_mtime = fingerprint.get("mtime_ns")
     continuation_size = fingerprint.get("size_bytes")
     if (
@@ -1366,7 +1394,7 @@ def classify_self_read_file(prior, stamp):
         return "updated"
     if changed:
         return "updated"
-    return "resume" if _self_read_resume_offset(prior, stamp) > 0 else None
+    return "resume" if _self_read_continuation(prior, stamp) is not None else None
 
 
 def _fingerprint_matches(fingerprint, stamp):
@@ -1381,18 +1409,33 @@ def _fingerprint_matches(fingerprint, stamp):
         return False
 
 
-def _self_read_resume_offset(prior, stamp):
-    """Return a continuation cursor only when it belongs to this fingerprint."""
+def _self_read_continuation(prior, stamp):
+    """Return a continuation only when it belongs to this file fingerprint."""
     continuation = prior.get("continuation") if isinstance(prior, dict) else None
     if not isinstance(continuation, dict):
-        return 0
+        return None
     if not _fingerprint_matches(continuation.get("fingerprint"), stamp):
+        return None
+    return continuation
+
+
+def _self_read_resume_offset(prior, stamp):
+    continuation = _self_read_continuation(prior, stamp)
+    if continuation is None:
         return 0
     try:
         offset = int(continuation.get("offset") or 0)
     except (TypeError, ValueError):
         return 0
     return max(0, offset)
+
+
+def _epub_cursor_from_history(prior, stamp):
+    continuation = _self_read_continuation(prior, stamp)
+    document = continuation.get("document") if continuation else None
+    if not isinstance(document, dict) or document.get("format") != "epub":
+        return None
+    return _normalize_epub_cursor(document.get("cursor"))
 
 
 def _self_read_fragment_window(result, prior, stamp, budget):
@@ -1407,25 +1450,44 @@ def _self_read_fragment_window(result, prior, stamp, budget):
     return fragments[start:end], start, end, len(fragments)
 
 
-def _set_self_read_continuation(record, stamp, *, next_offset, total_fragments):
-    """Persist or clear the compact continuation cursor for a processed file."""
+def _set_self_read_continuation(
+    record,
+    stamp,
+    *,
+    next_offset,
+    total_fragments,
+    document_cursor=None,
+):
+    """Persist a fragment cursor, an EPUB cursor, or both."""
     try:
         next_value = max(0, int(next_offset))
         total_value = max(0, int(total_fragments))
     except (TypeError, ValueError):
         next_value = 0
         total_value = 0
+
+    normalized_document_cursor = (
+        _normalize_epub_cursor(document_cursor)
+        if isinstance(document_cursor, dict)
+        else None
+    )
+    fragment_incomplete = next_value < total_value
     record.pop("continuation", None)
-    if next_value < total_value:
+    if fragment_incomplete or normalized_document_cursor is not None:
         record["continuation"] = {
-            "offset": next_value,
-            "total_fragments": total_value,
+            "offset": next_value if fragment_incomplete else 0,
+            "total_fragments": total_value if fragment_incomplete else 1,
             "fingerprint": {
                 "mtime_ns": stamp.get("mtime_ns"),
                 "size_bytes": stamp.get("size_bytes"),
             },
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if normalized_document_cursor is not None:
+            record["continuation"]["document"] = {
+                "format": "epub",
+                "cursor": normalized_document_cursor,
+            }
     return record
 
 
@@ -1700,8 +1762,302 @@ def _extract_odt_text(path, *, max_chars=12000):
     return _extract_odt_text_bytes(data, str(path), max_chars=max_chars)
 
 
-def fragment_document_text(text, source, transformer, doc_type=None, *, vocab_source=None):
-    chunks = _document_chunks(text, source)
+class _EPUBHTMLTextParser(HTMLParser):
+    """Small dependency-free fallback for imperfect XHTML chapter files."""
+
+    _IGNORED_TAGS = {"head", "script", "style", "noscript", "svg"}
+    _BREAK_TAGS = {
+        "address", "article", "aside", "blockquote", "br", "div", "footer",
+        "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "main", "nav",
+        "p", "pre", "section", "table", "tr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.casefold()
+        if tag in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+        elif not self._ignored_depth and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if not self._ignored_depth and tag.casefold() in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.casefold()
+        if tag in self._IGNORED_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif not self._ignored_depth and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def _xml_local_name(tag):
+    return str(tag).rsplit("}", 1)[-1].casefold()
+
+
+def _safe_epub_member_name(package_name, href):
+    """Resolve an OPF-relative href without allowing it above the EPUB root."""
+    raw_href = unquote(urldefrag(str(href or ""))[0]).replace("\\", "/")
+    href_path = PurePosixPath(raw_href)
+    if not raw_href or href_path.is_absolute():
+        return None
+
+    parts = []
+    for part in PurePosixPath(package_name).parent.parts + href_path.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts) or None
+
+
+def _read_epub_member(archive, member_name, size_limit):
+    info = archive.getinfo(member_name)
+    if info.is_dir() or info.file_size > size_limit:
+        raise ValueError(f"EPUB member exceeds limit: {member_name}")
+    with archive.open(info, "r") as member:
+        return _read_limited(member, size_limit)
+
+
+def _epub_section_text(data):
+    try:
+        root = ET.fromstring(data)
+        body = next(
+            (element for element in root.iter() if _xml_local_name(element.tag) == "body"),
+            root,
+        )
+        ignored = {"head", "script", "style", "noscript", "svg"}
+        parts = []
+
+        def append_element_text(element):
+            if _xml_local_name(element.tag) in ignored:
+                if element.tail:
+                    parts.append(element.tail)
+                return
+            if element.text:
+                parts.append(element.text)
+            for child_element in element:
+                append_element_text(child_element)
+            if element.tail:
+                parts.append(element.tail)
+
+        append_element_text(body)
+        return _normalize_document_text(" ".join(parts))
+    except ET.ParseError:
+        parser = _EPUBHTMLTextParser()
+        parser.feed(data.decode("utf-8", errors="replace"))
+        parser.close()
+        return _normalize_document_text("".join(parser.parts))
+
+
+def _normalize_epub_cursor(cursor):
+    cursor = cursor if isinstance(cursor, dict) else {}
+    try:
+        section = max(0, int(cursor.get("section") or 0))
+        char = max(0, int(cursor.get("char") or 0))
+    except (TypeError, ValueError):
+        section, char = 0, 0
+    return {"section": section, "char": char}
+
+
+def _extract_epub_archive_text(
+    archive,
+    source_label,
+    *,
+    max_chars=12000,
+    cursor=None,
+    with_progress=False,
+):
+    infos = archive.infolist()
+    if len(infos) > EPUB_ENTRY_COUNT_LIMIT:
+        raise ValueError(
+            f"EPUB contains more than {EPUB_ENTRY_COUNT_LIMIT} entries"
+        )
+    names = {info.filename for info in infos}
+
+    container_name = "META-INF/container.xml"
+    if container_name not in names:
+        raise ValueError("EPUB is missing META-INF/container.xml")
+    container = ET.fromstring(
+        _read_epub_member(archive, container_name, EPUB_PACKAGE_SIZE_LIMIT)
+    )
+    package_name = next(
+        (
+            element.attrib.get("full-path")
+            for element in container.iter()
+            if _xml_local_name(element.tag) == "rootfile"
+            and element.attrib.get("full-path")
+        ),
+        None,
+    )
+    if not package_name or package_name not in names:
+        raise ValueError("EPUB package document is missing")
+
+    package = ET.fromstring(
+        _read_epub_member(archive, package_name, EPUB_PACKAGE_SIZE_LIMIT)
+    )
+    manifest = {}
+    for element in package.iter():
+        if _xml_local_name(element.tag) != "item":
+            continue
+        item_id = element.attrib.get("id")
+        member_name = _safe_epub_member_name(package_name, element.attrib.get("href"))
+        media_type = element.attrib.get("media-type", "").casefold()
+        if (
+            item_id
+            and member_name in names
+            and (
+                media_type == "application/xhtml+xml"
+                or PurePosixPath(member_name).suffix.casefold()
+                in {".xhtml", ".html", ".htm"}
+            )
+        ):
+            manifest[item_id] = member_name
+
+    spine = []
+    for element in package.iter():
+        if _xml_local_name(element.tag) != "itemref":
+            continue
+        member_name = manifest.get(element.attrib.get("idref"))
+        if member_name and member_name not in spine:
+            spine.append(member_name)
+    if not spine:
+        spine = list(dict.fromkeys(manifest.values()))
+    if not spine:
+        raise ValueError("EPUB contains no readable spine documents")
+
+    start_cursor = _normalize_epub_cursor(cursor)
+    section_index = min(start_cursor["section"], len(spine))
+    char_offset = start_cursor["char"] if section_index < len(spine) else 0
+    parts = []
+    text_chars = 0
+    unreadable_sections = []
+
+    while section_index < len(spine) and text_chars < max_chars:
+        member_name = spine[section_index]
+        try:
+            data = _read_epub_member(archive, member_name, EPUB_SECTION_SIZE_LIMIT)
+            section_text = _epub_section_text(data)
+        except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+            log_to_statusbox(
+                f"[RawFileManager] Skipping EPUB section {member_name} "
+                f"in {source_label}: {exc}"
+            )
+            unreadable_sections.append(section_index)
+            section_index += 1
+            char_offset = 0
+            continue
+
+        if char_offset >= len(section_text):
+            section_index += 1
+            char_offset = 0
+            continue
+
+        separator = 2 if parts else 0
+        remaining = max(0, max_chars - text_chars - separator)
+        if not remaining:
+            break
+        excerpt = section_text[char_offset:char_offset + remaining]
+        if excerpt:
+            parts.append(excerpt)
+            text_chars += separator + len(excerpt)
+        char_offset += len(excerpt)
+        if char_offset >= len(section_text):
+            section_index += 1
+            char_offset = 0
+
+    complete = section_index >= len(spine) and not unreadable_sections
+    next_cursor = {"section": section_index, "char": char_offset}
+    if unreadable_sections and section_index >= len(spine):
+        next_cursor = {"section": unreadable_sections[0], "char": 0}
+    progress = {
+        "format": "epub",
+        "complete": complete,
+        "status": "complete" if complete else "partial",
+        "sections_total": len(spine),
+        "window_start": start_cursor,
+        "next_cursor": next_cursor,
+        "characters_in_window": sum(len(part) for part in parts),
+        "unreadable_sections": unreadable_sections,
+    }
+    text = "\n\n".join(parts)
+    return (text, progress) if with_progress else text
+
+
+def _extract_epub_text_bytes(
+    data,
+    source_label,
+    *,
+    max_chars=12000,
+    cursor=None,
+    with_progress=False,
+):
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return _extract_epub_archive_text(
+                archive,
+                source_label,
+                max_chars=max_chars,
+                cursor=cursor,
+                with_progress=with_progress,
+            )
+    except Exception as exc:
+        log_to_statusbox(f"[RawFileManager] Failed to read EPUB {source_label}: {exc}")
+        return ("", None) if with_progress else ""
+
+
+def _extract_epub_text(
+    path,
+    *,
+    max_chars=12000,
+    cursor=None,
+    with_progress=False,
+):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return _extract_epub_archive_text(
+                archive,
+                str(path),
+                max_chars=max_chars,
+                cursor=cursor,
+                with_progress=with_progress,
+            )
+    except Exception as exc:
+        log_to_statusbox(f"[RawFileManager] Failed to read EPUB {path}: {exc}")
+        return ("", None) if with_progress else ""
+
+
+def fragment_document_text(
+    text,
+    source,
+    transformer,
+    doc_type=None,
+    *,
+    vocab_source=None,
+    document_progress=None,
+    sequential=False,
+):
+    if sequential:
+        cleaned = _normalize_document_text(text)
+        chunks = [
+            cleaned[index:index + 400]
+            for index in range(0, len(cleaned), 400)
+        ]
+    else:
+        chunks = _document_chunks(text, source)
     if not chunks:
         return []
 
@@ -1711,6 +2067,8 @@ def fragment_document_text(text, source, transformer, doc_type=None, *, vocab_so
         tags = ["text", "self_read", "document"]
         if doc_type:
             tags.append(doc_type)
+        if isinstance(document_progress, dict):
+            tags.append("partial_document_read")
         tags = list(dict.fromkeys(tags))
 
         summary = f"Excerpt from {Path(source).name}: {chunk}"
@@ -1725,6 +2083,14 @@ def fragment_document_text(text, source, transformer, doc_type=None, *, vocab_so
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"curiosity": 0.55, "focus": 0.35}
         }
+        if isinstance(document_progress, dict):
+            fragment_progress = dict(document_progress)
+            fragment_progress["window_reaches_end"] = bool(
+                document_progress.get("complete")
+            )
+            fragment_progress["complete"] = False
+            fragment_progress["status"] = "partial"
+            frag["document_read_progress"] = fragment_progress
         vec = transformer.encode(frag)
         frag["importance"] = vec["importance"]
         try:
@@ -1741,14 +2107,28 @@ def fragment_document_text(text, source, transformer, doc_type=None, *, vocab_so
     return fragments
 
 
-def fragment_document(path, transformer, *, vocab_source=None):
+def fragment_document(
+    path,
+    transformer,
+    *,
+    vocab_source=None,
+    document_cursor=None,
+):
     ext = path.suffix.lower()
+    document_progress = None
     if ext == ".pdf":
         text = _extract_pdf_text(path)
         doc_type = "pdf"
     elif ext == ".odt":
         text = _extract_odt_text(path)
         doc_type = "odt"
+    elif ext == ".epub":
+        text, document_progress = _extract_epub_text(
+            path,
+            cursor=document_cursor,
+            with_progress=True,
+        )
+        doc_type = "epub"
     else:
         return []
 
@@ -1756,25 +2136,46 @@ def fragment_document(path, transformer, *, vocab_source=None):
         log_to_statusbox(f"[RawFileManager] No text extracted from {path}.")
         return []
     return fragment_document_text(
-        text, path.name, transformer, doc_type=doc_type, vocab_source=vocab_source
+        text,
+        path.name,
+        transformer,
+        doc_type=doc_type,
+        vocab_source=vocab_source,
+        document_progress=document_progress,
+        sequential=(doc_type == "epub"),
     )
 
 
 def fragment_document_bytes(data, source_label, transformer, suffix):
     ext = suffix.lower()
+    document_progress = None
     if ext == ".pdf":
         text = _extract_pdf_text_bytes(data, source_label)
         doc_type = "pdf"
     elif ext == ".odt":
         text = _extract_odt_text_bytes(data, source_label)
         doc_type = "odt"
+    elif ext == ".epub":
+        text, document_progress = _extract_epub_text_bytes(
+            data,
+            source_label,
+            with_progress=True,
+        )
+        doc_type = "epub"
     else:
         return []
 
     if not text:
         log_to_statusbox(f"[RawFileManager] No text extracted from {source_label}.")
         return []
-    return fragment_document_text(text, source_label, transformer, doc_type=doc_type)
+    return fragment_document_text(
+        text,
+        source_label,
+        transformer,
+        doc_type=doc_type,
+        document_progress=document_progress,
+        sequential=(doc_type == "epub"),
+    )
 
 
 def fragment_text(text, source, transformer, *, vocab_source=None):
@@ -2539,10 +2940,16 @@ def self_read_and_train():
                 )
 
             elif category == "document":
+                document_cursor = (
+                    _epub_cursor_from_history(prior, stamp)
+                    if path.suffix.casefold() == ".epub"
+                    else None
+                )
                 result = fragment_document(
                     path,
                     transformer,
                     vocab_source=f"self_read:{source_key}",
+                    document_cursor=document_cursor,
                 )
 
             elif category == "image":
@@ -2574,6 +2981,15 @@ def self_read_and_train():
             result = list(result or [])
             if not result:
                 return False
+
+            document_progress = next(
+                (
+                    frag.get("document_read_progress")
+                    for frag in result
+                    if isinstance(frag.get("document_read_progress"), dict)
+                ),
+                None,
+            )
 
             remaining = max(0, ceiling - count)
             fragments_to_save, start_offset, next_offset, total_fragments = (
@@ -2636,11 +3052,42 @@ def self_read_and_train():
             }
             record["fragment_count_seen"] = total_fragments
             record["fragment_count_saved"] = len(fragments_to_save)
+
+            document_cursor_for_continuation = None
+            if isinstance(document_progress, dict):
+                fragment_window_complete = next_offset >= total_fragments
+                reaches_end = bool(document_progress.get("window_reaches_end"))
+                document_complete = fragment_window_complete and reaches_end
+                history_progress = dict(document_progress)
+                history_progress["complete"] = document_complete
+                history_progress["status"] = (
+                    "complete" if document_complete else "partial"
+                )
+                record["document_read_progress"] = history_progress
+
+                if not fragment_window_complete:
+                    document_cursor_for_continuation = document_progress.get(
+                        "window_start"
+                    )
+                elif not reaches_end:
+                    document_cursor_for_continuation = document_progress.get(
+                        "next_cursor"
+                    )
+
+                if not document_complete:
+                    next_cursor = document_cursor_for_continuation or {}
+                    log_to_statusbox(
+                        f"[SelfRead] {path.name} remains partially read; "
+                        f"resume cursor section {next_cursor.get('section', 0)}, "
+                        f"character {next_cursor.get('char', 0)}."
+                    )
+
             _set_self_read_continuation(
                 record,
                 stamp,
                 next_offset=next_offset,
                 total_fragments=total_fragments,
+                document_cursor=document_cursor_for_continuation,
             )
             if next_offset < total_fragments:
                 record["fragment_limit_truncated"] = True

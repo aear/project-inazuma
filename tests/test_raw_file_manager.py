@@ -21,6 +21,175 @@ def _create_wav_file(path: Path):
         wf.writeframes(b"\x00\x00" * 200)
 
 
+def _create_epub(path: Path, chapters, *, spine_order=None, extra_members=None):
+    chapter_names = [name for name, _text in chapters]
+    order = spine_order or chapter_names
+    manifest_ids = {name: f"chapter_{index}" for index, name in enumerate(chapter_names)}
+    manifest = "\n".join(
+        f'<item id="{manifest_ids[name]}" href="{name}" media-type="application/xhtml+xml"/>'
+        for name in chapter_names
+    )
+    spine = "\n".join(
+        f'<itemref idref="{manifest_ids[name]}"/>' for name in order
+    )
+    container = (
+        '<?xml version="1.0"?>'
+        '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="EPUB/content.opf"/></rootfiles>'
+        '</container>'
+    )
+    package = (
+        '<?xml version="1.0"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        f'<manifest>{manifest}</manifest><spine>{spine}</spine>'
+        '</package>'
+    )
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("EPUB/content.opf", package)
+        for name, body in chapters:
+            archive.writestr(
+                f"EPUB/{name}",
+                (
+                    '<html xmlns="http://www.w3.org/1999/xhtml">'
+                    '<head><title>Hidden head title</title></head>'
+                    f'<body><p>{body}</p></body></html>'
+                ),
+            )
+        for name, data in extra_members or []:
+            archive.writestr(name, data)
+
+
+def test_epub_is_read_as_spine_ordered_document(tmp_path):
+    epub_path = tmp_path / "novel.epub"
+    _create_epub(
+        epub_path,
+        [
+            ("first.xhtml", "First chapter &amp; opening."),
+            ("second.xhtml", "Second chapter comes later."),
+        ],
+        spine_order=["second.xhtml", "first.xhtml"],
+        extra_members=[
+            (
+                "EPUB/unlisted.xhtml",
+                "<html><body>Unlisted appendix should not be read.</body></html>",
+            )
+        ],
+    )
+
+    text = rfm._extract_epub_text(epub_path)
+
+    assert rfm.classify_path(epub_path) == "document"
+    assert text.index("Second chapter") < text.index("First chapter")
+    assert "First chapter & opening." in text
+    assert "Hidden head title" not in text
+    assert "Unlisted appendix" not in text
+    assert rfm._extract_epub_text_bytes(epub_path.read_bytes(), "novel.epub") == text
+
+    class Transformer:
+        def encode(self, fragment):
+            return {"importance": 0.5}
+
+    fragments = rfm.fragment_document(epub_path, Transformer())
+    assert fragments
+    assert all("epub" in fragment["tags"] for fragment in fragments)
+    assert all(fragment["modality"] == "text" for fragment in fragments)
+
+
+    assert all("partial_document_read" in fragment["tags"] for fragment in fragments)
+    assert all(
+        fragment["document_read_progress"]["complete"] is False
+        for fragment in fragments
+    )
+    assert all(
+        fragment["document_read_progress"]["window_reaches_end"] is True
+        for fragment in fragments
+    )
+
+
+def test_epub_tolerates_imperfect_xhtml(tmp_path):
+    epub_path = tmp_path / "imperfect.epub"
+    _create_epub(
+        epub_path,
+        [("chapter.xhtml", "Readable <b>words</p> remain")],
+    )
+
+    text = rfm._extract_epub_text(epub_path)
+
+    assert "Readable words remain" in text
+
+
+def test_epub_rejects_unsafe_or_unbounded_packages(monkeypatch, tmp_path):
+    assert rfm._safe_epub_member_name("EPUB/content.opf", "../../outside.xhtml") is None
+
+    epub_path = tmp_path / "bounded.epub"
+    _create_epub(epub_path, [("chapter.xhtml", "A safe chapter.")])
+    monkeypatch.setattr(rfm, "EPUB_ENTRY_COUNT_LIMIT", 2)
+
+    assert rfm._extract_epub_text(epub_path) == ""
+
+
+def test_epub_cursor_progresses_until_the_whole_book_is_read(tmp_path):
+    epub_path = tmp_path / "long.epub"
+    _create_epub(
+        epub_path,
+        [
+            ("first.xhtml", "A" * 700),
+            ("second.xhtml", "B" * 700),
+        ],
+    )
+
+    cursor = None
+    windows = []
+    for _pass in range(4):
+        text, progress = rfm._extract_epub_text(
+            epub_path,
+            max_chars=500,
+            cursor=cursor,
+            with_progress=True,
+        )
+        windows.append(text)
+        if progress["complete"]:
+            break
+        cursor = progress["next_cursor"]
+
+    assert len(windows) == 3
+    assert all(len(window) <= 500 for window in windows)
+    assert progress["complete"] is True
+    assert cursor == {"section": 1, "char": 298}
+    assert "".join(windows).replace("\n", "") == ("A" * 700) + ("B" * 700)
+
+
+def test_epub_document_cursor_keeps_history_resumable():
+    stamp = {"mtime_ns": 10, "size_bytes": 20}
+    record = dict(stamp)
+
+    rfm._set_self_read_continuation(
+        record,
+        stamp,
+        next_offset=30,
+        total_fragments=30,
+        document_cursor={"section": 2, "char": 125},
+    )
+
+    assert rfm.classify_self_read_file(record, stamp) == "resume"
+    assert rfm._self_read_resume_offset(record, stamp) == 0
+    assert rfm._epub_cursor_from_history(record, stamp) == {
+        "section": 2,
+        "char": 125,
+    }
+
+    rfm._set_self_read_continuation(
+        record,
+        stamp,
+        next_offset=30,
+        total_fragments=30,
+    )
+    assert "continuation" not in record
+
+
 def test_fragment_audio_wav(tmp_path):
     wav_path = tmp_path / "sample.wav"
     _create_wav_file(wav_path)
@@ -513,7 +682,7 @@ def _configure_bounded_self_read_pass(
     monkeypatch.setattr(
         rfm,
         "fragment_text",
-        lambda text, source, transformer: json.loads(
+        lambda text, source, transformer, **_kwargs: json.loads(
             json.dumps(fragments_by_name[source])
         ),
     )
