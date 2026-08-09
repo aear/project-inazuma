@@ -70,6 +70,8 @@ class LMStudioAdapter:
         self.child = child
         self._base_path = Path(base_path) if base_path else Path("AI_Children")
         self.logger = ExperienceLogger(child=child, base_path=self._base_path)
+        self._relevance_cache_signature = None
+        self._relevance_cache = None
         self.bridge = LiveExperienceBridge(
             child=child, base_path=self._base_path, logger=self.logger
         )
@@ -130,6 +132,138 @@ class LMStudioAdapter:
             include_clarification=False,
             seed_questions=False,
         ))
+
+    def recall_relevant(
+        self,
+        prompt: str,
+        *,
+        max_items: int = 3,
+        max_chars: int = 800,
+        max_graph_bytes: int = 8 * 1024 * 1024,
+    ) -> List[Dict[str, Any]]:
+        """Offer a few cue-matched experience references, or decline cheaply."""
+        path = self._experience_graph_path()
+        try:
+            stat = path.stat()
+        except OSError:
+            return []
+        if stat.st_size <= 0 or stat.st_size > max(1, int(max_graph_bytes)):
+            return []
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if self._relevance_cache_signature != signature:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                return []
+            if not isinstance(payload, dict):
+                return []
+            events = {
+                str(event.get("id")): event
+                for event in payload.get("events", [])
+                if isinstance(event, dict) and event.get("id")
+            }
+            words_index = payload.get("words_index")
+            self._relevance_cache = {
+                "events": events,
+                "words_index": words_index if isinstance(words_index, dict) else {},
+            }
+            self._relevance_cache_signature = signature
+        cache = self._relevance_cache if isinstance(self._relevance_cache, dict) else {}
+        events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+        words_index = (
+            cache.get("words_index") if isinstance(cache.get("words_index"), dict) else {}
+        )
+        remaining = max(0, int(max_chars))
+        references: List[Dict[str, Any]] = []
+        seen_events = set()
+        cues = list(dict.fromkeys(self._tokenize(prompt)))
+        for cue in cues:
+            event_ids = words_index.get(cue) or []
+            if not isinstance(event_ids, list):
+                continue
+            for event_id in reversed(event_ids):
+                event = events.get(str(event_id))
+                if not isinstance(event, dict) or str(event_id) in seen_events:
+                    continue
+                narrative = " ".join(str(event.get("narrative") or "").split())
+                if not narrative:
+                    continue
+                summary = narrative[: min(320, remaining)].rstrip()
+                if not summary:
+                    return references
+                references.append({
+                    "event_id": str(event_id),
+                    "cue": cue,
+                    "summary": summary,
+                    "tags": list(event.get("situation_tags") or [])[:8],
+                    "source": "experience_graph.words_index",
+                })
+                seen_events.add(str(event_id))
+                remaining -= len(summary)
+                break
+            if len(references) >= max(0, int(max_items)) or remaining <= 0:
+                break
+        return references
+
+    def consider_recalled_memories(
+        self,
+        prompt: str,
+        candidates: Iterable[Dict[str, Any]],
+        *,
+        scene: Optional[Dict[str, Any]] = None,
+        threshold: float = 0.5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Final, overrideable consideration pass over retrieved candidates."""
+        prompt_terms = set(self._tokenize(prompt)) - _STOPWORDS
+        scene = scene if isinstance(scene, dict) else {}
+        scene_terms = set(scene.get("topic_terms") or [])
+        signals = scene.get("signals") if isinstance(scene.get("signals"), dict) else {}
+        scene_terms.update(signals.get("continuity_terms") or [])
+        accepted: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        for raw in candidates:
+            if not isinstance(raw, dict):
+                continue
+            candidate = dict(raw)
+            cue = str(candidate.get("cue") or "").lower()
+            summary_terms = set(self._tokenize(str(candidate.get("summary") or ""))) - _STOPWORDS
+            tag_terms = {
+                token
+                for tag in candidate.get("tags") or []
+                for token in self._tokenize(str(tag))
+            } - _STOPWORDS
+            support_terms = sorted((summary_terms | tag_terms) & (prompt_terms | scene_terms))
+            score = 0.0
+            if cue and cue in prompt_terms:
+                score += 0.42
+            elif cue and cue in scene_terms:
+                score += 0.2
+            score += min(0.35, 0.08 * len(support_terms))
+            if cue in _STOPWORDS or not cue:
+                score -= 0.25
+            bounded_threshold = max(0.0, min(1.0, float(threshold)))
+            candidate["consideration"] = {
+                "score": round(max(0.0, min(1.0, score)), 4),
+                "threshold": round(bounded_threshold, 4),
+                "support_terms": support_terms[:8],
+            }
+            if score >= bounded_threshold:
+                candidate["consideration"]["decision"] = "accepted"
+                candidate["consideration"]["description"] = (
+                    f"I recalled this through {cue!r} and decided it fits this scene: "
+                    + str(candidate.get("summary") or "")
+                )[:420]
+                accepted.append(candidate)
+            else:
+                candidate["consideration"]["decision"] = "rejected"
+                candidate["consideration"]["reason"] = "insufficient_scene_support"
+                candidate["consideration"]["description"] = (
+                    f"I recalled this through {cue!r}: "
+                    + str(candidate.get("summary") or "")
+                    + " I decided not to use it because the present scene did not support it enough."
+                )[:420]
+                rejected.append(candidate)
+        return {"accepted": accepted, "rejected": rejected}
 
     # ------------------------------------------------------------------
     # Internal helpers

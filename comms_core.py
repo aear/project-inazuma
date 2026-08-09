@@ -11,6 +11,7 @@ import threading
 import uuid
 import re
 
+from conversation_scene import ConversationSceneBuffer
 from experience_logger import ExperienceLogger
 from model_manager import increment_inastate_metric
 
@@ -109,11 +110,22 @@ class CommsCore:
         log_dir: Optional[Path] = None,
         process_inbound: Optional[Callable[[CommsMessage], CommsResponse]] = None,
         raw_fallback: Optional[Callable[[CommsMessage], None]] = None,
+        conversation_scene: Optional[ConversationSceneBuffer] = None,
+        scene_max_turns: int = 12,
+        scene_max_total_chars: int = 6000,
+        scene_max_channels: int = 32,
+        scene_ttl_seconds: float = 7200.0,
     ) -> None:
         self.instance_name = instance_name
         self._backends: Dict[str, Callable[[CommsMessage], None]] = {}
         self._process_inbound = process_inbound or self._default_process_inbound
         self._raw_fallback = raw_fallback
+        self._conversation_scene = conversation_scene or ConversationSceneBuffer(
+            max_turns=scene_max_turns,
+            max_total_chars=scene_max_total_chars,
+            max_scenes=scene_max_channels,
+            ttl_seconds=scene_ttl_seconds,
+        )
 
         # basic log file setup
         self.log_dir = log_dir or Path("logs")
@@ -178,6 +190,11 @@ class CommsCore:
                 **metadata,
             },
         )
+
+        self._conversation_scene.ingest_context(
+            msg, msg.metadata.get("conversation_context")
+        )
+        msg.metadata["conversation_scene"] = self._conversation_scene.observe(msg)
 
         if record_text_observation and text:
             try:
@@ -274,6 +291,7 @@ class CommsCore:
             metadata=response.metadata,
         )
 
+        self._attach_outbound_scene(outbound)
         self._log_message(outbound)
         self._dispatch_outbound(outbound)
         return outbound
@@ -314,9 +332,23 @@ class CommsCore:
             metadata=metadata,
         )
 
+        self._attach_outbound_scene(outbound)
         self._log_message(outbound)
         self._dispatch_outbound(outbound)
         return outbound
+
+    def _attach_outbound_scene(self, outbound: CommsMessage) -> None:
+        prior = outbound.metadata.get("conversation_scene")
+        snapshot = self._conversation_scene.observe(outbound)
+        if isinstance(prior, dict):
+            for key in (
+                "memory_candidates_considered",
+                "memory_references",
+                "memory_rejections",
+            ):
+                if key in prior:
+                    snapshot[key] = prior[key]
+        outbound.metadata["conversation_scene"] = snapshot
 
     def _dispatch_outbound(self, msg: CommsMessage) -> None:
         """Send an outbound message to its backend."""

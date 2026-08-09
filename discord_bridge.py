@@ -35,6 +35,7 @@ except ModuleNotFoundError as exc:
     raise
 
 from comms_core import CommsCore, CommsResponse, load_secret
+from conversation_scene import scene_with_memory_consideration
 from backend_discord import (
     make_sender_info_from_discord,
     make_channel_info_from_discord,
@@ -743,6 +744,7 @@ def choose_text_expression_strategy(
     emotion_available: bool,
     code_pointer_available: bool,
     song_available: bool = False,
+    conversation_scene: object = None,
 ) -> dict:
     """Choose response, deliberate mirroring, a fallback signal, or silence."""
     state = state if isinstance(state, dict) else {}
@@ -773,9 +775,21 @@ def choose_text_expression_strategy(
         expression_drive=drive,
     )
     previous_streak = int(mirror_evaluation["previous_mirror_streak"])
+    scene = conversation_scene if isinstance(conversation_scene, dict) else {}
+    scene_signals = scene.get("signals") if isinstance(scene.get("signals"), dict) else {}
+    has_prior_context = bool(scene_signals.get("has_prior_context"))
+    reply_expected = bool(scene_signals.get("reply_expected"))
+    continuity_count = len(scene_signals.get("continuity_terms") or [])
+    relevant_memory_count = len(scene.get("memory_references") or [])
+    scene_response_bonus = (
+        (0.12 if reply_expected else 0.0)
+        + (0.04 if has_prior_context else 0.0)
+        + min(0.06, 0.02 * continuity_count)
+        + min(0.06, 0.03 * relevant_memory_count)
+    )
 
     scores = {
-        "respond": 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest")
+        "respond": 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
         if adapter_available else None,
         "mirror": mirror_evaluation["score"] if mapped and coverage >= 0.6 else None,
         "emotion": (
@@ -788,7 +802,7 @@ def choose_text_expression_strategy(
             0.12 + 0.16 * unit("connection") + 0.14 * unit("interest")
             + 0.12 * playfulness + 0.08 * unit("intensity")
         ) if song_available else None,
-        "silence": 0.06 + 0.18 * (1.0 - drive) + 0.10 * unit("isolation") + 0.10 * (1.0 - unit("connection")),
+        "silence": max(0.0, 0.06 + 0.18 * (1.0 - drive) + 0.10 * unit("isolation") + 0.10 * (1.0 - unit("connection")) - (0.08 if reply_expected else 0.0)),
     }
     available = {name: score for name, score in scores.items() if score is not None}
     raw_intent = state.get("text_expression_intent")
@@ -823,6 +837,11 @@ def choose_text_expression_strategy(
             "expression_drive": round(drive, 4), "boredom": round(boredom, 4),
             "playfulness": round(playfulness, 4), "curiosity": round(unit("curiosity"), 4),
             "novelty": round(unit("novelty"), 4), "familiarity": round(unit("familiarity"), 4),
+            "scene_id": scene.get("scene_id"),
+            "scene_turn_count": int(scene.get("turn_count", 0) or 0),
+            "reply_expected": reply_expected,
+            "continuity_term_count": continuity_count,
+            "relevant_memory_count": relevant_memory_count,
         },
     }
 
@@ -1678,6 +1697,67 @@ def process_inbound_message(msg) -> CommsResponse:
     reply_text = None
     adapter = get_chat_adapter()
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "expression_arbiter"}
+    conversation_scene = (msg.metadata or {}).get("conversation_scene") or {}
+    prior_memory_candidates = [
+        dict(reference)
+        for reference in conversation_scene.get("memory_references", [])
+        if isinstance(reference, dict)
+    ]
+    conversation_scene = {
+        **conversation_scene,
+        "memory_references": [],
+        "memory_rejections": [],
+    }
+    memory_candidates = []
+    memory_consideration = {"accepted": [], "rejected": []}
+    recall_relevant = getattr(adapter, "recall_relevant", None)
+    consider_memories = getattr(adapter, "consider_recalled_memories", None)
+    if callable(recall_relevant) and user_text.strip():
+        try:
+            memory_limit = max(0, min(8, int(root_cfg.get("conversation_scene_memory_limit", 3))))
+            memory_chars = max(0, min(2400, int(root_cfg.get("conversation_scene_memory_chars", 800))))
+            memory_graph_bytes = max(1024, int(root_cfg.get("conversation_scene_memory_graph_max_bytes", 8 * 1024 * 1024)))
+            retrieved_candidates = recall_relevant(
+                user_text,
+                max_items=memory_limit,
+                max_chars=memory_chars,
+                max_graph_bytes=memory_graph_bytes,
+            )
+            candidate_by_key = {}
+            for candidate in [*prior_memory_candidates, *retrieved_candidates]:
+                if not isinstance(candidate, dict):
+                    continue
+                key = (candidate.get("event_id"), candidate.get("cue"))
+                candidate_by_key[key] = candidate
+            memory_candidates = list(candidate_by_key.values())[:memory_limit]
+            if callable(consider_memories):
+                memory_consideration = consider_memories(
+                    user_text, memory_candidates, scene=conversation_scene
+                )
+            elif memory_candidates:
+                memory_consideration = {
+                    "accepted": [],
+                    "rejected": [
+                        {
+                            **candidate,
+                            "consideration": {
+                                "decision": "rejected",
+                                "reason": "final_consideration_unavailable",
+                            },
+                        }
+                        for candidate in memory_candidates
+                    ],
+                }
+            conversation_scene = scene_with_memory_consideration(
+                conversation_scene,
+                memory_consideration,
+                max_items=memory_limit,
+                max_chars=memory_chars,
+            )
+            msg.metadata["conversation_scene"] = conversation_scene
+        except Exception:
+            logger.exception("Bounded conversational memory consideration failed.")
+    metadata["conversation_scene"] = conversation_scene
     if vision_context.get("perceptions"):
         metadata["vision_context"] = vision_context
 
@@ -1755,6 +1835,7 @@ def process_inbound_message(msg) -> CommsResponse:
         ],
         "channel": msg.channel.name,
         "conversation_context": conversation_context,
+        "conversation_scene": conversation_scene,
         "message_edit": edit_analysis,
         "expression_drive": urge_level,
         "vision": vision_context,
@@ -1856,6 +1937,7 @@ def process_inbound_message(msg) -> CommsResponse:
         emotion_available=emotion_signal is not None,
         code_pointer_available=code_pointer_signal is not None,
         song_available=bool(song_candidate.get("available")),
+        conversation_scene=conversation_scene,
     )
     decision_record = {
         **expression_decision,
@@ -2048,6 +2130,31 @@ def process_inbound_message(msg) -> CommsResponse:
             },
         )
         metadata.update(encoding_metadata)
+
+    show_memory_consideration = bool(
+        root_cfg.get("conversation_scene_show_memory_consideration", True)
+    )
+    if reply_text and show_memory_consideration:
+        consideration_descriptions = []
+        for reference in conversation_scene.get("memory_references", []):
+            decision = reference.get("consideration") if isinstance(reference, dict) else {}
+            description = decision.get("description") if isinstance(decision, dict) else None
+            if description:
+                consideration_descriptions.append(str(description))
+        for rejection in conversation_scene.get("memory_rejections", []):
+            decision = rejection.get("consideration") if isinstance(rejection, dict) else {}
+            description = decision.get("description") if isinstance(decision, dict) else None
+            if description:
+                consideration_descriptions.append(str(description))
+        if consideration_descriptions:
+            visible_limit = max(1, min(8, _coerce_positive_int(root_cfg.get("conversation_scene_memory_limit", 3), 3)))
+            reply_text += "\n\nMemory consideration:\n- " + "\n- ".join(
+                consideration_descriptions[:visible_limit]
+            )
+            metadata["memory_consideration_visible"] = True
+            metadata["memory_consideration_visible_count"] = min(
+                len(consideration_descriptions), visible_limit
+            )
 
     return CommsResponse(
         text=reply_text,
