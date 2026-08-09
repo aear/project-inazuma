@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from world_collision import HouseCollisionMap
+
 from world_protocol import (
     DEFAULT_STREAM_HOST,
     DEFAULT_STREAM_PORT,
@@ -320,11 +322,15 @@ class WorldState:
         bounds: Tuple[float, float, float, float],
         tv_channel: str,
         door_states: Optional[Dict[str, bool]] = None,
+        collision_map: Optional[HouseCollisionMap] = None,
+        collision_radius: float = 0.2,
     ) -> None:
         self._bounds = bounds
         self._tv_channel = tv_channel
         self._entities: Dict[str, EntityState] = {}
         self._doors: Dict[str, bool] = {}
+        self._collision_map = collision_map
+        self._collision_radius = max(0.01, float(collision_radius))
         if door_states:
             self._doors = {str(key): bool(value) for key, value in door_states.items()}
         self._lock = threading.Lock()
@@ -490,7 +496,15 @@ class WorldState:
         active = False
         with self._lock:
             for entity in self._entities.values():
-                entity_changed, entity_active = _step_entity(entity, dt, limits, self._bounds)
+                entity_changed, entity_active = _step_entity(
+                    entity,
+                    dt,
+                    limits,
+                    self._bounds,
+                    collision_map=self._collision_map,
+                    collision_radius=self._collision_radius,
+                    door_states=self._doors,
+                )
                 changed = changed or entity_changed
                 active = active or entity_active
             if changed:
@@ -548,6 +562,8 @@ class WorldServer:
         bounds: Tuple[float, float, float, float],
         tv_channel: str,
         door_states: Optional[Dict[str, bool]] = None,
+        collision_map: Optional[HouseCollisionMap] = None,
+        collision_radius: float = 0.2,
         scene_map: Dict[str, str],
         obs_bridge: Optional[Any],
         stream_enabled: bool,
@@ -568,7 +584,13 @@ class WorldServer:
         self._tcp_server: Optional[asyncio.AbstractServer] = None
         self._unix_server: Optional[asyncio.AbstractServer] = None
         self._limits = MotionLimits()
-        self._state = WorldState(bounds=bounds, tv_channel=tv_channel, door_states=door_states)
+        self._state = WorldState(
+            bounds=bounds,
+            tv_channel=tv_channel,
+            door_states=door_states,
+            collision_map=collision_map,
+            collision_radius=collision_radius,
+        )
         self._scene_map = scene_map
         self._obs_bridge = obs_bridge
         self._simulation_task: Optional[asyncio.Task] = None
@@ -1191,6 +1213,10 @@ def _step_entity(
     dt: float,
     limits: MotionLimits,
     bounds: Tuple[float, float, float, float],
+    *,
+    collision_map: Optional[HouseCollisionMap] = None,
+    collision_radius: float = 0.2,
+    door_states: Optional[Dict[str, bool]] = None,
 ) -> Tuple[bool, bool]:
     min_x, max_x, min_y, max_y = bounds
 
@@ -1251,9 +1277,27 @@ def _step_entity(
         entity.velocity[2] = 0.0
 
     old_pos = tuple(entity.position)
-    entity.position[0] += entity.velocity[0] * dt
-    entity.position[1] += entity.velocity[1] * dt
-    entity.position[2] += entity.velocity[2] * dt
+    desired = [
+        entity.position[0] + entity.velocity[0] * dt,
+        entity.position[1] + entity.velocity[1] * dt,
+        entity.position[2] + entity.velocity[2] * dt,
+    ]
+    if collision_map is not None:
+        resolved = collision_map.resolve_motion(
+            entity.position,
+            desired,
+            radius=collision_radius,
+            door_states=door_states,
+            foot_z=entity.position[2],
+        )
+        if abs(resolved[0] - desired[0]) > 1e-5:
+            entity.velocity[0] = 0.0
+        if abs(resolved[1] - desired[1]) > 1e-5:
+            entity.velocity[1] = 0.0
+        entity.position[:] = resolved
+    else:
+        # Compatibility path for a missing or unreadable house plan.
+        entity.position[:] = desired
 
     entity.position[0] = clamp(entity.position[0], min_x, max_x)
     entity.position[1] = clamp(entity.position[1], min_y, max_y)
@@ -1590,6 +1634,19 @@ async def _run(args: argparse.Namespace) -> None:
     if state_bounds is None:
         state_bounds = _load_bounds_from_plan(str(plan_path)) or (-10.0, 10.0, -10.0, 10.0)
 
+    collision_map = None
+    if plan_path:
+        try:
+            collision_map = HouseCollisionMap.from_plan(str(plan_path))
+            LOGGER.info("Loaded authoritative house collision from %s", plan_path)
+        except Exception as exc:
+            # Preserve the legacy outer-bounds fallback for malformed custom plans.
+            LOGGER.warning("House collision unavailable; using world bounds only: %s", exc)
+    try:
+        collision_radius = float(world_cfg.get("collision_radius", 0.2))
+    except (TypeError, ValueError):
+        collision_radius = 0.2
+
     server = WorldServer(
         unix_socket=args.unix_socket,
         tcp_host=args.tcp_host,
@@ -1599,6 +1656,8 @@ async def _run(args: argparse.Namespace) -> None:
         bounds=state_bounds,
         tv_channel=tv_channel,
         door_states=door_states,
+        collision_map=collision_map,
+        collision_radius=collision_radius,
         scene_map=scene_map,
         obs_bridge=obs_bridge,
         stream_enabled=args.stream_enabled,

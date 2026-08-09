@@ -8595,6 +8595,14 @@ def _maybe_emit_motor_intent() -> None:
     except Exception:
         cooldown = _MOTOR_INTENT_COOLDOWN
     cooldown = max(0.0, cooldown)
+    try:
+        action_min = max(0.5, float(config.get("motor_action_min_duration", 3.0)))
+        action_max = max(action_min, float(config.get("motor_action_max_duration", 6.0)))
+    except (TypeError, ValueError):
+        action_min, action_max = 3.0, 6.0
+    if cooldown > 0.0:
+        action_max = min(action_max, cooldown)
+        action_min = min(action_min, action_max)
 
     heartbeat_age = _age_seconds(get_inastate("last_world_heartbeat"), now=now)
     last_intent_age = _age_seconds(get_inastate("last_motor_intent"), now=now)
@@ -8729,7 +8737,7 @@ def _maybe_emit_motor_intent() -> None:
     forward = min(1.0, 0.35 + (0.45 * scale))
     strafe = random.uniform(-0.4, 0.4) * scale
     turn = random.uniform(-0.6, 0.6) * scale
-    duration = min(1.8, 0.6 + (0.9 * scale))
+    duration = action_min + ((action_max - action_min) * scale)
     run = scale > 0.75
 
     update_inastate(

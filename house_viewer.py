@@ -26,6 +26,8 @@ from geometry_utils import (
     get_unit_cylinder_meshdata,
     get_unit_sphere_meshdata,
 )
+from world_collision import HouseCollisionMap, distance_to_segment
+
 from house_model import (
     create_prototype_house,
     create_prototype_exterior,
@@ -888,6 +890,10 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.ina_avatar_parts: List[FurniturePart] = []
         self.ina_pos = None
         self.ina_velocity = np.zeros(3, dtype=float)
+        self._ina_network_target = None
+        self._ina_network_velocity = np.zeros(3, dtype=float)
+        self._ina_network_snapshot_at = 0.0
+        self._house_collision = None
         self.ina_anim_use_inastate = True
         self.ina_schema_path = "body_schema.json"
         self._schema_cache = {}
@@ -1321,6 +1327,8 @@ class HouseViewer(QtWidgets.QMainWindow):
         self.player_pos = None
         self.ina_avatar_parts = []
         self.ina_pos = None
+        self._ina_network_target = None
+        self._ina_network_snapshot_at = 0.0
         self.room_light_state = {}
         self.furniture_instances.clear()
         self.furniture_instances_by_id.clear()
@@ -1337,6 +1345,7 @@ class HouseViewer(QtWidgets.QMainWindow):
             house = create_prototype_house()
             exterior = create_prototype_exterior()
         self.exterior_model = exterior
+        self._house_collision = HouseCollisionMap(exterior)
         self._runtime_rooms = [room for room in house.rooms if room.name != "garden"]
         self._build_exterior(exterior)
 
@@ -3937,21 +3946,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         return math.hypot(end[0] - start[0], end[1] - start[1])
 
     def _distance_to_segment(self, point: Vec2, start: Vec2, end: Vec2):
-        px, py = point
-        sx, sy = start
-        ex, ey = end
-        vx = ex - sx
-        vy = ey - sy
-        length_sq = vx * vx + vy * vy
-        if length_sq < 1e-8:
-            return math.hypot(px - sx, py - sy), 0.0
-        t = ((px - sx) * vx + (py - sy) * vy) / length_sq
-        t = max(0.0, min(1.0, t))
-        proj_x = sx + t * vx
-        proj_y = sy + t * vy
-        dist = math.hypot(px - proj_x, py - proj_y)
-        offset = math.hypot(vx, vy) * t
-        return dist, offset
+        return distance_to_segment(point, start, end)
 
     def _set_architect_dirty(self):
         self.architect_dirty = True
@@ -5747,12 +5742,50 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._update_sky_positions()
         self._update_door_animations(min(dt, 0.05))
         self._update_tv_stream()
+        self._update_ina_network_motion(min(dt, 0.05))
         if not self.first_person_enabled:
             self._update_interaction_target()
             return
         self._apply_player_input(min(dt, 0.05))
         self._maybe_respawn_player()
         self._update_interaction_target()
+
+    def set_ina_network_pose(self, position, velocity=None) -> None:
+        target = np.array(position, dtype=float)
+        if target.shape != (3,) or not np.isfinite(target).all():
+            return
+        network_velocity = np.zeros(3, dtype=float)
+        if velocity is not None:
+            candidate = np.array(velocity, dtype=float)
+            if candidate.shape == (3,) and np.isfinite(candidate).all():
+                network_velocity = candidate
+        if self.ina_pos is None or self._ina_network_target is None:
+            self.ina_pos = target.copy()
+        elif float(np.linalg.norm(target - self.ina_pos)) > 2.0:
+            # Large changes are teleports or respawns; smoothing them crosses walls.
+            self.ina_pos = target.copy()
+        self._ina_network_target = target
+        self._ina_network_velocity = network_velocity
+        self.ina_velocity = network_velocity.copy()
+        self._ina_network_snapshot_at = time.perf_counter()
+        self._update_ina_avatar_mesh()
+
+    def _update_ina_network_motion(self, dt: float) -> None:
+        if self.ina_pos is None or self._ina_network_target is None:
+            return
+        age = max(0.0, time.perf_counter() - self._ina_network_snapshot_at)
+        velocity = self._ina_network_velocity if age <= 0.25 else np.zeros(3, dtype=float)
+        predicted = self._ina_network_target + velocity * min(age, 0.12)
+        delta = predicted - self.ina_pos
+        distance = float(np.linalg.norm(delta))
+        if distance > 2.0:
+            self.ina_pos = predicted.copy()
+        elif distance > 1e-5:
+            alpha = 1.0 - math.exp(-18.0 * max(0.0, dt))
+            self.ina_pos = self.ina_pos + delta * alpha
+        self.ina_velocity = velocity.copy()
+        if distance > 1e-5 or float(np.linalg.norm(velocity[:2])) > 0.01:
+            self._update_ina_avatar_mesh()
 
     def _apply_player_input(self, dt: float):
         if self.player_pos is None:
@@ -5895,18 +5928,20 @@ class HouseViewer(QtWidgets.QMainWindow):
         if self.exterior_model is None:
             return False
         radius = max(self.player_width, self.player_depth) * 0.5
-        px, py = float(pos[0]), float(pos[1])
-        for wall in self.exterior_model.walls:
-            dist, offset = self._distance_to_segment((px, py), wall.start, wall.end)
-            if dist <= (wall.thickness * 0.5 + radius):
-                if self._door_gap_allows(wall, offset, radius):
-                    continue
-                return True
-        if self._collides_with_fences(pos, radius):
+        collision = self._house_collision or HouseCollisionMap(self.exterior_model)
+        door_states = {
+            str(door.door_id): abs(door.current_angle) >= self.door_block_angle
+            for door in self.doors
+            if door.door_id
+        }
+        foot_z = float(pos[2]) - float(self.player_eye_height)
+        if collision.collides(
+            pos, radius=radius, door_states=door_states, foot_z=foot_z
+        ):
             return True
-        if self._collides_with_furniture(px, py, float(pos[2]), radius):
-            return True
-        return False
+        return self._collides_with_furniture(
+            float(pos[0]), float(pos[1]), float(pos[2]), radius
+        )
 
     def _collides_with_furniture(self, px: float, py: float, pz: float, radius: float) -> bool:
         if not self.furniture_instances:
@@ -5924,46 +5959,6 @@ class HouseViewer(QtWidgets.QMainWindow):
             if (dx * dx + dy * dy) <= (limit * limit):
                 return True
         return False
-
-    def _collides_with_fences(self, pos: np.ndarray, radius: float) -> bool:
-        if self.exterior_model is None:
-            return False
-        fences = []
-        if self.architect_state.fences:
-            fences = self.architect_state.fences
-        elif getattr(self.exterior_model, "fences", None):
-            fences = self.exterior_model.fences
-        if not fences:
-            return False
-        px, py = float(pos[0]), float(pos[1])
-        base_z = float(pos[2]) - float(self.player_eye_height)
-        for fence in fences:
-            if base_z >= float(fence.height) - 0.05:
-                continue
-            dist, _ = self._distance_to_segment((px, py), fence.start, fence.end)
-            if dist <= (float(fence.thickness) * 0.5 + radius):
-                return True
-        return False
-
-    def _door_gap_allows(self, wall: WallSegment, offset: float, radius: float) -> bool:
-        for opening in wall.openings:
-            if opening.type != "door":
-                continue
-            half_width = (opening.width * 0.5) + radius
-            if abs(offset - opening.offset_along_wall) <= half_width:
-                door = self._door_for_opening(wall, opening)
-                if door is not None and abs(door.current_angle) < self.door_block_angle:
-                    return False
-                return True
-        return False
-
-    def _door_for_opening(self, wall: WallSegment, opening: Opening) -> Optional[DoorInstance]:
-        for door in self.doors:
-            if door.wall_ref is not wall:
-                continue
-            if abs(door.offset_along_wall - opening.offset_along_wall) <= 1e-3:
-                return door
-        return None
 
     # ---- Generic mesh helper ----
 

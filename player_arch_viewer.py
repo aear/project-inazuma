@@ -607,16 +607,10 @@ class HouseViewerBridge(QtCore.QObject):
         pos = ina.get("position")
         if not isinstance(pos, (list, tuple)) or len(pos) < 3:
             return
-        self.viewer.ina_pos = np.array([float(pos[0]), float(pos[1]), float(pos[2])], dtype=float)
         velocity = ina.get("velocity")
-        if isinstance(velocity, (list, tuple)) and len(velocity) >= 3:
-            try:
-                self.viewer.ina_velocity = np.array(
-                    [float(velocity[0]), float(velocity[1]), float(velocity[2])], dtype=float
-                )
-            except Exception:
-                pass
-        self.viewer._update_ina_avatar_mesh()
+        if not isinstance(velocity, (list, tuple)) or len(velocity) < 3:
+            velocity = (0.0, 0.0, 0.0)
+        self.viewer.set_ina_network_pose(pos, velocity)
 
     def _send_door_state(self, door_id: str, open_state: bool) -> None:
         self.client.send({"type": "door", "door_id": door_id, "open": bool(open_state)})
