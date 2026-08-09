@@ -69,6 +69,7 @@ from text_memory import (
 from io_pressure import pressure_signal
 from music_delivery import ensure_opus_sidecar
 from discord_runtime import (
+    load_root_config as load_layered_root_config,
     typed_outbox_path,
     typed_outbox_history_path,
     typed_outbox_archive_path,
@@ -294,18 +295,12 @@ def _install_voice_debug_hooks():
 
 
 def load_root_config() -> dict:
-    """Lightweight loader for config.json without pulling in the full stack."""
-    if not CONFIG_PATH.exists():
-        return {}
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to read config at %s", CONFIG_PATH)
-        return {}
+    """Return the cached compatibility base plus owned config layers."""
+    return load_layered_root_config(CONFIG_PATH)
 
 
 def get_discord_config() -> dict:
-    """Return the discord block from config.json, or an empty dict."""
+    """Return the effective Discord policy block, or an empty dict."""
     cfg = load_root_config()
     section = cfg.get("discord") if isinstance(cfg, dict) else None
     return section if isinstance(section, dict) else {}

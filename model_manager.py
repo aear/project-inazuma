@@ -14,6 +14,7 @@ import gc
 import traceback
 import math
 import precision_memory_map
+from config_layers import load_config
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,17 +50,6 @@ try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
-
-def load_config():
-    path = Path("config.json")
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 config = load_config()
 CHILD = config.get("current_child", "Inazuma_Yagami")

@@ -1,21 +1,18 @@
 """Storage layout helpers for durable HDD + fast runtime devices."""
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from config_layers import load_config as load_layered_config
+
 
 def load_config(path: Path = Path("config.json")) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    if Path(path) == Path("config.json"):
+        return load_layered_config()
+    from io_utils import load_json_dict
+    return load_json_dict(Path(path))
 
 
 def format_child_path(raw: Any, child: str) -> Optional[Path]:

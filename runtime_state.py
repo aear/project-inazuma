@@ -7,18 +7,7 @@ from typing import Any, Dict, List, Optional
 from discord_runtime import typed_outbox_path
 from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json, file_lock
-
-
-def load_config() -> Dict[str, Any]:
-    path = Path("config.json")
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+from config_layers import load_config
 
 
 def _current_child() -> str:

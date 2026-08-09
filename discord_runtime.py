@@ -1,19 +1,17 @@
 """Resolve hot Discord bridge files without moving durable memory."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from config_layers import load_config as load_layered_config
+from io_utils import load_json_dict
+
 
 def load_root_config(path: Path = Path("config.json")) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    if Path(path) == Path("config.json"):
+        return load_layered_config()
+    return load_json_dict(Path(path))
 
 
 def discord_runtime_path(
