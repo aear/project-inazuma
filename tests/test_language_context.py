@@ -158,7 +158,7 @@ def test_shadow_reranker_reports_alternative_but_preserves_selected_symbol(monke
     }
     index = lp._build_text_vocab_word_symbol_index(links)
     audit = lp._shadow_audit_text_vocab_mappings(
-        ["bank"], links, index, child="TestChild",
+        "bank", ["bank"], links, index, child="TestChild",
         context={"language_context_snapshot": snapshot},
     )
 
@@ -166,3 +166,40 @@ def test_shadow_reranker_reports_alternative_but_preserves_selected_symbol(monke
     assert audit["candidate_audits"][0]["shadow_symbol"] == "sym_river"
     assert audit["selected_output_unchanged"] is True
     assert audit["counterfactual_audit"]["changed_tokens"] == ["bank"]
+
+
+def test_whole_written_message_is_retained_and_shapes_ambiguous_words():
+    text = "We sat beside the river bank.\n\nIt was quiet there."
+    state = {
+        "current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {}
+    }
+    snapshot = lc.build_language_context_snapshot(
+        {"source_text": text, "language_state_signals": state},
+        child="TestChild", logic_reader=False,
+    )
+    assert snapshot["message"]["text"] == text
+    assert snapshot["message"]["written_structure"]["sentence_count"] == 2
+    assert snapshot["message"]["written_structure"]["paragraph_count"] == 2
+
+    links = {"links": [
+        {"word": "bank", "symbol": "sym_finance", "confidence": 0.8, "tags": ["money"]},
+        {"word": "bank", "symbol": "sym_river", "confidence": 0.8, "tags": ["river"]},
+    ]}
+    index = lp._build_text_vocab_word_symbol_index(links)
+    tokens = [token.lower() for token in lp.re.findall(r"[A-Za-z0-9']+", text)]
+    audit = lp._shadow_audit_text_vocab_mappings(
+        text, tokens, links, index, child="TestChild",
+        context={"language_context_snapshot": snapshot},
+    )
+    bank = next(item for item in audit["candidate_audits"] if item["token"] == "bank")
+    assert bank["shadow_symbol"] == "sym_river"
+    assert bank["token_index"] == 5
+    assert [item["pass"] for item in bank["reread_choices"]] == [
+        "written_form", "discourse", "prediction_assisted"
+    ]
+    assert {item["symbol"] for item in bank["reread_choices"]} == {"sym_river"}
+    assert bank["reread_converged"] is True
+    assert bank["reread_helpful"] is True
+    assert bank["mapping_confidence_unchanged"] is True
+    assert audit["snapshot_summary"]["reread_converged"] == 1
+    assert audit["snapshot_summary"]["reread_helpful"] == 1

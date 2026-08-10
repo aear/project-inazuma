@@ -949,6 +949,7 @@ def _build_text_vocab_word_symbol_index(links_payload: Any) -> Dict[str, str]:
 
 
 def _shadow_audit_text_vocab_mappings(
+    text: str,
     tokens: List[str],
     links_payload: Any,
     linked_word_to_symbol: Dict[str, str],
@@ -959,8 +960,10 @@ def _shadow_audit_text_vocab_mappings(
     """Audit contextual alternatives without changing the selected mapping."""
     try:
         supplied = context.get("language_context_snapshot") if isinstance(context, dict) else None
+        snapshot_context = dict(context) if isinstance(context, dict) else {}
+        snapshot_context["source_text"] = text
         snapshot = supplied if isinstance(supplied, dict) else build_language_context_snapshot(
-            context, child=child, config=load_config()
+            snapshot_context, child=child, config=load_config()
         )
         if not snapshot.get("enabled"):
             return None
@@ -970,7 +973,12 @@ def _shadow_audit_text_vocab_mappings(
         counterfactual = []
         candidate_audits = []
         mapped_tokens = []
-        for token in tokens:
+        for token_index, token in enumerate(tokens):
+            occurrence_context = {
+                "index": token_index,
+                "before": tokens[max(0, token_index - 4):token_index],
+                "after": tokens[token_index + 1:token_index + 5],
+            }
             candidates = [
                 candidate
                 for candidate in _iter_text_vocab_link_candidates(
@@ -1005,7 +1013,9 @@ def _shadow_audit_text_vocab_mappings(
                 if not symbols:
                     continue
                 baseline = _score_text_vocab_candidate(candidate, empty_context)
-                contextual = score_mapping_candidate(candidate, snapshot)
+                contextual = score_mapping_candidate(
+                    candidate, snapshot, occurrence_context=occurrence_context
+                )
                 ranked.append({
                     "symbol": symbols[0],
                     "candidate": candidate,
@@ -1022,14 +1032,49 @@ def _shadow_audit_text_vocab_mappings(
                 max(ranked, key=lambda item: item["baseline_score"]),
             )
             shadow_choice = max(ranked, key=lambda item: item["combined_score"])
+            reread_choices = []
+            reread_limit = int((snapshot.get("reread_policy") or {}).get("max_passes", 1))
+            if len(distinct_symbols) > 1 and reread_limit > 1:
+                pass_names = ("written_form", "discourse", "prediction_assisted")
+
+                def pass_score(item, pass_index):
+                    parts = item["context_breakdown"].get("breakdown") or {}
+                    score = item["baseline_score"] + float(parts.get("written_neighbour_overlap", 0.0))
+                    if pass_index >= 1:
+                        score += float(parts.get("topic_tag_overlap", 0.0))
+                        score += float(parts.get("memory_tag_overlap", 0.0))
+                    if pass_index >= 2:
+                        score += float(parts.get("prediction_identity_match", 0.0))
+                    return score
+
+                for pass_index, pass_name in enumerate(pass_names[:reread_limit]):
+                    choice = max(ranked, key=lambda item: pass_score(item, pass_index))
+                    reread_choices.append({
+                        "pass": pass_name,
+                        "symbol": choice["symbol"],
+                        "score": round(pass_score(choice, pass_index), 4),
+                    })
+            reread_symbols = [choice["symbol"] for choice in reread_choices]
+            reread_converged = bool(
+                reread_symbols and len(set(reread_symbols)) == 1
+            )
+            reread_helpful = bool(
+                reread_choices
+                and shadow_choice["context_score"] > current_choice["context_score"]
+            )
             mapped_tokens.append(token)
             current.append(current_choice)
             counterfactual.append(shadow_choice)
             candidate_audits.append({
                 "token": token,
+                "token_index": token_index,
                 "current_symbol": current_choice["symbol"],
                 "shadow_symbol": shadow_choice["symbol"],
                 "changed": current_choice["symbol"] != shadow_choice["symbol"],
+                "reread_choices": reread_choices,
+                "reread_converged": reread_converged,
+                "reread_helpful": reread_helpful,
+                "mapping_confidence_unchanged": True,
                 "candidates": [
                     {
                         "symbol": item["symbol"],
@@ -1050,6 +1095,15 @@ def _shadow_audit_text_vocab_mappings(
             "prediction_fresh": bool((snapshot.get("prediction") or {}).get("fresh")),
             "prediction_eligible": bool(
                 (snapshot.get("prediction") or {}).get("eligible_for_shadow_score")
+            ),
+            "reread_tokens": sum(
+                1 for item in candidate_audits if item.get("reread_choices")
+            ),
+            "reread_converged": sum(
+                1 for item in candidate_audits if item.get("reread_converged")
+            ),
+            "reread_helpful": sum(
+                1 for item in candidate_audits if item.get("reread_helpful")
             ),
         }
         return {
@@ -1990,6 +2044,7 @@ def generate_symbolic_reply_from_text(
     links_payload = load_text_vocab_links(child, base_path=base_path)
     linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
     language_context_shadow = _shadow_audit_text_vocab_mappings(
+        text,
         tokens,
         links_payload,
         linked_word_to_symbol,

@@ -32,6 +32,7 @@ DEFAULT_POLICY = {
     "prediction_max_age_seconds": 1800.0,
     "prediction_min_confidence": 0.55,
     "prediction_min_clarity": 0.05,
+    "reread_max_passes": 3,
 }
 
 
@@ -44,6 +45,7 @@ def get_language_context_policy(config: Optional[Mapping[str, Any]] = None) -> D
     policy["max_turn_chars"] = max(40, min(600, int(policy["max_turn_chars"])))
     policy["max_memory_references"] = max(0, min(8, int(policy["max_memory_references"])))
     policy["max_logic_entries"] = max(0, min(8, int(policy["max_logic_entries"])))
+    policy["reread_max_passes"] = max(1, min(3, int(policy["reread_max_passes"])))
     return policy
 
 
@@ -120,6 +122,22 @@ def _compact_memories(scene: Mapping[str, Any], limit: int) -> list[dict]:
     return result
 
 
+def _text_structure(text: str) -> dict:
+    """Describe written form without turning it into separate language events."""
+    paragraphs = [part for part in re.split(r"\n\s*\n", text) if part.strip()]
+    sentences = [
+        part for part in re.split(r"(?<=[.!?])(?:\s+|$)|\n+", text) if part.strip()
+    ]
+    return {
+        "character_count": len(text),
+        "word_count": len(_words(text)),
+        "sentence_count": len(sentences),
+        "paragraph_count": len(paragraphs),
+        "line_count": len(text.splitlines()) if text else 0,
+        "has_terminal_punctuation": bool(re.search(r"[.!?][\"')\]]*\s*$", text)),
+    }
+
+
 def _prediction_signal(raw: Any, policy: Mapping[str, Any], now: datetime) -> dict:
     prediction = raw if isinstance(raw, Mapping) else {}
     vector = prediction.get("predicted_vector")
@@ -172,7 +190,8 @@ def build_language_context_snapshot(
     signals = signals if isinstance(signals, Mapping) else {}
     turns = _compact_turns(context, policy)
     memories = _compact_memories(scene, int(policy["max_memory_references"]))
-    current_words = _bounded_unique(_words(context.get("source_text")), 32)
+    current_text = str(context.get("source_text") or "")
+    current_words = _bounded_unique(_words(current_text), 64)
     topic_terms = _bounded_unique(scene.get("topic_terms") or [], 12)
     continuity = _bounded_unique(signals.get("continuity_terms") or [], 12)
     referents = _bounded_unique(
@@ -233,7 +252,14 @@ def build_language_context_snapshot(
         "enabled": True,
         "shadow_only": bool(policy["shadow_only"]),
         "captured_at": now.isoformat(),
-        "message": {"words": current_words, "channel": context.get("channel")},
+        "message": {
+            # This is the complete event text. Discord transport chunking occurs
+            # later and must never masquerade as separate thoughts here.
+            "text": current_text,
+            "words": current_words,
+            "channel": context.get("channel"),
+            "written_structure": _text_structure(current_text),
+        },
         "recent_scene": turns,
         "reply_ancestry": reply_ids,
         "candidate_referents": referents,
@@ -259,6 +285,12 @@ def build_language_context_snapshot(
         },
         "ambiguity_set": [],
         "evidence_channels": {kind: [] for kind in _EVIDENCE_KINDS},
+        "reread_policy": {
+            "max_passes": int(policy["reread_max_passes"]),
+            "trigger": "mapping_ambiguity",
+            "may_support_expression_confidence": True,
+            "mutates_mapping_confidence": False,
+        },
         "provenance": {
             "message": "event_context",
             "scene": "conversation_scene",
@@ -291,7 +323,12 @@ def _candidate_tags(candidate: Mapping[str, Any]) -> set[str]:
     return set(values)
 
 
-def score_mapping_candidate(candidate: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict:
+def score_mapping_candidate(
+    candidate: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    *,
+    occurrence_context: Optional[Mapping[str, Any]] = None,
+) -> dict:
     """Return an explainable shadow score; never mutate candidate confidence."""
     tags = _candidate_tags(candidate)
     topic = snapshot.get("topic_continuity") if isinstance(snapshot.get("topic_continuity"), Mapping) else {}
@@ -304,6 +341,10 @@ def score_mapping_candidate(candidate: Mapping[str, Any], snapshot: Mapping[str,
             memory_words.update(_words(memory.get("cue")))
             memory_words.update(_words(memory.get("tags")))
     memory_matches = sorted(tags & memory_words)
+    occurrence_context = occurrence_context if isinstance(occurrence_context, Mapping) else {}
+    neighbour_matches = sorted(tags & set(_words([
+        occurrence_context.get("before"), occurrence_context.get("after")
+    ])))
     prediction = snapshot.get("prediction") if isinstance(snapshot.get("prediction"), Mapping) else {}
     candidate_symbols = _bounded_unique([
         candidate.get("symbol"), candidate.get("symbol_id"), candidate.get("symbol_word_id"),
@@ -314,6 +355,7 @@ def score_mapping_candidate(candidate: Mapping[str, Any], snapshot: Mapping[str,
     breakdown = {
         "topic_tag_overlap": len(tag_matches) * 3.0,
         "memory_tag_overlap": len(memory_matches) * 2.0,
+        "written_neighbour_overlap": len(neighbour_matches) * 4.0,
         "prediction_identity_match": 4.0 if prediction_match else 0.0,
     }
     return {
@@ -321,6 +363,7 @@ def score_mapping_candidate(candidate: Mapping[str, Any], snapshot: Mapping[str,
         "breakdown": breakdown,
         "matched_topic_tags": tag_matches,
         "matched_memory_tags": memory_matches,
+        "matched_written_neighbours": neighbour_matches,
         "prediction_match": prediction_match,
     }
 

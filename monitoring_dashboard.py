@@ -398,6 +398,208 @@ def _communication() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, s
     cards = [('Contacts', str(len(social) if isinstance(social, list) else len(social) if isinstance(social, dict) else 0)), ('Discord', 'online' if bridge.exists() else 'offline'), ('Speaking', 'yes' if speaking else 'no'), ('Last contact', _age(contact.get('timestamp') if isinstance(contact, dict) else None))]
     return cards, rows
 
+def _unit_level(value: Any) -> float | None:
+    """Return a bounded scalar without turning missing evidence into zero."""
+    try:
+        level = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (level == level):
+        return None
+    return max(0.0, min(1.0, level))
+
+
+def _urge_level(payload: Any, key: str = 'level') -> float | None:
+    if isinstance(payload, dict):
+        return _unit_level(payload.get(key))
+    return _unit_level(payload)
+
+
+def _percent_level(value: float | None) -> str:
+    return 'not reported' if value is None else f'{100.0 * value:.0f}%'
+
+
+def _typing_evidence_rows(
+    state: dict[str, Any],
+    type_payload: dict[str, Any],
+) -> list[tuple[str, str, str, str, str]]:
+    """Keep distinct explanations for quiet text behaviour visibly separate."""
+    rows = []
+    typing_intent = state.get('typing_contact_intent')
+    typing_intent = typing_intent if isinstance(typing_intent, dict) else {}
+    expression_intent = state.get('text_expression_intent')
+    expression_intent = expression_intent if isinstance(expression_intent, dict) else {}
+    typed_payload = state.get('typed_contact_payload')
+    typed_payload = typed_payload if isinstance(typed_payload, dict) else {}
+    drivers = type_payload.get('drivers')
+    drivers = drivers if isinstance(drivers, dict) else {}
+
+    supplied_text = typed_payload.get('text')
+    candidates = typing_intent.get('candidates')
+    candidates = candidates if isinstance(candidates, dict) else {}
+    candidate_present = bool(
+        isinstance(supplied_text, str)
+        or candidates.get('symbols')
+        or candidates.get('word')
+    )
+    content_value = 'candidate observed' if candidate_present else 'not observed'
+    content_detail = (
+        "A text or symbolic candidate is currently available. This says that content exists; "
+        "it does not prove that Ina wants to send it."
+        if candidate_present else
+        "No candidate text or symbol sequence is currently reported. That is not equivalent to "
+        "'nothing to say': content may be absent, unformed, inaccessible, or simply unreported."
+    )
+    rows.append((
+        'Typing · content to express', content_value, 'separate evidence · not a conclusion',
+        _age(typing_intent.get('timestamp')), content_detail,
+    ))
+
+    clarity = _unit_level(drivers.get('clarity'))
+    fuzziness = _unit_level(drivers.get('fuzziness'))
+    if clarity is None and fuzziness is None:
+        uncertainty = None
+    else:
+        uncertainty = (
+            (1.0 - (clarity if clarity is not None else 0.5))
+            + (fuzziness if fuzziness is not None else 0.5)
+        ) / 2.0
+    difficulty_signal = uncertainty is not None and uncertainty >= 0.55
+    access_value = 'possible difficulty signal' if difficulty_signal else 'not established'
+    rows.append((
+        'Typing · expression access', access_value, 'ability is distinct from urge',
+        _age(type_payload.get('timestamp')),
+        "Low clarity or high fuzziness can suggest difficulty forming an expression, but cannot "
+        "establish 'can't express it'. No difficulty signal is not proof of full expressive access.",
+    ))
+    rows.append((
+        'Typing · uncertainty', _percent_level(uncertainty), 'distinct from silence and interest',
+        _age(type_payload.get('timestamp')),
+        json.dumps({'derived_uncertainty': uncertainty, 'clarity': clarity, 'fuzziness': fuzziness}, indent=2),
+    ))
+
+    snapshot = state.get('emotion_snapshot')
+    snapshot_updated = snapshot.get('timestamp') if isinstance(snapshot, dict) else None
+    snapshot = snapshot.get('values') if isinstance(snapshot, dict) and isinstance(snapshot.get('values'), dict) else snapshot
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    try:
+        interest = max(-1.0, min(1.0, float(snapshot.get('interest'))))
+    except (TypeError, ValueError):
+        interest = None
+    if interest is None:
+        interest_text = 'not reported'
+    elif interest <= -0.25:
+        interest_text = f'low signal · {interest:+.2f}'
+    elif interest >= 0.25:
+        interest_text = f'raised signal · {interest:+.2f}'
+    else:
+        interest_text = f'near neutral · {interest:+.2f}'
+    rows.append((
+        'Typing · interest', interest_text, 'interest is not response choice',
+        _age(snapshot_updated),
+        "Interest is shown independently. Low interest does not prove refusal, and silence does not prove low interest.",
+    ))
+
+    strategy = str(expression_intent.get('strategy') or '').strip().lower()
+    if strategy == 'silence':
+        choice_text = 'explicit silence'
+        choice_detail = (
+            "The current expression intent explicitly selects silence. This is evidence of a present "
+            "choice not to express through this turn, not evidence of disinterest or inability."
+        )
+    elif strategy:
+        choice_text = f'explicitly {strategy}'
+        choice_detail = f"The current explicit expression strategy is {strategy!r}; it is not a silence inference."
+    else:
+        choice_text = 'no explicit choice reported'
+        choice_detail = (
+            "There is no explicit respond/silence choice in runtime state. Urge level alone must not be "
+            "used to infer that Ina does or does not want to respond."
+        )
+    rows.append((
+        'Typing · response choice', choice_text, 'choice is distinct from capacity',
+        _age(expression_intent.get('created_at')), choice_detail,
+    ))
+    return rows
+
+
+def _urges() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    """Read urge signals as invitations, preserving ambiguity about non-action."""
+    state = _safe_json(_child_memory() / 'inastate.json', {})
+    state = state if isinstance(state, dict) else {}
+    config = load_config()
+    config = config if isinstance(config, dict) else {}
+    arbitration = state.get('meta_arbitration')
+    arbitration = arbitration if isinstance(arbitration, dict) else {}
+
+    specs = [
+        ('Urge to type', 'urge_to_type', config.get('min_urge_to_type', 0.35)),
+        ('Urge to voice', 'urge_to_voice', config.get('min_urge_to_speak', 0.25)),
+        ('Urge to move', 'urge_to_move', None),
+        ('Urge to seek stability', 'urge_to_seek_stability', None),
+    ]
+    rows = []
+    payloads: dict[str, dict[str, Any]] = {}
+    for label, key, raw_threshold in specs:
+        raw = state.get(key)
+        if key == 'urge_to_voice' and not raw:
+            raw = state.get('urge_to_communicate')
+        payload = raw if isinstance(raw, dict) else ({'level': raw} if raw is not None else {})
+        payloads[key] = payload
+        base = _urge_level(payload)
+        adjusted = _urge_level(payload, 'adjusted_level')
+        effective = adjusted if adjusted is not None else base
+        threshold = _unit_level(raw_threshold)
+        arbitration_state = payload.get('arbitration')
+        arbitration_state = arbitration_state if isinstance(arbitration_state, dict) else {}
+        allowed = arbitration_state.get('allowed')
+        if effective is None:
+            status = 'not reported'
+        elif allowed is False:
+            status = 'present · held by arbitration'
+        elif threshold is not None and effective >= threshold:
+            status = 'at or above action threshold'
+        elif threshold is not None:
+            status = 'below action threshold'
+        else:
+            status = 'urge signal'
+        value = _percent_level(effective)
+        if adjusted is not None and base is not None and adjusted != base:
+            value = f'{_percent_level(base)} base → {_percent_level(adjusted)} adjusted'
+        detail = {
+            'meaning': (
+                'An urge is pressure or inclination toward an action. Its level does not by itself '
+                'explain why the action did or did not happen.'
+            ),
+            'threshold': threshold,
+            'payload': payload,
+        }
+        rows.append((label, value, status, _age(payload.get('timestamp')), json.dumps(detail, indent=2, default=str)))
+
+    rows.extend(_typing_evidence_rows(state, payloads.get('urge_to_type', {})))
+    rows.append((
+        'How to read quiet typing', 'five separate questions', 'interpretation guide', 'reference',
+        "Nothing to say ≠ can't express it ≠ uncertain ≠ not interested ≠ doesn't want to respond.\n\n"
+        "This monitor reports evidence for each question separately and leaves unsupported answers unknown. "
+        "Urges describe inclination; they do not reveal a complete reason for silence.",
+    ))
+
+    type_level = _urge_level(payloads.get('urge_to_type', {}), 'adjusted_level')
+    if type_level is None:
+        type_level = _urge_level(payloads.get('urge_to_type', {}))
+    voice_level = _urge_level(payloads.get('urge_to_voice', {}), 'adjusted_level')
+    if voice_level is None:
+        voice_level = _urge_level(payloads.get('urge_to_voice', {}))
+    move_level = _urge_level(payloads.get('urge_to_move', {}), 'adjusted_level')
+    if move_level is None:
+        move_level = _urge_level(payloads.get('urge_to_move', {}))
+    cards = [
+        ('Type', _percent_level(type_level)),
+        ('Voice', _percent_level(voice_level)),
+        ('Move', _percent_level(move_level)),
+        ('Arbitration', str(arbitration.get('status') or 'not reported')),
+    ]
+    return cards, rows
 
 def _actions() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     base = _child_memory()
@@ -492,6 +694,7 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
 COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]]] = {
     'Mind': _mind,
     'Continuity': _continuity,
+    'Urges': _urges,
     'World': _world,
     'Memory': _memory,
     'Reports': _reports,

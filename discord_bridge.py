@@ -1857,10 +1857,14 @@ def process_inbound_message(msg) -> CommsResponse:
         audit = shadow.get("counterfactual_audit") if isinstance(shadow, dict) else None
         if isinstance(audit, dict):
             logger.info(
-                "Language context shadow: changed=%d delta=%s coherent=%s output_unchanged=true",
+                "Language context shadow: changed=%d delta=%s coherent=%s "
+                "reread=%s/%s helpful=%s output_unchanged=true",
                 len(audit.get("changed_tokens") or []),
                 audit.get("delta"),
                 audit.get("counterfactual_more_coherent"),
+                (shadow.get("snapshot_summary") or {}).get("reread_converged"),
+                (shadow.get("snapshot_summary") or {}).get("reread_tokens"),
+                (shadow.get("snapshot_summary") or {}).get("reread_helpful"),
             )
     vision_symbols = vision_context.get("recognized_symbols") or []
     if vision_symbols:
