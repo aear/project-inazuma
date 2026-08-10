@@ -5,6 +5,7 @@ import os
 import json
 import wave
 import contextlib
+import math
 import sys
 import atexit
 import signal
@@ -67,6 +68,13 @@ except Exception as e:  # pragma: no cover - import guard
     _AUDIO_DIGEST_IMPORT_ERROR = e
 
 _PDF_IMPORT_ERROR = None
+_AUDIO_METADATA_IMPORT_ERROR = None
+try:
+    from pydub.utils import mediainfo_json  # type: ignore
+except Exception as e:  # pragma: no cover - optional dependency
+    mediainfo_json = None
+    _AUDIO_METADATA_IMPORT_ERROR = e
+
 try:
     import fitz  # type: ignore
 except Exception as e:  # pragma: no cover - optional dependency
@@ -551,7 +559,10 @@ def _ina_owned_music_path(relative_label):
     """Recognize the explicit Ina-authored namespace in a music library."""
     normalized = str(relative_label or "").replace("\\", "/")
     parts = [part.strip().casefold() for part in normalized.split("/") if part.strip()]
-    return any(re.match(r"^ina[\s_-]+sings\b", part) for part in parts)
+    return any(
+        re.match(r"^ina[\s_-]+sings(?:$|[\s_:-])", part)
+        for part in parts
+    )
 
 
 def _is_studio_stem_root(base_root):
@@ -2306,11 +2317,310 @@ def fragment_image(image_source, transformer, source_label=None):
         log_to_statusbox(f"[RawFileManager] Failed to process image {label}: {e}")
         return []
 
+AUDIO_METADATA_TEXT_LIMIT = 2048
+AUDIO_LYRICS_TEXT_LIMIT = 32 * 1024
+AUDIO_METADATA_LIST_LIMIT = 32
+AUDIO_FEATURE_VECTOR_LIMIT = 512
+
+
+def _bounded_audio_metadata_text(value, limit=AUDIO_METADATA_TEXT_LIMIT):
+    if value is None or isinstance(value, dict):
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = [
+            _bounded_audio_metadata_text(item, limit)
+            for item in list(value)[:AUDIO_METADATA_LIST_LIMIT]
+        ]
+        value = "; ".join(part for part in parts if part)
+    elif isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    else:
+        value = str(value)
+    return " ".join(value.replace("\x00", " ").split())[:limit]
+
+
+def _bounded_audio_lyrics(value, limit=AUDIO_LYRICS_TEXT_LIMIT):
+    if isinstance(value, (list, tuple, set)):
+        parts = [
+            _bounded_audio_lyrics(item, limit)
+            for item in list(value)[:AUDIO_METADATA_LIST_LIMIT]
+        ]
+        value = "\n\n".join(part for part in parts if part)
+    elif isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    elif value is None or isinstance(value, dict):
+        return ""
+    else:
+        value = str(value)
+    normalized_lines = [
+        " ".join(line.split())
+        for line in value.replace("\x00", " ").replace("\r\n", "\n").split("\n")
+    ]
+    return "\n".join(normalized_lines).strip()[:limit]
+
+
+def _normalize_audio_metadata_value(value, limit=AUDIO_METADATA_TEXT_LIMIT):
+    if isinstance(value, (list, tuple, set)):
+        normalized = []
+        for item in list(value)[:AUDIO_METADATA_LIST_LIMIT]:
+            text = _bounded_audio_metadata_text(item, limit)
+            if text and text not in normalized:
+                normalized.append(text)
+        if not normalized:
+            return None
+        return normalized[0] if len(normalized) == 1 else normalized
+    text = _bounded_audio_metadata_text(value, limit)
+    return text or None
+
+
+def _audio_metadata_number(value, *, integer=False):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(round(number)) if integer else round(number, 6)
+
+
+def _normalized_audio_tag_key(value):
+    return re.sub(
+        r"_+",
+        "_",
+        str(value or "").strip().casefold().replace("-", "_").replace(" ", "_"),
+    ).strip("_")
+
+
+def _extract_audio_metadata(audio_path):
+    """Return bounded descriptive and technical metadata from ffprobe/pydub."""
+    if mediainfo_json is None:
+        return {}
+
+    try:
+        probe = mediainfo_json(str(audio_path))
+    except Exception as exc:
+        log_to_statusbox(
+            f"[RawFileManager] Audio metadata probe failed for {audio_path}: {exc}"
+        )
+        return {}
+    if not isinstance(probe, dict):
+        return {}
+
+    format_info = probe.get("format")
+    format_info = format_info if isinstance(format_info, dict) else {}
+    streams = probe.get("streams")
+    streams = streams if isinstance(streams, list) else []
+    audio_stream = next(
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        ),
+        {},
+    )
+
+    combined_tags = {}
+    for source in (audio_stream.get("tags"), format_info.get("tags")):
+        if not isinstance(source, dict):
+            continue
+        for raw_key, raw_value in source.items():
+            key = _normalized_audio_tag_key(raw_key)
+            if key:
+                combined_tags[key] = raw_value
+
+    lyrics_parts = []
+    normalized_tags = {}
+    for key, raw_value in combined_tags.items():
+        is_lyrics = (
+            key.startswith("lyrics")
+            or "unsyncedlyrics" in key
+            or "syncedlyrics" in key
+        )
+        if is_lyrics:
+            lyrics = _bounded_audio_lyrics(raw_value)
+            if lyrics and lyrics not in lyrics_parts:
+                lyrics_parts.append(lyrics)
+            continue
+        value = _normalize_audio_metadata_value(raw_value)
+        if value is not None:
+            normalized_tags[key] = value
+
+    aliases = {
+        "title": ("title",),
+        "artist": ("artist", "artists"),
+        "album": ("album",),
+        "album_artist": ("album_artist", "albumartist"),
+        "genre": ("genre",),
+        "date": ("date", "year"),
+        "track": ("track", "tracknumber", "track_number"),
+        "disc": ("disc", "discnumber", "disc_number"),
+        "composer": ("composer",),
+        "comment": ("comment", "description"),
+        "copyright": ("copyright",),
+    }
+    metadata = {}
+    for canonical, keys in aliases.items():
+        for key in keys:
+            value = normalized_tags.get(key)
+            if value is not None:
+                metadata[canonical] = value
+                break
+
+    if normalized_tags:
+        metadata["tags"] = normalized_tags
+    if lyrics_parts:
+        metadata["lyrics"] = "\n\n".join(lyrics_parts)[:AUDIO_LYRICS_TEXT_LIMIT]
+
+    technical = {}
+    text_fields = {
+        "format": format_info.get("format_name"),
+        "codec": audio_stream.get("codec_name"),
+    }
+    for key, value in text_fields.items():
+        normalized = _normalize_audio_metadata_value(value, 128)
+        if normalized is not None:
+            technical[key] = normalized
+
+    numeric_fields = {
+        "duration_seconds": (
+            audio_stream.get("duration") or format_info.get("duration"),
+            False,
+        ),
+        "bit_rate": (
+            audio_stream.get("bit_rate") or format_info.get("bit_rate"),
+            True,
+        ),
+        "sample_rate": (audio_stream.get("sample_rate"), True),
+        "channels": (audio_stream.get("channels"), True),
+        "file_size": (format_info.get("size"), True),
+        "stream_index": (audio_stream.get("index"), True),
+    }
+    for key, (value, integer) in numeric_fields.items():
+        normalized = _audio_metadata_number(value, integer=integer)
+        if normalized is not None:
+            technical[key] = normalized
+
+    attached_pictures = [
+        stream
+        for stream in streams
+        if isinstance(stream, dict)
+        and isinstance(stream.get("disposition"), dict)
+        and bool(stream["disposition"].get("attached_pic"))
+    ]
+    technical["attached_picture"] = bool(attached_pictures)
+    if attached_pictures:
+        artwork_codec = _normalize_audio_metadata_value(
+            attached_pictures[0].get("codec_name"),
+            128,
+        )
+        if artwork_codec:
+            technical["artwork_codec"] = artwork_codec
+    if technical:
+        metadata["technical"] = technical
+    return metadata
+
+
+def _flat_audio_feature_vector(analysis):
+    """Prefer the digest's bounded embedding; safely flatten legacy matrices."""
+    if not isinstance(analysis, dict):
+        return []
+
+    candidates = (analysis.get("embedding"), analysis.get("frames"))
+    for candidate in candidates:
+        values = []
+
+        def collect(value):
+            if len(values) >= AUDIO_FEATURE_VECTOR_LIMIT:
+                return
+            if isinstance(value, (list, tuple)):
+                for child_value in value:
+                    collect(child_value)
+                    if len(values) >= AUDIO_FEATURE_VECTOR_LIMIT:
+                        break
+                return
+            if isinstance(value, bool):
+                return
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return
+            if math.isfinite(number):
+                values.append(number)
+
+        collect(candidate)
+        if values:
+            return values
+    return []
+
+
+def _audio_fragment_summary(audio_path, analysis, metadata):
+    base = (
+        analysis.get("summary")
+        if isinstance(analysis, dict)
+        else None
+    ) or f"Sound fragment from {audio_path.name}"
+    title = _bounded_audio_metadata_text(metadata.get("title"), 300)
+    artist = _bounded_audio_metadata_text(metadata.get("artist"), 300)
+    if title and artist:
+        return f"{title} by {artist}. {base}"
+    if title:
+        return f"{title}. {base}"
+    return base
+
+
+def _attach_audio_analysis(frag, analysis, metadata):
+    if metadata:
+        frag["audio_metadata"] = metadata
+        tags = frag.setdefault("tags", [])
+        if "audio_metadata" not in tags:
+            tags.append("audio_metadata")
+        if metadata.get("lyrics") and "embedded_lyrics" not in tags:
+            tags.append("embedded_lyrics")
+        technical = metadata.get("technical")
+        if (
+            isinstance(technical, dict)
+            and technical.get("attached_picture")
+            and "embedded_cover_art" not in tags
+        ):
+            tags.append("embedded_cover_art")
+
+    analysis_payload = {}
+    for key in ("texture_signature", "diversity_boost", "unique_symbols", "language_hint"):
+        value = analysis.get(key) if isinstance(analysis, dict) else None
+        if value is not None:
+            analysis_payload[key] = value
+    if isinstance(analysis, dict) and analysis.get("symbol_embedding"):
+        analysis_payload["symbol_embedding"] = analysis["symbol_embedding"]
+    frames = analysis.get("frames") if isinstance(analysis, dict) else None
+    if isinstance(frames, list):
+        analysis_payload["frame_count"] = len(frames)
+        first_frame = frames[0] if frames else None
+        if isinstance(first_frame, (list, tuple)):
+            analysis_payload["feature_bins"] = len(first_frame)
+    if analysis_payload:
+        frag["audio_analysis"] = analysis_payload
+
+    if isinstance(analysis, dict):
+        frag["analysis_paths"] = {
+            "symbol_map": analysis.get("symbol_map_path"),
+            "symbol_words": analysis.get("symbol_words_path"),
+        }
+        frag["multi_symbol_pairs"] = analysis.get("multi_symbol_pairs", [])
+
+
 def fragment_audio(audio_path, transformer):
     ext = audio_path.suffix.lower()
+    supported_digest_formats = {".wav", ".mp3", ".opus"}
+    if ext not in supported_digest_formats:
+        log_to_statusbox(
+            f"[RawFileManager] Unsupported audio format for {audio_path.name}: {ext}"
+        )
+        return []
 
     analysis = None
-    if analyze_audio_clip is not None and ext in {".wav", ".mp3", ".opus"}:
+    if analyze_audio_clip is not None:
         try:
             try:
                 analysis = analyze_audio_clip(
@@ -2320,8 +2630,27 @@ def fragment_audio(audio_path, transformer):
                 if "unexpected keyword argument" not in str(exc):
                     raise
                 analysis = analyze_audio_clip(audio_path, transformer)
-        except Exception as e:
-            log_to_statusbox(f"[RawFileManager] Audio digest failed for {audio_path}: {e}")
+        except Exception as exc:
+            log_to_statusbox(
+                f"[RawFileManager] Audio digest failed for {audio_path}: {exc}"
+            )
+
+    metadata = (
+        _extract_audio_metadata(audio_path) if ext in {".mp3", ".opus"} else {}
+    )
+
+    def merged_tags():
+        tags = ["self_read", "audio"]
+        raw_tags = analysis.get("tags", []) if isinstance(analysis, dict) else []
+        if isinstance(raw_tags, str):
+            raw_tags = [raw_tags]
+        if not isinstance(raw_tags, (list, tuple, set)):
+            raw_tags = []
+        for tag in raw_tags:
+            normalized = _bounded_audio_metadata_text(tag, 128)
+            if normalized and normalized not in tags:
+                tags.append(normalized)
+        return tags
 
     if ext == ".wav":
         try:
@@ -2329,98 +2658,123 @@ def fragment_audio(audio_path, transformer):
                 frames = wf.readframes(wf.getnframes())
                 frame_count = wf.getnframes()
                 sample_rate = wf.getframerate()
-        except Exception as e:
-            log_to_statusbox(f"[RawFileManager] Failed to process WAV {audio_path}: {e}")
+                channel_count = wf.getnchannels()
+                sample_width_bits = wf.getsampwidth() * 8
+        except Exception as exc:
+            log_to_statusbox(
+                f"[RawFileManager] Failed to process WAV {audio_path}: {exc}"
+            )
             return []
 
-        duration = frame_count / float(sample_rate or 1)
-        audio_data = list(frames[:1024])
-        tags = ["self_read", "audio"]
-
-        if analysis:
-            for tag in analysis.get("tags", []):
-                if tag not in tags:
-                    tags.append(tag)
-
-        frag = {
-            "modality": "audio",
-            "audio_features": [x / 255.0 for x in audio_data],
-            "summary": analysis.get("summary", f"Sound fragment from {audio_path.name}") if analysis else f"Sound fragment from {audio_path.name}",
-            "tags": tags,
-            "source": str(audio_path),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "emotions": (analysis.get("emotions") if analysis else None) or {"attention": 0.5, "novelty": 0.6},
-            "duration": analysis.get("duration", duration) if analysis else duration,
-        }
-
-        if analysis:
-            frag["symbols"] = analysis.get("symbols", [])
-            frag["proto_words"] = analysis.get("proto_words", [])
-            frag["analysis_paths"] = {
-                "symbol_map": analysis.get("symbol_map_path"),
-                "symbol_words": analysis.get("symbol_words_path"),
+        wave_duration = frame_count / float(sample_rate or 1)
+        metadata = {
+            "technical": {
+                "format": "wav",
+                "codec": "pcm",
+                "duration_seconds": round(wave_duration, 6),
+                "sample_rate": sample_rate,
+                "channels": channel_count,
+                "sample_width_bits": sample_width_bits,
+                "attached_picture": False,
             }
-
-        vec = transformer.encode_audio_fragment(frag)
-        clarity = analysis.get("clarity") if analysis else None
-        try:
-            frag["importance"] = (
-                round(float(clarity), 4) if clarity is not None else vec["importance"]
+        }
+        digest_features = _flat_audio_feature_vector(analysis)
+        audio_data = list(frames[:1024])
+        fallback_features = [value / 255.0 for value in audio_data]
+        duration = (
+            _audio_metadata_number(
+                analysis.get("duration") if isinstance(analysis, dict) else None
             )
-        except (TypeError, ValueError):
-            frag["importance"] = vec["importance"]
-
-        return [frag]
-
-    if ext in {".mp3", ".opus"}:
-        if analysis is None:
-            if analyze_audio_clip is None:
-                log_to_statusbox(
-                    "[RawFileManager] Compressed audio decoding unavailable: "
-                    f"{_AUDIO_DIGEST_IMPORT_ERROR}"
-                )
-            else:
-                log_to_statusbox(
-                    f"[RawFileManager] Analysis returned no data for {audio_path.name}."
-                )
-            return []
-
-        tags = ["self_read", "audio"]
-        for tag in analysis.get("tags", []):
-            if tag not in tags:
-                tags.append(tag)
+            or wave_duration
+        )
+        emotions = (
+            analysis.get("emotions") if isinstance(analysis, dict) else None
+        )
+        if not isinstance(emotions, dict):
+            emotions = {"attention": 0.5, "novelty": 0.6}
 
         frag = {
             "modality": "audio",
-            "summary": analysis.get("summary", f"Sound fragment from {audio_path.name}"),
-            "tags": tags,
+            "audio_features": digest_features or fallback_features,
+            "summary": _audio_fragment_summary(audio_path, analysis, metadata),
+            "tags": merged_tags(),
             "source": str(audio_path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "emotions": analysis.get("emotions", {"attention": 0.5}),
-            "symbols": analysis.get("symbols", []),
-            "proto_words": analysis.get("proto_words", []),
-            "duration": analysis.get("duration", 0),
+            "emotions": emotions,
+            "duration": duration,
+            "symbols": (
+                analysis.get("symbols", [])
+                if isinstance(analysis, dict)
+                else []
+            ),
+            "proto_words": (
+                analysis.get("proto_words", [])
+                if isinstance(analysis, dict)
+                else []
+            ),
         }
-
-        frames = analysis.get("frames") or []
-        if frames:
-            frag["audio_features"] = frames[:256]
+        _attach_audio_analysis(frag, analysis, metadata)
 
         vec = transformer.encode_audio_fragment(frag)
-        clarity = analysis.get("clarity")
+        clarity = analysis.get("clarity") if isinstance(analysis, dict) else None
         try:
             frag["importance"] = (
-                round(float(clarity), 4) if clarity is not None else vec["importance"]
+                round(float(clarity), 4)
+                if clarity is not None
+                else vec["importance"]
             )
         except (TypeError, ValueError):
             frag["importance"] = vec["importance"]
-
         return [frag]
 
-    log_to_statusbox(
-        f"[RawFileManager] Unsupported audio format for {audio_path.name}: {ext}"
+    if analysis is None:
+        if analyze_audio_clip is None:
+            log_to_statusbox(
+                "[RawFileManager] Compressed audio decoding unavailable: "
+                f"{_AUDIO_DIGEST_IMPORT_ERROR}"
+            )
+        else:
+            log_to_statusbox(
+                f"[RawFileManager] Analysis returned no data for {audio_path.name}."
+            )
+        return []
+
+    technical = metadata.get("technical")
+    technical = technical if isinstance(technical, dict) else {}
+    duration = (
+        _audio_metadata_number(analysis.get("duration"))
+        or technical.get("duration_seconds")
+        or 0
     )
-    return []
+    emotions = analysis.get("emotions")
+    if not isinstance(emotions, dict):
+        emotions = {"attention": 0.5}
+
+    frag = {
+        "modality": "audio",
+        "audio_features": _flat_audio_feature_vector(analysis),
+        "summary": _audio_fragment_summary(audio_path, analysis, metadata),
+        "tags": merged_tags(),
+        "source": str(audio_path),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "emotions": emotions,
+        "symbols": analysis.get("symbols", []),
+        "proto_words": analysis.get("proto_words", []),
+        "duration": duration,
+    }
+    _attach_audio_analysis(frag, analysis, metadata)
+
+    vec = transformer.encode_audio_fragment(frag)
+    clarity = analysis.get("clarity")
+    try:
+        frag["importance"] = (
+            round(float(clarity), 4)
+            if clarity is not None
+            else vec["importance"]
+        )
+    except (TypeError, ValueError):
+        frag["importance"] = vec["importance"]
+    return [frag]
 
 
 def fragment_video(video_path, transformer, source_label=None):

@@ -205,28 +205,111 @@ def test_fragment_audio_wav(tmp_path):
     assert "self_read" in frag["tags"]
 
 
-def test_fragment_audio_opus(monkeypatch, tmp_path):
+def test_fragment_audio_opus_flattens_frames_and_keeps_metadata(
+    monkeypatch,
+    tmp_path,
+):
     opus_path = tmp_path / "clip.opus"
     opus_path.write_bytes(b"fake opus data")
 
     analysis = {
-        "summary": "Synthetic MP3 analysis",
+        "summary": "Synthetic compressed-audio analysis",
         "clarity": 0.432187,
         "tags": ["audio", "digest", "synthetic"],
         "emotions": {"focus": 0.2},
+        "frames": [[-1.0, -0.5], [-0.25, 0.0]],
+        "texture_signature": {"rms": 0.2},
+        "language_hint": "en",
+    }
+    metadata = {
+        "title": "Way Back Home",
+        "artist": ["projectgodhunter", "Ina"],
+        "lyrics": "A short embedded lyric.",
+        "technical": {
+            "codec": "opus",
+            "sample_rate": 48000,
+            "attached_picture": True,
+        },
     }
 
     monkeypatch.setattr(rfm, "analyze_audio_clip", lambda path, transformer: analysis)
+    monkeypatch.setattr(rfm, "_extract_audio_metadata", lambda path: metadata)
 
     transformer = FractalTransformer()
     fragments = rfm.fragment_audio(opus_path, transformer)
 
-    assert fragments, "Expected a fragment for MP3 input"
+    assert fragments, "Expected a fragment for compressed audio input"
     frag = fragments[0]
     assert frag["modality"] == "audio"
+    assert frag["audio_features"] == [-1.0, -0.5, -0.25, 0.0]
+    assert all(isinstance(value, float) for value in frag["audio_features"])
+    assert frag["audio_metadata"] == metadata
+    assert frag["summary"].startswith("Way Back Home by projectgodhunter; Ina.")
+    assert frag["audio_analysis"]["frame_count"] == 2
+    assert frag["audio_analysis"]["feature_bins"] == 2
     assert "self_read" in frag["tags"]
     assert "synthetic" in frag["tags"]
+    assert "audio_metadata" in frag["tags"]
+    assert "embedded_lyrics" in frag["tags"]
+    assert "embedded_cover_art" in frag["tags"]
     assert frag["importance"] == pytest.approx(0.4322, rel=0, abs=1e-4)
+
+
+def test_audio_metadata_normalizes_multivalue_tags_and_audio_stream(monkeypatch):
+    monkeypatch.setattr(
+        rfm,
+        "mediainfo_json",
+        lambda _path: {
+            "format": {
+                "format_name": "mp3",
+                "duration": ["287.424", "fallback"],
+                "size": "6666807",
+                "tags": {
+                    "TITLE": ["Way Back Home", "Alternate title"],
+                    "artist": "projectgodhunter",
+                    "comment": "created by Ina",
+                    "lyrics-eng": ["First line", "Second line"],
+                    "custom-tag": ["one", "two"],
+                },
+            },
+            "streams": [
+                {
+                    "index": 1,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": {"attached_pic": 1},
+                },
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "mp3",
+                    "sample_rate": ["48000"],
+                    "channels": 2,
+                    "bit_rate": "185130",
+                    "disposition": {"attached_pic": 0},
+                },
+            ],
+        },
+    )
+
+    metadata = rfm._extract_audio_metadata(Path("song.mp3"))
+
+    assert metadata["title"] == ["Way Back Home", "Alternate title"]
+    assert metadata["artist"] == "projectgodhunter"
+    assert metadata["lyrics"] == "First line\n\nSecond line"
+    assert metadata["tags"]["custom_tag"] == ["one", "two"]
+    assert metadata["technical"] == {
+        "format": "mp3",
+        "codec": "mp3",
+        "duration_seconds": 287.424,
+        "bit_rate": 185130,
+        "sample_rate": 48000,
+        "channels": 2,
+        "file_size": 6666807,
+        "stream_index": 0,
+        "attached_picture": True,
+        "artwork_codec": "mjpeg",
+    }
 
 
 def test_rapidcrest_music_is_external_signed_artist(tmp_path):
@@ -248,13 +331,20 @@ def test_rapidcrest_music_is_external_signed_artist(tmp_path):
     assert fragment["source_context"]["external_artist_hint"] == "rapidcrest"
 
 
-def test_ina_music_keeps_self_voice_ownership(tmp_path):
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "Ina Sings: Soft Orbit/master.wav",
+        "Ina Sings_ Way Back Home/Way Back Home.mp3",
+    ],
+)
+def test_ina_music_keeps_self_voice_ownership(tmp_path, relative_path):
     fragment = {"tags": ["self_read"], "metadata": {"flags": []}}
 
     rfm.annotate_fragment_source(
         fragment,
         "music",
-        "Ina Sings: Soft Orbit/master.wav",
+        relative_path,
         tmp_path,
     )
 
