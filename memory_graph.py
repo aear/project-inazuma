@@ -70,6 +70,7 @@ DEFAULT_INCREMENTAL_POLICY = {
     "local_rebuild_max_fragments": 2000,
     "emit_sparse_snapshot": True,
     "synapse_refresh_on_idle": True,
+    "synapse_refresh_interval_seconds": 3600.0,
     "max_fragments_per_neuron": 128,
     "max_tags_per_neuron": 32,
     "fragment_anchor_count": 12,
@@ -269,6 +270,11 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     emit_sparse_snapshot = bool(policy.get("emit_sparse_snapshot", True))
     synapse_refresh = bool(policy.get("synapse_refresh_on_idle", True))
     try:
+        synapse_refresh_interval = float(policy.get("synapse_refresh_interval_seconds", 3600.0))
+    except (TypeError, ValueError):
+        synapse_refresh_interval = 3600.0
+    synapse_refresh_interval = max(0.0, synapse_refresh_interval)
+    try:
         max_fragments_per_neuron = int(policy.get("max_fragments_per_neuron", 128))
     except (TypeError, ValueError):
         max_fragments_per_neuron = 128
@@ -389,6 +395,7 @@ def _neural_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "local_rebuild_max_fragments": local_rebuild_max,
         "emit_sparse_snapshot": emit_sparse_snapshot,
         "synapse_refresh_on_idle": synapse_refresh,
+        "synapse_refresh_interval_seconds": synapse_refresh_interval,
         "max_fragments_per_neuron": max_fragments_per_neuron,
         "max_tags_per_neuron": max_tags_per_neuron,
         "fragment_anchor_count": fragment_anchor_count,
@@ -653,6 +660,36 @@ def _parse_iso_timestamp(value: Optional[str]) -> Optional[float]:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
     except Exception:
         return None
+
+
+def _synapse_refresh_due(
+    existing_map: Dict[str, Any],
+    policy: Dict[str, Any],
+    *,
+    incremental: bool,
+    map_changed: bool,
+    queue_remaining: int,
+    input_processed: int,
+) -> bool:
+    """Prevent a continuously busy dirty queue from starving link updates."""
+    if not incremental:
+        return True
+    existing_neurons = existing_map.get("neurons", [])
+    if existing_neurons and not existing_map.get("synapses_updated_at"):
+        # Legacy maps predate refresh metadata and need one bootstrap pass.
+        return True
+    if map_changed:
+        if queue_remaining == 0:
+            return True
+        age = _age_seconds(existing_map.get("synapses_updated_at"))
+        interval = max(0.0, _safe_float(policy.get("synapse_refresh_interval_seconds"), 3600.0))
+        if age is None or interval == 0.0 or age >= interval:
+            return True
+    return bool(
+        queue_remaining == 0
+        and input_processed == 0
+        and policy.get("synapse_refresh_on_idle", True)
+    )
 
 
 def _age_seconds(value: Optional[str]) -> Optional[float]:
@@ -5338,13 +5375,14 @@ def build_fractal_memory(child):
         or totals["created"]
     )
     queue_remaining = len(pending_ids) if dirty_mode else 0
-    needs_synapse_refresh = False
-    if not incremental:
-        needs_synapse_refresh = True
-    elif queue_remaining == 0 and map_changed:
-        needs_synapse_refresh = True
-    elif queue_remaining == 0 and totals["input"] == 0 and policy.get("synapse_refresh_on_idle", True):
-        needs_synapse_refresh = True
+    needs_synapse_refresh = _synapse_refresh_due(
+        existing_map,
+        policy,
+        incremental=incremental,
+        map_changed=map_changed,
+        queue_remaining=queue_remaining,
+        input_processed=totals["input"],
+    )
 
     prior_synapses = existing_map.get("synapses", []) if incremental else []
     if not isinstance(prior_synapses, list):
@@ -5403,6 +5441,8 @@ def build_fractal_memory(child):
             "converted_from_legacy": existing_map.get("converted_from_legacy", False) if incremental else False,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
+        if needs_synapse_refresh:
+            result["synapses_updated_at"] = result["updated_at"]
         active_spill_store = spill_store if spill_store.has_spills() else None
         _save_neural_map_streaming(child, result, neurons, synapses, policy, active_spill_store)
         if policy.get("emit_sparse_snapshot", True):

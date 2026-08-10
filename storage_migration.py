@@ -106,6 +106,8 @@ def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_l
     if source.is_symlink():
         report.update(status="already_linked", link_target=os.readlink(source)); return report
     if not source.exists(): report["status"] = "missing_source"; return report
+    if source.is_file():
+        return migrate_file_and_link(source, target, apply=apply, relative_link=relative_link, child=child)
     if target.exists() and not target.is_dir(): report["status"] = "target_not_directory"; return report
     try:
         target.resolve().relative_to(source.resolve())
@@ -170,6 +172,91 @@ def migrate_tree_and_link(source: Path, target: Path, *, apply: bool, relative_l
         _atomic_write_json(manifest, report); report["manifest"] = str(manifest)
         _record_migration_summary(child, "tree_migration", report)
     return report
+def migrate_file_and_link(
+    source: Path,
+    target: Path,
+    *,
+    apply: bool,
+    relative_link: bool = True,
+    child: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Checksum-copy one file, retain a backup, then link its original path."""
+    source, target = Path(source).expanduser(), Path(target).expanduser()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = source.with_name(f"{source.name}.ina-migration-backup-{stamp}")
+    report: Dict[str, Any] = {
+        "source": str(source),
+        "target": str(target),
+        "backup": str(backup),
+        "apply": apply,
+        "kind": "file",
+        "copied": 0,
+        "verified": 0,
+        "failed": 0,
+        "bytes": 0,
+        "cutover": False,
+    }
+    if source.is_symlink():
+        report.update(status="already_linked", link_target=os.readlink(source))
+        return report
+    if not source.is_file():
+        report["status"] = "missing_source" if not source.exists() else "source_not_file"
+        return report
+    if target.exists() and not target.is_file():
+        report["status"] = "target_not_file"
+        return report
+
+    source_hash = _hash_file(source)
+    if not source_hash:
+        report.update(status="failed", failed=1, error="source_checksum_failed")
+        return report
+    report.update(bytes=int(source.stat().st_size), sha256=source_hash)
+    if not apply:
+        report["status"] = "ok"
+        return report
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(f".{target.name}.ina-copy-{stamp}")
+    try:
+        if target.exists():
+            if _hash_file(target) != source_hash:
+                raise OSError("target conflicts with source file")
+        else:
+            shutil.copy2(source, partial)
+            if _hash_file(partial) != source_hash:
+                raise OSError("target checksum failed")
+            os.replace(partial, target)
+            report["copied"] = 1
+        if _hash_file(target) != source_hash:
+            raise OSError("target verification failed")
+        report["verified"] = 1
+
+        source.rename(backup)
+        link_value = os.path.relpath(target, source.parent) if relative_link else str(target.resolve())
+        pending = source.with_name(f".{source.name}.ina-link-{stamp}")
+        pending.symlink_to(link_value, target_is_directory=False)
+        pending.replace(source)
+        report.update(cutover=True, link_target=link_value, status="ok")
+    except Exception as exc:
+        report.update(status="failed", failed=1, error=str(exc))
+        try:
+            if partial.exists():
+                partial.unlink()
+            if source.is_symlink():
+                source.unlink()
+            if backup.exists() and not source.exists():
+                backup.rename(source)
+            report["rolled_back"] = True
+        except Exception as rollback_exc:
+            report["rollback_error"] = str(rollback_exc)
+
+    manifest = target.parent / "migration_manifests" / f"file_migration_{stamp}.json"
+    _atomic_write_json(manifest, report)
+    report["manifest"] = str(manifest)
+    _record_migration_summary(child, "file_migration", report)
+    return report
+
+
 
 def _resolve_cold_storage_paths(child: str, cfg: Dict[str, Any]) -> tuple[Path, Path]:
     source = Path("AI_Children") / child / "memory" / "cold_storage"
@@ -566,8 +653,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of flat event files considered.")
     parser.add_argument("--keep-legacy", action="store_true", help="Copy into shards but keep the original flat event files.")
     parser.add_argument("--detail-limit", type=int, default=200, help="Maximum per-file entries retained in sharding reports.")
-    parser.add_argument("--migrate-source", type=Path, help="Tree to move while preserving this path as a symlink.")
-    parser.add_argument("--migrate-target", type=Path, help="Destination tree on an NVMe or new-system mount.")
+    parser.add_argument("--migrate-source", type=Path, help="File or tree to move while preserving this path as a symlink.")
+    parser.add_argument("--migrate-target", type=Path, help="Destination path on an NVMe or new-system mount.")
     parser.add_argument("--absolute-link", action="store_true", help="Use an absolute compatibility link; relative is portable by default.")
     parser.add_argument("--resume-managed", action="store_true", help="Advance Ina owned managed migration by one verified chunk.")
     args = parser.parse_args()

@@ -71,6 +71,32 @@ def test_memory_graph_phase_args_support_boot_and_neural_modes():
     assert mg._memory_graph_phase_args(["--phase", "neural"]).phase == "neural"
 
 
+def test_busy_dirty_queue_gets_periodic_synapse_refresh():
+    policy = {
+        "synapse_refresh_on_idle": False,
+        "synapse_refresh_interval_seconds": 3600,
+    }
+    fresh = datetime.now(timezone.utc).isoformat()
+    stale = datetime.fromtimestamp(time.time() - 7200, timezone.utc).isoformat()
+
+    assert mg._synapse_refresh_due(
+        {"neurons": [{"id": "legacy"}]}, policy, incremental=True, map_changed=False,
+        queue_remaining=200, input_processed=0,
+    )
+    assert mg._synapse_refresh_due(
+        {}, policy, incremental=True, map_changed=True,
+        queue_remaining=200, input_processed=12,
+    )
+    assert not mg._synapse_refresh_due(
+        {"synapses_updated_at": fresh}, policy, incremental=True, map_changed=True,
+        queue_remaining=200, input_processed=12,
+    )
+    assert mg._synapse_refresh_due(
+        {"synapses_updated_at": stale}, policy, incremental=True, map_changed=True,
+        queue_remaining=200, input_processed=12,
+    )
+
+
 
 def test_set_memory_graph_deferred_build_updates_inastate():
     child = "TestMemoryGraphPhaseState"

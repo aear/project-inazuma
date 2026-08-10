@@ -14,6 +14,84 @@ from emotion_engine import SLIDERS
 from symbol_generator import generate_symbol_from_parts
 
 # Map path is resolved per-child so all children get their own emotion symbols.
+DEFAULT_EMOTION_MAP_POLICY = {
+    "max_symbols": 4096,
+    "samples_per_pass": 24,
+    "max_json_load_bytes": 32 * 1024 * 1024,
+}
+
+
+def _status_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "emotion_symbol_map_status.json"
+
+
+def _emotion_map_policy(config=None):
+    policy = dict(DEFAULT_EMOTION_MAP_POLICY)
+    raw = config.get("emotion_map_policy") if isinstance(config, dict) else None
+    if isinstance(raw, dict):
+        policy.update({key: raw[key] for key in policy if key in raw})
+    for key in ("max_symbols", "samples_per_pass", "max_json_load_bytes"):
+        try:
+            policy[key] = max(0, int(policy[key]))
+        except (TypeError, ValueError):
+            policy[key] = DEFAULT_EMOTION_MAP_POLICY[key]
+    return policy
+
+
+def _write_emotion_map_status(child: str, symbol_count: int) -> dict:
+    source = _map_path(child)
+    try:
+        stat = source.stat()
+    except OSError:
+        return {}
+    payload = {
+        "version": 1,
+        "symbol_count": max(0, int(symbol_count)),
+        "source_size": int(stat.st_size),
+        "source_mtime_ns": int(stat.st_mtime_ns),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = _status_path(child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return payload
+
+
+def emotion_map_status(child: str, *, refresh: bool = False) -> dict:
+    source = _map_path(child)
+    try:
+        stat = source.stat()
+    except OSError:
+        return {"symbol_count": 0, "status": "missing"}
+    try:
+        cached = json.loads(_status_path(child).read_text(encoding="utf-8"))
+    except Exception:
+        cached = {}
+    if (
+        isinstance(cached, dict)
+        and int(cached.get("source_size", -1)) == int(stat.st_size)
+        and int(cached.get("source_mtime_ns", -1)) == int(stat.st_mtime_ns)
+    ):
+        return cached
+    if not refresh:
+        return {"symbol_count": None, "source_size": int(stat.st_size), "status": "metadata_pending"}
+
+    marker = b'"symbol_word_id"'
+    count = 0
+    overlap = b""
+    with source.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            data = overlap + chunk
+            count += data.count(marker)
+            overlap = data[-(len(marker) - 1):]
+    return _write_emotion_map_status(child, count)
+
+
 def _map_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "emotion_symbol_map.json"
 
@@ -47,14 +125,17 @@ def combined_distance(
 
 def load_existing_symbols(child: str):
     path = _map_path(child)
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-                return data.get("symbols", [])
-            except Exception:
-                return []
-    return []
+    if not path.exists():
+        return []
+    policy = _emotion_map_policy(load_config())
+    try:
+        if path.stat().st_size > policy["max_json_load_bytes"]:
+            return []
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return []
+    return data.get("symbols", []) if isinstance(data, dict) else []
 
 
 def save_emotion_map(child: str, symbols):
@@ -64,8 +145,11 @@ def save_emotion_map(child: str, symbols):
     }
     path = _map_path(child)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(temporary, path)
+    _write_emotion_map_status(child, len(symbols))
 
 def generate_emotion_vector():
     return {k: round(random.uniform(-1.0, 1.0), 4) for k in SLIDERS}
@@ -125,7 +209,27 @@ def rank_emotion_symbols(
 
 def build_emotion_map(child="Inazuma_Yagami", samples=100, similarity_threshold=0.93):
     log_to_statusbox("[EmotionMap] Generating symbolic emotion vocabulary...")
+    policy = _emotion_map_policy(load_config())
+    status = emotion_map_status(child, refresh=True)
+    existing_count = int(status.get("symbol_count") or 0)
+    max_symbols = int(policy["max_symbols"])
+    if max_symbols and existing_count >= max_symbols:
+        log_to_statusbox(
+            f"[EmotionMap] Vocabulary cap reached ({existing_count} symbols; cap {max_symbols}). "
+            "Skipping synthetic growth."
+        )
+        return
+
+    samples = min(max(0, int(samples)), int(policy["samples_per_pass"]))
+    if max_symbols:
+        samples = min(samples, max(0, max_symbols - existing_count))
     existing = load_existing_symbols(child)
+    if existing_count and not existing:
+        log_to_statusbox(
+            "[EmotionMap] Map is too large for bounded JSON loading; generation is paused "
+            "until the symbol store is migrated."
+        )
+        return
     new_symbols = []
     existing_vectors = [vector_from_emotion(e.get("average_emotion", {})) for e in existing]
 

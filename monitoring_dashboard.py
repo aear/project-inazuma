@@ -36,6 +36,32 @@ def _safe_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def _emotion_map_summary(path: Path) -> tuple[int | None, str, str]:
+    """Read compact metadata first and never deserialize an oversized map."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0, "0 symbols", "missing"
+
+    status_path = path.with_name("emotion_symbol_map_status.json")
+    status = _safe_json(status_path, {})
+    if (
+        isinstance(status, dict)
+        and int(status.get("source_size", -1)) == int(stat.st_size)
+        and int(status.get("source_mtime_ns", -1)) == int(stat.st_mtime_ns)
+    ):
+        count = max(0, int(status.get("symbol_count", 0) or 0))
+        return count, f"{count:,} symbols", "emotion map"
+
+    if stat.st_size <= MAX_JSON_BYTES:
+        payload = _safe_json(path, {})
+        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
+        count = len(symbols) if isinstance(symbols, (list, dict)) else 0
+        return count, f"{count:,} symbols", "emotion map"
+
+    return None, f"large JSON · {_size(stat.st_size)}", "metadata pending"
+
+
 def _size(value: int | float | None) -> str:
     amount = float(value or 0)
     for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
@@ -171,9 +197,7 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
         for name, count in sorted(queue_by_source.items(), key=lambda item: (-int(item[1] or 0), str(item[0])))
     ) or ('none queued' if remaining == 0 else 'source not yet reported')
     emotion_map_path = base / 'emotion_symbol_map.json'
-    emotion_map_data = _safe_json(emotion_map_path, {})
-    emotion_symbols = emotion_map_data.get('symbols', []) if isinstance(emotion_map_data, dict) else []
-    emotion_map_count = len(emotion_symbols) if isinstance(emotion_symbols, (list, dict)) else 0
+    emotion_map_count, emotion_map_label, emotion_map_state = _emotion_map_summary(emotion_map_path)
     vocab_status = 'cap reached' if word_count >= vocab_limit else f'cap {vocab_limit:,}'
     rows.extend([
         ('Observed vocabulary', f'{word_count:,} words · {vocab_status}', 'language', _age(vocab_data.get('updated') if isinstance(vocab_data, dict) else None), str(base / 'text_vocab.json')),
@@ -181,14 +205,15 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
         ('Mapping queue by source', queue_detail, 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Last mapping pass', f"{batch_mode} · {int(last_batch.get('new_mappings', 0) or 0):,} new · {int(last_batch.get('revisited_mappings', 0) or 0):,} revisited", 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Average links per word', f'{average_links:.2f}', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
-        ('Emotion map', f'{emotion_map_count:,} symbols', 'emotion map', _modified(emotion_map_path), str(emotion_map_path)),
+        ('Emotion map', emotion_map_label, emotion_map_state, _modified(emotion_map_path), str(emotion_map_path)),
     ])
     emotions = get_inastate('emotion_snapshot') or {}
     values = emotions.get('values', {}) if isinstance(emotions, dict) else {}
     strongest = sorted(values.items(), key=lambda item: abs(float(item[1] or 0)), reverse=True)[:5] if isinstance(values, dict) else []
     for name, value in strongest:
         rows.append((str(name).replace('_', ' ').title(), f'{float(value):+.3f}', 'emotion', _age(emotions.get('timestamp')), json.dumps(emotions, indent=2)))
-    cards = [('Neural maps', str(maps)), ('Nodes', f'{total_nodes:,}'), ('Links', f'{total_edges:,}'), ('Vocabulary', f'{word_count:,}'), ('Emotion map', f'{emotion_map_count:,}')]
+    emotion_card = f'{emotion_map_count:,}' if emotion_map_count is not None else 'large'
+    cards = [('Neural maps', str(maps)), ('Nodes', f'{total_nodes:,}'), ('Links', f'{total_edges:,}'), ('Vocabulary', f'{word_count:,}'), ('Emotion map', emotion_card)]
     return cards, rows
 
 
