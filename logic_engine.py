@@ -11,7 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from model_manager import load_config, get_inastate, seed_self_question, mark_self_question_resolved
 from transformers.fractal_multidimensional_transformers import FractalTransformer
-from logic_map_builder import run_logic_map_builder
+from logic_map_builder import extract_logic_vector, run_logic_map_builder
+
+try:
+    from logic_memory_store import store_logic_entry
+except Exception:  # pragma: no cover - JSON remains a compatibility fallback.
+    store_logic_entry = None
 
 
 def _json_safe(value):
@@ -135,7 +140,15 @@ def load_symbol_words(child):
         except:
             return []
 
+
 def log_logic_event(child, logic_entry):
+    safe_entry = _json_safe(logic_entry)
+    if store_logic_entry is not None:
+        try:
+            store_logic_entry(child, safe_entry, extract_logic_vector(safe_entry))
+        except Exception as exc:
+            print(f"[Logic] SQLite store unavailable; retaining JSON fallback: {exc}")
+
     path = Path("AI_Children") / child / "memory" / "logic_memory.json"
     if path.exists():
         try:
@@ -146,7 +159,7 @@ def log_logic_event(child, logic_entry):
     else:
         history = []
 
-    history.append(_json_safe(logic_entry))
+    history.append(safe_entry)
     history = history[-250:]
 
     with open(path, "w") as f:

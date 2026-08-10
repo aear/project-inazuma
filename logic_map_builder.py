@@ -1,6 +1,7 @@
 # === logic_map_builder.py (Neural Rewrite) ===
 
 from vector_math import cosine_similarity as shared_cosine_similarity, vector_norm
+import hashlib
 import json
 import math
 import random
@@ -11,6 +12,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from model_manager import load_config
 from gui_hook import log_to_statusbox
 from symbol_generator import generate_symbol_from_parts, available_symbol_components
+try:
+    from logic_memory_store import (
+        entry_count as durable_logic_count,
+        graph_counts as durable_logic_graph_counts,
+        recent_entries as recent_logic_entries,
+    )
+except Exception:  # pragma: no cover - JSON remains a compatibility fallback.
+    durable_logic_count = None
+    recent_logic_entries = None
+    durable_logic_graph_counts = None
 from body_schema import get_region_anchors
 
 LOGIC_MAP_BURST_DEFAULT = 150  # neurons per pass before pausing
@@ -19,6 +30,7 @@ DEFAULT_LOGIC_POLICY = {
     "edge_knn": 6,
     "edge_min_similarity": 0.35,
     "max_pairs": 12000,
+    "mode": "incremental",
     "max_edges": 3200,
     "build_budget_ms": 260.0,
 }
@@ -47,7 +59,9 @@ def _logic_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     policy["max_pairs"] = max(0, int(_safe_float(policy.get("max_pairs"), 12000)))
     policy["max_edges"] = max(0, int(_safe_float(policy.get("max_edges"), 3200)))
     policy["build_budget_ms"] = max(0.0, _safe_float(policy.get("build_budget_ms"), 260.0))
+    policy["mode"] = str(policy.get("mode") or "incremental").strip().lower()
     return policy
+
 
 def _flatten_numeric(value):
     """
@@ -141,7 +155,15 @@ def extract_logic_vector(entry):
 
     return vector
 
-def load_logic_memory(child):
+def load_logic_memory(child, *, limit: Optional[int] = None, config=None):
+    if recent_logic_entries is not None and durable_logic_count is not None:
+        try:
+            if durable_logic_count(child, config) > 0:
+                return recent_logic_entries(
+                    child, limit or LOGIC_MAP_BURST_DEFAULT, config=config
+                )
+        except Exception:
+            pass
     path = Path("AI_Children") / child / "memory" / "logic_memory.json"
     if not path.exists():
         return []
@@ -150,7 +172,8 @@ def load_logic_memory(child):
             data = json.load(f)
     except Exception:
         return []
-    return data if isinstance(data, list) else []
+    entries = data if isinstance(data, list) else []
+    return entries[-limit:] if limit else entries
 
 def build_logic_neural_map(logic_entries: List[Dict[str, Any]], *, policy: Dict[str, Any]):
     start_perf = time.perf_counter()
@@ -262,8 +285,8 @@ def run_logic_map_builder():
     config = load_config()
     child = config.get("current_child", "default_child")
     policy = _logic_policy(config)
-    logic_entries = load_logic_memory(child)
     burst_limit = policy["burst"]
+    logic_entries = load_logic_memory(child, limit=burst_limit, config=config)
 
     if not logic_entries:
         log_to_statusbox("[LogicMap] No logic entries found. Skipping map generation.")
@@ -276,6 +299,17 @@ def run_logic_map_builder():
         log_to_statusbox(f"[LogicMap] Loaded {len(logic_entries)} logic entries.")
 
     logic_map = build_logic_neural_map(logic_entries, policy=policy)
+    durable_counts = (
+        durable_logic_graph_counts(child, config)
+        if durable_logic_graph_counts is not None
+        else {"entries": len(logic_entries), "edges": 0}
+    )
+    logic_map["map_role"] = "active_projection"
+    logic_map["durable_store"] = {
+        "entries": int(durable_counts.get("entries", 0) or 0),
+        "edges": int(durable_counts.get("edges", 0) or 0),
+        "capacity": int(config.get("logic_store_policy", {}).get("max_entries", 10_000_000)),
+    }
     save_logic_neural_map(child, logic_map)
     stats = logic_map.get("build_stats", {}) if isinstance(logic_map, dict) else {}
     if isinstance(stats, dict):

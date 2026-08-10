@@ -15,6 +15,12 @@ from tkinter import ttk
 from typing import Any, Callable
 
 from model_manager import get_inastate, load_config
+try:
+    from logic_memory_store import graph_counts as durable_logic_counts
+except Exception:  # pragma: no cover
+    durable_logic_counts = None
+
+
 from storage_layout import fast_runtime_path
 
 MAX_JSON_BYTES = 32 * 1024 * 1024
@@ -51,7 +57,8 @@ def _emotion_map_summary(path: Path) -> tuple[int | None, str, str]:
         and int(status.get("source_mtime_ns", -1)) == int(stat.st_mtime_ns)
     ):
         count = max(0, int(status.get("symbol_count", 0) or 0))
-        return count, f"{count:,} symbols", "emotion map"
+        backend = "emotion database" if status.get("backend") == "sqlite" else "emotion map"
+        return count, f"{count:,} symbols", backend
 
     if stat.st_size <= MAX_JSON_BYTES:
         payload = _safe_json(path, {})
@@ -160,7 +167,18 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
             maps += 1
             total_nodes += node_count
             total_edges += edge_count
-            rows.append((path.stem.replace('_', ' ').title(), f'{node_count:,} nodes · {edge_count:,} links', 'neural map', _modified(path), str(path)))
+            label = 'Logic active projection' if path.stem == 'logic_neural_map' else path.stem.replace('_', ' ').title()
+            rows.append((label, f'{node_count:,} nodes · {edge_count:,} links', 'neural map', _modified(path), str(path)))
+    logic_counts = durable_logic_counts(child, config) if durable_logic_counts else {}
+    durable_logic_entries = int(logic_counts.get('entries', 0) or 0) if isinstance(logic_counts, dict) else 0
+    durable_logic_edges = int(logic_counts.get('edges', 0) or 0) if isinstance(logic_counts, dict) else 0
+    if durable_logic_entries or durable_logic_edges:
+        rows.append((
+            'Logic durable graph',
+            f'{durable_logic_entries:,} traces · {durable_logic_edges:,} sparse links',
+            'logic database', 'live', str(child),
+        ))
+
 
     vocab_data = _safe_json(base / 'text_vocab.json', {})
     vocab = vocab_data.get('vocab', {}) if isinstance(vocab_data, dict) else {}

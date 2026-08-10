@@ -30,7 +30,7 @@ def test_emotion_builder_stops_at_vocabulary_cap(monkeypatch):
     monkeypatch.setattr(emotion_map, "load_config", lambda: {})
     monkeypatch.setattr(
         emotion_map, "emotion_map_status",
-        lambda child, refresh=False: {"symbol_count": 4096},
+        lambda child, refresh=False: {"symbol_count": 10_000_000},
     )
     monkeypatch.setattr(
         emotion_map, "load_existing_symbols",
