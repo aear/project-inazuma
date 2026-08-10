@@ -12,6 +12,12 @@ from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from runtime_state import load_config, seed_self_question
 from experience_logger import ExperienceLogger
+from language_context import (
+    attach_ambiguity_set,
+    audit_counterfactual_expression,
+    build_language_context_snapshot,
+    score_mapping_candidate,
+)
 from symbol_generator import (
     ACCENT_GLYPHS,
     ALPHANUMERIC_GLYPHS,
@@ -942,6 +948,129 @@ def _build_text_vocab_word_symbol_index(links_payload: Any) -> Dict[str, str]:
     return index
 
 
+def _shadow_audit_text_vocab_mappings(
+    tokens: List[str],
+    links_payload: Any,
+    linked_word_to_symbol: Dict[str, str],
+    *,
+    child: str,
+    context: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Audit contextual alternatives without changing the selected mapping."""
+    try:
+        supplied = context.get("language_context_snapshot") if isinstance(context, dict) else None
+        snapshot = supplied if isinstance(supplied, dict) else build_language_context_snapshot(
+            context, child=child, config=load_config()
+        )
+        if not snapshot.get("enabled"):
+            return None
+        empty_context = {"words": set(), "tags": set()}
+        ambiguity = []
+        current = []
+        counterfactual = []
+        candidate_audits = []
+        mapped_tokens = []
+        for token in tokens:
+            candidates = [
+                candidate
+                for candidate in _iter_text_vocab_link_candidates(
+                    links_payload, linked_word_to_symbol.get(token, "")
+                )
+                if isinstance(candidate, dict) and _candidate_word(candidate).lower() == token
+            ]
+            # Alternatives can live under different symbols in flat link lists.
+            if isinstance(links_payload, dict):
+                for key in ("links", "items", "candidates"):
+                    for candidate in links_payload.get(key) or []:
+                        if (
+                            isinstance(candidate, dict)
+                            and _candidate_word(candidate).lower() == token
+                            and candidate not in candidates
+                        ):
+                            candidates.append(candidate)
+            candidates = candidates[:24]
+            if not candidates:
+                continue
+            distinct_symbols = list(dict.fromkeys(
+                symbol
+                for candidate in candidates
+                for symbol in _candidate_symbols(candidate)[:1]
+                if symbol
+            ))
+            if len(distinct_symbols) > 1:
+                ambiguity.append({"token": token, "candidate_symbols": distinct_symbols})
+            ranked = []
+            for candidate in candidates:
+                symbols = _candidate_symbols(candidate)
+                if not symbols:
+                    continue
+                baseline = _score_text_vocab_candidate(candidate, empty_context)
+                contextual = score_mapping_candidate(candidate, snapshot)
+                ranked.append({
+                    "symbol": symbols[0],
+                    "candidate": candidate,
+                    "baseline_score": round(baseline, 4),
+                    "context_score": contextual["score"],
+                    "combined_score": round(baseline + contextual["score"], 4),
+                    "context_breakdown": contextual,
+                })
+            if not ranked:
+                continue
+            current_symbol = linked_word_to_symbol.get(token)
+            current_choice = next(
+                (item for item in ranked if item["symbol"] == current_symbol),
+                max(ranked, key=lambda item: item["baseline_score"]),
+            )
+            shadow_choice = max(ranked, key=lambda item: item["combined_score"])
+            mapped_tokens.append(token)
+            current.append(current_choice)
+            counterfactual.append(shadow_choice)
+            candidate_audits.append({
+                "token": token,
+                "current_symbol": current_choice["symbol"],
+                "shadow_symbol": shadow_choice["symbol"],
+                "changed": current_choice["symbol"] != shadow_choice["symbol"],
+                "candidates": [
+                    {
+                        "symbol": item["symbol"],
+                        "baseline_score": item["baseline_score"],
+                        "context_score": item["context_score"],
+                        "combined_score": item["combined_score"],
+                        "context_breakdown": item["context_breakdown"],
+                    }
+                    for item in ranked
+                ],
+            })
+        snapshot = attach_ambiguity_set(snapshot, ambiguity)
+        snapshot_summary = {
+            "scene_turns": len(snapshot.get("recent_scene") or []),
+            "memory_reference_count": len(snapshot.get("active_memory_references") or []),
+            "ambiguity_count": len(snapshot.get("ambiguity_set") or []),
+            "prediction_present": bool((snapshot.get("prediction") or {}).get("present")),
+            "prediction_fresh": bool((snapshot.get("prediction") or {}).get("fresh")),
+            "prediction_eligible": bool(
+                (snapshot.get("prediction") or {}).get("eligible_for_shadow_score")
+            ),
+        }
+        return {
+            "mode": "shadow_only",
+            "snapshot_summary": snapshot_summary,
+            "candidate_audits": candidate_audits,
+            "counterfactual_audit": audit_counterfactual_expression(
+                mapped_tokens, current, counterfactual, snapshot
+            ),
+            "selected_output_unchanged": True,
+        }
+    except Exception as exc:
+        # Diagnostics must never make the established compatibility path fail.
+        return {
+            "mode": "shadow_only",
+            "status": "diagnostic_failed",
+            "reason": type(exc).__name__,
+            "selected_output_unchanged": True,
+        }
+
+
 def load_text_vocab_word_symbol_index(
     child: str,
     base_path: Optional[Path] = None,
@@ -1860,6 +1989,13 @@ def generate_symbolic_reply_from_text(
 
     links_payload = load_text_vocab_links(child, base_path=base_path)
     linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
+    language_context_shadow = _shadow_audit_text_vocab_mappings(
+        tokens,
+        links_payload,
+        linked_word_to_symbol,
+        child=child,
+        context=context,
+    )
     lang_hint = guess_language_code(text)
     vocab: Dict[str, Any] = {}
     word_to_symbol: Dict[str, str] = {}
@@ -1980,6 +2116,7 @@ def generate_symbolic_reply_from_text(
         "transformer_insights": transformer_insights,
         "length_profile": text_length_profile(text),
         "symbol_limit": symbol_limit,
+        "language_context_shadow": language_context_shadow,
     }
 
 

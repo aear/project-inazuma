@@ -1833,6 +1833,13 @@ def process_inbound_message(msg) -> CommsResponse:
         "conversation_scene": conversation_scene,
         "message_edit": edit_analysis,
         "expression_drive": urge_level,
+        "is_high_trust": bool((msg.metadata or {}).get("is_high_trust")),
+        "is_owner_friend": bool((msg.metadata or {}).get("is_owner_friend")),
+        "language_state_signals": {
+            "current_prediction": state.get("current_prediction"),
+            "machine_semantics": state.get("machine_semantics"),
+            "emotion_snapshot": state.get("emotion_snapshot"),
+        },
         "vision": vision_context,
     }
     symbolic = generate_symbolic_reply_from_text(
@@ -1845,6 +1852,16 @@ def process_inbound_message(msg) -> CommsResponse:
         ),
         context=symbolic_context,
     )
+    if isinstance(symbolic, dict):
+        shadow = symbolic.get("language_context_shadow")
+        audit = shadow.get("counterfactual_audit") if isinstance(shadow, dict) else None
+        if isinstance(audit, dict):
+            logger.info(
+                "Language context shadow: changed=%d delta=%s coherent=%s output_unchanged=true",
+                len(audit.get("changed_tokens") or []),
+                audit.get("delta"),
+                audit.get("counterfactual_more_coherent"),
+            )
     vision_symbols = vision_context.get("recognized_symbols") or []
     if vision_symbols:
         text_symbols = list(symbolic.get("symbols") or []) if symbolic else []
@@ -2164,7 +2181,42 @@ def process_inbound_message(msg) -> CommsResponse:
 # Discord client
 # ---------------------------------------------------------------------------
 
-class InaDiscordClient(discord.Client):
+def register_ina_application_commands(client) -> object:
+    """Register suggested slash commands while reusing the text-command handlers."""
+    raw_guild_ids = get_discord_config().get("slash_command_guild_ids") or []
+    guild_ids = []
+    for value in raw_guild_ids:
+        try:
+            guild_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    command_kwargs = {"guild_ids": guild_ids} if guild_ids else {}
+    ina = discord.SlashCommandGroup(
+        "ina", "Talk to and manage Ina's Discord bridge.", **command_kwargs
+    )
+    learn = ina.create_subgroup("learn", "Review Ina's language learning.")
+
+    @ina.command(name="status", description="Check whether Ina's bridge is listening.")
+    async def ina_status(ctx):
+        await client._handle_application_status(ctx)
+
+    @ina.command(name="join", description="Ask Ina to join the configured voice channel.")
+    async def ina_join(ctx):
+        await client._handle_application_voice(ctx, join=True)
+
+    @ina.command(name="leave", description="Ask Ina to leave voice chat.")
+    async def ina_leave(ctx):
+        await client._handle_application_voice(ctx, join=False)
+
+    @learn.command(name="history", description="Review recent chat and revisit language mappings.")
+    async def ina_learn_history(ctx):
+        await client._handle_application_history_review(ctx)
+
+    client.add_application_command(ina)
+    return ina
+
+
+class InaDiscordClient(discord.Bot):
     """
     Discord client that connects DMs and a configured text channel to Ina via CommsCore.
     """
@@ -2211,6 +2263,69 @@ class InaDiscordClient(discord.Client):
         self._load_outbox_history()
         self._typed_outbox_task = None
         self._language_review_task = None
+        self._ina_application_commands = register_ina_application_commands(self)
+
+    def _application_command_allowed(self, ctx, *, owner_only: bool = False) -> bool:
+        author = getattr(ctx, "author", None)
+        author_id = getattr(author, "id", None)
+        if owner_only:
+            return author_id == SAKURA_USER_ID
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            return bool(
+                author_id == SAKURA_USER_ID
+                or is_owner_friend(author_id)
+                or is_high_trust(author_id)
+            )
+        channel = getattr(ctx, "channel", None)
+        channel_id = str(getattr(channel, "id", ""))
+        channel_name = str(getattr(channel, "name", "")).strip().casefold()
+        cfg = get_discord_config()
+        if channel_id and channel_id == str(cfg.get("text_channel_id") or ""):
+            return True
+        roleplay = cfg.get("roleplay") or {}
+        if not isinstance(roleplay, dict):
+            return False
+        reply_ids = {str(value) for value in roleplay.get("reply_channel_ids", [])}
+        reply_names = {
+            str(value).strip().casefold()
+            for value in roleplay.get("reply_channel_names", ["ina-text"])
+        }
+        return channel_id in reply_ids or channel_name in reply_names
+
+    async def _handle_application_status(self, ctx) -> None:
+        if not self._application_command_allowed(ctx):
+            await ctx.respond("Ina's commands are not enabled in this channel.", ephemeral=True)
+            return
+        await ctx.respond("Ina is listening here.", ephemeral=True)
+
+    async def _handle_application_history_review(self, ctx) -> None:
+        if not self._application_command_allowed(ctx, owner_only=True):
+            await ctx.respond("Only Ina's operator can start a history review.", ephemeral=True)
+            return
+        await ctx.defer(ephemeral=True)
+        result = await self._run_language_review(force=True)
+        await ctx.followup.send(format_history_review_result(result), ephemeral=True)
+
+    async def _handle_application_voice(self, ctx, *, join: bool) -> None:
+        if not self._application_command_allowed(ctx):
+            await ctx.respond("Ina's commands are not enabled in this channel.", ephemeral=True)
+            return
+        await ctx.defer()
+
+        async def send_followup(text: str) -> None:
+            await ctx.followup.send(text)
+
+        # Existing voice behavior remains canonical; this small adapter only
+        # changes where its status replies are delivered after interaction defer.
+        target = type("InteractionCommandTarget", (), {})()
+        target.author = ctx.author
+        target.channel = type("InteractionResponseChannel", (), {})()
+        target.channel.send = send_followup
+        if join:
+            await self._handle_voice_join(target)
+        else:
+            await self._handle_voice_leave(target)
 
     def _roleplay_mode(self, message: discord.Message) -> Optional[str]:
         """Return read_only/respond for configured RP spaces (Umani-compatible)."""
