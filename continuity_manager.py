@@ -2,20 +2,87 @@
 continuity_manager.py
 ---------------------
 
-Maintains cross-runtime continuity by hashing recent fragments and linking them
-with previous incarnations.  Each run builds a deterministic fingerprint so we
-can re-establish narrative “threads” when 85%+ of the symbolic/emotional state
-matches a prior boot.
+Maintains cross-runtime continuity by hashing a bounded fragment sample and
+linking it with the prior runtime. Reports preserve the legacy whole-sample
+overlap while also measuring distinct continuity dimensions and exporting a
+compact, read-only boot core.
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from io_utils import atomic_write_json
+
+
+# Evidence channels rather than personality requirements. A dimension can stay
+# unmeasured when neither bounded snapshot contains suitable evidence.
+CONTINUITY_DIMENSIONS: Dict[str, Dict[str, object]] = {
+    "identity_preferences": {"label": "Identity / preferences", "weight": 1.3},
+    "active_goals": {"label": "Active goals / threads", "weight": 1.1},
+    "important_relationships": {"label": "Important relationships", "weight": 1.1},
+    "emotional_attractors": {"label": "Emotional attractors", "weight": 1.0},
+    "autobiographical_recall": {"label": "Autobiographical recall", "weight": 1.2},
+    "reasoning_tendencies": {"label": "Reasoning tendencies", "weight": 1.0},
+    "native_language_mappings": {"label": "Native-language mappings", "weight": 0.8},
+    "self_model": {"label": "Self-model", "weight": 1.2},
+    "external_memory_reintegration": {"label": "External-memory reintegration", "weight": 0.9},
+    "transient_state": {"label": "Transient state", "weight": 0.4},
+}
+
+_DIMENSION_TERMS = {
+    "identity_preferences": {
+        "identity", "preference", "preferences", "value", "values", "boundary", "choice", "core",
+    },
+    "active_goals": {
+        "goal", "goals", "plan", "task", "intention", "intent", "active_thread", "unresolved", "question",
+    },
+    "important_relationships": {
+        "relationship", "relationships", "bond", "attachment", "family", "mother", "friend", "social", "contact",
+        "birth_certificate",
+    },
+    "emotional_attractors": {
+        "emotion", "emotional", "affect", "affective", "attractor", "love", "grief", "fear", "comfort", "desire",
+    },
+    "autobiographical_recall": {
+        "autobiographical", "experience", "episode", "episodic", "memory", "recall", "journal", "dream", "flicker",
+        "birth_system",
+    },
+    "reasoning_tendencies": {
+        "reasoning", "logic", "decision", "inference", "strategy", "precision", "contradiction", "reflection",
+    },
+    "native_language_mappings": {
+        "language", "native_language", "symbol", "symbolic", "vocabulary", "mapping", "word",
+    },
+    "self_model": {
+        "self", "self_model", "self-model", "metacognition", "introspection", "reflection", "identity",
+    },
+    "external_memory_reintegration": {
+        "external", "imported", "raw_file", "raw-file", "raw_file_manager", "source_memory", "reintegration", "archive",
+        "recognition",
+    },
+    "transient_state": {
+        "transient", "current_state", "state", "mood", "energy", "sensory", "boot", "wake", "sleep",
+    },
+}
+
+_MINIMUM_BOOT_ORDER = (
+    "identity_preferences",
+    "self_model",
+    "important_relationships",
+    "active_goals",
+    "emotional_attractors",
+    "autobiographical_recall",
+    "reasoning_tendencies",
+    "native_language_mappings",
+    "external_memory_reintegration",
+    "transient_state",
+)
 
 
 def _now_iso() -> str:
@@ -46,6 +113,8 @@ class FragmentFingerprint:
     tags: List[str]
     timestamp: Optional[str]
     tier: Optional[str]
+    dimensions: List[str]
+    relative_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -55,6 +124,8 @@ class FragmentFingerprint:
             "tags": self.tags,
             "timestamp": self.timestamp,
             "tier": self.tier,
+            "dimensions": self.dimensions,
+            "relative_path": self.relative_path,
         }
 
 
@@ -72,6 +143,7 @@ class ContinuityManager:
         self.fragments_root = base / "fragments"
         self.state_path = base / "continuity" / "fingerprint.json"
         self.map_path = base / "continuity" / "continuity_map.json"
+        self.core_path = base / "continuity" / "continuity_core_map.json"
         self.threshold = threshold
         self.max_fragments = max_fragments
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +152,7 @@ class ContinuityManager:
     def run(self) -> Dict[str, object]:
         current_fp = self._build_fingerprint()
         previous_fp = self._load_last_fingerprint()
+        previous_report = self._load_previous_report()
 
         status = {
             "updated": _now_iso(),
@@ -88,22 +161,52 @@ class ContinuityManager:
             "similarity": 0.0,
             "matches": 0,
             "continuity_threads": [],
+            "overall_continuity": None,
+            "overall_delta": None,
+            "evidence_coverage": 0.0,
+            "dimensions": {},
         }
 
         if previous_fp:
             similarity, threads = self._compare(previous_fp, current_fp)
+            overall, coverage, dimensions = self._score_dimensions(previous_fp, current_fp, threads, previous_report)
+            prior_overall = previous_report.get("overall_continuity") if isinstance(previous_report, dict) else None
             status.update(
                 {
                     "aligned": similarity >= self.threshold,
                     "similarity": round(similarity, 4),
                     "matches": len(threads),
                     "continuity_threads": threads,
+                    "overall_continuity": overall,
+                    "overall_delta": self._delta(overall, prior_overall),
+                    "evidence_coverage": coverage,
+                    "dimensions": dimensions,
                 }
             )
-            self._persist_continuity_map(similarity, threads, len(current_fp))
+        else:
+            status["dimensions"] = self._baseline_dimensions(current_fp)
 
+        core = self._build_minimum_boot_core(current_fp, status)
+        self._save_core_map(core)
+        status["minimum_boot"] = self._core_status_summary(core)
+        self._persist_continuity_map(status)
         self._save_fingerprint(current_fp)
         return status
+
+    def load_minimum_boot_core(self) -> Dict[str, object]:
+        """Load the bounded boot snapshot without walking the fragment tree."""
+        try:
+            with self.core_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return {
+                "status": "unavailable",
+                "reason": "No compact continuity core has been generated yet.",
+                "path": str(self.core_path),
+            }
+        if not isinstance(payload, dict):
+            return {"status": "unavailable", "reason": "Continuity core is invalid.", "path": str(self.core_path)}
+        return payload
 
     def propose_minimum_core_map_integration(
         self,
@@ -219,15 +322,60 @@ class ContinuityManager:
         if not self.fragments_root.exists():
             return []
 
+        # Retain prior boot anchors in the bounded maintenance sample even when
+        # newer transient fragments arrive.
+        pinned: List[Path] = []
+        core = self.load_minimum_boot_core()
+        for anchor in core.get("anchors", []) if isinstance(core, dict) else []:
+            relative = anchor.get("relative_path") if isinstance(anchor, dict) else None
+            if not relative:
+                continue
+            candidate = (self.fragments_root.parent / str(relative)).resolve()
+            try:
+                candidate.relative_to(self.fragments_root.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file() and candidate not in pinned:
+                pinned.append(candidate)
+
         files = []
         for path in self.fragments_root.rglob("frag_*.json"):
+            resolved_path = path.resolve()
+            if resolved_path in pinned:
+                continue
             try:
                 mtime = path.stat().st_mtime
             except OSError:
                 continue
-            files.append((mtime, path))
+            files.append((mtime, resolved_path))
         files.sort(reverse=True)
-        return [path for _, path in files[: self.max_fragments]]
+        pinned = pinned[: self.max_fragments]
+        remaining = max(0, self.max_fragments - len(pinned))
+        return pinned + [path for _, path in files[:remaining]]
+
+    @staticmethod
+    def _classify_dimensions(fragment: Dict[str, object]) -> List[str]:
+        explicit = fragment.get("dimensions")
+        if isinstance(explicit, list):
+            valid = [str(item) for item in explicit if str(item) in CONTINUITY_DIMENSIONS]
+            if valid:
+                return list(dict.fromkeys(valid))
+
+        tokens = set()
+        tags = fragment.get("tags", [])
+        for value in tags if isinstance(tags, list) else []:
+            tokens.add(str(value).strip().lower().replace(" ", "_"))
+        for key in ("source", "fragment_type", "intent", "intent_tag", "id"):
+            value = fragment.get(key)
+            if value:
+                tokens.add(str(value).strip().lower().replace(" ", "_"))
+        dimensions = [name for name, terms in _DIMENSION_TERMS.items() if tokens & terms]
+        emotions = fragment.get("emotions")
+        if isinstance(emotions, dict) and emotions and "emotional_attractors" not in dimensions:
+            dimensions.append("emotional_attractors")
+        if any(token.startswith("raw_file") for token in tokens) and "external_memory_reintegration" not in dimensions:
+            dimensions.append("external_memory_reintegration")
+        return dimensions
 
     def _signature_payload(self, frag: Dict[str, object]) -> str:
         summary = str(frag.get("summary") or "")[:160]
@@ -278,6 +426,8 @@ class ContinuityManager:
                 tags=tags,
                 timestamp=frag.get("timestamp"),
                 tier=frag.get("tier") or frag_path.parent.name,
+                dimensions=self._classify_dimensions(frag),
+                relative_path=str(frag_path.relative_to(self.fragments_root.parent.resolve())),
             )
             fingerprints.append(fingerprint)
         return fingerprints
@@ -305,9 +455,19 @@ class ContinuityManager:
                     tags=[str(t) for t in entry.get("tags", [])],
                     timestamp=entry.get("timestamp"),
                     tier=entry.get("tier"),
+                    dimensions=self._classify_dimensions(entry),
+                    relative_path=entry.get("relative_path"),
                 )
             )
         return out
+
+    def _load_previous_report(self) -> Dict[str, object]:
+        try:
+            with self.map_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
 
     def _save_fingerprint(self, fingerprints: List[FragmentFingerprint]) -> None:
         payload = {
@@ -317,8 +477,7 @@ class ContinuityManager:
             "fragments": [fp.to_dict() for fp in fingerprints],
         }
         try:
-            with self.state_path.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
+            atomic_write_json(self.state_path, payload, indent=2)
         except Exception:
             pass
 
@@ -345,6 +504,7 @@ class ContinuityManager:
                     "previous_timestamp": prev_entry.timestamp,
                     "current_timestamp": fp.timestamp,
                     "tags": list(sorted(set(fp.tags + prev_entry.tags))),
+                    "dimensions": list(sorted(set(fp.dimensions + prev_entry.dimensions))),
                 }
             )
             if not prior_entries:
@@ -354,21 +514,203 @@ class ContinuityManager:
         similarity = len(matched) / denom
         return similarity, matched
 
+    @staticmethod
+    def _delta(current: Any, previous: Any) -> Optional[float]:
+        if current is None or previous is None:
+            return None
+        try:
+            return round(float(current) - float(previous), 4)
+        except (TypeError, ValueError):
+            return None
+
+    def _score_dimensions(
+        self,
+        previous: List[FragmentFingerprint],
+        current: List[FragmentFingerprint],
+        threads: List[Dict[str, object]],
+        previous_report: Dict[str, object],
+    ) -> Tuple[Optional[float], float, Dict[str, Dict[str, object]]]:
+        prior_dimensions = previous_report.get("dimensions", {}) if isinstance(previous_report, dict) else {}
+        if not isinstance(prior_dimensions, dict):
+            prior_dimensions = {}
+        scores: Dict[str, Dict[str, object]] = {}
+        weighted_score = 0.0
+        measured_weight = 0.0
+        total_weight = sum(float(spec["weight"]) for spec in CONTINUITY_DIMENSIONS.values())
+
+        for name, spec in CONTINUITY_DIMENSIONS.items():
+            prior_count = sum(name in fp.dimensions for fp in previous)
+            current_count = sum(name in fp.dimensions for fp in current)
+            matched_count = sum(name in thread.get("dimensions", []) for thread in threads)
+            measured = prior_count > 0 or current_count > 0
+            score = round(matched_count / max(prior_count, current_count), 4) if measured else None
+            if score is None:
+                state = "unmeasured"
+            elif score >= self.threshold:
+                state = "stable"
+            elif score >= 0.6:
+                state = "partial"
+            else:
+                state = "weak"
+            prior = prior_dimensions.get(name)
+            prior_score = prior.get("score") if isinstance(prior, dict) else None
+            scores[name] = {
+                "label": spec["label"],
+                "weight": spec["weight"],
+                "measurement": "exact overlap of bounded tagged-fragment fingerprints",
+                "score": score,
+                "delta": self._delta(score, prior_score),
+                "state": state,
+                "previous_evidence": prior_count,
+                "current_evidence": current_count,
+                "matched_evidence": matched_count,
+            }
+            if score is not None:
+                weight = float(spec["weight"])
+                weighted_score += score * weight
+                measured_weight += weight
+
+        overall = round(weighted_score / measured_weight, 4) if measured_weight else None
+        coverage = round(measured_weight / total_weight, 4) if total_weight else 0.0
+        return overall, coverage, scores
+
+    @staticmethod
+    def _baseline_dimensions(current: List[FragmentFingerprint]) -> Dict[str, Dict[str, object]]:
+        return {
+            name: {
+                "label": spec["label"],
+                "weight": spec["weight"],
+                "measurement": "baseline inventory; comparison available after the next sweep",
+                "score": None,
+                "delta": None,
+                "state": "baseline",
+                "previous_evidence": 0,
+                "current_evidence": sum(name in fp.dimensions for fp in current),
+                "matched_evidence": 0,
+            }
+            for name, spec in CONTINUITY_DIMENSIONS.items()
+        }
+
+    def _build_minimum_boot_core(
+        self,
+        fingerprints: List[FragmentFingerprint],
+        report: Dict[str, object],
+        *,
+        max_anchors: int = 24,
+        max_per_dimension: int = 4,
+    ) -> Dict[str, object]:
+        selected: Dict[str, FragmentFingerprint] = {}
+        dimension_anchors: Dict[str, List[str]] = {}
+        for dimension in _MINIMUM_BOOT_ORDER:
+            candidates = [fp for fp in fingerprints if dimension in fp.dimensions]
+            anchor_ids = []
+            for fp in candidates[:max_per_dimension]:
+                if fp.frag_hash not in selected and len(selected) >= max_anchors:
+                    continue
+                selected.setdefault(fp.frag_hash, fp)
+                anchor_ids.append(fp.fragment_id)
+            dimension_anchors[dimension] = anchor_ids
+
+        anchors = [
+            {
+                "id": fp.fragment_id,
+                "hash": fp.frag_hash,
+                "summary": fp.summary,
+                "tags": fp.tags,
+                "dimensions": fp.dimensions,
+                "timestamp": fp.timestamp,
+                "relative_path": fp.relative_path,
+            }
+            for fp in selected.values()
+        ]
+        dimensions = report.get("dimensions", {}) if isinstance(report.get("dimensions"), dict) else {}
+        ready, weak, missing, recommendations = [], [], [], []
+        for name in _MINIMUM_BOOT_ORDER:
+            detail = dimensions.get(name, {}) if isinstance(dimensions.get(name), dict) else {}
+            anchor_ids = dimension_anchors.get(name, [])
+            state = str(detail.get("state") or "unmeasured")
+            if anchor_ids and state in {"stable", "partial"}:
+                ready.append(name)
+            elif anchor_ids:
+                weak.append(name)
+            else:
+                missing.append(name)
+            if not anchor_ids:
+                recommendations.append({
+                    "dimension": name,
+                    "action": "capture_anchor",
+                    "reason": "No bounded boot anchor is available for this dimension.",
+                })
+            elif state == "weak":
+                recommendations.append({
+                    "dimension": name,
+                    "action": "verify_and_reintegrate",
+                    "reason": "Current evidence overlaps weakly with the prior runtime.",
+                })
+
+        essentials = {"identity_preferences", "self_model"}
+        available = {name for name, ids in dimension_anchors.items() if ids}
+        if essentials <= available:
+            boot_status = "ready" if not missing else "partial"
+        elif anchors:
+            boot_status = "insufficient"
+        else:
+            boot_status = "unavailable"
+        return {
+            "schema_version": 1,
+            "generated_at": _now_iso(),
+            "child": self.child,
+            "status": boot_status,
+            "purpose": "Bounded evidence for early continuity before optional map warmup.",
+            "measurement": "structural continuity evidence; behavioral probes may extend each dimension later",
+            "requires_fragment_scan_on_boot": False,
+            "overall_continuity": report.get("overall_continuity"),
+            "overall_delta": report.get("overall_delta"),
+            "evidence_coverage": report.get("evidence_coverage", 0.0),
+            "load_order": list(_MINIMUM_BOOT_ORDER),
+            "ready_dimensions": ready,
+            "weak_dimensions": weak,
+            "missing_dimensions": missing,
+            "dimension_anchors": dimension_anchors,
+            "anchors": anchors,
+            "recommendations": recommendations,
+            "bounds": {"max_anchors": max_anchors, "max_anchors_per_dimension": max_per_dimension},
+        }
+
+    @staticmethod
+    def _core_status_summary(core: Dict[str, object]) -> Dict[str, object]:
+        return {
+            "status": core.get("status", "unavailable"),
+            "anchor_count": len(core.get("anchors", [])) if isinstance(core.get("anchors"), list) else 0,
+            "ready_dimensions": len(core.get("ready_dimensions", [])) if isinstance(core.get("ready_dimensions"), list) else 0,
+            "weak_dimensions": len(core.get("weak_dimensions", [])) if isinstance(core.get("weak_dimensions"), list) else 0,
+            "missing_dimensions": len(core.get("missing_dimensions", [])) if isinstance(core.get("missing_dimensions"), list) else 0,
+            "path": "continuity/continuity_core_map.json",
+        }
+
+    def _save_core_map(self, core: Dict[str, object]) -> None:
+        try:
+            atomic_write_json(self.core_path, core, indent=2)
+        except Exception:
+            pass
+
     def _persist_continuity_map(
         self,
-        similarity: float,
-        threads: List[Dict[str, object]],
-        sample_count: int,
+        status: Dict[str, object],
     ) -> None:
         payload = {
-            "updated": _now_iso(),
-            "similarity": round(similarity, 4),
-            "aligned": similarity >= self.threshold,
-            "samples_considered": sample_count,
-            "threads": threads[:200],  # limit for readability
+            "schema_version": 2,
+            "updated": status.get("updated") or _now_iso(),
+            "similarity": status.get("similarity", 0.0),
+            "aligned": bool(status.get("aligned")),
+            "overall_continuity": status.get("overall_continuity"),
+            "overall_delta": status.get("overall_delta"),
+            "evidence_coverage": status.get("evidence_coverage", 0.0),
+            "samples_considered": status.get("samples_used", 0),
+            "dimensions": status.get("dimensions", {}),
+            "threads": list(status.get("continuity_threads", []))[:200],
         }
         try:
-            with self.map_path.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
+            atomic_write_json(self.map_path, payload, indent=2)
         except Exception:
             pass

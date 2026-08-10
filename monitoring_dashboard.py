@@ -137,6 +137,97 @@ def _file_row(label: str, path: Path, state: str = 'available') -> tuple[str, st
         return (label, '—', 'missing', '—', str(path))
 
 
+def _continuity_percent(value: Any) -> str:
+    try:
+        return f'{100.0 * float(value):.1f}%'
+    except (TypeError, ValueError):
+        return 'unmeasured'
+
+
+def _continuity_delta(value: Any) -> str:
+    try:
+        points = 100.0 * float(value)
+    except (TypeError, ValueError):
+        return 'new baseline'
+    return f'{points:+.1f} pp'
+
+
+def _continuity() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    """Read only the compact continuity report and bounded boot core."""
+    base = _child_memory()
+    report_path = base / 'continuity' / 'continuity_map.json'
+    core_path = base / 'continuity' / 'continuity_core_map.json'
+    report = _safe_json(report_path, {})
+    core = _safe_json(core_path, {})
+    report = report if isinstance(report, dict) else {}
+    core = core if isinstance(core, dict) else {}
+    overall = report.get('overall_continuity')
+    overall_delta = report.get('overall_delta')
+    coverage = report.get('evidence_coverage')
+    boot_status = str(core.get('status') or 'unavailable')
+    dimensions = report.get('dimensions', {})
+    dimensions = dimensions if isinstance(dimensions, dict) else {}
+    recommendations = core.get('recommendations', [])
+    recommendations = recommendations if isinstance(recommendations, list) else []
+    dimension_anchors = core.get('dimension_anchors', {})
+    dimension_anchors = dimension_anchors if isinstance(dimension_anchors, dict) else {}
+
+    rows = []
+    overall_state = 'continuity summary'
+    try:
+        if overall is not None and float(overall) < 0.6:
+            overall_state += ' · highlight'
+    except (TypeError, ValueError):
+        overall_state += ' · highlight'
+    rows.append((
+        'Overall continuity',
+        f'{_continuity_percent(overall)} · {_continuity_delta(overall_delta)}',
+        overall_state,
+        _age(report.get('updated')),
+        json.dumps(report, indent=2, default=str),
+    ))
+    for name, detail in dimensions.items():
+        if not isinstance(detail, dict):
+            continue
+        state = str(detail.get('state') or 'unmeasured')
+        row_state = f'continuity · {state}'
+        if state in {'weak', 'unmeasured'}:
+            row_state += ' · highlight'
+        anchors = dimension_anchors.get(name, [])
+        anchors = anchors if isinstance(anchors, list) else []
+        related = [item for item in recommendations if isinstance(item, dict) and item.get('dimension') == name]
+        detail_payload = dict(detail)
+        detail_payload['dimension'] = name
+        detail_payload['boot_anchor_ids'] = anchors
+        detail_payload['recommendations'] = related
+        evidence = (
+            f"{int(detail.get('matched_evidence', 0) or 0)}/"
+            f"{max(int(detail.get('previous_evidence', 0) or 0), int(detail.get('current_evidence', 0) or 0))} evidence"
+        )
+        rows.append((
+            str(detail.get('label') or name.replace('_', ' ').title()),
+            f"{_continuity_percent(detail.get('score'))} · {_continuity_delta(detail.get('delta'))}",
+            f'{row_state} · {evidence}',
+            _age(report.get('updated')),
+            json.dumps(detail_payload, indent=2, default=str),
+        ))
+    rows.append((
+        'Minimum boot core',
+        f"{boot_status} · {len(core.get('anchors', [])) if isinstance(core.get('anchors'), list) else 0} anchors",
+        'bounded boot snapshot' + (' · highlight' if boot_status in {'unavailable', 'insufficient'} else ''),
+        _age(core.get('generated_at')),
+        json.dumps(core, indent=2, default=str),
+    ))
+
+    cards = [
+        ('Overall', _continuity_percent(overall)),
+        ('Change', _continuity_delta(overall_delta)),
+        ('Evidence', _continuity_percent(coverage)),
+        ('Minimal boot', boot_status),
+    ]
+    return cards, rows
+
+
 def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     base = _child_memory()
     neural = base / 'neural'
@@ -400,6 +491,7 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
 
 COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]]] = {
     'Mind': _mind,
+    'Continuity': _continuity,
     'World': _world,
     'Memory': _memory,
     'Reports': _reports,

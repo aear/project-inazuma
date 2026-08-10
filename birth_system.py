@@ -5,6 +5,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from continuity_manager import ContinuityManager
 from model_manager import update_inastate, load_config, get_inastate
 from gui_hook import log_to_statusbox
 from safe_popen import safe_popen
@@ -112,6 +113,28 @@ def ensure_defaults(child):
         update_inastate("current_precision", 64)
 
 
+def load_continuity_boot_core(child):
+    """Publish the prior bounded core before any corpus or map traversal."""
+    core = ContinuityManager(child).load_minimum_boot_core()
+    anchors = core.get("anchors", []) if isinstance(core, dict) else []
+    status = {
+        "status": core.get("status", "unavailable") if isinstance(core, dict) else "unavailable",
+        "generated_at": core.get("generated_at") if isinstance(core, dict) else None,
+        "anchor_count": len(anchors) if isinstance(anchors, list) else 0,
+        "ready_dimensions": len(core.get("ready_dimensions", [])) if isinstance(core, dict) and isinstance(core.get("ready_dimensions"), list) else 0,
+        "weak_dimensions": len(core.get("weak_dimensions", [])) if isinstance(core, dict) and isinstance(core.get("weak_dimensions"), list) else 0,
+        "missing_dimensions": len(core.get("missing_dimensions", [])) if isinstance(core, dict) and isinstance(core.get("missing_dimensions"), list) else 0,
+        "requires_fragment_scan_on_boot": False,
+    }
+    update_inastate("continuity_boot_core", core)
+    update_inastate("continuity_core_map_status", status)
+    log_to_statusbox(
+        f"[Continuity] Minimal boot core: {status['status']} · "
+        f"{status['anchor_count']} anchors · {status['ready_dimensions']} ready dimensions."
+    )
+    return core
+
+
 def save_boot_summary_fragment(child, duration, flickers):
     frag = {
         "id": f"frag_boot_summary_{int(time.time())}",
@@ -164,6 +187,7 @@ def run_birth_sequence(child):
 
     try:
         ensure_defaults(child)
+        load_continuity_boot_core(child)
 
         flick_start = datetime.now(timezone.utc).isoformat()
         scanned, matched = trigger_birth_flickers(child)

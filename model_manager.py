@@ -5265,13 +5265,20 @@ def _ensure_continuity_thread(force: bool = False):
     try:
         status = continuity_manager.run()
         update_inastate("continuity_status", status)
+        update_inastate("continuity_core_map_status", status.get("minimum_boot", {}))
         _last_continuity_run = now
         try:
-            similarity = float(status.get("similarity", 0.0) or 0.0)
+            continuity = status.get("overall_continuity")
+            if continuity is None:
+                continuity = status.get("similarity", 0.0)
+            similarity = float(continuity or 0.0)
+            coverage = float(status.get("evidence_coverage", 0.0) or 0.0)
         except Exception:
             similarity = 0.0
+            coverage = 0.0
         log_to_statusbox(
-            f"[Continuity] {'Aligned' if status.get('aligned') else 'Re-seeding'} threads (similarity={similarity:.2%})."
+            f"[Continuity] {'Aligned' if status.get('aligned') else 'Re-seeding'} threads "
+            f"(overall={similarity:.2%}, evidence={coverage:.2%})."
         )
     except Exception as exc:
         _last_continuity_run = now
