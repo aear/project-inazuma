@@ -87,6 +87,7 @@ def test_epub_is_read_as_spine_ordered_document(tmp_path):
     assert "Hidden head title" not in text
     assert "Unlisted appendix" not in text
     assert rfm._extract_epub_text_bytes(epub_path.read_bytes(), "novel.epub") == text
+    assert "\n\n" in text
 
     class Transformer:
         def encode(self, fragment):
@@ -96,6 +97,10 @@ def test_epub_is_read_as_spine_ordered_document(tmp_path):
     assert fragments
     assert all("epub" in fragment["tags"] for fragment in fragments)
     assert all(fragment["modality"] == "text" for fragment in fragments)
+    assert all(fragment["written_example"]["complete_text"] for fragment in fragments)
+    assert all(fragment["written_example"]["interpretation_unit"] for fragment in fragments)
+    assert all(fragment["written_example"]["storage_fragment"] for fragment in fragments)
+    assert all(not fragment["written_example"]["transport_chunk"] for fragment in fragments)
 
 
     assert all("partial_document_read" in fragment["tags"] for fragment in fragments)
@@ -107,6 +112,46 @@ def test_epub_is_read_as_spine_ordered_document(tmp_path):
         fragment["document_read_progress"]["window_reaches_end"] is True
         for fragment in fragments
     )
+
+
+def test_written_passages_keep_whole_words_and_paragraphs():
+    text = (
+        "First paragraph has a complete sentence. " * 12
+        + "\n\n"
+        + "Second paragraph also stays readable. " * 12
+    )
+    passages = rfm._written_passages(text, target_chars=240)
+
+    assert len(passages) > 2
+    assert all(len(passage) <= 240 for passage in passages)
+    assert all(not passage.startswith(("irst", "econd")) for passage in passages)
+    assert all(passage[-1] in ".!?" for passage in passages)
+    assert " ".join(" ".join(passages).split()) == " ".join(text.split())
+
+
+def test_document_passage_selection_and_ids_are_stable_for_rereads(monkeypatch):
+    text = "\n\n".join(
+        f"Paragraph {index} contains a complete example sentence. " * 8
+        for index in range(30)
+    )
+    first = rfm._document_chunks(text, "same-book.epub", chunk_size=240, max_chunks=5)
+    second = rfm._document_chunks(text, "same-book.epub", chunk_size=240, max_chunks=5)
+    assert first == second
+
+    class Transformer:
+        def encode(self, fragment):
+            return {"importance": 0.5}
+
+    monkeypatch.setattr(rfm, "update_text_vocab", lambda *args, **kwargs: True)
+    first_fragments = rfm.fragment_document_text(
+        "\n\n".join(first), "same-book.epub", Transformer(), sequential=True
+    )
+    second_fragments = rfm.fragment_document_text(
+        "\n\n".join(first), "same-book.epub", Transformer(), sequential=True
+    )
+    assert [item["written_example"]["passage_id"] for item in first_fragments] == [
+        item["written_example"]["passage_id"] for item in second_fragments
+    ]
 
 
 def test_epub_tolerates_imperfect_xhtml(tmp_path):

@@ -13,6 +13,7 @@ import io
 import zipfile
 import tarfile
 import gzip
+import hashlib
 import bz2
 import lzma
 import uuid
@@ -1656,8 +1657,19 @@ def log_reflection(child, fragment):
 def _normalize_document_text(text):
     if not text:
         return ""
-    cleaned = text.replace("\x00", " ")
-    return " ".join(cleaned.split())
+    cleaned = text.replace("\x00", " ").replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = []
+    current = []
+    for raw_line in cleaned.split("\n"):
+        line = " ".join(raw_line.split())
+        if line:
+            current.append(line)
+        elif current:
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return "\n\n".join(paragraphs)
 
 
 def _document_chunk_starts(length, chunk_size, max_chunks, seed):
@@ -1677,13 +1689,61 @@ def _document_chunk_starts(length, chunk_size, max_chunks, seed):
     return sorted(starts)[:max_chunks]
 
 
-def _document_chunks(text, source, chunk_size=400, max_chunks=5):
+def _written_passages(text, target_chars=1200):
+    """Split storage at written boundaries while preserving each reading unit."""
     cleaned = _normalize_document_text(text)
     if not cleaned:
         return []
-    seed = hash(source) & 0xFFFFFFFF
-    starts = _document_chunk_starts(len(cleaned), chunk_size, max_chunks, seed)
-    return [cleaned[start:start + chunk_size] for start in starts]
+    target = max(200, int(target_chars))
+    passages = []
+    start = 0
+    while start < len(cleaned):
+        remaining = len(cleaned) - start
+        if remaining <= target:
+            end = len(cleaned)
+        else:
+            ceiling = start + target
+            floor = start + max(80, target // 2)
+            paragraph_boundary = cleaned.rfind("\n\n", floor, ceiling + 1)
+            sentence_boundary = max(
+                cleaned.rfind(mark, floor, ceiling + 1)
+                for mark in (". ", "? ", "! ")
+            )
+            word_boundary = cleaned.rfind(" ", floor, ceiling + 1)
+            boundary = next(
+                (
+                    candidate
+                    for candidate in (
+                        paragraph_boundary, sentence_boundary, word_boundary
+                    )
+                    if candidate >= floor
+                ),
+                -1,
+            )
+            if boundary < floor:
+                end = ceiling
+            else:
+                marker = cleaned[boundary:boundary + 2]
+                end = boundary + (1 if marker in {". ", "? ", "! "} else 0)
+        passage = cleaned[start:end].strip()
+        if passage:
+            passages.append(passage)
+        start = end
+        while start < len(cleaned) and cleaned[start].isspace():
+            start += 1
+    return passages
+
+
+def _document_chunks(text, source, chunk_size=1200, max_chunks=5):
+    passages = _written_passages(text, target_chars=chunk_size)
+    if len(passages) <= max_chunks:
+        return passages
+    seed = int(
+        hashlib.sha256(str(source).encode("utf-8", errors="replace")).hexdigest()[:8],
+        16,
+    )
+    indexes = _document_chunk_starts(len(passages), 1, max_chunks, seed)
+    return [passages[index] for index in indexes]
 
 
 def _limit_text(text, limit):
@@ -1851,22 +1911,28 @@ def _epub_section_text(data):
             root,
         )
         ignored = {"head", "script", "style", "noscript", "svg"}
+        block_tags = _EPUBHTMLTextParser._BREAK_TAGS
         parts = []
 
         def append_element_text(element):
-            if _xml_local_name(element.tag) in ignored:
+            tag = _xml_local_name(element.tag)
+            if tag in ignored:
                 if element.tail:
                     parts.append(element.tail)
                 return
+            if tag in block_tags:
+                parts.append("\n")
             if element.text:
                 parts.append(element.text)
             for child_element in element:
                 append_element_text(child_element)
+            if tag in block_tags:
+                parts.append("\n")
             if element.tail:
                 parts.append(element.tail)
 
         append_element_text(body)
-        return _normalize_document_text(" ".join(parts))
+        return _normalize_document_text("".join(parts))
     except ET.ParseError:
         parser = _EPUBHTMLTextParser()
         parser.feed(data.decode("utf-8", errors="replace"))
@@ -2062,18 +2128,15 @@ def fragment_document_text(
     sequential=False,
 ):
     if sequential:
-        cleaned = _normalize_document_text(text)
-        chunks = [
-            cleaned[index:index + 400]
-            for index in range(0, len(cleaned), 400)
-        ]
+        chunks = _written_passages(text)
     else:
         chunks = _document_chunks(text, source)
     if not chunks:
         return []
 
     fragments = []
-    for chunk in chunks:
+    passage_count = len(chunks)
+    for passage_index, chunk in enumerate(chunks):
         frag_id = f"frag_text_{uuid.uuid4().hex[:10]}"
         tags = ["text", "self_read", "document"]
         if doc_type:
@@ -2093,6 +2156,22 @@ def fragment_document_text(
             "source": source,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"curiosity": 0.55, "focus": 0.35}
+        }
+        frag["written_example"] = {
+            "passage_id": "passage_" + hashlib.sha256(
+                (str(source) + "\x00" + chunk).encode("utf-8", errors="replace")
+            ).hexdigest()[:20],
+            "passage_index": passage_index,
+            "passage_count": passage_count,
+            "unit": "passage",
+            "complete_text": True,
+            "interpretation_unit": True,
+            "storage_fragment": True,
+            "transport_chunk": False,
+            "boundary_policy": "written_structure",
+            "paragraph_count": len([part for part in chunk.split("\n\n") if part.strip()]),
+            "reread_eligible": True,
+            "repetition_is_new_evidence": False,
         }
         if isinstance(document_progress, dict):
             fragment_progress = dict(document_progress)
