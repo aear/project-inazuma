@@ -1829,6 +1829,12 @@ def process_inbound_message(msg) -> CommsResponse:
             *vision_context.get("recognized_symbols", []),
         ],
         "channel": msg.channel.name,
+        "current_speaker": {
+            "id": msg.sender.backend_id,
+            "display_name": msg.sender.display_name,
+            "is_self": bool(msg.sender.is_self),
+            "is_bot": bool((msg.metadata or {}).get("author_is_bot")),
+        },
         "conversation_context": conversation_context,
         "conversation_scene": conversation_scene,
         "message_edit": edit_analysis,
@@ -2076,7 +2082,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 for perception in vision_context.get("perceptions", [])
             )
             # The adapter is a grounded-memory responder, not an external
-            # dictionary. Give it only operator-authored text: generated
+            # dictionary. Give it only sender-authored text: generated
             # instructions and context wrappers otherwise become bogus unknown
             # words in its exact-vocabulary fallback.
             explain_targets = symbolic_unknown or tokens
@@ -2375,6 +2381,10 @@ class InaDiscordClient(discord.Bot):
                     "author_name": getattr(prior.author, "display_name", None) or str(prior.author),
                     "content": content[:2000],
                     "created_at": prior.created_at.replace(tzinfo=timezone.utc).isoformat(),
+                    "is_self": bool(
+                        self.user and str(prior.author.id) == str(self.user.id)
+                    ),
+                    "author_is_bot": bool(getattr(prior.author, "bot", False)),
                 })
         except Exception:
             logger.exception("Failed to read recent Discord context for channel %s", message.channel.id)
@@ -2774,7 +2784,11 @@ class InaDiscordClient(discord.Bot):
         edit_analysis: Optional[dict] = None,
         roleplay: bool = False,
     ) -> None:
-        sender = make_sender_info_from_discord(message, backend_name=BACKEND_NAME)
+        sender = make_sender_info_from_discord(
+            message,
+            backend_name=BACKEND_NAME,
+            self_user_id=getattr(self.user, "id", None),
+        )
         channel = make_channel_info_from_discord(message, backend_name=BACKEND_NAME)
         metadata = {
             "discord_author_id": str(message.author.id),
@@ -2782,6 +2796,7 @@ class InaDiscordClient(discord.Bot):
             "is_dm": is_dm,
             "is_owner_friend": owner_friend,
             "is_high_trust": high_trust,
+            "author_is_bot": bool(getattr(message.author, "bot", False)),
             "conversation_context": list(conversation_context or []),
             "is_roleplay_context": roleplay,
         }

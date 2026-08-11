@@ -265,6 +265,7 @@ def build_language_context_snapshot(
         "candidate_referents": referents,
         "active_memory_references": memories,
         "social_context": {
+            "current_speaker": dict(context.get("current_speaker") or {}),
             "participants": _bounded_unique(scene.get("participants") or [], 8),
             "is_dm": "dm" in _words(context.get("tags")),
             "is_high_trust": bool(context.get("is_high_trust")),

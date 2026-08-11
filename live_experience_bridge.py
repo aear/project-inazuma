@@ -62,7 +62,7 @@ class AudioCaptureConfig:
 
     speaker: str = "operator"
     tags: Iterable[str] = field(default_factory=lambda: ["conversation", "live"])
-    narrative_prefix: str = "Conversation with the operator"
+    narrative_prefix: str = "Conversation"
 
 
 class LiveExperienceBridge:
@@ -400,4 +400,3 @@ class LiveExperienceBridge:
 
 
 __all__ = ["LiveExperienceBridge", "ScreenCaptureConfig", "AudioCaptureConfig"]
-

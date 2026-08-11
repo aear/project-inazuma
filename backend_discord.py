@@ -18,6 +18,7 @@ def make_sender_info_from_discord(
     message: discord.Message,
     *,
     backend_name: str = "discord",
+    self_user_id: object = None,
 ) -> SenderInfo:
     """Map a discord.Message author into a SenderInfo."""
     author = message.author
@@ -26,7 +27,12 @@ def make_sender_info_from_discord(
         internal_id=str(author.id),               # you can remap this later if you want
         backend_id=str(author.id),
         display_name=author.display_name,
-        is_self=author.bot,                      # True for bots (including Ina if she ever has a Discord user)
+        # A proxy or another bot is still an external speaker.  Only Ina's
+        # actual Discord account is self-authored.
+        is_self=(
+            self_user_id is not None
+            and str(author.id) == str(self_user_id)
+        ),
         backend=backend_name,
     )
 

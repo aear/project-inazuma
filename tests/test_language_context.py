@@ -81,6 +81,22 @@ def test_supplied_event_state_avoids_reloading_runtime_state():
     assert snapshot["prediction"]["present"] is False
 
 
+def test_snapshot_keeps_current_speaker_distinct_from_operator_role():
+    speaker = {
+        "id": "22", "display_name": "Rowan", "is_self": False, "is_bot": False
+    }
+    snapshot = lc.build_language_context_snapshot(
+        {
+            "current_speaker": speaker,
+            "language_state_signals": {
+                "current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {}
+            },
+        },
+        child="TestChild", logic_reader=False,
+    )
+    assert snapshot["social_context"]["current_speaker"] == speaker
+
+
 def test_logic_snapshot_read_and_result_are_bounded():
     calls = []
 

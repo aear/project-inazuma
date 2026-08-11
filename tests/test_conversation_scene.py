@@ -15,6 +15,7 @@ def _message(
     direction: str = "inbound",
     channel_id: str = "room-a",
     speaker: str = "Sakura",
+    is_self: bool = False,
     metadata=None,
 ):
     return SimpleNamespace(
@@ -25,7 +26,12 @@ def _message(
         created_at="2026-08-09T10:00:00+00:00",
         reply_to_id=None,
         metadata=metadata or {},
-        sender=SimpleNamespace(display_name=speaker, internal_id=speaker.lower()),
+        sender=SimpleNamespace(
+            display_name=speaker,
+            internal_id=speaker.lower(),
+            backend_id=speaker.lower(),
+            is_self=is_self,
+        ),
         channel=SimpleNamespace(
             internal_id=channel_id,
             backend_id=channel_id,
@@ -61,6 +67,17 @@ def test_scene_marks_questions_and_continuity_without_forcing_a_reply() -> None:
     assert snapshot["signals"]["reply_expected"] is True
     assert snapshot["signals"]["current_is_question"] is True
     assert snapshot["signals"]["continuity_terms"] == ["garden"]
+
+
+def test_scene_keeps_external_and_self_speakers_distinct() -> None:
+    scenes = ConversationSceneBuffer()
+    scenes.observe(_message("1", "Hello", speaker="Rowan", is_self=False))
+    snapshot = scenes.observe(
+        _message("2", "Hello Rowan", direction="outbound", speaker="Ina", is_self=True)
+    )
+    assert [(turn["speaker"], turn["is_self"]) for turn in snapshot["turns"]] == [
+        ("Rowan", False), ("Ina", True)
+    ]
 
 
 def test_final_consideration_preserves_bounded_rejection_description() -> None:

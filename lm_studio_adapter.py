@@ -63,6 +63,34 @@ _STOPWORDS = {
 }
 
 
+def _speaker_aware_narrative(record: Dict[str, Any]) -> str:
+    """Repair legacy operator-labelled dialogue at read time, without rewriting it."""
+    narrative = str(record.get("narrative") or "").strip()
+    internal = record.get("internal_state")
+    internal = internal if isinstance(internal, dict) else {}
+    usages = record.get("word_usage")
+    usages = usages if isinstance(usages, list) else []
+    first_usage = next((item for item in usages if isinstance(item, dict)), {})
+    speaker = str(
+        record.get("speaker")
+        or internal.get("speaker")
+        or first_usage.get("speaker")
+        or ""
+    ).strip()
+    if (
+        narrative.casefold().startswith("conversation with the operator:")
+        and speaker
+        and speaker.casefold() != "operator"
+    ):
+        utterance = str(record.get("utterance") or first_usage.get("utterance") or "").strip()
+        return (
+            f"Conversation: {speaker} said '{utterance}'"
+            if utterance
+            else f"Conversation with {speaker}."
+        )
+    return narrative
+
+
 class LMStudioAdapter:
     """Translate LM Studio chat prompts into Ina's grounded language loop."""
 
@@ -106,7 +134,7 @@ class LMStudioAdapter:
             entity_links=entity_payload,
         )
         response = self._compose_reply(
-            prompt, include_clarification=include_clarification
+            prompt, speaker=speaker, include_clarification=include_clarification
         )
 
         outbound_tags = list(base_tags)
@@ -185,7 +213,7 @@ class LMStudioAdapter:
                 event = events.get(str(event_id))
                 if not isinstance(event, dict) or str(event_id) in seen_events:
                     continue
-                narrative = " ".join(str(event.get("narrative") or "").split())
+                narrative = " ".join(_speaker_aware_narrative(event).split())
                 if not narrative:
                     continue
                 summary = narrative[: min(320, remaining)].rstrip()
@@ -281,6 +309,7 @@ class LMStudioAdapter:
         self,
         prompt: str,
         *,
+        speaker: str = "unknown speaker",
         include_clarification: bool = True,
         seed_questions: bool = True,
     ) -> str:
@@ -309,9 +338,10 @@ class LMStudioAdapter:
                 seen_unknown.add(word)
 
         if unknown_words and seed_questions:
+            speaker_name = str(speaker or "unknown speaker").strip()[:80]
             for word in unknown_words:
                 seed_self_question(
-                    f"What experience grounds the word '{word}' mentioned by the operator?"
+                    f"What experience grounds the word '{word}' mentioned by {speaker_name}?"
                 )
 
         if not grounded_details and not unknown_words:
@@ -360,7 +390,7 @@ class LMStudioAdapter:
             return None
 
         entry = entries[0]
-        narrative = entry.get("narrative") or "I remember the word but not the story."
+        narrative = _speaker_aware_narrative(entry) or "I remember the word but not the story."
         narrative = narrative.strip()
         if len(narrative) > 220:
             narrative = narrative[:217].rstrip() + "..."

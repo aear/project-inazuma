@@ -33,6 +33,8 @@ def test_log_conversation_turn_creates_event_with_word_usage(bridge):
     assert event_file == sharded_event_path(events_dir, event_id)
     assert event_file.exists()
     event_data = json.loads(event_file.read_text(encoding="utf-8"))
+    assert event_data["narrative"] == "Conversation: parent said 'Hello Ina'"
+    assert "operator" not in event_data["narrative"].lower()
     assert event_data["word_usage"], "word usage annotations should be recorded"
     assert event_data["word_usage"][0]["words"] == ["hello", "ina"]
 

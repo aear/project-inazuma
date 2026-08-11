@@ -99,6 +99,8 @@ class ConversationSceneBuffer:
                     "speaker": speaker,
                     "text": text,
                     "created_at": raw.get("created_at") or raw.get("timestamp"),
+                    "is_self": bool(raw.get("is_self")),
+                    "author_is_bot": bool(raw.get("author_is_bot")),
                     "seeded": True,
                 })
                 known.add(signature)
@@ -131,6 +133,8 @@ class ConversationSceneBuffer:
                 "text": text,
                 "created_at": getattr(message, "created_at", None),
                 "reply_to_id": getattr(message, "reply_to_id", None),
+                "is_self": bool(getattr(sender, "is_self", False)),
+                "speaker_backend_id": getattr(sender, "backend_id", None),
                 "seeded": False,
             }
             if text:
