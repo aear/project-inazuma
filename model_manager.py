@@ -174,7 +174,8 @@ _STORAGE_VITALS_INTERVAL = 60.0
 _last_storage_vitals = 0.0
 _REFLECTION_JOURNAL_INTERVAL_SECONDS = 24 * 60 * 60
 _REFLECTION_JOURNAL_STATE_KEY = "reflection_journal_state"
-_PROCESS_SCHEDULER_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
+_PROCESS_SCHEDULER_RUNTIME_STATE_PATH = MEMORY_PATH / "process_scheduler_state.json"
+_PROCESS_SCHEDULER_STATE_PATH = _PROCESS_SCHEDULER_RUNTIME_STATE_PATH
 _PROCESS_SCHEDULER_TICK_INTERVAL = 5.0
 _RESOURCE_VITALS_STALE_SEC = 180.0
 _last_process_scheduler_tick = 0.0
@@ -1061,12 +1062,17 @@ def _save_process_scheduler_state(state: Dict[str, Any], limits: Optional[Dict[s
     }
     state["planner"] = _build_process_scheduler_summary(state, limits)
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    saved = False
     try:
         _PROCESS_SCHEDULER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(_PROCESS_SCHEDULER_STATE_PATH, state)
+        saved = True
     except Exception as exc:
         log_to_statusbox(f"[Scheduler] Failed to save process scheduler state: {exc}")
-    update_inastate("process_scheduler", state)
+    # Tests and diagnostic callers redirect the scheduler file to an isolated
+    # path. Never mirror those synthetic states into Ina's live inastate.
+    if saved and _PROCESS_SCHEDULER_STATE_PATH == _PROCESS_SCHEDULER_RUNTIME_STATE_PATH:
+        update_inastate("process_scheduler", state)
 
 
 def _scheduler_gpu_snapshot(track_gpu: bool = True) -> Dict[str, Any]:

@@ -182,10 +182,12 @@ def test_extract_resource_context_includes_scheduler_payload():
     assert resource_context["scheduler_next_slots"][0]["label"] == "memory graph neural"
 
 
-def test_request_scheduler_task_enqueues_generic_runtime_module():
+def test_request_scheduler_task_enqueues_generic_runtime_module(monkeypatch):
     original_path = mm._PROCESS_SCHEDULER_STATE_PATH
     temp_dir = tempfile.mkdtemp(prefix='scheduler_test_')
     mm._PROCESS_SCHEDULER_STATE_PATH = Path(temp_dir) / 'process_scheduler_state.json'
+    published = []
+    monkeypatch.setattr(mm, "update_inastate", lambda key, value: published.append((key, value)))
     try:
         task_id = mm.request_scheduler_task('logic_engine_run', reason='unit_test', priority=81)
         state = mm._load_process_scheduler_state()
@@ -193,6 +195,7 @@ def test_request_scheduler_task_enqueues_generic_runtime_module():
         assert state['queue']
         assert state['queue'][0]['task_key'] == 'logic_engine_run'
         assert state['planner']['queue_depth'] == 1
+        assert published == []
     finally:
         mm._PROCESS_SCHEDULER_STATE_PATH = original_path
         shutil.rmtree(temp_dir, ignore_errors=True)
