@@ -40,9 +40,9 @@ def test_cgroup_status_verifies_actual_kernel_files(tmp_path):
     assert status["kernel_swap_limit_bytes"] == 1000
 
 
-def test_scope_command_sets_independent_ram_and_swap_limits(monkeypatch):
+def test_service_command_sets_independent_ram_and_swap_limits(monkeypatch):
     monkeypatch.setattr(re.os, "getpid", lambda: 42)
-    command = re.systemd_scope_command(
+    command = re.systemd_service_command(
         ["python", "GUI.py"],
         {
             "unit_prefix": "ina-runtime",
@@ -50,7 +50,10 @@ def test_scope_command_sets_independent_ram_and_swap_limits(monkeypatch):
             "swap_limit_bytes": 250,
         },
     )
-    assert "--unit=ina-runtime-42.scope" in command
+    assert "--unit=ina-runtime-42.service" in command
+    assert "--scope" not in command
+    assert "--service-type=exec" in command
+    assert "--same-dir" in command
     assert "--property=MemoryMax=100" in command
     assert "--property=MemorySwapMax=250" in command
     assert command[-2:] == ["python", "GUI.py"]

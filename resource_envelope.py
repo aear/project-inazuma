@@ -160,14 +160,15 @@ def cgroup_status(
     }
 
 
-def systemd_scope_command(command: Iterable[str], limits: Dict[str, Any]) -> list[str]:
-    unit = f"{limits['unit_prefix']}-{os.getpid()}.scope"
+def systemd_service_command(command: Iterable[str], limits: Dict[str, Any]) -> list[str]:
+    unit = f"{limits['unit_prefix']}-{os.getpid()}.service"
     return [
         "systemd-run",
         "--user",
-        "--scope",
         "--quiet",
         "--collect",
+        "--service-type=exec",
+        "--same-dir",
         f"--unit={unit}",
         "--property=MemoryAccounting=yes",
         f"--property=MemoryMax={int(limits['ram_limit_bytes'])}",
@@ -178,7 +179,7 @@ def systemd_scope_command(command: Iterable[str], limits: Dict[str, Any]) -> lis
 
 
 def ensure_runtime_hard_limit(command: Optional[Iterable[str]] = None) -> Dict[str, Any]:
-    """Verify the current cgroup or re-exec the entry point in a strict scope.
+    """Verify the current cgroup or re-exec the entry point as a strict service.
 
     When ``required`` is true this fails closed: a runtime is never silently
     started with only the cooperative Python guard.
@@ -197,7 +198,7 @@ def ensure_runtime_hard_limit(command: Optional[Iterable[str]] = None) -> Dict[s
     runner = shutil.which("systemd-run")
     if command is not None and runner and not already_attempted and sys.platform.startswith("linux"):
         os.environ["INA_RESOURCE_ENVELOPE_BOOTSTRAP"] = "1"
-        argv = systemd_scope_command(command, limits)
+        argv = systemd_service_command(command, limits)
         os.execv(runner, argv)
 
     reason = "systemd-run unavailable" if not runner else "kernel cgroup limits did not verify"
