@@ -2,13 +2,21 @@
 
 import json
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+if __name__ == "__main__":
+    from resource_envelope import ensure_runtime_hard_limit
+
+    ensure_runtime_hard_limit([sys.executable, *sys.argv])
+
 from continuity_manager import ContinuityManager
 from model_manager import update_inastate, load_config, get_inastate
 from gui_hook import log_to_statusbox
 from safe_popen import safe_popen
+from runtime_services import ensure_runtime_service_supervisor
 from who_am_i import run_reflection
 
 
@@ -188,6 +196,16 @@ def run_birth_sequence(child):
     try:
         ensure_defaults(child)
         load_continuity_boot_core(child)
+
+        service_supervisor_pid = ensure_runtime_service_supervisor(child)
+        if service_supervisor_pid:
+            log_to_statusbox(f"[Birth] Runtime services supervised by pid={service_supervisor_pid}.")
+            workspace_cfg = load_config().get("virtual_workspace", {})
+            workspace_cfg = workspace_cfg if isinstance(workspace_cfg, dict) else {}
+            if bool(workspace_cfg.get("launch_viewer_on_birth", True)):
+                safe_popen([sys.executable, "virtual_workspace_viewer.py", "--child", str(child)])
+        else:
+            log_to_statusbox("[Birth] Runtime service supervisor failed to start.")
 
         flick_start = datetime.now(timezone.utc).isoformat()
         scanned, matched = trigger_birth_flickers(child)

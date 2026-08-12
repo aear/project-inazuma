@@ -29,6 +29,7 @@ DEFAULT_MEANING_POLICY = {
     "vector_round_digits": 6,
     "gc_every_batches": 4,
     "max_words_total": 0,
+    "max_pair_entries_per_store": 100000,
 }
 
 
@@ -123,6 +124,7 @@ def _meaning_policy(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     policy["vector_round_digits"] = max(2, min(8, int(_safe_float(policy.get("vector_round_digits"), 6))))
     policy["gc_every_batches"] = max(0, int(_safe_float(policy.get("gc_every_batches"), 4)))
     policy["max_words_total"] = max(0, int(_safe_float(policy.get("max_words_total"), 0)))
+    policy["max_pair_entries_per_store"] = max(1000, int(_safe_float(policy.get("max_pair_entries_per_store"), 100000)))
     return policy
 
 
@@ -288,6 +290,9 @@ def _upsert_symbol_pair_entry(
     stability_divisor: float = 10.0,
     flexible_limit: int = 5,
 ) -> Dict[str, Any]:
+    max_entries = int(policy.get("max_pair_entries_per_store", 100000))
+    if key not in store and max_entries > 0 and len(store) >= max_entries:
+        return {}
     entry = store.get(key) if isinstance(store.get(key), dict) else {}
     now = datetime.now(timezone.utc).isoformat()
     prior_uses = int(_safe_float(entry.get("uses"), 0))

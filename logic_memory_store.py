@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from emotion_symbol_store import _lsh_signature, _nearby_lsh_keys
+from ina_ml import coerce_vector, cosine_similarity as shared_cosine_similarity
 from storage_layout import fast_runtime_path, load_config
 
 
@@ -121,22 +122,11 @@ def _event_id(payload: Dict[str, Any]) -> str:
 
 
 def _coerce_vector(vector: Iterable[Any]) -> list[float]:
-    values = []
-    for value in vector:
-        try:
-            values.append(float(value))
-        except (TypeError, ValueError):
-            values.append(0.0)
-    return values
+    return coerce_vector(vector)
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
-    if not left or not right:
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = sum(value * value for value in left) ** 0.5
-    right_norm = sum(value * value for value in right) ** 0.5
-    return dot / (left_norm * right_norm + 1e-8)
+    return shared_cosine_similarity(left, right)
 
 
 def _candidate_rows(

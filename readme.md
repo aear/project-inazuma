@@ -1,4 +1,4 @@
-# Project Inazuma — Ethical AGI Runtime
+# Project Inazuma V3 — Ethical AGI Runtime
 > _“Raise, don’t just run.”_ — Project Godhunter
 
 Inazuma (“Ina”) is an emergent AGI runtime focused on **symbolic cognition, emotional state modeling, and self‑programming**.  

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+from ina_desktop.client import launch_environment
 from storage_layout import fast_runtime_path, load_config
 
 
@@ -102,6 +103,7 @@ def paint_runtime_is_running(child: str, config: Dict[str, Any] | None = None) -
 def run_paint_runtime() -> int:
     config = load_config(PROJECT_ROOT / "config.json")
     child = str(config.get("current_child") or "default_child")
+    os.environ.update(launch_environment(child))
     paths = paint_runtime_paths(child, config)
     paths["root"].mkdir(parents=True, exist_ok=True)
     lock_handle = paths["lock"].open("a+")

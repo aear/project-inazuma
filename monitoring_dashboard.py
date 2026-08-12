@@ -388,14 +388,24 @@ def _communication() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, s
     flush = get_inastate('discord_outbox_flush') or {}
     speaking = get_inastate('currently_speaking')
     bridge = base / 'discord_bridge.lock'
+    runtime_status_path = base / 'runtime_services.json'
+    runtime_status = _safe_json(runtime_status_path, {})
+    services = runtime_status.get('services') if isinstance(runtime_status, dict) else {}
+    services = services if isinstance(services, dict) else {}
+    world_state = services.get('world_server') if isinstance(services.get('world_server'), dict) else {}
+    discord_state = services.get('discord_bridge') if isinstance(services.get('discord_bridge'), dict) else {}
+    supervisor_state = runtime_status.get('status') if isinstance(runtime_status, dict) else None
     rows = [
-        ('Discord bridge', 'lock present' if bridge.exists() else 'not running', 'bridge', _modified(bridge), str(bridge)),
+        ('Runtime supervisor', _state_text(supervisor_state), 'service manager', _modified(runtime_status_path), json.dumps(runtime_status, indent=2)),
+        ('World server', _state_text(world_state.get('status')), 'supervised service', _age(world_state.get('updated_at')), json.dumps(world_state, indent=2)),
+        ('Discord bridge', _state_text(discord_state.get('status')), 'supervised service', _age(discord_state.get('updated_at')), json.dumps(discord_state, indent=2)),
+        ('Discord process lock', 'lock present' if bridge.exists() else 'not present', 'process evidence', _modified(bridge), str(bridge)),
         ('Last heard contact', _state_text(contact.get('name') or contact.get('display_name') if isinstance(contact, dict) else contact), 'conversation', _age(contact.get('timestamp') if isinstance(contact, dict) else None), json.dumps(contact, indent=2) if isinstance(contact, dict) else str(contact)),
         ('Outbox flush', _state_text(flush.get('status') if isinstance(flush, dict) else flush), 'delivery', _age(flush.get('timestamp') if isinstance(flush, dict) else None), json.dumps(flush, indent=2) if isinstance(flush, dict) else str(flush)),
         ('Speaking now', _state_text(speaking), 'voice', 'live state', str(speaking)),
         _file_row('Typed outbox', base / 'typed_outbox.jsonl', 'recent messages'),
     ]
-    cards = [('Contacts', str(len(social) if isinstance(social, list) else len(social) if isinstance(social, dict) else 0)), ('Discord', 'online' if bridge.exists() else 'offline'), ('Speaking', 'yes' if speaking else 'no'), ('Last contact', _age(contact.get('timestamp') if isinstance(contact, dict) else None))]
+    cards = [('Contacts', str(len(social) if isinstance(social, list) else len(social) if isinstance(social, dict) else 0)), ('Discord', _state_text(discord_state.get('status'))), ('World', _state_text(world_state.get('status'))), ('Speaking', 'yes' if speaking else 'no'), ('Last contact', _age(contact.get('timestamp') if isinstance(contact, dict) else None))]
     return cards, rows
 
 def _unit_level(value: Any) -> float | None:
@@ -683,6 +693,44 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
             _age(migration.get('updated_at')),
             json.dumps(migration, indent=2, default=str),
         ))
+    envelope = vitals.get('resource_envelope') if isinstance(vitals, dict) else {}
+    if not isinstance(envelope, dict):
+        envelope = {}
+    rows.append((
+        'Kernel resource envelope',
+        'verified' if envelope.get('enforced') else 'UNVERIFIED',
+        f"RAM {_size(envelope.get('ram_current_bytes'))} / {_size(envelope.get('kernel_ram_limit_bytes'))}; "
+        f"swap {_size(envelope.get('swap_current_bytes'))} / {_size(envelope.get('kernel_swap_limit_bytes'))}",
+        _age(vitals.get('timestamp') if isinstance(vitals, dict) else None),
+        json.dumps(envelope, indent=2, default=str),
+    ))
+    services = _safe_json(base / 'runtime_services.json', {})
+    service_rows = services.get('services') if isinstance(services, dict) else {}
+    service_rows = service_rows if isinstance(service_rows, dict) else {}
+    live_services = sum(1 for detail in service_rows.values() if isinstance(detail, dict) and detail.get('status') == 'running')
+    rows.append((
+        'Supervised runtime services',
+        f"{live_services}/{len(service_rows)} running",
+        str(services.get('status') or 'unavailable'),
+        _age(services.get('updated_at')),
+        json.dumps(services, indent=2, default=str),
+    ))
+    workspace = _safe_json(base / 'virtual_workspace' / 'status.json', {})
+    audio = workspace.get('audio') if isinstance(workspace, dict) else {}
+    audio = audio if isinstance(audio, dict) else {}
+    workspace_state = str(workspace.get('status') or 'unavailable')
+    workspace_detail = (
+        f"{workspace.get('display') or 'no display'} · "
+        f"{'audio isolated' if audio.get('ready') else 'audio unavailable'} · "
+        f"{'input enabled' if workspace.get('input_enabled') else 'input disabled'}"
+    )
+    rows.append((
+        'Ina virtual desktop',
+        workspace_state,
+        workspace_detail + (' · highlight' if workspace_state in {'failed', 'blocked'} else ''),
+        _age(workspace.get('updated_at')),
+        json.dumps(workspace, indent=2, default=str),
+    ))
     rows.extend([_file_row('Runtime state', base / 'inastate.json', 'state store'), _file_row('Scheduler state', base / 'process_scheduler_state.json', 'scheduler')])
     cpu = vitals.get('ina_cpu_percent', 0) if isinstance(vitals, dict) else 0
     memory = vitals.get('ina_ram_bytes', 0) if isinstance(vitals, dict) else 0

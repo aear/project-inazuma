@@ -8,6 +8,7 @@ import hashlib
 import uuid
 import threading
 import os
+import sys
 import random
 import signal
 import gc
@@ -15,7 +16,6 @@ import traceback
 import math
 import precision_memory_map
 from config_layers import load_config
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,9 +31,19 @@ from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
 from io_utils import atomic_write_json
+from memory_index import ensure_memory_index_db, index_is_current, touch_fragments
+from resource_envelope import cgroup_status, desired_limits
 from discord_runtime import typed_outbox_path
 from self_read_policy import SELF_READ_FOCUS_ENV, self_read_focus_from_emotions
-from runtime_state import append_inastate_queue
+from runtime_state import (
+    append_inastate_queue, get_inastate as _runtime_get_inastate,
+    increment_inastate_metric as _runtime_increment_metric,
+    set_inastate_metric as _runtime_set_metric, update_inastate as _runtime_update_inastate,
+    seed_self_question as _runtime_seed_self_question,
+    mark_self_question_resolved as _runtime_mark_self_question_resolved,
+    append_typed_outbox_entry as _runtime_append_typed_outbox_entry,
+)
+from ina_desktop.client import workspace_command_environment
 from storage_layout import fast_runtime_path
 from storage_vitals import sample_storage_vitals
 from io_pressure import active_pressure
@@ -45,9 +55,14 @@ from operator_permissions import (
 )
 from github_submission import append_github_issue_entry, get_github_submission_config, github_delivery_request_path, labels_for_kind, report_github_finding, request_github_delivery
 from transformers.fractal_multidimensional_transformers import FractalTransformer
+from cognition_runtime import (
+    CapabilityRegistry, CognitionRuntime, CognitiveContext, ExistingSchedulerAdapter,
+    ResourceBudget, ResultBus, capability_specs_from_task_profiles,
+)
+from cognition_runtime.default_capabilities import build_task_profiles
 
 try:
-    import psutil  # type: ignore
+    from ina_process import psutil
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 
@@ -61,10 +76,13 @@ RUNNING_MODULES_PATH = Path("running_modules.json")
 _SEMANTIC_SCAFFOLD_PATH = MEMORY_PATH / "semantic_scaffold.json"
 TYPED_OUTBOX_PATH = typed_outbox_path(CHILD, config)
 GITHUB_SUBMISSION_STATE_PATH = MEMORY_PATH / "github_submission_state.json"
+_RESOURCE_BUDGET = ResourceBudget(
+    config_loader=load_config, envelope_reader=cgroup_status, desired_reader=desired_limits,
+)
+_COGNITION_RUNTIME: Optional[CognitionRuntime] = None
+_COGNITION_RUNTIME_LOCK = threading.RLock()
 _DECISION_PANIC_LOG_PATH = MEMORY_PATH / "decision_panic_log.jsonl"
-_SELF_QUESTIONS_PATH = MEMORY_PATH / "self_questions.json"
 _FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
-_INASTATE_LOCK_PATH = MEMORY_PATH / "inastate.lock"
 
 _DEFAULT_SELF_READ_SOURCE_CHOICES = {
     "code": True,
@@ -200,221 +218,8 @@ _ATTENTION_POLICY_DEFAULTS = {
     "default_request_ttl_sec": 300.0,
     "max_request_ttl_sec": 1800.0,
 }
-_PROCESS_TASK_PROFILES = {
-    "memory_graph_neural": {
-        "kind": "subprocess",
-        "command": ["python", "memory_graph.py", "--phase", "neural"],
-        "module": "memory_graph",
-        "priority": 90,
-        "memory_class": "high",
-        "cpu_class": "high",
-        "gpu_class": "none",
-        "exclusive_group": "memory_recall",
-    },
-    "deep_recall_step": {
-        "kind": "step",
-        "module": "deep_recall",
-        "priority": 70,
-        "memory_class": "high",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "memory_recall",
-    },
-    "dreamstate_run": {
-        "kind": "subprocess",
-        "command": ["python", "dreamstate.py"],
-        "module": "dreamstate",
-        "priority": 84,
-        "memory_class": "medium",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "conscious_mode",
-    },
-    "storage_migration_step": {
-        "kind": "subprocess",
-        "command": ["python", "storage_migration.py", "--resume-managed"],
-        "module": "storage_migration",
-        "priority": 99,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "memory_recall",
-        "max_runtime_sec": 600.0,
-    },
-    "experience_archive_step": {
-        "kind": "subprocess",
-        "command": ["python", "experience_maintenance.py"],
-        "module": "experience_archive",
-        "priority": 61,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "memory_recall",
-        "max_runtime_sec": 150.0,
-    },
-    "memory_reconciliation_step": {
-        "kind": "subprocess",
-        "command": ["python", "memory_reconciliation.py", "--max-new-records", "50000", "--max-seconds", "30"],
-        "module": "memory_reconciliation",
-        "priority": 62,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "memory_recall",
-        "max_runtime_sec": 120.0,
-    },
+_PROCESS_TASK_PROFILES = build_task_profiles(CHILD)
 
-    "meditation_state_run": {
-        "kind": "subprocess",
-        "command": ["python", "meditation_state.py"],
-        "module": "meditation_state",
-        "priority": 82,
-        "memory_class": "medium",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "conscious_mode",
-    },
-    "emotion_engine_run": {
-        "kind": "subprocess",
-        "command": ["python", "emotion_engine.py"],
-        "module": "emotion_engine",
-        "priority": 72,
-        "memory_class": "low",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "instinct_engine_run": {
-        "kind": "subprocess",
-        "command": ["python", "instinct_engine.py"],
-        "module": "instinct_engine",
-        "priority": 74,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "early_comm_run": {
-        "kind": "subprocess",
-        "command": ["python", "early_comm.py"],
-        "module": "early_comm",
-        "priority": 58,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "predictive_layer_run": {
-        "kind": "subprocess",
-        "command": ["python", "predictive_layer.py"],
-        "module": "predictive_layer",
-        "priority": 76,
-        "memory_class": "medium",
-        "cpu_class": "high",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "logic_engine_run": {
-        "kind": "subprocess",
-        "command": ["python", "logic_engine.py"],
-        "module": "logic_engine",
-        "priority": 76,
-        "memory_class": "medium",
-        "cpu_class": "high",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "meaning_map_refresh": {
-        "kind": "subprocess",
-        "command": ["python", "meaning_map.py"],
-        "module": "meaning_map",
-        "priority": 78,
-        "memory_class": "high",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "map_build",
-    },
-    "neural_graph_refresh": {
-        "kind": "subprocess",
-        "command": ["python", "neural_graph.py"],
-        "module": "neural_graph",
-        "priority": 74,
-        "memory_class": "medium",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "map_build",
-    },
-    "logic_map_refresh": {
-        "kind": "subprocess",
-        "command": ["python", "logic_map_builder.py"],
-        "module": "logic_map",
-        "priority": 76,
-        "memory_class": "high",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "map_build",
-    },
-    "emotion_map_refresh": {
-        "kind": "subprocess",
-        "command": ["python", "emotion_map.py"],
-        "module": "emotion_map",
-        "priority": 72,
-        "memory_class": "medium",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "map_build",
-    },
-    "who_am_i_run": {
-        "kind": "subprocess",
-        "command": ["python", "who_am_i.py"],
-        "module": "who_am_i",
-        "priority": 68,
-        "memory_class": "low",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "trauma_processor_run": {
-        "kind": "subprocess",
-        "command": ["python", "trauma_processor.py"],
-        "module": "trauma_processor",
-        "priority": 80,
-        "memory_class": "medium",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "boredom_state_run": {
-        "kind": "subprocess",
-        "command": ["python", "boredom_state.py"],
-        "module": "boredom_state",
-        "priority": 54,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "",
-    },
-    "paint_window_open": {
-        "kind": "subprocess",
-        "command": ["python", "paint_runtime.py"],
-        "module": "paint_window",
-        "priority": 52,
-        "memory_class": "low",
-        "cpu_class": "low",
-        "gpu_class": "none",
-        "exclusive_group": "creative_ui",
-    },
-    "daw_window_open": {
-        "kind": "subprocess",
-        "command": ["python", "daw_window.py", "--child", str(CHILD)],
-        "module": "daw_window",
-        "priority": 53,
-        "memory_class": "low",
-        "cpu_class": "medium",
-        "gpu_class": "none",
-        "exclusive_group": "creative_ui",
-    },
-}
 _BUNDLE_POLICY_DEFAULTS = {
     "enabled": False,
     "allow_apply": False,
@@ -560,6 +365,17 @@ def _ina_process_tree_rss_gb() -> float:
     return rss_bytes / (1024.0 ** 3)
 
 
+def _ina_cgroup_memory_gb() -> float:
+    try:
+        status = cgroup_status()
+        current = status.get("ram_current_bytes")
+        if status.get("enforced") and isinstance(current, int):
+            return max(0.0, current / (1024.0 ** 3))
+    except Exception:
+        pass
+    return 0.0
+
+
 def _trim_allocator_memory() -> bool:
     """
     Best-effort trim for glibc allocators on Linux to return free arenas.
@@ -636,11 +452,21 @@ def _memory_guard_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
     limits["ram_soft_percent"] = min(limits["ram_soft_percent"], limits["ram_hard_percent"])
     limits["swap_soft_percent"] = min(limits["swap_soft_percent"], limits["swap_hard_percent"])
+    envelope = desired_limits(cfg)
+    envelope_hard_gb = float(envelope.get("ram_limit_bytes", 0)) / (1024.0 ** 3)
+    if envelope.get("enabled") and envelope_hard_gb > 0:
+        if limits["ina_hard_gb"] <= 0:
+            limits["ina_hard_gb"] = envelope_hard_gb
+        else:
+            limits["ina_hard_gb"] = min(limits["ina_hard_gb"], envelope_hard_gb)
     if limits["ina_hard_gb"] > 0:
         if limits["ina_soft_gb"] <= 0:
-            limits["ina_soft_gb"] = max(0.0, limits["ina_hard_gb"] * 0.8)
+            limits["ina_soft_gb"] = max(0.0, limits["ina_hard_gb"] * 0.85)
         else:
             limits["ina_soft_gb"] = min(limits["ina_soft_gb"], limits["ina_hard_gb"])
+    limits["resource_envelope_required"] = bool(envelope.get("required"))
+    limits["resource_envelope_ram_gb"] = round(envelope_hard_gb, 3)
+    limits["resource_envelope_swap_gb"] = round(float(envelope.get("swap_limit_bytes", 0)) / (1024.0 ** 3), 3)
     return limits
 
 
@@ -759,6 +585,10 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
     _last_memory_guard_check = now
     timestamp = datetime.now(timezone.utc).isoformat()
     limits = _memory_guard_limits()
+    try:
+        envelope_status = cgroup_status()
+    except Exception as exc:
+        envelope_status = {"enforced": False, "verification": "error", "reason": str(exc)}
 
     if psutil is None:
         state = {"timestamp": timestamp, "level": "unknown", "reason": "psutil_unavailable"}
@@ -768,11 +598,16 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
         vm = psutil.virtual_memory()
         swap = psutil.swap_memory()
         available_gb = vm.available / (1024.0 ** 3)
-        ina_rss_gb = _ina_process_tree_rss_gb()
+        process_tree_rss_gb = _ina_process_tree_rss_gb()
+        cgroup_memory_gb = _ina_cgroup_memory_gb()
+        ina_rss_gb = cgroup_memory_gb if cgroup_memory_gb > 0 else process_tree_rss_gb
         triggers = []
         level = "ok"
 
         hard = False
+        if limits.get("resource_envelope_required") and not envelope_status.get("enforced"):
+            triggers.append("hard_limit_unverified")
+            hard = True
         if limits["min_available_gb"] > 0 and available_gb <= limits["min_available_gb"]:
             triggers.append("available_low")
             hard = True
@@ -811,6 +646,9 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
             "swap_percent": round(swap.percent, 1),
             "swap_used_gb": round(swap.used / (1024.0 ** 3), 2),
             "ina_rss_gb": round(ina_rss_gb, 2),
+            "ina_memory_source": "cgroup_v2" if cgroup_memory_gb > 0 else "process_tree_rss",
+            "ina_process_tree_rss_gb": round(process_tree_rss_gb, 2),
+            "resource_envelope": envelope_status,
             "limits": {
                 "ram_soft_percent": limits["ram_soft_percent"],
                 "ram_hard_percent": limits["ram_hard_percent"],
@@ -819,6 +657,8 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
                 "min_available_gb": limits["min_available_gb"],
                 "ina_soft_gb": limits["ina_soft_gb"],
                 "ina_hard_gb": limits["ina_hard_gb"],
+                "resource_envelope_ram_gb": limits["resource_envelope_ram_gb"],
+                "resource_envelope_swap_gb": limits["resource_envelope_swap_gb"],
                 "queue_enabled": limits["queue_enabled"],
                 "queue_ram_used_gb": limits["queue_ram_used_gb"],
                 "queue_swap_used_gb": limits["queue_swap_used_gb"],
@@ -834,52 +674,8 @@ def _refresh_memory_guard_state(force: bool = False) -> Dict[str, Any]:
 
 
 def _process_scheduler_limits(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cfg = cfg or load_config()
-    raw = cfg.get("process_scheduler") if isinstance(cfg, dict) else None
-    raw = raw if isinstance(raw, dict) else {}
-
-    limits = _PROCESS_SCHEDULER_DEFAULTS.copy()
-    limits["enabled"] = _coerce_bool(raw.get("enabled", limits["enabled"]), limits["enabled"])
-    for key in (
-        "max_queue_slots",
-        "max_parallel_tasks",
-        "max_memory_heavy_tasks",
-        "max_cpu_heavy_tasks",
-        "max_gpu_tasks",
-        "history_limit",
-        "decision_limit",
-    ):
-        if key in raw:
-            limits[key] = max(1, _coerce_int(raw.get(key), int(limits[key])))
-    for key in ("cpu_soft_percent", "cpu_hard_percent", "gpu_soft_percent", "gpu_hard_percent"):
-        if key in raw:
-            limits[key] = _clamp_percent(raw.get(key), limits[key])
-    for key in (
-        "history_window_hours",
-        "max_total_rss_gb",
-        "max_managed_rss_gb",
-        "min_available_gb",
-        "memory_estimate_low_gb",
-        "memory_estimate_medium_gb",
-        "memory_estimate_high_gb",
-        "terminate_grace_sec",
-    ):
-        if key in raw:
-            limits[key] = max(0.0, _coerce_float(raw.get(key), limits[key]))
-    for key in ("memory_budget_enabled", "terminate_over_budget_tasks", "track_gpu"):
-        if key in raw:
-            limits[key] = _coerce_bool(raw.get(key), limits[key])
-
-    limits["max_memory_heavy_tasks"] = min(limits["max_memory_heavy_tasks"], limits["max_parallel_tasks"])
-    limits["max_cpu_heavy_tasks"] = min(limits["max_cpu_heavy_tasks"], limits["max_parallel_tasks"])
-    limits["max_gpu_tasks"] = min(limits["max_gpu_tasks"], limits["max_parallel_tasks"])
-    limits["cpu_soft_percent"] = min(limits["cpu_soft_percent"], limits["cpu_hard_percent"])
-    limits["gpu_soft_percent"] = min(limits["gpu_soft_percent"], limits["gpu_hard_percent"])
-    if limits["max_total_rss_gb"] > 0 and limits["max_managed_rss_gb"] > 0:
-        limits["max_managed_rss_gb"] = min(limits["max_managed_rss_gb"], limits["max_total_rss_gb"])
-    limits["history_window_hours"] = max(0.25, _coerce_float(limits.get("history_window_hours"), 24.0))
-    limits["terminate_grace_sec"] = max(1.0, limits["terminate_grace_sec"])
-    return limits
+    """Compatibility façade over cognition_runtime.resource_budget."""
+    return _RESOURCE_BUDGET.scheduler_limits(cfg or load_config(), _PROCESS_SCHEDULER_DEFAULTS)
 
 
 def _attention_policy(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1344,14 +1140,15 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
             cpu_percent = 0.0
     gpu = _scheduler_gpu_snapshot(track_gpu=bool(limits.get("track_gpu", True)))
     tree_rss_gb = round(_ina_process_tree_rss_gb(), 3)
+    cgroup_memory_gb = round(_ina_cgroup_memory_gb(), 3)
     vitals = _fresh_resource_vitals()
     vitals_rss_gb = _resource_vitals_ram_gb(vitals)
-    if vitals_rss_gb > tree_rss_gb:
-        ina_rss_gb = vitals_rss_gb
-        ina_rss_source = "resource_vitals"
+    if cgroup_memory_gb > 0:
+        ina_rss_gb, ina_rss_source = cgroup_memory_gb, "cgroup_v2"
+    elif vitals_rss_gb > tree_rss_gb:
+        ina_rss_gb, ina_rss_source = vitals_rss_gb, "resource_vitals"
     else:
-        ina_rss_gb = tree_rss_gb
-        ina_rss_source = "process_tree"
+        ina_rss_gb, ina_rss_source = tree_rss_gb, "process_tree_rss"
     running_modules = set(get_running_modules())
     for item in (vitals.get("top_modules") if isinstance(vitals.get("top_modules"), list) else [])[:8]:
         if isinstance(item, dict) and str(item.get("name") or "").strip():
@@ -1362,6 +1159,7 @@ def _scheduler_resource_snapshot(memory_guard: Optional[Dict[str, Any]] = None, 
         "ina_rss_gb": round(ina_rss_gb, 3),
         "ina_rss_source": ina_rss_source,
         "ina_process_tree_rss_gb": tree_rss_gb,
+        "ina_cgroup_memory_gb": cgroup_memory_gb,
         "resource_vitals_rss_gb": round(vitals_rss_gb, 3),
         "ram_available_gb": round(max(0.0, _coerce_float(guard_state.get("ram_available_gb"), 0.0)), 3),
         "ram_used_gb": round(max(0.0, _coerce_float(guard_state.get("ram_used_gb"), 0.0)), 3),
@@ -2029,6 +1827,7 @@ def _scheduler_enforce_memory_limits(state: Dict[str, Any], resources: Dict[str,
 def _reconcile_process_scheduler_running(state: Dict[str, Any], limits: Dict[str, Any]) -> None:
     running = state.get("running") if isinstance(state.get("running"), list) else []
     next_running: List[Dict[str, Any]] = []
+    restart_after_exit: List[Tuple[str, int]] = []
     finished_at = datetime.now(timezone.utc).isoformat()
     for entry in running:
         pid = _coerce_int(entry.get("pid"), 0)
@@ -2109,7 +1908,14 @@ def _reconcile_process_scheduler_running(state: Dict[str, Any], limits: Dict[str
         if metrics:
             history_payload["last_metrics"] = metrics
         _scheduler_record_history(state, history_payload, limits)
+        if entry.get("restart_after_exit") and task_key:
+            restart_after_exit.append((task_key, int(entry.get("priority", 0) or 0)))
     state["running"] = next_running
+    for task_key, priority in restart_after_exit:
+        _enqueue_process_task(
+            state, task_key, limits=limits, priority=priority or None,
+            reason="operator_restart", metadata={"restart_after_exit": True},
+        )
 
 
 def _default_shed_patterns() -> List[str]:
@@ -2763,45 +2569,6 @@ def _active_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-@contextmanager
-def _inastate_lock():
-    try:
-        import fcntl  # Unix-only; best-effort on other platforms.
-    except Exception:
-        yield
-        return
-    _INASTATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_INASTATE_LOCK_PATH, "w") as lock_handle:
-        try:
-            fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        except Exception:
-            yield
-            return
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(lock_handle, fcntl.LOCK_UN)
-            except Exception:
-                pass
-
-
-def _load_inastate_state() -> Dict[str, Any]:
-    path = MEMORY_PATH / "inastate.json"
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _atomic_write_inastate(state: Dict[str, Any]) -> None:
-    atomic_write_json(MEMORY_PATH / "inastate.json", state, indent=4)
-
-
 def safe_popen(cmd, description=None, **popen_kwargs):
     action = {"command": cmd, "description": description or " ".join(map(str, cmd))}
     feedback = check_action(action)
@@ -3065,17 +2832,12 @@ def get_sweet_spots():
     }
 
 def get_inastate(key, default=None):
-    state = _load_inastate_state()
-    if not isinstance(state, dict):
-        return default
-    return state.get(key, default)
+    """Compatibility façade over the canonical runtime-state store."""
+    return _runtime_get_inastate(key, default, child=CHILD)
 
 
 def update_inastate(key, value):
-    with _inastate_lock():
-        state = _load_inastate_state()
-        state[key] = value
-        _atomic_write_inastate(state)
+    return _runtime_update_inastate(key, value, child=CHILD)
 
 
 def clear_attention_request() -> None:
@@ -3241,59 +3003,22 @@ def _maybe_update_storage_vitals(*, now: Optional[float] = None, force: bool = F
 
 
 def increment_inastate_metric(metric: str, amount: int = 1):
-    with _inastate_lock():
-        state = _load_inastate_state()
-        metrics = state.get("metrics", {})
-        metrics[metric] = int(metrics.get(metric, 0)) + int(amount)
-        state["metrics"] = metrics
-        _atomic_write_inastate(state)
+    return _runtime_increment_metric(metric, amount, child=CHILD)
 
 
 def set_inastate_metric(metric: str, value):
-    with _inastate_lock():
-        state = _load_inastate_state()
-        metrics = state.get("metrics", {})
-        metrics[metric] = value
-        state["metrics"] = metrics
-        _atomic_write_inastate(state)
+    return _runtime_set_metric(metric, value, child=CHILD)
 
 
 def append_typed_outbox_entry(
-    text: Optional[str],
-    *,
-    target: str = "owner_dm",
-    user_id: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-    allow_empty: bool = False,
+    text: Optional[str], *, target: str = "owner_dm", user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None, allow_empty: bool = False,
     attachment_path: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Persist a volitional typed message so the Discord bridge can deliver it.
-    Returns the queued entry id if successful.
-    """
-    payload = "" if text is None else str(text)
-    if not allow_empty and not payload.strip() and not attachment_path:
-        return None
-
-    entry = {
-        "id": f"typed_{uuid.uuid4().hex}",
-        "text": payload,
-        "target": target,
-        "user_id": str(user_id) if user_id is not None else None,
-        "metadata": metadata or {},
-        "allow_empty": allow_empty,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if attachment_path:
-        entry["attachment_path"] = attachment_path
-    try:
-        TYPED_OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with TYPED_OUTBOX_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return entry["id"]
-    except Exception as exc:
-        log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")
-        return None
+    return _runtime_append_typed_outbox_entry(
+        text, target=target, user_id=user_id, metadata=metadata,
+        allow_empty=allow_empty, attachment_path=attachment_path, child=CHILD,
+    )
 
 
 def request_discord_outbox_flush(
@@ -4439,25 +4164,7 @@ def _memory_index_db_path(child: str) -> Path:
 
 
 def _memory_index_db_is_current(json_path: Path, db_path: Path) -> bool:
-    if not db_path.exists():
-        return False
-    if not json_path.exists():
-        return True
-    conn = None
-    try:
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT value FROM meta WHERE key = 'source_mtime_ns'").fetchone()
-        if not row or row[0] is None:
-            return False
-        return int(row[0]) == int(json_path.stat().st_mtime_ns)
-    except Exception:
-        return False
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return index_is_current(json_path, db_path)
 
 
 def _sample_fragment_ids_for_reflection(child: str, limit: int = 12) -> List[str]:
@@ -4546,7 +4253,13 @@ class _FragmentMemoryBackend:
 
     def _sqlite_index_available(self) -> bool:
         if self._db_enabled is None:
-            self._db_enabled = _memory_index_db_is_current(self.memory_map_path, self.memory_db_path)
+            try:
+                self._db_enabled = ensure_memory_index_db(
+                    self.memory_map_path, self.memory_db_path
+                )
+            except Exception as exc:
+                log_to_statusbox(f"[DeepRecall] Bounded memory index build failed: {exc}")
+                self._db_enabled = False
         return bool(self._db_enabled)
 
     def _connect_db(self) -> Optional[sqlite3.Connection]:
@@ -4564,6 +4277,19 @@ class _FragmentMemoryBackend:
 
     def _load_json_index(self):
         if self._json_meta is not None:
+            return
+
+        try:
+            json_size = self.memory_map_path.stat().st_size
+        except OSError:
+            json_size = 0
+        if json_size > 32 * 1024 * 1024:
+            # Never turn a sidecar failure back into an unbounded in-process
+            # load or a recursive million-fragment scan. A later runtime can retry.
+            self._json_meta = {}
+            log_to_statusbox(
+                "[DeepRecall] Large memory index has no current SQLite sidecar; deferring recall."
+            )
             return
 
         meta: Dict[str, Dict[str, Any]] = {}
@@ -4779,34 +4505,17 @@ class _MemoryIndexUpdater:
         self.manager = manager
 
     def ingest_fragments(self, fragments: List[Dict[str, Any]]) -> None:
-        if not getattr(self.manager, "_map_loaded", False):
-            self.manager.load_map()
-        now_iso = datetime.now(timezone.utc).isoformat()
-        updated = False
-
-        for frag in fragments:
-            frag_id = frag.get("id")
-            if not frag_id:
-                continue
-
-            existing = self.manager.memory_map.get(frag_id, {})
-            filename = existing.get("filename") or frag.get("source") or f"{frag_id}.json"
-            tier = frag.get("tier") or existing.get("tier") or "short"
-
-            merged = {
-                "tier": tier,
-                "tags": frag.get("tags", existing.get("tags", [])),
-                "importance": frag.get("importance", existing.get("importance", 0)),
-                "last_seen": now_iso,
-                "filename": filename,
-            }
-
-            if merged != existing:
-                self.manager.memory_map[frag_id] = merged
-                updated = True
-
-        if updated:
-            self.manager.save_map()
+        # Recall touches used to load and rewrite the complete 449MB JSON map
+        # inside the long-lived manager. Update the bounded sidecar instead.
+        json_path = self.manager.index_path
+        db_path = _memory_index_db_path(self.manager.child)
+        try:
+            if not ensure_memory_index_db(json_path, db_path):
+                return
+            ids = [str(frag.get("id")) for frag in fragments if frag.get("id")]
+            touch_fragments(db_path, ids, datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            log_to_statusbox(f"[DeepRecall] Failed to touch bounded memory index: {exc}")
 
 
 def _publish_deep_recall_state():
@@ -4940,6 +4649,130 @@ def request_scheduler_task(
     )
     _save_process_scheduler_state(state, limits)
     return task_id
+
+
+def get_cognition_runtime() -> CognitionRuntime:
+    """Return the modular runtime behind this stable compatibility façade."""
+    global _COGNITION_RUNTIME
+    with _COGNITION_RUNTIME_LOCK:
+        if _COGNITION_RUNTIME is None:
+            limits = _process_scheduler_limits()
+            registry = CapabilityRegistry(
+                capability_specs_from_task_profiles(_PROCESS_TASK_PROFILES, limits)
+            )
+            bus = ResultBus(max_contributions=max(128, int(limits.get("history_limit", 512))))
+            scheduler = ExistingSchedulerAdapter(
+                registry, _RESOURCE_BUDGET, bus, enqueue=request_scheduler_task,
+            )
+            _COGNITION_RUNTIME = CognitionRuntime(
+                registry, bus, scheduler=scheduler,
+                max_parallel=int(limits.get("max_parallel_tasks", 2)),
+            )
+        return _COGNITION_RUNTIME
+
+
+def list_cognitive_capabilities(*, available_only: bool = False) -> List[Dict[str, Any]]:
+    return get_cognition_runtime().registry.describe(available_only=available_only)
+
+
+def restart_cognitive_capability(capability: str) -> Dict[str, Any]:
+    """Gracefully restart a process-backed specialist through the existing queue."""
+    profile = _scheduler_task_profile(capability)
+    if profile is None:
+        return {"ok": False, "reason": "unknown_capability", "capability": capability}
+    state = _load_process_scheduler_state()
+    limits = _process_scheduler_limits()
+    for entry in state.get("running", []):
+        if str(entry.get("task_key") or "") != profile["task_key"]:
+            continue
+        entry["restart_after_exit"] = True
+        stopped = _scheduler_request_task_stop(
+            entry, state, limits, "operator_restart", force=False,
+        )
+        _save_process_scheduler_state(state, limits)
+        return {
+            "ok": bool(stopped), "status": "restart_pending" if stopped else "stop_failed",
+            "capability": profile["task_key"], "pid": entry.get("pid"),
+        }
+    task_id = _enqueue_process_task(
+        state, profile["task_key"], limits=limits,
+        priority=int(profile.get("priority", 50)), reason="operator_restart",
+        metadata={"operator_requested": True},
+    )
+    _save_process_scheduler_state(state, limits)
+    return {
+        "ok": bool(task_id), "status": "queued" if task_id else "queue_failed",
+        "capability": profile["task_key"], "task_id": task_id,
+    }
+
+
+def build_cognitive_context(
+    *, observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+) -> CognitiveContext:
+    return CognitiveContext.build(
+        observations=observations, goals=goals, active_state=active_state,
+        provenance=provenance, references=references, metadata=metadata,
+    )
+
+
+def route_cognitive_work(
+    capability: str, *, context: Optional[CognitiveContext] = None, payload: Any = None,
+    observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+    reason: str = "model_manager_facade", priority: Optional[int] = None, measured=None,
+):
+    cycle = context or build_cognitive_context(
+        observations=observations, goals=goals, active_state=active_state,
+        provenance=provenance, references=references, metadata=metadata,
+    )
+    return get_cognition_runtime().route(
+        capability, cycle, payload=payload, reason=reason, priority=priority,
+        metadata=metadata, measured=measured,
+    )
+
+
+def route_cognitive_work_many(
+    capabilities, *, context: Optional[CognitiveContext] = None, payloads=None,
+    observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+):
+    cycle = context or build_cognitive_context(
+        observations=observations, goals=goals, active_state=active_state,
+        provenance=provenance, references=references, metadata=metadata,
+    )
+    return get_cognition_runtime().route_many(capabilities, cycle, payloads=payloads)
+
+
+def install_cognitive_handler(capability: str, handler, *, source: str = "model_manager", validator=None):
+    return get_cognition_runtime().install_handler(capability, handler, source=source, validator=validator)
+
+
+def install_cognitive_patch(capability: str, path: Path | str, attribute: str, *, validator=None):
+    return get_cognition_runtime().live_patches.install_from_path(
+        capability, path, attribute, validator=validator,
+        allowed_root=Path(__file__).resolve().parent,
+    )
+
+
+def rollback_cognitive_patch(capability: str):
+    return get_cognition_runtime().live_patches.rollback(capability)
+
+
+def cognitive_runtime_status() -> Dict[str, Any]:
+    runtime = get_cognition_runtime()
+    try:
+        budget = _RESOURCE_BUDGET.snapshot().as_dict()
+    except Exception as exc:
+        budget = {"enforced": False, "verification": "error", "reason": str(exc)}
+    scheduler = _load_process_scheduler_state()
+    return {
+        "child": CHILD, "capability_count": len(runtime.registry.list()),
+        "available_capability_count": len(runtime.registry.list(available_only=True)),
+        "capabilities": runtime.registry.describe(),
+        "live_patches": runtime.live_patches.status(), "resource_budget": budget,
+        "scheduler": {
+            "queue": scheduler.get("queue", []), "running": scheduler.get("running", []),
+            "updated_at": scheduler.get("updated_at"), "planner": scheduler.get("planner", {}),
+        },
+    }
 
 
 def _request_memory_graph_neural_task(reason: str = "deferred_resume", *, priority: Optional[int] = None, force: bool = False) -> Optional[str]:
@@ -5124,7 +4957,8 @@ def _scheduler_start_subprocess_task(entry: Dict[str, Any], state: Dict[str, Any
     command = profile.get("command")
     if not isinstance(command, list) or not command:
         return False
-    process = safe_popen(command)
+    workspace_env = workspace_command_environment(CHILD, command)
+    process = safe_popen(command, env=workspace_env) if workspace_env is not None else safe_popen(command)
     if process is None:
         return False
     started_at = datetime.now(timezone.utc).isoformat()
@@ -5415,98 +5249,12 @@ def _run_prediction_meta_analysis():
     log_to_statusbox(f"[Manager] Prediction meta-analysis flagged: {reason}")
     _last_meta_alert = now
 
-def _load_self_question_entries() -> List[Dict[str, Any]]:
-    if not _SELF_QUESTIONS_PATH.exists():
-        return []
-    try:
-        with _SELF_QUESTIONS_PATH.open("r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except Exception:
-        return []
-
-    entries: List[Dict[str, Any]] = []
-    if isinstance(raw, list):
-        for entry in raw:
-            if not isinstance(entry, dict) or not entry.get("question"):
-                continue
-            first = entry.get("first_asked") or entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
-            last = entry.get("last_updated") or entry.get("timestamp") or first
-            count = int(entry.get("count", entry.get("times", 1)) or 1)
-            normalized = {
-                "question": entry.get("question"),
-                "first_asked": first,
-                "last_updated": last,
-                "count": count,
-            }
-            if entry.get("resolved_at"):
-                normalized["resolved_at"] = entry.get("resolved_at")
-            if entry.get("resolved_reason"):
-                normalized["resolved_reason"] = entry.get("resolved_reason")
-            if entry.get("resolution_history"):
-                normalized["resolution_history"] = entry.get("resolution_history")
-            entries.append(normalized)
-    return entries
-
-
-def _save_self_question_entries(entries: List[Dict[str, Any]]) -> None:
-    _SELF_QUESTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _SELF_QUESTIONS_PATH.open("w", encoding="utf-8") as fh:
-        json.dump(entries, fh, indent=4)
-
-
 def seed_self_question(question: str) -> None:
-    if not question:
-        return
-    entries = _load_self_question_entries()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    normalized_question = question.strip()
-    existing = None
-    for entry in entries:
-        if entry.get("question") == normalized_question:
-            existing = entry
-            break
-
-    if existing:
-        existing["count"] = int(existing.get("count", 1) or 1) + 1
-        existing["last_updated"] = now_iso
-        existing.pop("resolved_at", None)
-        existing.pop("resolved_reason", None)
-    else:
-        entries.append(
-            {
-                "question": normalized_question,
-                "first_asked": now_iso,
-                "last_updated": now_iso,
-                "count": 1,
-            }
-        )
-
-    entries.sort(key=lambda item: item.get("first_asked", now_iso))
-    entries = entries[-100:]
-    _save_self_question_entries(entries)
-    log_to_statusbox(f"[Manager] Self-question seeded: {normalized_question}")
+    return _runtime_seed_self_question(question, child=CHILD)
 
 
 def mark_self_question_resolved(question: str, reason: Optional[str] = None) -> None:
-    if not question:
-        return
-    entries = _load_self_question_entries()
-    lower = question.strip().lower()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    updated = False
-    for entry in entries:
-        text = (entry.get("question") or "").strip().lower()
-        if text != lower:
-            continue
-        entry["resolved_at"] = now_iso
-        if reason:
-            entry["resolved_reason"] = reason
-        entry["last_updated"] = now_iso
-        history = entry.setdefault("resolution_history", [])
-        history.append({"timestamp": now_iso, "reason": reason})
-        updated = True
-    if updated:
-        _save_self_question_entries(entries)
+    return _runtime_mark_self_question_resolved(question, reason, child=CHILD)
 
 
 def _load_symbol_map():
@@ -9606,6 +9354,9 @@ def schedule_runtime():
             log_to_statusbox(traceback.format_exc())
             time.sleep(5)
 
-if __name__ == "__main__":  
+if __name__ == "__main__":
+    from resource_envelope import ensure_runtime_hard_limit
+
+    ensure_runtime_hard_limit([sys.executable, *sys.argv])
     launch_background_loops()
     schedule_runtime()

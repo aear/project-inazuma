@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 # Optional: use psutil if available for memory checks
 try:
-    import psutil  # type: ignore
+    from ina_process import psutil
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 

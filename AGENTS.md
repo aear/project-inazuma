@@ -191,6 +191,14 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Instrument a path and observe its real use before deleting it.
 - Assume today's compatibility path becomes tomorrow's haunted basement; keep it inspectable, bounded, and removable.
 
+## Adversarial testing isolation (NON-NEGOTIABLE)
+
+- Ina must not be running during adversarial, exploit, prompt-injection, containment-escape, or other security testing.
+- Before any such test begins, stop the complete Ina runtime tree, including detached helpers and bridges, then verify that no Ina process remains.
+- Record the verification result in the private test log before executing the first adversarial input.
+- If shutdown cannot be completed or independently verified, the adversarial test is blocked. Do not substitute an in-process pause or scheduler guard for full shutdown.
+- Run adversarial fixtures in an isolated test environment that cannot read or write Ina's live memory stores.
+
 ## Memory handling (IMPORTANT)
 
 ### Avoid memory tree scans

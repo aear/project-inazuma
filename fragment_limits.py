@@ -4,7 +4,7 @@ import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
-    import psutil  # type: ignore
+    from ina_process import psutil
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 

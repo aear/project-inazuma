@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+from ina_desktop.client import launch_environment
 from audio_device_resolution import AudioDeviceResolution, resolve_audio_device
 from daw_engine import (
     AudioStem,
@@ -2794,6 +2795,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
+    cfg = load_config()
+    workspace_child = str(args.child or cfg.get("current_child") or "Inazuma_Yagami")
+    os.environ.update(launch_environment(workspace_child))
     try:
         window = DawWindow(child=args.child)
     except StudioAlreadyRunningError as exc:

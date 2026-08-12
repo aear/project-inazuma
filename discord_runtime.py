@@ -25,6 +25,11 @@ def discord_runtime_path(
     child_name = str(child or cfg.get("current_child") or "Inazuma_Yagami")
     discord_cfg = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else {}
     raw = discord_cfg.get(key)
+    current_child = str(cfg.get("current_child") or "Inazuma_Yagami")
+    # A concrete fast-runtime path belongs only to the configured child. Explicit
+    # operations for another child must not leak into that child's live outbox.
+    if child is not None and child_name != current_child and isinstance(raw, str) and "{child}" not in raw:
+        raw = None
     if isinstance(raw, str) and raw.strip():
         try:
             return Path(raw.format(child=child_name)).expanduser()

@@ -390,6 +390,7 @@ def test_scheduler_blocks_task_when_total_rss_budget_would_be_exceeded():
 def test_scheduler_resource_snapshot_uses_fresh_resource_vitals_rss_when_higher():
     original_get = mm.get_inastate
     original_tree_rss = mm._ina_process_tree_rss_gb
+    original_cgroup_memory = mm._ina_cgroup_memory_gb
     original_gpu = mm._scheduler_gpu_snapshot
     try:
         payload = {
@@ -399,6 +400,7 @@ def test_scheduler_resource_snapshot_uses_fresh_resource_vitals_rss_when_higher(
         }
         mm.get_inastate = lambda key, default=None: payload if key == "resource_vitals" else default
         mm._ina_process_tree_rss_gb = lambda: 12.0
+        mm._ina_cgroup_memory_gb = lambda: 0.0
         mm._scheduler_gpu_snapshot = lambda track_gpu=True: {
             "available": False,
             "utilization_percent": 0.0,
@@ -417,6 +419,7 @@ def test_scheduler_resource_snapshot_uses_fresh_resource_vitals_rss_when_higher(
     finally:
         mm.get_inastate = original_get
         mm._ina_process_tree_rss_gb = original_tree_rss
+        mm._ina_cgroup_memory_gb = original_cgroup_memory
         mm._scheduler_gpu_snapshot = original_gpu
 
 

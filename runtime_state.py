@@ -63,6 +63,26 @@ def update_inastate(key: str, value: Any, *, child: Optional[str] = None) -> Non
         atomic_write_json(_inastate_path(target_child), state, indent=4)
 
 
+def increment_inastate_metric(metric: str, amount: int = 1, *, child: Optional[str] = None) -> None:
+    target_child = child or _current_child()
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
+        metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+        metrics[str(metric)] = int(metrics.get(str(metric), 0) or 0) + int(amount)
+        state["metrics"] = metrics
+        atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+
+def set_inastate_metric(metric: str, value: Any, *, child: Optional[str] = None) -> None:
+    target_child = child or _current_child()
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
+        metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+        metrics[str(metric)] = value
+        state["metrics"] = metrics
+        atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+
 def set_text_expression_intent(
     strategy: str,
     *,
@@ -250,11 +270,11 @@ def _save_self_question_entries(entries: List[Dict[str, Any]], child: Optional[s
         json.dump(entries, fh, indent=4)
 
 
-def seed_self_question(question: str) -> None:
+def seed_self_question(question: str, *, child: Optional[str] = None) -> None:
     if not question:
         return
-    child = _current_child()
-    entries = _load_self_question_entries(child)
+    target_child = child or _current_child()
+    entries = _load_self_question_entries(target_child)
     now_iso = datetime.now(timezone.utc).isoformat()
     normalized_question = question.strip()
     existing = None
@@ -280,8 +300,33 @@ def seed_self_question(question: str) -> None:
 
     entries.sort(key=lambda item: item.get("first_asked", now_iso))
     entries = entries[-100:]
-    _save_self_question_entries(entries, child)
+    _save_self_question_entries(entries, target_child)
     log_to_statusbox(f"[Manager] Self-question seeded: {normalized_question}")
+
+
+def mark_self_question_resolved(
+    question: str, reason: Optional[str] = None, *, child: Optional[str] = None,
+) -> None:
+    if not question:
+        return
+    target_child = child or _current_child()
+    entries = _load_self_question_entries(target_child)
+    lower = question.strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = False
+    for entry in entries:
+        if str(entry.get("question") or "").strip().lower() != lower:
+            continue
+        entry["resolved_at"] = now_iso
+        if reason:
+            entry["resolved_reason"] = reason
+        entry["last_updated"] = now_iso
+        history = entry.setdefault("resolution_history", [])
+        history.append({"timestamp": now_iso, "reason": reason})
+        del history[:-32]
+        updated = True
+    if updated:
+        _save_self_question_entries(entries, target_child)
 
 
 def append_typed_outbox_entry(
@@ -292,6 +337,7 @@ def append_typed_outbox_entry(
     metadata: Optional[Dict[str, Any]] = None,
     allow_empty: bool = False,
     attachment_path: Optional[str] = None,
+    child: Optional[str] = None,
 ) -> Optional[str]:
     payload = "" if text is None else str(text)
     if not allow_empty and not payload.strip() and not attachment_path:
@@ -310,7 +356,7 @@ def append_typed_outbox_entry(
         entry["attachment_path"] = attachment_path
 
     try:
-        path = _typed_outbox_path()
+        path = _typed_outbox_path(child)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")

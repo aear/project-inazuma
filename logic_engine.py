@@ -12,6 +12,9 @@ from pathlib import Path
 from model_manager import load_config, get_inastate, seed_self_question, mark_self_question_resolved
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from logic_map_builder import extract_logic_vector, run_logic_map_builder
+from io_utils import atomic_write_json
+from streaming_json import iter_selected_array_objects
+from ina_ml import cosine_similarity
 
 try:
     from logic_memory_store import store_logic_entry
@@ -62,11 +65,12 @@ def logic_ops(a, b):
 def aggregate_ops(values):
     if not values:
         return {}
+    mean = sum(values) / len(values)
     return {
-        "mean": sum(values) / len(values),
+        "mean": mean,
         "max": max(values),
         "min": min(values),
-        "variance": sum((x - sum(values)/len(values))**2 for x in values) / len(values)
+        "variance": sum((x - mean) ** 2 for x in values) / len(values),
     }
 
 def conditional_logic(a, b, logic_type="greater"):
@@ -134,11 +138,42 @@ def load_symbol_words(child):
     path = Path("AI_Children") / child / "memory" / "symbol_words.json"
     if not path.exists():
         return []
-    with open(path, "r") as f:
-        try:
-            return json.load(f).get("words", [])
-        except:
-            return []
+    config = load_config()
+    raw_policy = config.get("logic_engine_policy") if isinstance(config, dict) else {}
+    policy = raw_policy if isinstance(raw_policy, dict) else {}
+    candidate_limit = max(32, int(policy.get("symbol_candidate_limit", 20_000)))
+    compact_path = path.with_name("symbol_words.logic_index.json")
+    source_mtime_ns = int(path.stat().st_mtime_ns)
+    try:
+        with compact_path.open("r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if (
+            isinstance(cached, dict)
+            and int(cached.get("source_mtime_ns", -1)) == source_mtime_ns
+            and isinstance(cached.get("words"), list)
+        ):
+            return cached["words"][:candidate_limit]
+    except Exception:
+        pass
+
+    # Legacy entries can retain enormous component histories. Logic matching
+    # needs only compact semantic fields, so stream past component payloads.
+    fields = {"symbol_word_id", "summary", "tags", "vector", "symbol"}
+    try:
+        words = list(iter_selected_array_objects(path, "words", fields, limit=candidate_limit))
+    except Exception as exc:
+        print(f"[Logic] Failed to stream symbol candidates: {exc}")
+        return []
+    try:
+        atomic_write_json(
+            compact_path,
+            {"source_mtime_ns": source_mtime_ns, "candidate_limit": candidate_limit, "words": words},
+            indent=2,
+            ensure_ascii=True,
+        )
+    except Exception:
+        pass
+    return words
 
 
 def log_logic_event(child, logic_entry):
@@ -181,26 +216,48 @@ def suggest_precision_override(score, reason="logic insight"):
         json.dump(hint, f, indent=4)
     print(f"[Logic] Suggested precision override → {score} due to: {reason}")
 
-def test_prediction_against_logic(prediction, symbol_words, transformer):
+def rank_prediction_against_logic(prediction, symbol_words, transformer, limit=3):
+    """Return calibrated alternatives so ambiguous meanings remain visible."""
     pred_vec = prediction.get("predicted_vector", {}).get("vector", [])
     if not pred_vec:
-        return None, None
+        return []
 
-    best_id = None
-    best_sim = 0.0
+    candidates = []
     for word in symbol_words:
-        if not word.get("components"):
+        if not isinstance(word, dict):
             continue
-        fake_fragments = [{"summary": word["summary"], "tags": word.get("tags", []), "emotions": {"trust": 0.6}}]
-        result = transformer.encode_many(fake_fragments)
-        avg_vec = result[0]["vector"]
-        sim = sum(a * b for a, b in zip(pred_vec, avg_vec)) / (
-            (sum(a * a for a in pred_vec) ** 0.5) * (sum(b * b for b in avg_vec) ** 0.5) + 1e-6)
-        if sim > best_sim:
-            best_sim = sim
-            best_id = word["symbol_word_id"]
+        existing = word.get("vector")
+        if isinstance(existing, list) and existing:
+            candidates.append((word, existing, None))
+            continue
+        summary = str(word.get("summary") or "").strip()
+        if summary:
+            candidates.append((word, None, {
+                "summary": summary,
+                "tags": word.get("tags", []),
+                "emotions": {"trust": 0.6},
+            }))
 
-    return best_id, best_sim
+    missing = [fragment for _word, vector, fragment in candidates if vector is None]
+    encoded_missing = iter(transformer.encode_many(missing) if missing else [])
+    ranked = []
+    for word, existing, _fragment in candidates:
+        avg_vec = existing if existing is not None else next(encoded_missing).get("vector", [])
+        similarity = cosine_similarity(pred_vec, avg_vec, epsilon=0.0)
+        ranked.append({
+            "symbol_word_id": word.get("symbol_word_id"),
+            "summary": str(word.get("summary") or ""),
+            "similarity": float(similarity),
+        })
+    ranked.sort(key=lambda item: item["similarity"], reverse=True)
+    return ranked[:max(1, int(limit))]
+
+
+def test_prediction_against_logic(prediction, symbol_words, transformer):
+    ranked = rank_prediction_against_logic(prediction, symbol_words, transformer, limit=1)
+    if not ranked:
+        return None, 0.0 if prediction.get("predicted_vector", {}).get("vector") else None
+    return ranked[0]["symbol_word_id"], ranked[0]["similarity"]
 
 def logic_session():
     config = load_config()
@@ -219,7 +276,12 @@ def logic_session():
         pv = prediction.get("predicted_vector", {}).get("vector", [])
         predicted_emotion = {f"dim_{i}": v for i, v in enumerate(pv)} if pv else {}
     predicted_vector = prediction.get("predicted_vector", {}).get("vector", [])
-    symbol_word_id, sim = test_prediction_against_logic(prediction, symbol_words, transformer)
+    ranked_matches = rank_prediction_against_logic(prediction, symbol_words, transformer, limit=3)
+    best_match = ranked_matches[0] if ranked_matches else {}
+    symbol_word_id = best_match.get("symbol_word_id")
+    sim = float(best_match.get("similarity") or 0.0)
+    second_sim = float(ranked_matches[1].get("similarity") or 0.0) if len(ranked_matches) > 1 else 0.0
+    match_margin = max(0.0, sim - second_sim)
 
     # Run some symbolic tests
     samples = evolve_logic_expressions([1.0, 2.5, 3.3])
@@ -228,15 +290,21 @@ def logic_session():
         "prediction": predicted_emotion,
         "prediction_vector": predicted_vector,
         "symbol_word_id": symbol_word_id,
-        "similarity": round(sim, 4),
+        "similarity": round(float(sim or 0.0), 4),
+        "similarity_margin": round(match_margin, 4),
+        "symbol_alternatives": [
+            {"symbol_word_id": item.get("symbol_word_id"), "summary": item.get("summary"),
+             "similarity": round(float(item.get("similarity") or 0.0), 4)}
+            for item in ranked_matches
+        ],
         "trace_tests": samples,
         "description": f"Logic check on predicted emotion: {max(predicted_emotion, key=predicted_emotion.get, default='unknown')}"
     }
 
-    if sim < 0.5 and symbol_word_id:
+    if float(sim or 0.0) < 0.5 and symbol_word_id:
         seed_self_question(f"Is my logic drifting from what {symbol_word_id} means?")
         suggest_precision_override(32, reason="logic drift")
-    elif sim > 0.9 and symbol_word_id:
+    elif float(sim or 0.0) > 0.9 and match_margin >= 0.08 and symbol_word_id:
         seed_self_question(f"What makes {symbol_word_id} so aligned with my thinking?")
         suggest_precision_override(48, reason="symbolic alignment")
 

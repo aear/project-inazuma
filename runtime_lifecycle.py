@@ -4,8 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
 
-import psutil
+from ina_process import psutil
 
+
+RUNTIME_SERVICE_SCRIPTS = frozenset({"discord_bridge.py", "world_server.py", "runtime_services.py", "virtual_workspace.py", "virtual_workspace_viewer.py"})
 
 CORE_RUNTIME_SCRIPTS = frozenset({
     "model_manager.py",
@@ -19,7 +21,6 @@ CORE_RUNTIME_SCRIPTS = frozenset({
     "emotion_engine.py",
     "emotion_map.py",
     "expression_log.py",
-    "fractal_multidimensional_transformers.py",
     "fragmentation_engine.py",
     "inject_birth_fragment.py",
     "instinct_engine.py",
@@ -63,13 +64,13 @@ def _belongs_to_project(process: Any, cmdline: Sequence[str], project_root: Path
     return False
 
 
-def stop_core_runtime(
+def _stop_runtime_scripts(
     project_root: Path | str,
+    scripts: frozenset[str],
     *,
     grace_seconds: float = 3.0,
     processes: Optional[Iterable[Any]] = None,
 ) -> Dict[str, Any]:
-    """Stop project-owned cognition workers while preserving external bridges."""
     root = Path(project_root).resolve()
     candidates = processes if processes is not None else psutil.process_iter(["pid", "cmdline"])
     selected = []
@@ -77,7 +78,7 @@ def stop_core_runtime(
     for process in candidates:
         try:
             cmdline = process.cmdline()
-            script = core_script_from_command(cmdline)
+            script = next((Path(str(arg)).name for arg in cmdline if Path(str(arg)).name in scripts), None)
             if script and _belongs_to_project(process, cmdline, root):
                 selected.append((process, script))
         except (psutil.Error, OSError) as exc:
@@ -101,5 +102,30 @@ def stop_core_runtime(
         "stopped": len(gone),
         "forced": len(alive),
         "errors": errors,
-        "bridges_preserved": ["discord_bridge.py", "world_server.py"],
     }
+
+
+def stop_core_runtime(
+    project_root: Path | str,
+    *,
+    grace_seconds: float = 3.0,
+    processes: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    """Stop project-owned cognition workers while preserving supervised services."""
+    result = _stop_runtime_scripts(
+        project_root, CORE_RUNTIME_SCRIPTS, grace_seconds=grace_seconds, processes=processes
+    )
+    result["bridges_preserved"] = sorted(RUNTIME_SERVICE_SCRIPTS)
+    return result
+
+
+def stop_runtime_services(
+    project_root: Path | str,
+    *,
+    grace_seconds: float = 3.0,
+    processes: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    """Stop the supervisor and both project-owned bridge services."""
+    return _stop_runtime_scripts(
+        project_root, RUNTIME_SERVICE_SCRIPTS, grace_seconds=grace_seconds, processes=processes
+    )

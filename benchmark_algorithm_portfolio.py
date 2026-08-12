@@ -16,7 +16,7 @@ from algorithm_portfolio import GalacticSearch, LocalSearch, SolarSearch
 from embedding_stack import MultimodalEmbedder
 
 try:
-    import psutil
+    from ina_process import psutil
 except Exception:  # pragma: no cover
     psutil = None
 

@@ -1,26 +1,16 @@
 import math
+from ina_ml import coerce_vector, cosine_similarity as shared_cosine_similarity
 from typing import Any, Dict, Iterator, List, Optional
 
 
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    if not v1 or not v2:
-        return 0.0
-    length = min(len(v1), len(v2))
-    if length <= 0:
-        return 0.0
-    dot = sum(float(v1[i]) * float(v2[i]) for i in range(length))
-    norm1 = math.sqrt(sum(float(v1[i]) * float(v1[i]) for i in range(length)))
-    norm2 = math.sqrt(sum(float(v2[i]) * float(v2[i]) for i in range(length)))
-    return dot / (norm1 * norm2 + 1e-8)
+    return shared_cosine_similarity(v1, v2, overlap_norms=True)
 
 
 def normalize_vector(value: Any) -> Optional[List[float]]:
     if not isinstance(value, list) or not value:
         return None
-    cleaned: List[float] = []
-    for item in value:
-        if isinstance(item, (int, float)):
-            cleaned.append(float(item))
+    cleaned = coerce_vector(item for item in value if isinstance(item, (int, float)))
     return cleaned or None
 
 

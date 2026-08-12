@@ -3,11 +3,11 @@
 import json
 import math
 import time
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from ina_ml import deterministic_hash_bucket, normalize_vector, numeric_summary
 
 try:
     import numpy as np
@@ -558,8 +558,7 @@ class FractalTransformer:
         trigram_vec = [0.0] * self.embed_dim
         for i in range(len(clean) - 2):
             tri = clean[i : i + 3]
-            h = int(hashlib.sha256(tri.encode()).hexdigest()[:8], 16)
-            trigram_vec[h % self.embed_dim] += 1.0
+            trigram_vec[deterministic_hash_bucket(tri, self.embed_dim)] += 1.0
 
         # Emotion sliders as context
         emo_values = []
@@ -581,8 +580,7 @@ class FractalTransformer:
         # Tag presence hashed
         tag_vec = [0.0] * (self.embed_dim // 4)
         for tag in tags:
-            h = int(hashlib.sha256(str(tag).encode()).hexdigest()[:8], 16)
-            tag_vec[h % len(tag_vec)] += 1.0
+            tag_vec[deterministic_hash_bucket(str(tag), len(tag_vec))] += 1.0
 
         combined = trigram_vec + emo_stats + tag_vec
         return self._normalize_vector(combined)
@@ -597,14 +595,7 @@ class FractalTransformer:
         return self._normalize_vector(stats + hashed)
 
     def _describe_numeric(self, seq: Sequence[float]) -> List[float]:
-        if not seq:
-            return [0.0, 0.0, 0.0, 0.0, 0.0]
-        mean = np.mean(seq)
-        std = np.std(seq)
-        mn = min(seq)
-        mx = max(seq)
-        med = median(seq)
-        return [float(round(x, 6)) for x in (mean, std, mn, mx, med)]
+        return [float(round(value, 6)) for value in numeric_summary(seq)]
 
     def _hash_project(self, seq: Sequence[float], dim: int) -> List[float]:
         if dim <= 0:
@@ -616,9 +607,7 @@ class FractalTransformer:
         return projected
 
     def _normalize_vector(self, vec: Iterable[float]) -> List[float]:
-        vec = list(vec)
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [round((v / norm) * self.precision, 6) for v in vec]
+        return normalize_vector(vec, scale=self.precision, digits=6)
     
     def load_precision_profile(self, child="Inazuma_Yagami"):
         from gui_hook import log_to_statusbox

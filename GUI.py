@@ -1,23 +1,37 @@
+import os
+import sys
+if __name__ == "__main__":
+    from resource_envelope import ensure_runtime_hard_limit
+
+    ensure_runtime_hard_limit([sys.executable, *sys.argv])
+
 import tkinter as tk
 from tkinter import Menu, messagebox, filedialog, simpledialog, ttk
 import json
-import os
-import sys
 from datetime import datetime, timezone
 from safe_popen import safe_popen
-import psutil
+from ina_process import psutil
+from resource_envelope import cgroup_status
 import shutil
 from pathlib import Path
-from model_manager import get_inastate, update_inastate, request_meal, offer_meal
+from project_version import RELEASE
+from model_manager import (
+    cognitive_runtime_status, get_inastate, offer_meal, request_meal,
+    restart_cognitive_capability, rollback_cognitive_patch, update_inastate,
+)
 import threading
 import time
 from memory_graph import build_fractal_memory
 import platform
 from runtime_lifecycle import stop_core_runtime
+from runtime_services import ensure_runtime_service_supervisor, request_service_restart, supervisor_status_path
+from ina_desktop.client import launch_environment
 from birth_system import boot
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
 from monitoring_dashboard import MonitoringWindow
+from subsystem_window import SubsystemWindow
+from io_utils import load_json_dict
 from collections import deque
 
 STATUS_RETENTION_SEC = float(os.environ.get("INA_STATUS_RETENTION_SEC", "600"))
@@ -157,6 +171,7 @@ music_path_var = None
 model_running = False
 vitals_window = None
 monitoring_window = None
+subsystem_window = None
 app_icon = None
 _usage_labels = {}
 energy_var = None
@@ -379,6 +394,14 @@ def open_audio_devices_window():
     safe_popen([sys.executable, "audio_device_window.py"], verbose=True)
 
 
+def open_virtual_workspace():
+    child = str(config.get("current_child", "Inazuma_Yagami") or "Inazuma_Yagami")
+    ensure_runtime_service_supervisor(child)
+    status_box.insert(tk.END, "Opening Ina Virtual Desktop.\n")
+    status_box.see(tk.END)
+    safe_popen([sys.executable, "virtual_workspace_viewer.py", "--child", child])
+
+
 def open_music_studio():
     child = str(config.get("current_child", "Inazuma_Yagami") or "Inazuma_Yagami")
     status_box.insert(tk.END, "Opening Ina Music Studio.\n")
@@ -387,6 +410,7 @@ def open_music_studio():
         [sys.executable, "daw_window.py", "--child", child],
         label="Music Studio",
         verbose=True,
+        env=launch_environment(child),
     )
 
 
@@ -415,6 +439,27 @@ def open_eeg_view():
     status_box.insert(tk.END, "Opening EEG window.\n")
     status_box.see(tk.END)
     safe_popen([sys.executable, "EEG.py"], label="EEG", verbose=True)
+
+def restart_runtime_service(service_name):
+    child = config.get("current_child", "Inazuma_Yagami")
+
+    def _restart():
+        result = request_service_restart(child, service_name)
+        if result.get("ok"):
+            append_status(f"[Services] Restart requested for {service_name.replace('_', ' ')}.\n")
+            return
+        if result.get("reason") == "supervisor_not_running":
+            pid = ensure_runtime_service_supervisor(child)
+            if pid:
+                append_status(f"[Services] Supervisor restored (pid={pid}); services are starting.\n")
+                return
+        append_status(
+            f"[Services ERROR] Could not restart {service_name.replace('_', ' ')}: {result.get('reason', 'unknown error')}\n",
+            tag="error",
+        )
+
+    threading.Thread(target=_restart, daemon=True).start()
+
 
 def update_ai_count_label():
     ai_count = 1 if model_running else 0
@@ -579,19 +624,6 @@ def _ina_processes():
     for child in children:
         processes[int(child.pid)] = child
 
-    roots = _process_scan_roots()
-    script_names = _project_script_names()
-    if roots:
-        try:
-            iterator = psutil.process_iter(['pid'])
-        except Exception:
-            iterator = []
-        for proc in iterator:
-            pid = int(getattr(proc, 'pid', 0) or 0)
-            if pid <= 0 or pid in processes:
-                continue
-            if _looks_like_ina_runtime_process(proc, roots, script_names):
-                processes[pid] = proc
     return list(processes.values())
 
 def _process_cpu_sample_key(proc):
@@ -814,6 +846,20 @@ def _format_scheduler_slots(scheduler):
 
 
 def _resource_pressure_level(stats):
+    envelope = stats.get('resource_envelope') if isinstance(stats, dict) else {}
+    if isinstance(envelope, dict) and envelope:
+        if not envelope.get('enforced') and envelope.get('required', True):
+            return 'hard'
+        ratios = []
+        for current_key, limit_key in (("ram_current_bytes", "kernel_ram_limit_bytes"), ("swap_current_bytes", "kernel_swap_limit_bytes")):
+            current = envelope.get(current_key)
+            limit = envelope.get(limit_key)
+            if isinstance(current, int) and isinstance(limit, int) and limit > 0:
+                ratios.append(current / limit)
+        if ratios and max(ratios) >= 0.95:
+            return 'hard'
+        if ratios and max(ratios) >= 0.85:
+            return 'soft'
     system_mem = float(stats.get('system_mem') or 0.0)
     if system_mem >= 92.0:
         return 'hard'
@@ -909,7 +955,9 @@ def _summarize_resource_usage(stats):
     else:
         note = 'Pressure is stable. The largest RAM holders are the clearest optimisation targets.'
     return (
-        f"Total Ina RAM is {_format_ram_value(int(stats.get('mem_bytes') or 0))} across {int(stats.get('processes') or 0)} process(es). "
+        f"Total Ina RAM is {_format_ram_value(int(stats.get('mem_bytes') or 0))} via {stats.get('memory_source') or 'unknown'}; "
+        f"process PSS {_format_ram_value(int(stats.get('process_pss_bytes') or 0))}, swap {_format_ram_value(int(stats.get('swap_bytes') or 0))}, "
+        f"across {int(stats.get('processes') or 0)} process(es). "
         f"System RAM is at {float(stats.get('system_mem') or 0.0):.1f}%. "
         f"Top RAM: {top_text}. Top CPU: {cpu_text}. {note}"
     )
@@ -983,6 +1031,10 @@ def _publish_resource_snapshot(stats):
         'timestamp': timestamp,
         'pressure_level': _resource_pressure_level(stats),
         'ina_ram_bytes': int(stats.get('mem_bytes') or 0),
+        'ina_process_pss_bytes': int(stats.get('process_pss_bytes') or 0),
+        'ina_process_rss_bytes': int(stats.get('process_rss_bytes') or 0),
+        'ina_swap_bytes': int(stats.get('swap_bytes') or 0),
+        'memory_source': stats.get('memory_source'),
         'system_ram_percent': round(float(stats.get('system_mem') or 0.0), 1),
         'top_modules': top_modules[:3],
         'top_cpu_modules': top_cpu_modules[:3],
@@ -997,6 +1049,11 @@ def _publish_resource_snapshot(stats):
         'ina_cpu_percent': round(float(stats.get('cpu') or 0.0), 1),
         'ina_ram_bytes': int(stats.get('mem_bytes') or 0),
         'ina_ram_human': _format_ram_value(int(stats.get('mem_bytes') or 0)),
+        'ina_process_pss_bytes': int(stats.get('process_pss_bytes') or 0),
+        'ina_process_rss_bytes': int(stats.get('process_rss_bytes') or 0),
+        'ina_swap_bytes': int(stats.get('swap_bytes') or 0),
+        'memory_source': stats.get('memory_source'),
+        'resource_envelope': stats.get('resource_envelope') or {},
         'system_cpu_percent': round(float(stats.get('system_cpu') or 0.0), 1),
         'system_ram_percent': round(float(stats.get('system_mem') or 0.0), 1),
         'process_count': int(stats.get('processes') or 0),
@@ -1035,6 +1092,11 @@ def _collect_usage_snapshot():
     stats = {
         'cpu': 0.0,
         'mem_bytes': 0,
+        'process_pss_bytes': 0,
+        'process_rss_bytes': 0,
+        'memory_source': 'process_pss',
+        'swap_bytes': 0,
+        'resource_envelope': {},
         'threads': 0,
         'processes': 0,
         'system_cpu': 0.0,
@@ -1053,12 +1115,19 @@ def _collect_usage_snapshot():
             key = _process_cpu_sample_key(proc)
             live_keys.add(key)
             cpu = _sample_process_cpu_percent(proc, now=now)
-            mem_bytes = int(proc.memory_info().rss)
+            rss_bytes = int(proc.memory_info().rss)
+            try:
+                full_info = proc.memory_full_info()
+                mem_bytes = int(getattr(full_info, "pss", 0) or rss_bytes)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                mem_bytes = rss_bytes
             threads = proc.num_threads()
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
         stats['cpu'] += cpu
         stats['mem_bytes'] += mem_bytes
+        stats['process_pss_bytes'] += mem_bytes
+        stats['process_rss_bytes'] += rss_bytes
         stats['threads'] += threads
         stats['processes'] += 1
         name = _module_process_name(proc)
@@ -1078,8 +1147,21 @@ def _collect_usage_snapshot():
 
     try:
         stats['system_mem'] = psutil.virtual_memory().percent
+        stats['swap_bytes'] = int(psutil.swap_memory().used)
     except Exception:
         stats['system_mem'] = 0.0
+        stats['swap_bytes'] = 0
+
+    try:
+        envelope = cgroup_status()
+    except Exception:
+        envelope = {}
+    stats['resource_envelope'] = envelope
+    cgroup_current = envelope.get("ram_current_bytes") if isinstance(envelope, dict) else None
+    if envelope.get("enforced") and isinstance(cgroup_current, int):
+        stats['mem_bytes'] = max(0, cgroup_current)
+        stats['swap_bytes'] = max(0, int(envelope.get("swap_current_bytes") or 0))
+        stats['memory_source'] = "cgroup_v2"
 
     for item in modules.values():
         item['pids'] = sorted(dict.fromkeys(item.get('pids') or []))
@@ -1410,6 +1492,21 @@ def open_monitoring_window():
         monitoring_window.lift()
         return
     monitoring_window = MonitoringWindow(root)
+
+
+def open_subsystem_window():
+    global subsystem_window
+    if subsystem_window is not None and subsystem_window.exists():
+        subsystem_window.lift()
+        return
+    child = str(config.get("current_child") or "Inazuma_Yagami")
+    subsystem_window = SubsystemWindow(
+        root, status_provider=cognitive_runtime_status,
+        services_provider=lambda: load_json_dict(supervisor_status_path(child)),
+        restart_service=restart_runtime_service,
+        restart_capability=restart_cognitive_capability,
+        rollback_capability=rollback_cognitive_patch,
+    )
 
 
 def open_vitals_window():
@@ -1812,7 +1909,7 @@ def quit_program():
         status_box.see(tk.END)
 
 root = tk.Tk()
-root.title("Ina")
+root.title(f"Ina — Project Inazuma {RELEASE}")
 
 refresh_config()
 configure_app_icon(root)
@@ -1877,6 +1974,7 @@ options_menu.add_command(label="Timers", command=open_timers_config)
 options_menu.add_command(label="Audio Devices", command=open_audio_devices_window)
 options_menu.add_command(label="Music Studio", command=open_music_studio)
 options_menu.add_command(label="Monitor", command=open_monitoring_window)
+options_menu.add_command(label="Subsystems", command=open_subsystem_window)
 options_menu.add_command(label="Control Centre", command=open_vitals_window)
 options_menu.add_command(label="Signal High Memory", command=lambda: signal_memory_too_high(source="gui_menu"))
 menu_bar.add_cascade(label="Options", menu=options_menu)
@@ -1983,6 +2081,11 @@ _action_button(tools_frame, 'Control centre', open_vitals_window, 0, 1)
 _action_button(tools_frame, 'Self questions', open_logs, 0, 2)
 _action_button(tools_frame, 'Clear log', clear_status_log, 1, 0)
 _action_button(tools_frame, 'Music studio', open_music_studio, 2, 0)
+_action_button(tools_frame, 'Ina desktop', open_virtual_workspace, 3, 0)
+_action_button(tools_frame, 'Restart desktop', lambda: restart_runtime_service('virtual_workspace'), 3, 1)
+_action_button(tools_frame, 'Restart world', lambda: restart_runtime_service('world_server'), 2, 1)
+_action_button(tools_frame, 'Restart Discord', lambda: restart_runtime_service('discord_bridge'), 2, 2)
+_action_button(tools_frame, 'Subsystems', open_subsystem_window, 3, 2)
 if config.get('is_root', False):
     _action_button(tools_frame, 'Pretrain', pretrain_mode, 1, 1)
     _action_button(tools_frame, 'EEG', open_eeg_view, 1, 2)

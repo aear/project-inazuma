@@ -26,6 +26,8 @@ except Exception:  # pragma: no cover - optional at runtime
     pyautogui = None
 
 from live_experience_bridge import LiveExperienceBridge
+from ina_desktop.client import workspace_status
+from ina_desktop.x11 import X11Desktop
 
 
 def _load_child() -> str:
@@ -67,6 +69,7 @@ class DesktopOpticNerve:
         self.bridge.configure_screen_capture(tags=self.tags, narrative=self.narrative)
 
         self._capture = None
+        self._workspace_capture = None
         self._episode_started = False
         self._window_capture_bounds: Optional[Dict[str, int]] = None
         self._window_capture_meta: Optional[Dict[str, Any]] = None
@@ -102,12 +105,34 @@ class DesktopOpticNerve:
             except Exception:
                 pass
             self._capture = None
+        if self._workspace_capture is not None:
+            try:
+                self._workspace_capture.close()
+            except Exception:
+                pass
+            self._workspace_capture = None
 
     # ------------------------------------------------------------------
     # Capture + logging
     # ------------------------------------------------------------------
     def capture_frame(self) -> Optional[np.ndarray]:
         """Grab the current Desktop 1 frame."""
+        status = workspace_status(self.child)
+        if status.get("ready") and status.get("display"):
+            try:
+                if self._workspace_capture is None or self._workspace_capture.display_name != str(status["display"]):
+                    if self._workspace_capture is not None:
+                        self._workspace_capture.close()
+                    self._workspace_capture = X11Desktop(str(status["display"]))
+                return self._workspace_capture.capture()
+            except Exception:
+                if self._workspace_capture is not None:
+                    try:
+                        self._workspace_capture.close()
+                    except Exception:
+                        pass
+                self._workspace_capture = None
+
         self._refresh_window_capture()
         window_bounds = self._window_capture_bounds
         if mss:

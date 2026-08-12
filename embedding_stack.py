@@ -7,10 +7,11 @@ Goals:
 - Carry lightweight language hints derived from scripts/characters.
 """
 
-import hashlib
 import math
 import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from ina_ml import cosine_similarity, hash_project, normalize_vector
 
 try:
     import numpy as _np
@@ -51,17 +52,11 @@ def guess_language_code(text: str, default: str = "und") -> str:
 
 
 def _safe_norm(vec: Iterable[float]) -> List[float]:
-    lst = list(float(v) for v in vec)
-    norm = math.sqrt(sum(v * v for v in lst)) or 1.0
-    return [v / norm for v in lst]
+    return normalize_vector(vec)
 
 
 def _hash_project(tokens: Iterable[str], dim: int) -> List[float]:
-    vec = [0.0] * dim
-    for tok in tokens:
-        h = int(hashlib.sha256(tok.encode("utf-8")).hexdigest()[:8], 16)
-        vec[h % dim] += 1.0
-    return vec
+    return hash_project(tokens, dim)
 
 
 def _stats(values: Sequence[float], target_dim: int) -> List[float]:
@@ -207,12 +202,4 @@ class MultimodalEmbedder:
         return _safe_norm(avg)
 
     def cosine(self, a: Sequence[float], b: Sequence[float]) -> float:
-        va = [float(x) for x in (a or [])]
-        vb = [float(x) for x in (b or [])]
-        if not va or not vb:
-            return 0.0
-        length = min(len(va), len(vb))
-        dot = sum(va[i] * vb[i] for i in range(length))
-        norm_a = math.sqrt(sum(x * x for x in va[:length])) or 1.0
-        norm_b = math.sqrt(sum(x * x for x in vb[:length])) or 1.0
-        return dot / (norm_a * norm_b)
+        return cosine_similarity(a, b, epsilon=0.0, overlap_norms=True)

@@ -1832,7 +1832,7 @@ def process_inbound_message(msg) -> CommsResponse:
         "current_speaker": {
             "id": msg.sender.backend_id,
             "display_name": msg.sender.display_name,
-            "is_self": bool(msg.sender.is_self),
+            "is_self": bool(getattr(msg.sender, "is_self", False)),
             "is_bot": bool((msg.metadata or {}).get("author_is_bot")),
         },
         "conversation_context": conversation_context,
@@ -1936,8 +1936,11 @@ def process_inbound_message(msg) -> CommsResponse:
             adapter_has_constructive_reply = False
             constructive_probe_failed = True
     else:
-        adapter_has_constructive_reply = (
-            adapter_can_respond and not has_unmapped_input
+        # Legacy adapters have no side-effect-free capability probe. Preserve
+        # their operator-text contract when symbolic mapping produced no answer,
+        # but do not let them override an explicitly partial/unknown mapping.
+        adapter_has_constructive_reply = bool(
+            adapter_can_respond and (symbolic is None or not symbolic_unknown)
         )
     adapter_rejection = None
     if adapter_can_respond and not adapter_has_constructive_reply:
