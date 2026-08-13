@@ -170,6 +170,11 @@ def daw_control_api_payload() -> dict[str, Any]:
                 "arguments": {"filename": "optional studio-local filename stem"},
             },
             {
+                "action": "save_close",
+                "aliases": ["save_and_close"],
+                "arguments": {"filename": "optional studio-local filename stem"},
+            },
+            {
                 "action": "export",
                 "aliases": [],
                 "arguments": {"filename": "optional studio-local filename stem"},
@@ -177,7 +182,7 @@ def daw_control_api_payload() -> dict[str, Any]:
             {
                 "action": "close",
                 "aliases": ["done", "finish"],
-                "arguments": {},
+                "arguments": {"save": "optional boolean; defaults true", "filename": "optional save name"},
             },
         ],
         "limits": {
@@ -226,6 +231,7 @@ def daw_control_api_payload() -> dict[str, Any]:
             {"action": "stop"},
             {"action": "save", "filename": "ina_first_loop"},
             {"action": "export", "filename": "ina_first_loop"},
+            {"action": "save_close", "filename": "ina_first_loop"},
         ],
     }
 
@@ -1070,6 +1076,7 @@ class DawWindow(tk.Tk):
         ttk.Button(toolbar, text="Save project", command=self.save_project_dialog).grid(row=0, column=10, padx=3)
         ttk.Button(toolbar, text="Load project", command=self.load_project_dialog).grid(row=0, column=11, padx=3)
         ttk.Button(toolbar, text="Export WAV", command=self.export_wav_dialog).grid(row=0, column=12, padx=3)
+        ttk.Button(toolbar, text="Save & close", command=self.save_and_close).grid(row=0, column=13, padx=3)
 
         notebook = ttk.Notebook(outer)
         notebook.grid(row=2, column=0, sticky="nsew")
@@ -1744,13 +1751,40 @@ class DawWindow(tk.Tk):
         if path is not None:
             self._save_snapshot(snapshot, path)
 
-    def _save_snapshot(self, snapshot: DawProject, path: Path) -> bool:
+    def _save_snapshot(
+        self,
+        snapshot: DawProject,
+        path: Path,
+        *,
+        after_save: Optional[Callable[[Path], None]] = None,
+    ) -> bool:
         def done(saved: Path) -> None:
             self.project_path = saved
             self._set_status(f"Project saved: {saved.name}")
             self._publish_workspace("saved")
+            if after_save is not None:
+                after_save(saved)
 
         return self._background("Saving project…", lambda: save_project(snapshot, path), done)
+
+    def save_and_close(self, filename: Any = None) -> Optional[Path]:
+        """Save to the studio project folder, then close only after success."""
+        try:
+            snapshot = self._project_snapshot()
+        except Exception as exc:
+            self._show_error("Cannot save project", exc)
+            return None
+        if filename not in (None, ""):
+            name = safe_filename_stem(filename) + ".ina-daw.json"
+            path = self.paths.projects / name
+        elif self.project_path is not None and path_is_within(self.project_path, self.paths.projects):
+            path = self.project_path
+        else:
+            path = self.paths.projects / (
+                safe_filename_stem(snapshot.name) + ".ina-daw.json"
+            )
+        accepted = self._save_snapshot(snapshot, path, after_save=lambda _saved: self.close_window())
+        return path if accepted else None
 
     def load_project_dialog(self) -> None:
         if self._stem_import_pending:
@@ -2706,6 +2740,14 @@ class DawWindow(tk.Tk):
                 if not self._save_snapshot(snapshot, path):
                     raise RuntimeError("project save was not scheduled")
                 result = {"status": "scheduled", "path": str(path)}
+            elif action in {"save_close", "save_and_close"}:
+                path = self.save_and_close(command.get("filename"))
+                if path is None:
+                    raise RuntimeError("project save-and-close was not scheduled")
+                result = {
+                    "status": "scheduled", "path": str(path),
+                    "saved": False, "closed": False, "closing_after_save": True,
+                }
             elif action == "export":
                 snapshot = self._project_snapshot()
                 filename = safe_filename_stem(command.get("filename") or snapshot.name) + ".wav"
@@ -2714,8 +2756,18 @@ class DawWindow(tk.Tk):
                     raise RuntimeError("WAV export was not scheduled")
                 result = {"status": "scheduled", "path": str(path)}
             elif action in {"close", "done", "finish"}:
-                self.after(50, self.close_window)
-                result = {"status": "scheduled", "closed": True}
+                save_before_close = _bool_value(command.get("save", True), "save")
+                if save_before_close:
+                    path = self.save_and_close(command.get("filename"))
+                    if path is None:
+                        raise RuntimeError("project save-and-close was not scheduled")
+                    result = {
+                        "status": "scheduled", "path": str(path),
+                        "saved": False, "closed": False, "closing_after_save": True,
+                    }
+                else:
+                    self.after(50, self.close_window)
+                    result = {"status": "scheduled", "saved": False, "closed": True}
             else:
                 result = {"status": "error", "error": f"unknown action: {action or 'missing'}"}
         except Exception as exc:

@@ -26,6 +26,33 @@ except Exception:  # pragma: no cover
     fcntl = None
 
 
+def workspace_control_api_payload() -> dict[str, Any]:
+    """Describe the bounded virtual-desktop controls available to Ina."""
+    return {
+        "version": 1,
+        "commands": [
+            {"action": "windows", "arguments": {}},
+            {
+                "action": "focus_tool",
+                "aliases": ["select_tool"],
+                "arguments": {"tool": "paint, daw, music, or a visible window-title fragment"},
+            },
+            {
+                "action": "cycle_window",
+                "aliases": ["next_window", "previous_window"],
+                "arguments": {"direction": "1 for next, -1 for previous"},
+            },
+            {"action": "tile", "arguments": {}},
+            {"action": "capture", "arguments": {}},
+        ],
+        "examples": [
+            {"action": "focus_tool", "tool": "paint"},
+            {"action": "focus_tool", "tool": "daw"},
+            {"action": "next_window"},
+        ],
+    }
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -139,7 +166,10 @@ class VirtualWorkspaceService:
         if desktop is None:
             return {"ok": False, "error": "display unavailable"}
         action = str(request.get("action") or "").strip().lower()
-        input_actions = {"mouse_move", "mouse_button", "key", "type_text", "focus"}
+        input_actions = {
+            "mouse_move", "mouse_button", "key", "type_text", "focus",
+            "focus_tool", "select_tool", "cycle_window", "next_window", "previous_window",
+        }
         if action in input_actions and not self.input_enabled:
             return {"ok": False, "error": "workspace input is disabled by policy"}
         if action == "status":
@@ -157,6 +187,27 @@ class VirtualWorkspaceService:
             desktop.type_text(text)
         elif action == "focus":
             desktop.focus(int(request.get("window_id", 0)))
+        elif action in {"focus_tool", "select_tool"}:
+            tool = str(request.get("tool") or request.get("name") or request.get("title") or "")
+            selected = desktop.focus_tool(tool)
+            if selected is None:
+                return {
+                    "ok": False,
+                    "error": f"no open window matches tool: {tool or 'missing'}",
+                    "windows": [item.__dict__ for item in desktop.windows()],
+                }
+            return {"ok": True, "window": selected.__dict__}
+        elif action in {"cycle_window", "next_window", "previous_window"}:
+            if action == "previous_window":
+                direction = -1
+            elif action == "next_window":
+                direction = 1
+            else:
+                direction = int(request.get("direction", 1) or 1)
+            selected = desktop.cycle_window(direction)
+            if selected is None:
+                return {"ok": False, "error": "no titled windows are open"}
+            return {"ok": True, "window": selected.__dict__}
         elif action == "tile":
             return {"ok": True, "windows": desktop.tile()}
         elif action == "windows":
@@ -211,6 +262,7 @@ class VirtualWorkspaceService:
                 display_process_pid=self.xvfb.pid if self.xvfb is not None else None,
                 input_enabled=self.input_enabled, share_bus_enabled=self.share_bus_enabled,
                 control_socket=str(socket_path(self.child)), share_root=str(share_root(self.child)),
+                control_api=workspace_control_api_payload(),
             )
             self._serve()
             return 0

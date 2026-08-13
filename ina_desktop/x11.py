@@ -97,6 +97,10 @@ class X11Desktop:
         ]
         self.x11.XRaiseWindow.argtypes = [display_p, ctypes.c_ulong]
         self.x11.XSetInputFocus.argtypes = [display_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        self.x11.XGetInputFocus.argtypes = [
+            display_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+        ]
+        self.x11.XGetInputFocus.restype = ctypes.c_int
         self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
         self.x11.XStringToKeysym.restype = ctypes.c_ulong
         self.x11.XKeysymToKeycode.argtypes = [display_p, ctypes.c_ulong]
@@ -235,6 +239,61 @@ class X11Desktop:
             self.x11.XRaiseWindow(self.display, int(window_id))
             self.x11.XSetInputFocus(self.display, int(window_id), 1, 0)
             self.x11.XFlush(self.display)
+
+    def focused_window_id(self) -> int | None:
+        focused = ctypes.c_ulong()
+        revert_to = ctypes.c_int()
+        with self._lock:
+            ok = self.x11.XGetInputFocus(
+                self.display, ctypes.byref(focused), ctypes.byref(revert_to)
+            )
+        value = int(focused.value)
+        return value if ok and value not in {0, self.root} else None
+
+    def cycle_window(self, direction: int = 1) -> WindowInfo | None:
+        """Raise and focus the next or previous titled top-level window."""
+        windows = self.windows()
+        if not windows:
+            return None
+        step = -1 if int(direction) < 0 else 1
+        focused = self.focused_window_id()
+        current = next(
+            (index for index, item in enumerate(windows) if item.window_id == focused),
+            None,
+        )
+        if current is None:
+            target = windows[-1] if step < 0 else windows[0]
+        else:
+            target = windows[(current + step) % len(windows)]
+        self.focus(target.window_id)
+        return target
+
+    def focus_tool(self, name: str) -> WindowInfo | None:
+        """Focus a titled tool using stable human-facing names."""
+        query = " ".join(str(name or "").casefold().split())
+        if not query:
+            return None
+        aliases = {
+            "paint": ("ina paint",),
+            "drawing": ("ina paint",),
+            "canvas": ("ina paint",),
+            "daw": ("ina music studio",),
+            "music": ("ina music studio",),
+            "studio": ("ina music studio",),
+            "music studio": ("ina music studio",),
+        }
+        candidates = aliases.get(query, (query,))
+        windows = self.windows()
+        target = next(
+            (
+                window for candidate in candidates for window in reversed(windows)
+                if candidate == window.title.casefold() or candidate in window.title.casefold()
+            ),
+            None,
+        )
+        if target is not None:
+            self.focus(target.window_id)
+        return target
 
     def mouse_move(self, x: int, y: int) -> None:
         width, height = self.size()

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from ina_desktop import audio
 from ina_desktop.client import launch_environment, share_file
 from ina_desktop.paths import display_number
-from ina_desktop.service import VirtualWorkspaceService
+from ina_desktop.service import VirtualWorkspaceService, workspace_control_api_payload
+from ina_desktop.x11 import WindowInfo, X11Desktop
 
 
 def test_launch_environment_routes_display_and_private_audio(monkeypatch):
@@ -69,6 +70,12 @@ def test_service_dispatch_exposes_full_input_and_bounded_capture(tmp_path):
         def key(self, keysym, pressed): calls.append(("key", keysym, pressed))
         def type_text(self, text): calls.append(("text", text))
         def focus(self, window_id): calls.append(("focus", window_id))
+        def focus_tool(self, tool):
+            calls.append(("focus_tool", tool))
+            return WindowInfo(8, "Ina Paint")
+        def cycle_window(self, direction):
+            calls.append(("cycle", direction))
+            return WindowInfo(9, "Ina Music Studio — Ina")
         def tile(self): return [{"window_id": 1}]
         def windows(self): return []
         def save_ppm(self, path): path.write_bytes(b"P6\n1 1\n255\n\0\0\0"); return path
@@ -82,8 +89,39 @@ def test_service_dispatch_exposes_full_input_and_bounded_capture(tmp_path):
     assert service._dispatch({"action": "type_text", "text": "hello"})["ok"]
     assert service._dispatch({"action": "focus", "window_id": 7})["ok"]
     assert service._dispatch({"action": "tile"})["windows"] == [{"window_id": 1}]
+    assert service._dispatch({"action": "focus_tool", "tool": "paint"})["window"]["window_id"] == 8
+    assert service._dispatch({"action": "next_window"})["window"]["window_id"] == 9
+    assert service._dispatch({"action": "previous_window"})["window"]["window_id"] == 9
     assert service._dispatch({"action": "capture"})["path"].endswith("latest.ppm")
     assert calls == [
         ("move", 4, 8), ("button", 1, True), ("key", "a", True),
-        ("text", "hello"), ("focus", 7),
+        ("text", "hello"), ("focus", 7), ("focus_tool", "paint"),
+        ("cycle", 1), ("cycle", -1),
     ]
+
+
+def test_workspace_control_api_advertises_semantic_focus_and_cycle():
+    payload = workspace_control_api_payload()
+    advertised = {
+        name
+        for command in payload["commands"]
+        for name in [command["action"], *command.get("aliases", [])]
+    }
+    assert {"focus_tool", "select_tool", "cycle_window", "next_window", "previous_window"} <= advertised
+
+
+def test_x11_desktop_cycles_and_focuses_tools_without_a_window_manager():
+    desktop = object.__new__(X11Desktop)
+    windows = [
+        WindowInfo(1, "Ina Paint"),
+        WindowInfo(2, "Ina Music Studio — Ina"),
+    ]
+    focused = []
+    desktop.windows = lambda: windows
+    desktop.focused_window_id = lambda: 1
+    desktop.focus = focused.append
+
+    assert desktop.cycle_window(1) == windows[1]
+    assert focused == [2]
+    focused.clear()
+    assert desktop.focus_tool("daw") == windows[1]

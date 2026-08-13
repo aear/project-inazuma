@@ -467,7 +467,7 @@ class PaintWindow:
             highlightbackground="#d0d0d0",
             cursor="crosshair",
         )
-        self.canvas.grid(row=1, column=0, columnspan=9, padx=10, pady=10)
+        self.canvas.grid(row=1, column=0, columnspan=10, padx=10, pady=10)
 
         self._init_image()
 
@@ -529,7 +529,10 @@ class PaintWindow:
         tk.Checkbutton(self.root, text="Eraser", variable=self.is_eraser).grid(row=0, column=5, padx=6, pady=6)
         tk.Button(self.root, text="Clear", command=self._clear_canvas).grid(row=0, column=6, padx=6, pady=6)
         tk.Button(self.root, text="Save", command=self._save_image).grid(row=0, column=7, padx=6, pady=6)
-        tk.Button(self.root, text="Share", command=self._share_image).grid(row=0, column=8, padx=(6, 10), pady=6)
+        tk.Button(self.root, text="Save & close", command=self._save_and_close).grid(
+            row=0, column=8, padx=6, pady=6
+        )
+        tk.Button(self.root, text="Share", command=self._share_image).grid(row=0, column=9, padx=(6, 10), pady=6)
 
     def _bind_canvas(self) -> None:
         self.canvas.bind("<ButtonPress-1>", self._start_draw)
@@ -673,7 +676,7 @@ class PaintWindow:
             "queue_key": PAINT_API_QUEUE_KEY,
             "result_key": PAINT_API_LAST_RESULT_KEY,
             "canvas_state_key": PAINT_CANVAS_STATE_KEY,
-            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "close", "inspect", "undo"],
+            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "save_close", "close", "inspect", "undo"],
             "patterns": PAINT_API_PATTERNS,
             "coordinate_space": "normalized 0..1 by default; use space='pixels' for canvas pixels",
             "workspace_background": DEFAULT_BG,
@@ -912,7 +915,7 @@ class PaintWindow:
                 result = self._api_inspect(command)
             elif action == "undo":
                 result = self._api_undo(command)
-            elif action in {"close", "finish", "done"}:
+            elif action in {"close", "finish", "done", "save_close", "save_and_close"}:
                 result = self._api_close(command)
             else:
                 result = {"status": "error", "error": f"unknown action: {action or 'missing'}"}
@@ -1031,10 +1034,26 @@ class PaintWindow:
             "dirty": self.dirty,
         }
 
+    def _save_and_close(self) -> dict:
+        return self._api_close({"action": "save_close", "save": True})
+
     def _api_close(self, command: dict) -> dict:
         save_before_close = _coerce_bool(command.get("save"), True)
+        saved_path = None
+        if save_before_close:
+            if self.dirty or self.last_saved_path is None:
+                saved_path = self._save_image(show_errors=False)
+            else:
+                saved_path = str(self.last_saved_path)
+            if not saved_path:
+                return {
+                    "status": "error",
+                    "closed": False,
+                    "saved": False,
+                    "path": None,
+                    "error": "save failed; paint window left open",
+                }
         self._hide_for_close()
-        saved_path = self._save_image(show_errors=False) if save_before_close and self.dirty else None
         self._set_window_state(False)
         try:
             self.root.destroy()
@@ -1043,7 +1062,7 @@ class PaintWindow:
         return {
             "status": "ok",
             "closed": True,
-            "saved": bool(saved_path),
+            "saved": bool(save_before_close and saved_path),
             "path": saved_path,
         }
 

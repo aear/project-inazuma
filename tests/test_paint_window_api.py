@@ -484,6 +484,20 @@ class PaintWindowApiTests(unittest.TestCase):
         self.assertFalse(store["paint_window_open"])
         self.assertEqual(store[pw.PAINT_API_STATUS_KEY]["status"], "closed")
 
+    def test_save_close_leaves_paint_open_when_save_fails(self):
+        window = _window_stub()
+        window.dirty = True
+        window._save_image = lambda **_kwargs: None
+
+        result = window._process_api_command(
+            {"id": "safe-close", "action": "save_close"}
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertFalse(result["closed"])
+        self.assertFalse(window.root.withdrawn)
+        self.assertFalse(window.root.destroyed)
+        self.assertTrue(window._api_poll_active)
 
 if __name__ == "__main__":
     unittest.main()

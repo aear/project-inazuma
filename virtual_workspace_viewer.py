@@ -31,6 +31,7 @@ class WorkspaceViewer:
         toolbar = tk.Frame(self.root, bg="#151923")
         toolbar.pack(fill="x")
         tk.Button(toolbar, text="Tile windows", command=self.tile).pack(side="left", padx=4, pady=4)
+        tk.Button(toolbar, text="Next window", command=self.next_window).pack(side="left", padx=4, pady=4)
         tk.Button(toolbar, text="Refresh", command=self.refresh_now).pack(side="left", padx=4, pady=4)
         self.status_var = tk.StringVar(value="Connecting to Ina's workspace…")
         tk.Label(toolbar, textvariable=self.status_var, fg="#d8deef", bg="#151923").pack(side="left", padx=10)
@@ -125,6 +126,11 @@ class WorkspaceViewer:
         result = send_command(self.child, {"action": "tile"})
         if not result.get("ok"):
             self.status_var.set(f"Tile failed: {result.get('error')}")
+
+    def next_window(self) -> None:
+        result = send_command(self.child, {"action": "next_window"})
+        if not result.get("ok"):
+            self.status_var.set(f"Window focus failed: {result.get('error')}")
 
     def refresh_now(self) -> None:
         if self.desktop is None:

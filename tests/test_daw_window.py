@@ -832,6 +832,47 @@ def test_api_reports_background_rejection_instead_of_scheduled():
     assert "not scheduled" in result["error"]
 
 
+def test_save_and_close_waits_for_success_callback(tmp_path):
+    window = object.__new__(DawWindow)
+    snapshot = SimpleNamespace(name="Quiet Orbit")
+    callbacks = []
+    closed = []
+    window.project_path = None
+    window.paths = SimpleNamespace(projects=tmp_path)
+    window._project_snapshot = lambda: snapshot
+    window._show_error = lambda *_args: None
+
+    def schedule(_snapshot, _path, *, after_save=None):
+        callbacks.append(after_save)
+        return True
+
+    window._save_snapshot = schedule
+    window.close_window = lambda: closed.append(True)
+
+    path = window.save_and_close()
+
+    assert path == tmp_path / "Quiet_Orbit.ina-daw.json"
+    assert closed == []
+    callbacks[0](path)
+    assert closed == [True]
+
+
+def test_close_api_saves_by_default_and_can_explicitly_discard(tmp_path):
+    window = object.__new__(DawWindow)
+    window.save_and_close = lambda filename=None: tmp_path / "saved.ina-daw.json"
+    window.after = lambda _delay, callback: callback()
+    closed = []
+    window.close_window = lambda: closed.append(True)
+
+    safe = window._process_api_command({"id": "safe", "action": "close"})
+    assert safe["closing_after_save"] is True
+    assert safe["closed"] is False
+    assert closed == []
+
+    discard = window._process_api_command({"id": "discard", "action": "close", "save": False})
+    assert discard["closed"] is True
+
+
 def test_control_api_advertises_exact_dispatcher_without_autonomous_microphone():
     payload = daw_control_api_payload()
     advertised = {
@@ -854,6 +895,8 @@ def test_control_api_advertises_exact_dispatcher_without_autonomous_microphone()
         "stop",
         "save",
         "export",
+        "save_close",
+        "save_and_close",
         "close",
         "done",
         "finish",
