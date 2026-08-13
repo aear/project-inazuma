@@ -80,6 +80,43 @@ def test_scene_keeps_external_and_self_speakers_distinct() -> None:
     ]
 
 
+def test_scene_resolves_your_to_current_self_addressee() -> None:
+    scenes = ConversationSceneBuffer()
+    scenes.observe(_message("1", "I am here", direction="outbound", speaker="Ina", is_self=True))
+    snapshot = scenes.observe(_message("2", "Careful with your memory", speaker="Sakura"))
+
+    resolution = next(
+        item for item in snapshot["discourse"]["resolutions"] if item["surface"] == "your"
+    )
+    assert resolution["role"] == "addressee"
+    assert resolution["possessive"] is True
+    assert resolution["referents"][0]["id"] == "self"
+
+
+def test_pronoun_memory_cue_is_supported_by_role_alignment() -> None:
+    adapter = object.__new__(LMStudioAdapter)
+    adapter.child = "Ina"
+    current = {
+        "discourse": {
+            "resolutions": [{"surface": "your", "role": "addressee", "referents": [{"id": "self"}]}]
+        }
+    }
+    candidate = {
+        "event_id": "role-memory", "cue": "your", "summary": "Careful with your memory use.",
+        "tags": [],
+        "discourse": {
+            "resolutions": [{"surface": "your", "role": "addressee", "referents": [{"id": "self"}]}]
+        },
+    }
+
+    considered = adapter.consider_recalled_memories("Check your memory", [candidate], scene=current)
+
+    assert [item["event_id"] for item in considered["accepted"]] == ["role-memory"]
+    alignment = considered["accepted"][0]["consideration"]["discourse_alignment"]
+    assert alignment["matched"] is True
+    assert alignment["score"] == 0.5
+
+
 def test_final_consideration_preserves_bounded_rejection_description() -> None:
     scene = {"scene_id": "scene_test", "signals": {}}
     consideration = {

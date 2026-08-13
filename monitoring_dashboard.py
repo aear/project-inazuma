@@ -6,6 +6,7 @@ They never load the large memory map, symbol-word store, or conversation archive
 from __future__ import annotations
 
 import json
+from collections import Counter
 import os
 import time
 import tkinter as tk
@@ -15,6 +16,7 @@ from tkinter import ttk
 from typing import Any, Callable
 
 from model_manager import get_inastate, load_config
+from neural_taxonomy import count_node_types
 try:
     from logic_memory_store import graph_counts as durable_logic_counts
 except Exception:  # pragma: no cover
@@ -151,7 +153,6 @@ def _continuity_delta(value: Any) -> str:
         return 'new baseline'
     return f'{points:+.1f} pp'
 
-
 def _continuity() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     """Read only the compact continuity report and bounded boot core."""
     base = _child_memory()
@@ -233,6 +234,7 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     neural = base / 'neural'
     rows = []
     total_nodes = total_edges = maps = 0
+    type_counts: Counter[str] = Counter()
     config = load_config()
     child = str(config.get('current_child', 'Inazuma_Yagami'))
     durable_primary = neural / 'neural_memory_map.json'
@@ -252,6 +254,8 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
         data = _safe_json(path, {})
         nodes = data.get('nodes', data.get('neurons', data.get('node_ids', []))) if isinstance(data, dict) else []
         edges = data.get('edges', data.get('synapses', [])) if isinstance(data, dict) else []
+        fallback_network = 'logic' if path.stem == 'logic_neural_map' else 'memory_graph'
+        type_counts.update(count_node_types(nodes, fallback_network))
         node_count = len(nodes) if isinstance(nodes, (list, dict)) else 0
         edge_count = len(edges) if isinstance(edges, (list, dict)) else int(data.get('edge_count', 0) or 0) if isinstance(data, dict) else 0
         if node_count or edge_count:
@@ -260,6 +264,12 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
             total_edges += edge_count
             label = 'Logic active projection' if path.stem == 'logic_neural_map' else path.stem.replace('_', ' ').title()
             rows.append((label, f'{node_count:,} nodes · {edge_count:,} links', 'neural map', _modified(path), str(path)))
+    for neural_type, count in sorted(type_counts.items()):
+        rows.append((
+            f'{neural_type.replace("_", " ").title()} neurons',
+            f'{count:,} nodes', 'neural type · EEG taxonomy', 'live',
+            json.dumps({"type": neural_type, "count": count}, indent=2),
+        ))
     logic_counts = durable_logic_counts(child, config) if durable_logic_counts else {}
     durable_logic_entries = int(logic_counts.get('entries', 0) or 0) if isinstance(logic_counts, dict) else 0
     durable_logic_edges = int(logic_counts.get('edges', 0) or 0) if isinstance(logic_counts, dict) else 0

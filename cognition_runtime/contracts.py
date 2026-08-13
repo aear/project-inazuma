@@ -32,6 +32,7 @@ class CostEstimate:
 class CapabilitySpec:
     name: str
     description: str
+    version: str = "V1"
     accepts: Mapping[str, str] = field(default_factory=dict)
     returns: Mapping[str, str] = field(default_factory=dict)
     expected_cost: CostEstimate = field(default_factory=CostEstimate)
@@ -52,6 +53,7 @@ class CapabilitySpec:
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name, "description": self.description,
+            "version": self.version,
             "accepts": dict(self.accepts), "returns": dict(self.returns),
             "expected_cost": self.expected_cost.as_dict(),
             "supported_context": sorted(self.supported_context),

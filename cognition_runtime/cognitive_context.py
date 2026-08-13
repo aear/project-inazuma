@@ -39,6 +39,7 @@ class CognitiveContext:
     observations: tuple[Any, ...] = ()
     goals: tuple[Any, ...] = ()
     active_state: Mapping[str, Any] = field(default_factory=dict)
+    discourse: Mapping[str, Any] = field(default_factory=dict)
     provenance: tuple[str, ...] = ()
     references: tuple[ContextReference, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -46,7 +47,8 @@ class CognitiveContext:
     @classmethod
     def build(
         cls, *, observations: Iterable[Any] = (), goals: Iterable[Any] = (),
-        active_state: Mapping[str, Any] | None = None, provenance: Iterable[str] = (),
+        active_state: Mapping[str, Any] | None = None,
+        discourse: Mapping[str, Any] | None = None, provenance: Iterable[str] = (),
         references: Iterable[ContextReference | Mapping[str, Any] | str] = (),
         metadata: Mapping[str, Any] | None = None, max_observations: int = 32,
         max_goals: int = 16, max_references: int = 64,
@@ -73,6 +75,7 @@ class CognitiveContext:
             observations=tuple(_bounded(item) for item in islice(observations, max(0, int(max_observations)))),
             goals=tuple(_bounded(item) for item in islice(goals, max(0, int(max_goals)))),
             active_state=_bounded(active_state or {}),
+            discourse=_bounded(discourse or {}),
             provenance=tuple(str(item)[:512] for item in islice(provenance, 64)),
             references=tuple(refs), metadata=_bounded(metadata or {}),
         )
@@ -86,6 +89,7 @@ class CognitiveContext:
             observations=self.observations if "observations" in allowed else (),
             goals=self.goals if "goals" in allowed else (),
             active_state=self.active_state if "active_state" in allowed else {},
+            discourse=self.discourse if "discourse" in allowed else {},
             provenance=self.provenance,
             references=self.references if "references" in allowed else (),
             metadata=self.metadata if "metadata" in allowed else {},

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
+from discourse_context import build_discourse_context
 from io_utils import file_lock
 
 
@@ -197,6 +198,15 @@ def build_language_context_snapshot(
     referents = _bounded_unique(
         [*topic_terms, *continuity, *(memory.get("cue") for memory in memories)], 16
     )
+    supplied_discourse = scene.get("discourse")
+    if not isinstance(supplied_discourse, Mapping):
+        supplied_discourse = build_discourse_context(
+            current_text, speaker=context.get("current_speaker") or "unknown",
+            addressee={"id": child, "name": child, "is_self": True},
+            self_identity={"id": child, "name": child, "is_self": True},
+            current_subject=referents[0] if referents else None,
+            mentioned_entities=scene.get("participants") or (),
+        )
     supplied_state = context.get("language_state_signals")
     supplied_state = supplied_state if isinstance(supplied_state, Mapping) else {}
 
@@ -269,6 +279,7 @@ def build_language_context_snapshot(
             "participants": _bounded_unique(scene.get("participants") or [], 8),
             "is_dm": "dm" in _words(context.get("tags")),
             "is_high_trust": bool(context.get("is_high_trust")),
+            "discourse": dict(supplied_discourse),
             "is_owner_friend": bool(context.get("is_owner_friend")),
         },
         "affective_state": compact_affect,

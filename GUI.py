@@ -31,6 +31,8 @@ from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
 from monitoring_dashboard import MonitoringWindow
 from subsystem_window import SubsystemWindow
+from module_benchmark_window import ModuleBenchmarkWindow
+from self_questions_window import SelfQuestionsWindow
 from io_utils import load_json_dict
 from collections import deque
 
@@ -1796,26 +1798,16 @@ def open_vitals_window():
     vitals_window.after(500, _update_usage_labels)
 
 def open_logs():
-    log_path = Path("AI_Children") / load_config().get("current_child", "Inazuma_Yagami") / "memory" / "self_questions.json"
+    child = load_config().get("current_child", "Inazuma_Yagami")
+    log_path = Path("AI_Children") / str(child) / "memory" / "self_questions.json"
     if not log_path.exists():
         messagebox.showinfo("Log", "No log found.")
         return
-    with open(log_path, "r") as f:
-        log = json.load(f)
-    display = tk.Toplevel()
-    display.title("Self Questions")
-    text = tk.Text(display, height=20, width=80)
-    text.pack()
-    for entry in log[-20:]:
-        question = entry.get("question", "unknown")
-        first = entry.get("first_asked") or entry.get("timestamp") or ""
-        count = entry.get("count", 1)
-        resolved = entry.get("resolved_at")
-        line = f"{first} — {question} (×{count})"
-        if resolved:
-            line += f" [resolved {resolved}]"
-        text.insert(tk.END, line + "\n")
-    text.config(state=tk.DISABLED)
+    SelfQuestionsWindow(root, log_path)
+
+
+def open_module_benchmarks():
+    ModuleBenchmarkWindow(root)
 
 def emergency_shutdown():
     global model_running
@@ -2080,6 +2072,7 @@ _action_button(tools_frame, 'Monitor', open_monitoring_window, 0, 0)
 _action_button(tools_frame, 'Control centre', open_vitals_window, 0, 1)
 _action_button(tools_frame, 'Self questions', open_logs, 0, 2)
 _action_button(tools_frame, 'Clear log', clear_status_log, 1, 0)
+_action_button(tools_frame, 'Benchmarks', open_module_benchmarks, 1, 1)
 _action_button(tools_frame, 'Music studio', open_music_studio, 2, 0)
 _action_button(tools_frame, 'Ina desktop', open_virtual_workspace, 3, 0)
 _action_button(tools_frame, 'Restart desktop', lambda: restart_runtime_service('virtual_workspace'), 3, 1)
@@ -2087,8 +2080,8 @@ _action_button(tools_frame, 'Restart world', lambda: restart_runtime_service('wo
 _action_button(tools_frame, 'Restart Discord', lambda: restart_runtime_service('discord_bridge'), 2, 2)
 _action_button(tools_frame, 'Subsystems', open_subsystem_window, 3, 2)
 if config.get('is_root', False):
-    _action_button(tools_frame, 'Pretrain', pretrain_mode, 1, 1)
-    _action_button(tools_frame, 'EEG', open_eeg_view, 1, 2)
+    _action_button(tools_frame, 'Pretrain', pretrain_mode, 1, 2)
+    _action_button(tools_frame, 'EEG', open_eeg_view, 4, 0)
 
 
 

@@ -191,6 +191,18 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Instrument a path and observe its real use before deleting it.
 - Assume today's compatibility path becomes tomorrow's haunted basement; keep it inspectable, bounded, and removable.
 
+### Ina's Rule 34: Benchmark everything
+
+> **Rule 34:** If a function exists, it will have a benchmark.
+>
+> **Rule 34b:** If a benchmark does not exist, it will be created.
+
+- Benchmarks may measure correctness, capability, quality, resource use, or performance as appropriate to the function.
+- Benchmark module versions explicitly (`V1`, `V2`, `V3`, and so on) so changes can be compared instead of merely described.
+- Prefer deterministic, reproducible cases with inspectable scoring and retained historical results.
+- Keep benchmarks bounded and explicitly invoked. Rule 34 does not authorize tight loops, continuous evaluation, or cognition that runs merely because time passed.
+- When touching an unbenchmarked function, add the smallest meaningful benchmark or record why measurement is currently blocked.
+
 ## Adversarial testing isolation (NON-NEGOTIABLE)
 
 - Ina must not be running during adversarial, exploit, prompt-injection, containment-escape, or other security testing.

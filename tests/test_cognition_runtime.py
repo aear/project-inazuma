@@ -34,6 +34,7 @@ def test_registry_holds_metadata_without_reasoning_logic():
     registry = CapabilityRegistry([spec("logic", backend="python", confidence_semantics="cosine margin")])
     described = registry.describe()[0]
     assert described["name"] == "logic"
+    assert described["version"] == "V1"
     assert described["confidence_semantics"] == "cosine margin"
     assert not hasattr(registry, "route")
 
@@ -45,12 +46,15 @@ def test_context_is_bounded_and_references_do_not_load_durable_store(monkeypatch
     monkeypatch.setattr(Path, "open", lambda self, *a, **k: opened.append(self) or original_open(self, *a, **k))
     context = CognitiveContext.build(
         observations=["x" * 10000] * 100, goals=range(100),
+        discourse={"speaker": {"id": "sakura"}, "resolutions": list(range(100))},
         references=[str(durable)], metadata={str(i): i for i in range(100)},
     )
     assert len(context.observations) == 32
     assert len(context.observations[0]) == 4096
     assert len(context.goals) == 16
     assert context.references[0].uri == str(durable)
+    assert context.discourse["speaker"]["id"] == "sakura"
+    assert len(context.discourse["resolutions"]) == 32
     assert opened == []
 
 

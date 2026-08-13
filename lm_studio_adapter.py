@@ -20,6 +20,7 @@ from language_processing import (
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
 from model_manager import load_config, seed_self_question
+from discourse_context import DISCOURSE_TERMS, build_discourse_context, role_alignment
 
 
 _STOPWORDS = {
@@ -225,6 +226,8 @@ class LMStudioAdapter:
                     "summary": summary,
                     "tags": list(event.get("situation_tags") or [])[:8],
                     "source": "experience_graph.words_index",
+                    "speaker": str(event.get("speaker") or (event.get("internal_state") or {}).get("speaker") or "unknown")[:80],
+                    "discourse": self._episode_discourse(event),
                 })
                 seen_events.add(str(event_id))
                 remaining -= len(summary)
@@ -247,6 +250,7 @@ class LMStudioAdapter:
         scene_terms = set(scene.get("topic_terms") or [])
         signals = scene.get("signals") if isinstance(scene.get("signals"), dict) else {}
         scene_terms.update(signals.get("continuity_terms") or [])
+        present_discourse = scene.get("discourse") if isinstance(scene.get("discourse"), dict) else {}
         accepted: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
         for raw in candidates:
@@ -267,13 +271,23 @@ class LMStudioAdapter:
             elif cue and cue in scene_terms:
                 score += 0.2
             score += min(0.35, 0.08 * len(support_terms))
-            if cue in _STOPWORDS or not cue:
+            discourse_alignment = role_alignment(
+                present_discourse,
+                candidate.get("discourse") if isinstance(candidate.get("discourse"), dict) else {},
+                cue,
+            ) if cue in DISCOURSE_TERMS else {
+                "available": False, "matched": False, "score": 0.0,
+            }
+            if discourse_alignment.get("available"):
+                score += float(discourse_alignment.get("score") or 0.0)
+            elif cue in _STOPWORDS or not cue:
                 score -= 0.25
             bounded_threshold = max(0.0, min(1.0, float(threshold)))
             candidate["consideration"] = {
                 "score": round(max(0.0, min(1.0, score)), 4),
                 "threshold": round(bounded_threshold, 4),
                 "support_terms": support_terms[:8],
+                "discourse_alignment": discourse_alignment,
             }
             if score >= bounded_threshold:
                 candidate["consideration"]["decision"] = "accepted"
@@ -296,6 +310,24 @@ class LMStudioAdapter:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _episode_discourse(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        internal = event.get("internal_state")
+        internal = internal if isinstance(internal, dict) else {}
+        speaker = event.get("speaker") or internal.get("speaker") or "unknown"
+        addressee = event.get("addressee") or internal.get("addressee")
+        if not addressee and str(speaker).casefold() != self.child.casefold():
+            addressee = self.child
+        text = event.get("utterance") or _speaker_aware_narrative(event)
+        speaker_role = {"id": speaker, "name": speaker, "is_self": str(speaker).casefold() == self.child.casefold()}
+        addressee_role = {
+            "id": addressee or "unknown", "name": addressee or "unknown",
+            "is_self": str(addressee or "").casefold() == self.child.casefold(),
+        }
+        return build_discourse_context(
+            str(text or ""), speaker=speaker_role, addressee=addressee_role,
+            self_identity={"id": self.child, "name": self.child, "is_self": True},
+        )
+
     def _experience_graph_path(self) -> Path:
         return (
             self._base_path

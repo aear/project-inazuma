@@ -10,6 +10,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
 
+from discourse_context import build_discourse_context
+
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
 _STOPWORDS = {
@@ -227,6 +229,20 @@ class ConversationSceneBuffer:
         participants = list(dict.fromkeys(
             turn.get("speaker") for turn in turns if turn.get("speaker")
         ))[-8:]
+        current_speaker = (current_turn or {}).get("speaker") or "unknown"
+        self_speakers = [turn.get("speaker") for turn in turns if turn.get("is_self")]
+        external_speakers = [turn.get("speaker") for turn in turns if not turn.get("is_self")]
+        if (current_turn or {}).get("is_self"):
+            addressee = external_speakers[-1] if external_speakers else "unknown"
+        else:
+            addressee = self_speakers[-1] if self_speakers else "self"
+        discourse = build_discourse_context(
+            current_text,
+            speaker={"id": current_speaker, "name": current_speaker, "is_self": bool((current_turn or {}).get("is_self"))},
+            addressee={"id": addressee, "name": addressee, "is_self": addressee in self_speakers or addressee == "self"},
+            self_identity={"id": self_speakers[-1] if self_speakers else "self", "name": self_speakers[-1] if self_speakers else "self", "is_self": True},
+            current_subject=topics[0] if topics else None, mentioned_entities=participants,
+        )
         reply_expected = bool(
             current_turn
             and current_turn.get("direction") == "inbound"
@@ -241,6 +257,7 @@ class ConversationSceneBuffer:
             "participants": participants,
             "topic_terms": topics,
             "memory_references": [dict(ref) for ref in scene.memory_references],
+            "discourse": discourse,
             "signals": {
                 "has_prior_context": len(turns) > 1,
                 "reply_expected": reply_expected,

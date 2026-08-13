@@ -14,6 +14,7 @@ import pyqtgraph.opengl as gl
 from eeg_rendering import RENDER_PROFILES, dangling_endpoint_ids, pack_edges, pack_nodes
 from gui_hook import log_to_statusbox
 from storage_layout import fast_runtime_path
+from neural_taxonomy import normalize_node_type
 from model_manager import (
     get_inastate,
     get_running_modules,
@@ -53,6 +54,7 @@ TYPE_COLORS: Dict[str, Tuple[float, float, float]] = {
     "word": (0.98, 0.85, 0.3),
     "symbol": (0.82, 0.55, 0.98),
     "logic": (0.48, 0.9, 1.0),
+    "memory": (0.33, 0.82, 1.0),
 }
 
 
@@ -349,7 +351,7 @@ class BrainDataLoader:
             "pos": pos,
             "activation": activation,
             "network_type": network_type,
-            "node_type": entry.get("type") or entry.get("node_type"),
+            "node_type": normalize_node_type(entry, str(network_type)),
             "label": label,
             "last_used": last_used or 0.0,
             "strength": float(entry.get("weight", 0.0)) if isinstance(entry.get("weight"), (int, float)) else 0.0,

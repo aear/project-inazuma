@@ -4713,21 +4713,21 @@ def restart_cognitive_capability(capability: str) -> Dict[str, Any]:
 
 
 def build_cognitive_context(
-    *, observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+    *, observations=(), goals=(), active_state=None, discourse=None, provenance=(), references=(), metadata=None,
 ) -> CognitiveContext:
     return CognitiveContext.build(
-        observations=observations, goals=goals, active_state=active_state,
+        observations=observations, goals=goals, active_state=active_state, discourse=discourse,
         provenance=provenance, references=references, metadata=metadata,
     )
 
 
 def route_cognitive_work(
     capability: str, *, context: Optional[CognitiveContext] = None, payload: Any = None,
-    observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+    observations=(), goals=(), active_state=None, discourse=None, provenance=(), references=(), metadata=None,
     reason: str = "model_manager_facade", priority: Optional[int] = None, measured=None,
 ):
     cycle = context or build_cognitive_context(
-        observations=observations, goals=goals, active_state=active_state,
+        observations=observations, goals=goals, active_state=active_state, discourse=discourse,
         provenance=provenance, references=references, metadata=metadata,
     )
     return get_cognition_runtime().route(
@@ -4738,10 +4738,10 @@ def route_cognitive_work(
 
 def route_cognitive_work_many(
     capabilities, *, context: Optional[CognitiveContext] = None, payloads=None,
-    observations=(), goals=(), active_state=None, provenance=(), references=(), metadata=None,
+    observations=(), goals=(), active_state=None, discourse=None, provenance=(), references=(), metadata=None,
 ):
     cycle = context or build_cognitive_context(
-        observations=observations, goals=goals, active_state=active_state,
+        observations=observations, goals=goals, active_state=active_state, discourse=discourse,
         provenance=provenance, references=references, metadata=metadata,
     )
     return get_cognition_runtime().route_many(capabilities, cycle, payloads=payloads)
