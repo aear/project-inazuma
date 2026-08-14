@@ -681,12 +681,133 @@ def _continuity_recall_v2() -> dict[str, Any]:
     ])
 
 
+def _background_interference_v1() -> dict[str, Any]:
+    source = _v1_text("AGENTS.md")
+    capabilities = (
+        ("audio xrun and error rate", "audio xrun"),
+        ("input latency", "input latency"),
+        ("desktop frame latency", "desktop frame latency"),
+        ("context switches per second", "context switches/sec"),
+        ("involuntary context switches", "involuntary context switches"),
+        ("writeback pressure", "writeback pressure"),
+        ("per-core saturation", "per-core saturation"),
+        ("thread fan-out and runnable workers", "runnable threads"),
+        ("explicit numerical thread-pool limits", "OMP_NUM_THREADS"),
+    )
+    return _capability([
+        {"case": case, "component": "interference", "correct": marker in source}
+        for case, marker in capabilities
+    ])
+
+
+def _background_interference_v2() -> dict[str, Any]:
+    import sys
+    import tempfile
+    from background_interference import BackgroundInterferenceBenchmark
+
+    audio_values = iter(({"sink": 0}, {"sink": 0}, {"sink": 0}, {"sink": 1}))
+    with tempfile.TemporaryDirectory(prefix="ina_interference_benchmark_") as directory:
+        result = BackgroundInterferenceBenchmark(
+            phase_seconds=0.1,
+            sample_interval_seconds=0.01,
+            audio_error_probe=lambda: next(audio_values),
+            input_probe=lambda: None,
+            frame_probe=lambda: None,
+        ).run(
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            working_directory=directory,
+            environment={"OMP_NUM_THREADS": "1"},
+        )
+    loaded = result["loaded"]
+    thread_peak = loaded["threads"].get("task_peak") or {}
+    return _capability([
+        {"case": "audio xrun and error rate", "component": "audio",
+         "correct": loaded["audio"]["available"] and loaded["audio"]["error_delta"] == 1},
+        {"case": "input latency", "component": "input",
+         "correct": loaded["input_latency"]["available"] and "p95_ms" in loaded["input_latency"]},
+        {"case": "desktop frame latency", "component": "desktop",
+         "correct": loaded["desktop_frame_latency"]["available"] and "p95_ms" in loaded["desktop_frame_latency"]},
+        {"case": "context switches per second", "component": "scheduler",
+         "correct": loaded["context_switches_per_second"] >= 0},
+        {"case": "involuntary context switches", "component": "scheduler",
+         "correct": loaded["involuntary_context_switches_per_second"] >= 0},
+        {"case": "writeback pressure", "component": "storage",
+         "correct": "io_stall_ms_per_second" in loaded["writeback_pressure"]},
+        {"case": "per-core saturation", "component": "cpu",
+         "correct": "max_busy_percent" in loaded["per_core"]},
+        {"case": "thread fan-out and runnable workers", "component": "threads",
+         "correct": thread_peak.get("thread_count", 0) >= 1 and "runnable_thread_count" in thread_peak},
+        {"case": "explicit numerical thread-pool limits", "component": "threads",
+         "correct": result["task"]["thread_environment"].get("OMP_NUM_THREADS") == "1"},
+    ])
+
+
+
+def _codex_harness_v1() -> dict[str, Any]:
+    source = _v1_text("AGENTS.md")
+    return _capability([
+        {"case": "standalone app-server GUI", "component": "gui", "correct": "subscription-only Codex harness" in source},
+        {"case": "ChatGPT-only authentication", "component": "auth", "correct": "forced_login_method" in source},
+        {"case": "user-routed approvals", "component": "safety", "correct": "user-routed approvals" in source},
+        {"case": "bounded transcript", "component": "memory", "correct": "bounded transcript" in source},
+        {"case": "separate from Ina runtime", "component": "isolation", "correct": "separate from Ina" in source},
+    ])
+
+
+def _codex_harness_v2() -> dict[str, Any]:
+    from codex_harness import BLOCKED_BILLING_ENV, subscription_environment
+    source = Path("codex_harness.py").read_text(encoding="utf-8")
+    ui = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    environment = subscription_environment({"OPENAI_API_KEY": "blocked", "PATH": "test"})
+    return _capability([
+        {"case": "standalone app-server GUI", "component": "gui",
+         "correct": '"app-server", "--stdio"' in source and "<title>Codex Harness</title>" in ui},
+        {"case": "ChatGPT-only authentication", "component": "auth",
+         "correct": 'forced_login_method="chatgpt"' in source and not (BLOCKED_BILLING_ENV & environment.keys())},
+        {"case": "user-routed approvals", "component": "safety",
+         "correct": '"approvalsReviewer": "user"' in source and "/api/approval" in ui},
+        {"case": "bounded transcript", "component": "memory",
+         "correct": "deque(maxlen=self.maximum)" in source and "MAX_EVENT_CHARS" in source},
+        {"case": "separate from Ina runtime", "component": "isolation",
+         "correct": "INA_CODEX_HARNESS" in source and "AI_Children" not in source},
+    ])
+
+
+def _thread_governor_v1() -> dict[str, Any]:
+    source = _v1_text("AGENTS.md")
+    return _capability([
+        {"case": "per-module learned profile", "component": "scope", "correct": "per-module learned thread profile" in source},
+        {"case": "explicit exploration budget", "component": "bounds", "correct": "thread exploration budget" in source},
+        {"case": "smallest sufficient count", "component": "selection", "correct": "smallest sufficient thread count" in source},
+        {"case": "module-scoped numerical pools", "component": "launch", "correct": "INA_THREAD_GOVERNOR_MODULE" in source},
+    ])
+
+
+def _thread_governor_v2() -> dict[str, Any]:
+    import tempfile
+    from thread_governor import AdaptiveThreadGovernor, ThreadObservation
+    with tempfile.TemporaryDirectory(prefix="ina_thread_governor_benchmark_") as directory:
+        governor = AdaptiveThreadGovernor(Path(directory) / "state.json", exploration_budget=3, hard_ceiling=4)
+        for threads, capability, interference in ((1, 0.7, 0.1), (2, 1.0, 0.3), (4, 1.4, 0.8)):
+            governor.record_observation(ThreadObservation.create(
+                "meaning_map", "background", "benchmark-hardware", threads, capability, interference,
+            ))
+        decision = governor.decide("meaning_map", "background", "benchmark-hardware")
+        environment = governor.environment_for("meaning_map", base={}, workload="background", hardware="benchmark-hardware")
+    return _capability([
+        {"case": "per-module learned profile", "component": "scope", "correct": decision.module == "meaning_map"},
+        {"case": "explicit exploration budget", "component": "bounds", "correct": decision.explored == decision.budget == 3},
+        {"case": "smallest sufficient count", "component": "selection", "correct": decision.threads == 2},
+        {"case": "module-scoped numerical pools", "component": "launch", "correct": environment.get("INA_THREAD_GOVERNOR_MODULE") == "meaning_map" and environment.get("OMP_NUM_THREADS") == "2"},
+    ])
+
 _HISTORY_BACKED_MODULES = {
     "q_decoder", "bridge_origin", "mirror_audience", "hindsight_claims",
     "mycelial_links", "seedling_clusters", "shadow_candidates", "soul_drift",
     "self_question_origins", "ina_ml_distribution", "language_components",
     "discord_retention", "native_test_support", "self_read_language",
-    "experience_cycle", "virtual_file_explorer", "continuity_recall",
+    "experience_cycle", "virtual_file_explorer", "continuity_recall", "background_interference",
+    "codex_harness", "thread_governor",
 }
 
 
@@ -714,6 +835,18 @@ _REGISTRY = {
     "continuity_recall": (
         ModuleVersion("continuity_recall", "V1", "Historical isolated continuity snapshots", _continuity_recall_v1),
         ModuleVersion("continuity_recall", "V2", "Federated bounded recall with descriptive bias telemetry", _continuity_recall_v2),
+    ),
+    "background_interference": (
+        ModuleVersion("background_interference", "V1", "Historical aggregate resource checks", _background_interference_v1),
+        ModuleVersion("background_interference", "V2", "Human-visible idle-vs-loaded interference and thread fan-out", _background_interference_v2),
+    ),
+    "codex_harness": (
+        ModuleVersion("codex_harness", "V1", "Historical VS Code-hosted Codex workflow", _codex_harness_v1),
+        ModuleVersion("codex_harness", "V2", "Standalone subscription-only app-server GUI", _codex_harness_v2),
+    ),
+    "thread_governor": (
+        ModuleVersion("thread_governor", "V1", "Historical unmanaged module thread pools", _thread_governor_v1),
+        ModuleVersion("thread_governor", "V2", "Bounded per-module observation-driven thread selection", _thread_governor_v2),
     ),
 }
 

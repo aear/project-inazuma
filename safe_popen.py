@@ -1,8 +1,10 @@
 import subprocess
 import threading
+from pathlib import Path
 from typing import Sequence, Union, Optional
 
 from gui_hook import log_to_statusbox
+from thread_governor import governed_environment
 
 Command = Union[str, Sequence[str]]
 
@@ -17,7 +19,8 @@ def _stderr_tag(line: str) -> str:
 
 
 def safe_popen(command: Command, *, label: Optional[str] = None, verbose: bool = False,
-               timeout: Optional[float] = None, **popen_kwargs) -> Optional[subprocess.Popen]:
+               timeout: Optional[float] = None, governor_module: Optional[str] = None,
+               governor_interactive: bool = False, **popen_kwargs) -> Optional[subprocess.Popen]:
     """Run subprocess.Popen with GUI-aware error handling.
 
     Parameters
@@ -34,6 +37,14 @@ def safe_popen(command: Command, *, label: Optional[str] = None, verbose: bool =
         Additional keyword arguments forwarded to subprocess.Popen.
     """
     cmd_display = command if isinstance(command, str) else " ".join(map(str, command))
+    if governor_module:
+        popen_kwargs["env"] = governed_environment(
+            governor_module,
+            project_root=Path(__file__).resolve().parent,
+            base=popen_kwargs.get("env"),
+            workload="interactive" if governor_interactive else "background",
+            interactive=governor_interactive,
+        )
     try:
         process = subprocess.Popen(
             command,

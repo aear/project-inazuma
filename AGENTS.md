@@ -208,6 +208,30 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - A code change is not complete until each changed behaviour has an explicitly versioned benchmark entry (for example, retained `V1` and candidate `V2`) in the benchmark suite. Unit tests verify correctness but do not replace this comparison. If a meaningful comparison cannot yet run, record the blocker in the benchmark registry or change notes rather than silently omitting it.
 - Benchmark UI and export/reporting changes as user-facing capabilities too; measurement is not limited to numerical kernels.
 
+### Background interference benchmarks
+
+- Changes to heavy or persistent background work must run a bounded idle-versus-loaded interference benchmark. Measure audio xrun/error rate, input latency, desktop frame latency, context switches/second, involuntary context switches, writeback pressure, and per-core saturation; aggregate CPU/GPU/RAM totals are not sufficient evidence of responsiveness.
+- Measure concurrency explicitly: system and benchmark-task thread counts, task-tree peak, runnable versus sleeping/uninterruptible workers, threads per logical CPU, and numerical-library pool settings such as `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS`.
+- Thread pools must be deliberate and module-scoped. Do not create a full hardware-sized pool in every module by default; retain or cap fan-out according to measured benefit and human-visible interference, and prefer shared/bounded execution where capability is unchanged.
+- Label real probes and proxies separately. Scheduler wake delay may be retained as an input-dispatch proxy, but must not be reported as a real input round trip; absent frame or audio instrumentation is `unavailable`, not zero.
+- Run only explicitly invoked, time-bounded tasks in isolated temporary storage. Preserve bounded raw samples and compare with a historical implementation materialized from its pinned Git revision.
+
+### Adaptive thread governance
+
+- Thread-count learning is module-, workload-, and hardware-specific. Never treat aggregate idle CPU as evidence that another full hardware-sized pool is harmless.
+- Start unmeasured background modules conservatively and interactive/audio-adjacent modules lower still. Choose the smallest measured count that preserves capability within the background-interference budget.
+- Learning advances only from explicitly invoked, bounded benchmarks with a finite exploration budget. The governor must not continuously probe, poll, or tune itself while Ina is running.
+- Preserve observations and the previous usable decision so a worse candidate can be rejected or rolled back. Separate allocated workers, runnable workers, and numerical-library pools in reports.
+
+### Standalone Codex harness
+
+- The lightweight Codex GUI harness is a development tool and must run as a separate process from Ina. It must not import Ina's runtime, memory stores, or process tree.
+- Authentication is ChatGPT-subscription-only: force `forced_login_method = "chatgpt"`, reuse Codex's cached login or device/browser login, and reject API-key, access-token, custom-base-URL, or automatic fallback paths that could create usage-based charges.
+- Use Codex app-server rather than reimplementing model/tool behavior. Keep command and file-change approvals user-routed; never add an automatic approve-for-me path.
+- Bind the GUI to localhost with a per-launch access token. Keep transcript/events bounded and fetch optional capability catalogs on demand.
+- Cached authentication is private local state: never copy it into this repository, logs, benchmark fixtures, or exported reports. VS Code does not need to be running for cached CLI/app-server authentication to work.
+- Benchmark the historical VS Code-hosted workflow against the standalone harness for capability coverage, startup/runtime resources, latency, isolation, and authentication safety.
+
 ## Experiential action design
 
 - Experience Engine owns the optional domain-neutral cycle: intent, one bounded attempt, observation, evaluation, then keep/revise/revisit/stop. Attempts are retained, and revision/revisit cycles link to their parent cycle.

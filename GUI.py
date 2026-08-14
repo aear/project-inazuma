@@ -401,7 +401,11 @@ def open_virtual_workspace():
     ensure_runtime_service_supervisor(child)
     status_box.insert(tk.END, "Opening Ina Virtual Desktop.\n")
     status_box.see(tk.END)
-    safe_popen([sys.executable, "virtual_workspace_viewer.py", "--child", child])
+    safe_popen(
+        [sys.executable, "virtual_workspace_viewer.py", "--child", child],
+        governor_module="virtual_workspace_viewer",
+        governor_interactive=True,
+    )
 
 
 def open_music_studio():

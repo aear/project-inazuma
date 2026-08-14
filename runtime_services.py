@@ -196,7 +196,11 @@ class RuntimeServiceSupervisor:
         command = list(SERVICE_COMMANDS[name])
         if name == "virtual_workspace":
             command.extend(["--child", self.child])
-        process = safe_popen(command, cwd=str(self.project_root))
+        process = safe_popen(
+            command,
+            cwd=str(self.project_root),
+            governor_module=name,
+        )
         if process is None:
             self.events.put(("exit", name, {"process": None, "returncode": None, "error": "launch_failed"}))
             return
