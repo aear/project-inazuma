@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from io_utils import atomic_write_json
+from continuity_recall import ContinuityRecallCoordinator
 
 
 # Evidence channels rather than personality requirements. A dimension can stay
@@ -70,6 +71,15 @@ _DIMENSION_TERMS = {
         "transient", "current_state", "state", "mood", "energy", "sensory", "boot", "wake", "sleep",
     },
 }
+
+_DIMENSION_MEMORY_TYPES = {
+    "identity_preferences": "identity", "active_goals": "prospective",
+    "important_relationships": "social", "emotional_attractors": "emotional",
+    "autobiographical_recall": "episodic", "reasoning_tendencies": "semantic",
+    "native_language_mappings": "linguistic", "self_model": "identity",
+    "external_memory_reintegration": "external", "transient_state": "sensory",
+}
+
 
 _MINIMUM_BOOT_ORDER = (
     "identity_preferences",
@@ -140,6 +150,7 @@ class ContinuityManager:
     ):
         self.child = child
         base = Path(memory_root) if memory_root else Path("AI_Children") / child / "memory"
+        self.memory_root = base
         self.fragments_root = base / "fragments"
         self.state_path = base / "continuity" / "fingerprint.json"
         self.map_path = base / "continuity" / "continuity_map.json"
@@ -147,6 +158,7 @@ class ContinuityManager:
         self.threshold = threshold
         self.max_fragments = max_fragments
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._recall_coordinator: Optional[ContinuityRecallCoordinator] = None
 
     # ------------------------------------------------------------------ public
     def run(self) -> Dict[str, object]:
@@ -316,6 +328,63 @@ class ContinuityManager:
                 "Do not bypass scheduler memory limits for normal boots.",
             ],
         }
+
+    def _recall(self) -> ContinuityRecallCoordinator:
+        if self._recall_coordinator is None:
+            self._recall_coordinator = ContinuityRecallCoordinator(self.child, self.memory_root)
+        return self._recall_coordinator
+
+    def _core_recall_candidates(self, cue: str, *, limit: int = 8) -> List[Dict[str, object]]:
+        """Cue-match the compact boot core without traversing modality stores."""
+        cue_terms = {part.casefold() for part in str(cue).replace("_", " ").split() if len(part) > 1}
+        core = self.load_minimum_boot_core()
+        candidates = []
+        for anchor in core.get("anchors", []) if isinstance(core, dict) else []:
+            if not isinstance(anchor, dict):
+                continue
+            terms = {
+                part.casefold()
+                for value in [anchor.get("summary"), *(anchor.get("tags") or [])]
+                for part in str(value or "").replace("_", " ").split()
+                if len(part) > 1
+            }
+            if cue_terms and not cue_terms.intersection(terms):
+                continue
+            dimensions = anchor.get("dimensions") if isinstance(anchor.get("dimensions"), list) else []
+            memory_type = next((_DIMENSION_MEMORY_TYPES[item] for item in dimensions if item in _DIMENSION_MEMORY_TYPES), "semantic")
+            candidates.append({
+                "id": anchor.get("id") or anchor.get("hash"),
+                "path": anchor.get("relative_path"),
+                "summary": anchor.get("summary") or "",
+                "tags": anchor.get("tags") or [],
+                "timestamp": anchor.get("timestamp"),
+                "source": "continuity_core_map",
+                "memory_type": memory_type,
+                "confidence": 0.75,
+            })
+            if len(candidates) >= max(0, int(limit)):
+                break
+        return candidates
+
+    def coordinate_recall(
+        self, cue: str, candidates: Iterable[Dict[str, object]], *,
+        include_core: bool = True, max_results: int = 6,
+        autonomous_continuation_budget: int = 0,
+    ) -> Dict[str, object]:
+        """Rank read-only witnesses and represent recall as one bounded experience."""
+        witness_candidates = [dict(item) for item in candidates if isinstance(item, dict)]
+        if include_core:
+            witness_candidates.extend(self._core_recall_candidates(cue))
+        return self._recall().recall(
+            cue, witness_candidates, max_results=max_results,
+            autonomous_continuation_budget=autonomous_continuation_budget,
+        )
+
+    def choose_recall(self, cycle_id: str, choice: str, *, evaluation: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        return self._recall().choose(cycle_id, choice, evaluation=evaluation)
+
+    def load_memory_relationships(self) -> Dict[str, object]:
+        return self._recall().load_relationships()
 
     # ----------------------------------------------------------------- helpers
     def _fragment_paths(self) -> List[Path]:

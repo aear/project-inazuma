@@ -11,6 +11,7 @@ from tkinter import colorchooser, messagebox, simpledialog
 from PIL import Image, ImageColor, ImageDraw
 
 from gui_hook import log_to_statusbox
+from creative_experience import choose_next
 from model_manager import (
     append_typed_outbox_entry,
     get_inastate,
@@ -676,7 +677,7 @@ class PaintWindow:
             "queue_key": PAINT_API_QUEUE_KEY,
             "result_key": PAINT_API_LAST_RESULT_KEY,
             "canvas_state_key": PAINT_CANVAS_STATE_KEY,
-            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "save_close", "close", "inspect", "undo"],
+            "commands": ["stroke", "pattern", "set_brush", "clear", "save", "save_close", "close", "inspect", "undo", "experience_choice"],
             "patterns": PAINT_API_PATTERNS,
             "coordinate_space": "normalized 0..1 by default; use space='pixels' for canvas pixels",
             "workspace_background": DEFAULT_BG,
@@ -749,6 +750,7 @@ class PaintWindow:
             "empty_ratio": spatial["empty_ratio"],
             "spatial": spatial,
             "brush": self._brush_state(),
+            "creative_experience": get_inastate("creative_experience_drawing") or {},
         }
         payload.update(extra)
         return payload
@@ -913,6 +915,13 @@ class PaintWindow:
                     result["error"] = "save failed"
             elif action in {"inspect", "state", "snapshot"}:
                 result = self._api_inspect(command)
+            elif action == "experience_choice":
+                current = get_inastate("creative_experience_drawing") or {}
+                if not isinstance(current, dict) or not current.get("cycle_id"):
+                    raise RuntimeError("no active drawing experience cycle")
+                updated = choose_next(current, command.get("choice"), reflection=command.get("reflection", ""))
+                update_inastate("creative_experience_drawing", updated)
+                result = {"status": "ok", "creative_experience": updated}
             elif action == "undo":
                 result = self._api_undo(command)
             elif action in {"close", "finish", "done", "save_close", "save_and_close"}:

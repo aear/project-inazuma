@@ -1,6 +1,9 @@
 import hashlib
 
-from ina_ml import cosine_similarity, deterministic_hash_bucket, normalize_vector, numeric_summary
+from ina_ml import (
+    cosine_similarity, deterministic_hash_bucket, mean_center, normalize_distribution,
+    normalize_vector, numeric_summary, shannon_entropy,
+)
 
 
 def test_hash_bucket_preserves_existing_sha256_mapping():
@@ -13,6 +16,10 @@ def test_shared_vector_kernels_are_dependency_free_and_stable():
     assert normalize_vector([3, 4]) == [0.6, 0.8]
     assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) > 0.999999
     assert numeric_summary([1, 2, 3]) == [2.0, (2 / 3) ** 0.5, 1.0, 3.0, 2.0]
+    assert normalize_distribution([2, 3]) == [0.4, 0.6]
+    assert normalize_distribution([0, 0]) == [0.5, 0.5]
+    assert mean_center([1, 3]) == [-1.0, 1.0]
+    assert shannon_entropy([0.5, 0.5]) > 0.69
 
 
 def test_rgb_frame_validates_and_downsamples_without_numpy():

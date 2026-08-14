@@ -24,6 +24,7 @@ logs/
 *.jsonl
 *.orig
 !benchmarks/*.jsonl
+!benchmarks/*.json
 *.glb
 logic_pause.flag
 

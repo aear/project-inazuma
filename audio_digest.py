@@ -41,12 +41,24 @@ def _proto_confidence(uses: int, base: float = 0.2) -> float:
 # Audio loading (numba/librosa free)
 # ------------------------------------------------------------
 
-def _load_waveform(clip_path, target_sr=TARGET_SR):
-    """
-    Load an audio file with pydub, convert to mono float32 waveform in [-1, 1].
-    """
+def _load_waveform(clip_path, target_sr=TARGET_SR, *, max_seconds=None, start_seconds=0.0):
+    """Load mono audio, optionally decoding only one bounded media excerpt."""
     try:
-        audio = AudioSegment.from_file(str(clip_path))
+        start = max(0.0, float(start_seconds or 0.0))
+    except (TypeError, ValueError):
+        start = 0.0
+    duration = None
+    if max_seconds is not None:
+        try:
+            duration = max(1.0, min(120.0, float(max_seconds)))
+        except (TypeError, ValueError):
+            duration = 30.0
+    try:
+        audio = AudioSegment.from_file(
+            str(clip_path),
+            start_second=start if start else None,
+            duration=duration,
+        )
     except Exception as e:
         log_to_statusbox(f"[AudioDigest] Failed to read {clip_path}: {e}")
         return np.zeros(0, dtype=np.float32), target_sr, 0.0
@@ -516,7 +528,10 @@ def update_multi_symbol_words(symbol_sequence, symbol_words, proto_store=None, *
 # 4. MAIN ANALYSIS STEP
 # ------------------------------------------------------------
 
-def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknown"):
+def analyze_audio_clip(
+    clip_path, transformer=None, *, child=None, label="unknown",
+    max_seconds=None, start_seconds=0.0,
+):
     """
     Converts an audio file into:
       - cochlear features
@@ -525,7 +540,10 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
     """
     child = _current_child(child)
     try:
-        wave, sr, duration = _load_waveform(clip_path, target_sr=TARGET_SR)
+        wave, sr, duration = _load_waveform(
+            clip_path, target_sr=TARGET_SR,
+            max_seconds=max_seconds, start_seconds=start_seconds,
+        )
         texture = _texture_signature(wave, sr)
         diversity_boost = _diversity_boost_from_texture(texture)
         features = extract_cochlear_features(wave, sr)
@@ -592,6 +610,11 @@ def analyze_audio_clip(clip_path, transformer=None, *, child=None, label="unknow
             "language_hint": language_hint,
             "embedding": audio_embedding,
             "symbol_embedding": symbol_embedding,
+            "analysis_window": {
+                "start_seconds": round(max(0.0, float(start_seconds or 0.0)), 3),
+                "duration_seconds": round(duration, 3),
+                "bounded_excerpt": max_seconds is not None,
+            },
         }
 
     except Exception as e:

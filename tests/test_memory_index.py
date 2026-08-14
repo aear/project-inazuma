@@ -20,7 +20,7 @@ def test_bounded_index_build_and_direct_recall_touch(tmp_path):
             "filename": f"frag_{index}.json",
             "last_seen": "2025-01-01T00:00:00+00:00",
             "importance": 0.5,
-            "tags": ["symbolic"],
+            "tags": ["symbolic", "unresolved"] if index % 10 == 0 else ["symbolic"],
         }
         for index in range(125)
     }
@@ -35,5 +35,13 @@ def test_bounded_index_build_and_direct_recall_touch(tmp_path):
         touched = conn.execute(
             "SELECT last_seen FROM fragments WHERE frag_id = 'frag_7'"
         ).fetchone()[0]
+        unresolved = [row[0] for row in conn.execute(
+            "SELECT frag_id FROM fragment_tags WHERE tag = 'unresolved' ORDER BY frag_id"
+        )]
+        tag_index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_fragment_tags_tag'"
+        ).fetchone()
     assert count == 125
     assert touched == "2026-08-12T00:00:00+00:00"
+    assert set(unresolved) == {f"frag_{index}" for index in range(0, 125, 10)}
+    assert tag_index == (1,)

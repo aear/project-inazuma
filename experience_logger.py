@@ -14,6 +14,7 @@ import json
 
 from experience_archive import load_archived_experience, recent_archived_experiences
 from experience_storage import newest_event_paths, resolve_event_path
+from experience_engine import ExperienceCycleEngine
 
 
 def _now_iso() -> str:
@@ -100,7 +101,10 @@ class EpisodeRecord:
 class ExperienceLogger:
     """Persist multimodal events and assemble them into episodes."""
 
-    def __init__(self, child: str = "Inazuma_Yagami", base_path: Optional[Path] = None) -> None:
+    def __init__(
+        self, child: str = "Inazuma_Yagami", base_path: Optional[Path] = None, *,
+        enable_cycles: bool = False,
+    ) -> None:
         self.child = child
         self._base_path = Path(base_path) if base_path else Path("AI_Children")
         self._root = self._base_path / child / "memory" / "experiences"
@@ -110,6 +114,28 @@ class ExperienceLogger:
         self._events_dir.mkdir(parents=True, exist_ok=True)
         self._episodes_dir.mkdir(parents=True, exist_ok=True)
         self._active_episode: Optional[EpisodeRecord] = None
+        self._cycle_engine: Optional[ExperienceCycleEngine] = (
+            ExperienceCycleEngine(child=self.child, base_path=self._base_path)
+            if enable_cycles else None
+        )
+
+    def _cycles(self) -> ExperienceCycleEngine:
+        if self._cycle_engine is None:
+            self._cycle_engine = ExperienceCycleEngine(child=self.child, base_path=self._base_path)
+        return self._cycle_engine
+
+    def start_experience_cycle(self, intent: str, **kwargs: Any) -> Dict[str, Any]:
+        """Explicitly opt into one bounded Experience Cycle."""
+        return self._cycles().start_cycle(intent, **kwargs)
+
+    def complete_experience_attempt(self, cycle_id: str, **kwargs: Any) -> Dict[str, Any]:
+        return self._cycles().complete_attempt(cycle_id, **kwargs)
+
+    def choose_experience_outcome(self, cycle_id: str, choice: str, **kwargs: Any) -> Dict[str, Any]:
+        return self._cycles().record_choice(cycle_id, choice, **kwargs)
+
+    def continue_experience_cycle(self, parent_cycle_id: str, **kwargs: Any) -> Dict[str, Any]:
+        return self._cycles().continue_cycle(parent_cycle_id, **kwargs)
 
     # ------------------------------------------------------------------
     # Event management

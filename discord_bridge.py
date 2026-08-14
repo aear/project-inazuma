@@ -74,6 +74,7 @@ from discord_runtime import (
     typed_outbox_history_path,
     typed_outbox_archive_path,
 )
+from discord_retention import BoundedIdSet, compact_jsonl_tail, prune_buffer_files, tail_jsonl_entries
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -498,6 +499,14 @@ def get_outbox_policy() -> dict:
         "min_send_interval_seconds": DEFAULT_DISCORD_SEND_INTERVAL_SECONDS,
         "rate_limit_padding_seconds": DEFAULT_DISCORD_RATE_LIMIT_PADDING_SECONDS,
         "max_send_retries": DEFAULT_DISCORD_SEND_RETRIES,
+        "history_seen_limit": 10_000,
+        "history_compact_bytes": 64 * 1024 * 1024,
+        "history_keep_lines": 10_000,
+        "history_tail_bytes": 8 * 1024 * 1024,
+        "history_compact_on_start": False,
+        "voice_buffer_max_files": 256,
+        "voice_buffer_max_bytes": 512 * 1024 * 1024,
+        "voice_buffer_max_age_hours": 24.0,
     }
     if not isinstance(policy, dict):
         return defaults
@@ -539,6 +548,14 @@ def get_outbox_policy() -> dict:
             retry_raw,
             defaults["max_send_retries"],
         )
+    for key in ("history_seen_limit", "history_compact_bytes", "history_keep_lines", "history_tail_bytes", "voice_buffer_max_files", "voice_buffer_max_bytes"):
+        if policy.get(key) is not None:
+            result[key] = _coerce_positive_int(policy[key], defaults[key])
+    if policy.get("voice_buffer_max_age_hours") is not None:
+        result["voice_buffer_max_age_hours"] = _coerce_nonnegative_float(
+            policy["voice_buffer_max_age_hours"], defaults["voice_buffer_max_age_hours"]
+        )
+    result["history_compact_on_start"] = bool(policy.get("history_compact_on_start", defaults["history_compact_on_start"]))
     archive_path = policy.get("archive_path")
     if archive_path:
         result["archive_path"] = str(archive_path)
@@ -2268,7 +2285,7 @@ class InaDiscordClient(discord.Bot):
             if archive_override
             else typed_outbox_archive_path(self.child)
         )
-        self._typed_outbox_seen = set()
+        self._typed_outbox_seen = BoundedIdSet(self._outbox_policy["history_seen_limit"])
         self._typed_outbox_history_offset = 0
         self._discord_send_lock = asyncio.Lock()
         self._next_discord_send_at = 0.0
@@ -2966,13 +2983,36 @@ class InaDiscordClient(discord.Bot):
         except Exception:
             logger.exception("Failed to read typed outbox at %s", self._typed_outbox_path)
 
-        if len(self._typed_outbox_seen) > 5000:
-            self._typed_outbox_seen = set(list(self._typed_outbox_seen)[-2000:])
         return entries, stats
 
     def _load_outbox_history(self) -> None:
-        self._typed_outbox_history_offset = 0
-        self._refresh_outbox_history()
+        try:
+            if self._outbox_policy.get("history_compact_on_start"):
+                result = compact_jsonl_tail(
+                    self._typed_outbox_history_path,
+                    max_bytes=self._outbox_policy["history_compact_bytes"],
+                    keep_lines=self._outbox_policy["history_keep_lines"],
+                    tail_bytes=self._outbox_policy["history_tail_bytes"],
+                )
+                if result.get("compacted"):
+                    logger.info("Compacted Discord outbox history from %d to %d bytes", result["old_bytes"], result["new_bytes"])
+            self._typed_outbox_seen.clear()
+            entries = tail_jsonl_entries(
+                self._typed_outbox_history_path,
+                max_lines=self._outbox_policy["history_seen_limit"],
+                max_tail_bytes=self._outbox_policy["history_tail_bytes"],
+            )
+            self._typed_outbox_seen.update(
+                entry.get("id") or entry.get("entry_id") for entry in entries
+                if entry.get("id") or entry.get("entry_id")
+            )
+            self._typed_outbox_history_offset = (
+                self._typed_outbox_history_path.stat().st_size
+                if self._typed_outbox_history_path.exists() else 0
+            )
+        except Exception:
+            logger.exception("Failed to load bounded typed outbox history from %s", self._typed_outbox_history_path)
+            self._typed_outbox_history_offset = 0
 
     def _refresh_outbox_history(self) -> None:
         if not self._typed_outbox_history_path.exists():
@@ -2981,7 +3021,8 @@ class InaDiscordClient(discord.Bot):
         try:
             size = self._typed_outbox_history_path.stat().st_size
             if size < self._typed_outbox_history_offset:
-                self._typed_outbox_history_offset = 0
+                self._load_outbox_history()
+                return
             with self._typed_outbox_history_path.open("r", encoding="utf-8") as fh:
                 fh.seek(self._typed_outbox_history_offset)
                 for line in fh:
@@ -3964,6 +4005,14 @@ class InaDiscordClient(discord.Bot):
         try:
             out_path.write_bytes(pcm_bytes)
             logger.info("Discord voice segment saved to %s (%d bytes)", out_path, len(pcm_bytes))
+            retention = prune_buffer_files(
+                self.voice_buffer_dir,
+                max_files=self._outbox_policy["voice_buffer_max_files"],
+                max_bytes=self._outbox_policy["voice_buffer_max_bytes"],
+                max_age_hours=self._outbox_policy["voice_buffer_max_age_hours"],
+            )
+            if retention["removed_files"]:
+                logger.info("Pruned %d old Discord voice buffers (%d bytes)", retention["removed_files"], retention["removed_bytes"])
         except Exception:
             logger.exception("Failed to persist Discord voice segment to %s", out_path)
 

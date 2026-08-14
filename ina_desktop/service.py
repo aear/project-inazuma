@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ def workspace_control_api_payload() -> dict[str, Any]:
             },
             {"action": "tile", "arguments": {}},
             {"action": "capture", "arguments": {}},
+            {"action": "open_file_explorer", "arguments": {}, "execution_policy": "launches only the fixed data-only explorer"},
         ],
         "examples": [
             {"action": "focus_tool", "tool": "paint"},
@@ -215,6 +217,15 @@ class VirtualWorkspaceService:
         elif action == "capture":
             path = desktop.save_ppm(self.root / "latest.ppm")
             return {"ok": True, "path": str(path)}
+        elif action == "open_file_explorer":
+            project_root = Path(__file__).resolve().parents[1]
+            env = os.environ.copy()
+            env.update({"DISPLAY": self.display, "INA_VIRTUAL_WORKSPACE": "1", "INA_WORKSPACE_CHILD": self.child})
+            process = subprocess.Popen(
+                [sys.executable, str(project_root / "ina_file_explorer.py"), "--child", self.child],
+                cwd=str(project_root), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return {"ok": True, "pid": process.pid, "execution_allowed": False}
         else:
             return {"ok": False, "error": f"unknown action: {action}"}
         return {"ok": True}

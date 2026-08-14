@@ -79,6 +79,6 @@ def share_file(child: str, source: Path | str, *, channel: str = "outbox") -> di
 
 def workspace_command_environment(child: str, command: Sequence[str]) -> Optional[dict[str, str]]:
     names = {Path(str(part)).name for part in command}
-    if names & {"paint_runtime.py", "paint_window.py", "daw_window.py"}:
+    if names & {"paint_runtime.py", "paint_window.py", "daw_window.py", "ina_file_explorer.py"}:
         return launch_environment(child)
     return None

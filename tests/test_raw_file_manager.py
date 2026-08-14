@@ -1134,10 +1134,7 @@ def test_music_iterator_accepts_audio_stem_archives_and_language_context(tmp_pat
     )
     for name in names:
         (tmp_path / name).write_bytes(b"x")
-    expected = sorted(
-        names[:-2],
-        key=str.casefold,
-    )
+    expected = sorted(names, key=str.casefold)
 
     legacy = [
         path.name
@@ -1170,11 +1167,11 @@ def test_music_archive_filters_before_fragmenting_and_keeps_member_context(
 
     calls = []
 
-    def fragments(data, inner_path, container_path, category, _transformer):
+    def fragments(data, inner_path, container_path, category, _transformer, **_kwargs):
         calls.append((inner_path.as_posix(), category, data))
         return [
             {
-                "modality": "audio" if category == "audio" else "text",
+                "modality": category,
                 "source": f"{container_path.name}:{inner_path.as_posix()}",
                 "tags": ["self_read"],
             }
@@ -1185,14 +1182,15 @@ def test_music_archive_filters_before_fragmenting_and_keeps_member_context(
     result = rfm.process_archive(
         archive_path,
         object(),
-        allowed_categories={"audio", "text"},
+        allowed_categories={"audio", "text", "image"},
     )
 
     assert [(name, category) for name, category, _data in calls] == [
         ("stems/0 Lead Vocals.wav", "audio"),
         ("lyrics and style.txt", "text"),
+        ("cover.png", "image"),
     ]
-    assert len(result) == 2
+    assert len(result) == 3
     assert result[0]["source_context"]["archive_container_name"] == archive_path.name
     assert result[0]["source_context"]["archive_member_path"] == "stems/0 Lead Vocals.wav"
     assert "archive_audio_member" in result[0]["tags"]
@@ -1217,6 +1215,10 @@ def test_music_archive_filters_before_fragmenting_and_keeps_member_context(
     assert "self_voice" not in text["tags"]
     assert text["source_context"]["ownership_hint"] == "self_creation"
     assert text["source_context"]["music_asset_kind"] == "lyrics_style_context"
+    cover = result[2]
+    assert "album_cover" in cover["tags"]
+    assert cover["visual_learning"]["practice_use"] == "drawing"
+    assert set(cover["visual_learning"]["alignment_keys"]) & set(audio["language_learning"]["alignment_keys"])
 
 
 def test_direct_music_lyrics_use_language_not_audio_provenance(tmp_path):
@@ -1331,7 +1333,7 @@ def test_archive_member_tag_uses_the_actual_category(monkeypatch, tmp_path):
     monkeypatch.setattr(
         rfm,
         "_fragments_from_data_buffer",
-        lambda *_args: [{"modality": "image", "tags": []}],
+        lambda *_args, **_kwargs: [{"modality": "image", "tags": []}],
     )
 
     fragments = rfm.process_archive(archive_path, object())
@@ -1413,7 +1415,7 @@ def test_archive_member_aggregate_and_fragment_budgets(monkeypatch, tmp_path):
 
     calls = []
 
-    def fake_fragments(data, inner_path, container_path, category, transformer):
+    def fake_fragments(data, inner_path, container_path, category, transformer, **_kwargs):
         calls.append(inner_path.name)
         return [{"summary": inner_path.name, "tags": []}]
 
@@ -1442,7 +1444,7 @@ def test_archive_member_aggregate_and_fragment_budgets(monkeypatch, tmp_path):
 
     calls.clear()
 
-    def three_fragments(data, inner_path, container_path, category, transformer):
+    def three_fragments(data, inner_path, container_path, category, transformer, **_kwargs):
         calls.append(inner_path.name)
         return [{"summary": str(index), "tags": []} for index in range(3)]
 

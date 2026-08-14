@@ -21,6 +21,7 @@ from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
 from model_manager import load_config, seed_self_question
 from discourse_context import DISCOURSE_TERMS, build_discourse_context, role_alignment
+from continuity_manager import ContinuityManager
 
 
 _STOPWORDS = {
@@ -101,6 +102,7 @@ class LMStudioAdapter:
         self.logger = ExperienceLogger(child=child, base_path=self._base_path)
         self._relevance_cache_signature = None
         self._relevance_cache = None
+        self._continuity_manager = ContinuityManager(child, memory_root=self._base_path / child / "memory")
         self.bridge = LiveExperienceBridge(
             child=child, base_path=self._base_path, logger=self.logger
         )
@@ -226,6 +228,9 @@ class LMStudioAdapter:
                     "summary": summary,
                     "tags": list(event.get("situation_tags") or [])[:8],
                     "source": "experience_graph.words_index",
+                    "memory_type": "episodic",
+                    "confidence": 0.7,
+                    "path": str(path),
                     "speaker": str(event.get("speaker") or (event.get("internal_state") or {}).get("speaker") or "unknown")[:80],
                     "discourse": self._episode_discourse(event),
                 })
@@ -234,7 +239,17 @@ class LMStudioAdapter:
                 break
             if len(references) >= max(0, int(max_items)) or remaining <= 0:
                 break
-        return references
+        if not references:
+            return references
+        try:
+            coordinated = self._continuity_manager.coordinate_recall(
+                prompt, references, include_core=True, max_results=max_items,
+            )
+            selected = coordinated.get("selected", [])
+            return selected if isinstance(selected, list) else references
+        except Exception:
+            # Recall remains available if coordination metadata cannot be persisted.
+            return references
 
     def consider_recalled_memories(
         self,

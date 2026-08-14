@@ -50,7 +50,13 @@ from self_read_policy import (
     VALID_SELF_READ_FOCUS,
     self_read_focus_from_emotions,
 )
+from self_read_language import (
+    annotate_music_language_evidence, attach_media_experience,
+    media_seek_fraction, video_language_kind,
+)
 from text_memory import update_text_vocab
+from language_intelligence import reading_span_metadata
+from learned_media_lessons import record_media_lesson
 from github_history_materializer import materialize_commit_history
 
 _VIDEO_IMPORT_ERROR = None
@@ -89,7 +95,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
 
 
 FRAG_LIMIT = 1000
-TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py"}
+TEXT_EXTENSIONS = {".txt", ".md", ".json", ".py", ".lrc", ".srt", ".vtt"}
 DOCUMENT_EXTENSIONS = {".pdf", ".odt", ".epub"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pgm", ".ppm", ".pnm"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
@@ -157,7 +163,7 @@ DEFAULT_CODE_SCAN_PRUNED_DIRS = frozenset(
     }
 )
 MUSIC_SCAN_EXTENSIONS = frozenset(
-    {".wav", ".mp3", ".opus", ".txt", ".md", ".json", ".zip"}
+    AUDIO_EXTENSIONS | VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | {".txt", ".md", ".json", ".lrc", ".srt", ".vtt", ".zip"}
 )
 # Compatibility name for the existing music-root traversal flag.
 AUDIO_ONLY_SCAN_EXTENSIONS = MUSIC_SCAN_EXTENSIONS
@@ -713,6 +719,8 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
             context.setdefault("stem_manifest_relative_path", manifest_path)
             if modality == "text":
                 context.setdefault("stem_collection_context", True)
+
+        annotate_music_language_evidence(fragment, relative_label)
 
 
 def _read_limited(stream, limit):
@@ -2157,10 +2165,11 @@ def fragment_document_text(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emotions": {"curiosity": 0.55, "focus": 0.35}
         }
+        span_metadata = reading_span_metadata(
+            str(source), passage_index, passage_count, chunk, document_progress
+        )
         frag["written_example"] = {
-            "passage_id": "passage_" + hashlib.sha256(
-                (str(source) + "\x00" + chunk).encode("utf-8", errors="replace")
-            ).hexdigest()[:20],
+            **span_metadata,
             "passage_index": passage_index,
             "passage_count": passage_count,
             "unit": "passage",
@@ -2666,7 +2675,7 @@ def _attach_audio_analysis(frag, analysis, metadata):
             tags.append("embedded_cover_art")
 
     analysis_payload = {}
-    for key in ("texture_signature", "diversity_boost", "unique_symbols", "language_hint"):
+    for key in ("texture_signature", "diversity_boost", "unique_symbols", "language_hint", "analysis_window"):
         value = analysis.get(key) if isinstance(analysis, dict) else None
         if value is not None:
             analysis_payload[key] = value
@@ -2689,7 +2698,28 @@ def _attach_audio_analysis(frag, analysis, metadata):
         frag["multi_symbol_pairs"] = analysis.get("multi_symbol_pairs", [])
 
 
-def fragment_audio(audio_path, transformer):
+def _probe_media_duration(audio_path, metadata=None):
+    metadata = metadata if isinstance(metadata, dict) else {}
+    technical = metadata.get("technical")
+    technical = technical if isinstance(technical, dict) else {}
+    duration = _audio_metadata_number(technical.get("duration_seconds"))
+    if duration:
+        return duration
+    if Path(audio_path).suffix.casefold() == ".wav":
+        try:
+            with contextlib.closing(wave.open(str(audio_path), "r")) as wf:
+                return wf.getnframes() / float(wf.getframerate() or 1)
+        except Exception:
+            return None
+    probed = _extract_audio_metadata(audio_path)
+    technical = probed.get("technical") if isinstance(probed, dict) else {}
+    return _audio_metadata_number(technical.get("duration_seconds")) if isinstance(technical, dict) else None
+
+
+def fragment_audio(
+    audio_path, transformer, *, seek_fraction=None, seek_seconds=None,
+    excerpt_seconds=60.0,
+):
     ext = audio_path.suffix.lower()
     supported_digest_formats = {".wav", ".mp3", ".opus"}
     if ext not in supported_digest_formats:
@@ -2698,25 +2728,45 @@ def fragment_audio(audio_path, transformer):
         )
         return []
 
+    metadata = (
+        _extract_audio_metadata(audio_path) if ext in {".mp3", ".opus"} else {}
+    )
+    full_duration = _probe_media_duration(audio_path, metadata)
+    try:
+        selected_fraction = max(0.0, min(1.0, float(seek_fraction if seek_fraction is not None else 0.5)))
+    except (TypeError, ValueError):
+        selected_fraction = 0.5
+    analysis_start = 0.0
+    analysis_limit = None
+    if seek_seconds is not None or seek_fraction is not None:
+        try:
+            requested_seconds = max(0.0, float(seek_seconds)) if seek_seconds is not None else None
+        except (TypeError, ValueError):
+            requested_seconds = None
+        analysis_limit = max(1.0, min(120.0, float(excerpt_seconds)))
+        centre = requested_seconds if requested_seconds is not None else (float(full_duration or 0.0) * selected_fraction)
+        if requested_seconds is not None and full_duration:
+            selected_fraction = max(0.0, min(1.0, requested_seconds / float(full_duration)))
+        analysis_start = max(0.0, centre - analysis_limit / 2.0)
+        if full_duration:
+            analysis_start = min(analysis_start, max(0.0, float(full_duration) - analysis_limit))
+
     analysis = None
     if analyze_audio_clip is not None:
         try:
             try:
                 analysis = analyze_audio_clip(
-                    audio_path, transformer, child=child, label="self_read"
+                    audio_path, transformer, child=child, label="self_read",
+                    max_seconds=analysis_limit, start_seconds=analysis_start,
                 )
             except TypeError as exc:
-                if "unexpected keyword argument" not in str(exc):
+                if analysis_limit is not None or "unexpected keyword argument" not in str(exc):
                     raise
                 analysis = analyze_audio_clip(audio_path, transformer)
         except Exception as exc:
             log_to_statusbox(
                 f"[RawFileManager] Audio digest failed for {audio_path}: {exc}"
             )
-
-    metadata = (
-        _extract_audio_metadata(audio_path) if ext in {".mp3", ".opus"} else {}
-    )
 
     def merged_tags():
         tags = ["self_read", "audio"]
@@ -2734,8 +2784,8 @@ def fragment_audio(audio_path, transformer):
     if ext == ".wav":
         try:
             with contextlib.closing(wave.open(str(audio_path), "r")) as wf:
-                frames = wf.readframes(wf.getnframes())
                 frame_count = wf.getnframes()
+                frames = wf.readframes(min(frame_count, 1024))
                 sample_rate = wf.getframerate()
                 channel_count = wf.getnchannels()
                 sample_width_bits = wf.getsampwidth() * 8
@@ -2761,7 +2811,8 @@ def fragment_audio(audio_path, transformer):
         audio_data = list(frames[:1024])
         fallback_features = [value / 255.0 for value in audio_data]
         duration = (
-            _audio_metadata_number(
+            full_duration
+            or _audio_metadata_number(
                 analysis.get("duration") if isinstance(analysis, dict) else None
             )
             or wave_duration
@@ -2793,6 +2844,11 @@ def fragment_audio(audio_path, transformer):
             ),
         }
         _attach_audio_analysis(frag, analysis, metadata)
+        observed_duration = _audio_metadata_number(analysis.get("duration")) if isinstance(analysis, dict) else duration
+        attach_media_experience(
+            frag, media_kind="audio", duration_seconds=duration, seek_fraction=selected_fraction,
+            observed_start=analysis_start, observed_end=min(float(duration or 0.0), analysis_start + float(observed_duration or 0.0)),
+        )
 
         vec = transformer.encode_audio_fragment(frag)
         clarity = analysis.get("clarity") if isinstance(analysis, dict) else None
@@ -2821,7 +2877,8 @@ def fragment_audio(audio_path, transformer):
     technical = metadata.get("technical")
     technical = technical if isinstance(technical, dict) else {}
     duration = (
-        _audio_metadata_number(analysis.get("duration"))
+        full_duration
+        or _audio_metadata_number(analysis.get("duration"))
         or technical.get("duration_seconds")
         or 0
     )
@@ -2842,6 +2899,11 @@ def fragment_audio(audio_path, transformer):
         "duration": duration,
     }
     _attach_audio_analysis(frag, analysis, metadata)
+    observed_duration = _audio_metadata_number(analysis.get("duration")) or duration
+    attach_media_experience(
+        frag, media_kind="audio", duration_seconds=duration, seek_fraction=selected_fraction,
+        observed_start=analysis_start, observed_end=min(float(duration or 0.0), analysis_start + float(observed_duration or 0.0)),
+    )
 
     vec = transformer.encode_audio_fragment(frag)
     clarity = analysis.get("clarity")
@@ -2856,9 +2918,17 @@ def fragment_audio(audio_path, transformer):
     return [frag]
 
 
-def fragment_video(video_path, transformer, source_label=None):
+def fragment_video(
+    video_path, transformer, source_label=None, *, seek_fraction=None,
+    seek_seconds=None, excerpt_seconds=30.0,
+):
     summary_parts = []
+    try:
+        selected_fraction = max(0.0, min(1.0, float(seek_fraction if seek_fraction is not None else 0.5)))
+    except (TypeError, ValueError):
+        selected_fraction = 0.5
     preview_features = []
+    visual_sample_seconds = []
     duration_seconds = None
     resolution = None
 
@@ -2874,18 +2944,28 @@ def fragment_video(video_path, transformer, source_label=None):
             if width and height:
                 resolution = (width, height)
 
-            target_frame = frame_count // 2 if frame_count else 0
-            if target_frame:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-
-            success, frame = capture.read()
-            if success and frame is not None and Image is not None and np is not None:
+            try:
+                requested_seconds = max(0.0, float(seek_seconds)) if seek_seconds is not None else None
+            except (TypeError, ValueError):
+                requested_seconds = None
+            target_seconds = requested_seconds if requested_seconds is not None else (float(duration_seconds or 0.0) * selected_fraction)
+            visual_window = min(max(1.0, float(excerpt_seconds)), 60.0, float(duration_seconds or 1.0))
+            sample_points = [
+                max(0.0, min(float(duration_seconds or 0.0), target_seconds + offset))
+                for offset in (-visual_window / 2.0, 0.0, visual_window / 2.0)
+            ]
+            for sample_second in dict.fromkeys(round(value, 3) for value in sample_points):
+                target_frame = min(frame_count - 1, int(sample_second * fps)) if frame_count and fps else 0
+                if target_frame > 0:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                success, frame = capture.read()
+                if not success or frame is None or Image is None or np is None:
+                    continue
                 try:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    preview_image = Image.fromarray(frame_rgb).convert("L").resize((32, 32))
-                    preview_features = (
-                        np.array(preview_image).astype(float).flatten() / 255.0
-                    ).tolist()
+                    preview_image = Image.fromarray(frame_rgb).convert("L").resize((16, 16))
+                    preview_features.extend((np.array(preview_image).astype(float).flatten() / 255.0).tolist())
+                    visual_sample_seconds.append(sample_second)
                 except Exception as frame_err:
                     log_to_statusbox(
                         f"[RawFileManager] Failed to extract frame from {video_path}: {frame_err}"
@@ -2897,6 +2977,12 @@ def fragment_video(video_path, transformer, source_label=None):
         log_to_statusbox(
             f"[RawFileManager] OpenCV unavailable for {video_path.name}: {_VIDEO_IMPORT_ERROR}"
         )
+
+    if not duration_seconds:
+        probed = _extract_audio_metadata(video_path)
+        technical = probed.get("technical") if isinstance(probed, dict) else {}
+        if isinstance(technical, dict):
+            duration_seconds = _audio_metadata_number(technical.get("duration_seconds"))
 
     if duration_seconds:
         summary_parts.append(f"~{duration_seconds:.1f}s")
@@ -2912,17 +2998,50 @@ def fragment_video(video_path, transformer, source_label=None):
     summary_details = " (" + ", ".join(summary_parts) + ")" if summary_parts else ""
     source = source_label or str(video_path)
 
+    video_kind = video_language_kind(duration_seconds)
+    summary_kind = "Video essay" if video_kind == "video_essay" else "Channel video"
     frag = {
         "modality": "video",
-        "summary": f"Video essay from {Path(source).name}{summary_details}",
+        "summary": f"{summary_kind} from {Path(source).name}{summary_details}",
         "tags": ["self_read", "video"],
         "source": source,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "emotions": {"focus": 0.4, "curiosity": 0.55},
+        "duration": duration_seconds or 0.0,
     }
+
+    bounded_excerpt = min(max(1.0, float(excerpt_seconds)), 60.0, float(duration_seconds or 1.0))
+    try:
+        requested_seconds = max(0.0, float(seek_seconds)) if seek_seconds is not None else None
+    except (TypeError, ValueError):
+        requested_seconds = None
+    excerpt_centre = requested_seconds if requested_seconds is not None else (float(duration_seconds or 0.0) * selected_fraction)
+    if requested_seconds is not None and duration_seconds:
+        selected_fraction = max(0.0, min(1.0, requested_seconds / float(duration_seconds)))
+    excerpt_start = max(0.0, excerpt_centre - bounded_excerpt / 2.0)
+    if duration_seconds:
+        excerpt_start = min(excerpt_start, max(0.0, float(duration_seconds) - bounded_excerpt))
+
+    if analyze_audio_clip is not None and duration_seconds:
+        try:
+            spoken_analysis = analyze_audio_clip(
+                video_path, transformer, child=child,
+                label="video_essay_spoken" if video_kind == "video_essay" else "channel_video_audio",
+                max_seconds=bounded_excerpt, start_seconds=excerpt_start,
+            )
+        except Exception as exc:
+            spoken_analysis = None
+            log_to_statusbox(f"[RawFileManager] Video audio excerpt failed for {video_path}: {exc}")
+        if isinstance(spoken_analysis, dict):
+            frag["audio_features"] = _flat_audio_feature_vector(spoken_analysis)
+            frag["symbols"] = spoken_analysis.get("symbols", [])
+            frag["proto_words"] = spoken_analysis.get("proto_words", [])
+            frag["tags"].append("bounded_audio_excerpt")
+            _attach_audio_analysis(frag, spoken_analysis, {})
 
     if preview_features:
         frag["video_features"] = preview_features[:1024]
+        frag["visual_sample_seconds"] = visual_sample_seconds[:3]
     else:
         metadata_features = []
         if duration_seconds:
@@ -2935,12 +3054,20 @@ def fragment_video(video_path, transformer, source_label=None):
         if metadata_features:
             frag["video_features"] = metadata_features
 
+    attach_media_experience(
+        frag, media_kind="video", duration_seconds=duration_seconds, seek_fraction=selected_fraction,
+        observed_start=excerpt_start, observed_end=min(float(duration_seconds or 0.0), excerpt_start + bounded_excerpt),
+    )
+
     vec = transformer.encode_video_fragment(frag)
     frag["importance"] = vec.get("importance", 0.0)
     return [frag]
 
 
-def _fragments_from_data_buffer(data, inner_path, container_path, category, transformer):
+def _fragments_from_data_buffer(
+    data, inner_path, container_path, category, transformer, *,
+    seek_fraction=None, seek_seconds=None,
+):
     source_label = f"{container_path.name}:{inner_path.as_posix()}"
     if category == "text":
         try:
@@ -2962,9 +3089,14 @@ def _fragments_from_data_buffer(data, inner_path, container_path, category, tran
             tmp.flush()
             temp_path = Path(tmp.name)
             if category == "audio":
-                results = fragment_audio(temp_path, transformer)
+                results = fragment_audio(
+                    temp_path, transformer, seek_fraction=seek_fraction, seek_seconds=seek_seconds
+                )
             else:
-                results = fragment_video(temp_path, transformer, source_label=source_label)
+                results = fragment_video(
+                    temp_path, transformer, source_label=source_label,
+                    seek_fraction=seek_fraction, seek_seconds=seek_seconds,
+                )
             for frag in results:
                 frag["source"] = source_label
             return results
@@ -2992,6 +3124,8 @@ def process_archive(
     aggregate_limit=ARCHIVE_TOTAL_UNCOMPRESSED_LIMIT,
     fragment_limit=ARCHIVE_FRAGMENT_LIMIT,
     allowed_categories=None,
+    media_seek_fraction_value=None,
+    media_seek_seconds=None,
 ):
     """Process a bounded archive sample without materializing an unbounded result."""
     fragments = []
@@ -3028,6 +3162,8 @@ def process_archive(
                 path,
                 category,
                 transformer,
+                seek_fraction=media_seek_fraction_value,
+                seek_seconds=media_seek_seconds,
             )
             or []
         )
@@ -3362,6 +3498,10 @@ def self_read_and_train():
         )
 
         try:
+            navigation = prior.get("media_navigation") if isinstance(prior, dict) else {}
+            navigation = navigation if isinstance(navigation, dict) else {}
+            selected_seek_fraction = media_seek_fraction(read_reason, prior)
+            requested_seek_seconds = navigation.get("requested_seek_seconds")
             if category == "text":
                 with open(path, "r", encoding="utf-8", errors="ignore") as handle:
                     text = handle.read()
@@ -3389,20 +3529,28 @@ def self_read_and_train():
                 result = fragment_image(path, transformer)
 
             elif category == "audio":
-                result = fragment_audio(path, transformer)
+                result = fragment_audio(
+                    path, transformer, seek_fraction=selected_seek_fraction,
+                    seek_seconds=requested_seek_seconds,
+                )
 
             elif category == "video":
-                result = fragment_video(path, transformer)
+                result = fragment_video(
+                    path, transformer, seek_fraction=selected_seek_fraction,
+                    seek_seconds=requested_seek_seconds,
+                )
 
             elif category == "archive":
                 result = process_archive(
                     path,
                     transformer,
                     allowed_categories=(
-                        {"audio", "text"}
+                        {"audio", "text", "image"}
                         if candidate.get("audio_only")
                         else None
                     ),
+                    media_seek_fraction_value=selected_seek_fraction,
+                    media_seek_seconds=requested_seek_seconds,
                 )
 
             else:
@@ -3447,6 +3595,7 @@ def self_read_and_train():
                 base_root=base_root,
             )
             saved_ids = []
+            observed_media = []
             for frag in fragments_to_save:
                 frag_id = frag.get("id") or f"frag_text_{uuid.uuid4().hex[:10]}"
                 frag["id"] = frag_id
@@ -3459,6 +3608,20 @@ def self_read_and_train():
                     record=record,
                     focus=read_focus,
                 )
+                media_experience = frag.get("media_experience")
+                if isinstance(media_experience, dict):
+                    observed_media.append({
+                        "fragment_id": frag_id,
+                        "mode": media_experience.get("mode"),
+                        "seek_fraction": media_experience.get("seek_fraction"),
+                        "observed_spans": list(media_experience.get("observed_spans") or ())[:4],
+                    })
+
+                if source_key == "music":
+                    try:
+                        record_media_lesson(child, frag)
+                    except Exception as exc:
+                        log_to_statusbox(f"[SelfRead] Learned-media lesson index skipped for {path.name}: {exc}")
 
                 frag_path = _child_memory_path(
                     child,
@@ -3485,6 +3648,16 @@ def self_read_and_train():
             }
             record["fragment_count_seen"] = total_fragments
             record["fragment_count_saved"] = len(fragments_to_save)
+            if observed_media:
+                record["media_navigation"] = {
+                    "last_seek_fraction": observed_media[0].get("seek_fraction", selected_seek_fraction),
+                    "last_observed": observed_media[:4],
+                    "next_suggested_fraction": media_seek_fraction(
+                        "revisit", {"read_count": record.get("read_count", 1)}
+                    ),
+                    "revisit_allowed": True,
+                    "requested_seek_seconds": None,
+                }
 
             document_cursor_for_continuation = None
             if isinstance(document_progress, dict):

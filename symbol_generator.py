@@ -41,18 +41,21 @@ def _attach_seedling_insights(entries: List[Dict[str, object]]) -> List[Dict[str
     transformer = SeedlingTransformer(seed=_stable_symbol_seed('|'.join(sorted(symbols))))
     result = transformer.germinate(symbols)
     clusters = result.get('clusters') if isinstance(result, dict) else {}
+    symbol_clusters = result.get('symbol_clusters') if isinstance(result, dict) else {}
     seeds = result.get('seeds') if isinstance(result, dict) else {}
     clusters = clusters if isinstance(clusters, dict) else {}
+    symbol_clusters = symbol_clusters if isinstance(symbol_clusters, dict) else {}
     seeds = seeds if isinstance(seeds, dict) else {}
 
     for entry in entries:
         symbol = str(entry.get('symbol') or '').strip()
-        key = symbol[:1] if symbol else ''
+        key = symbol_clusters.get(symbol, '')
         insights = entry.get('transformer_insights') if isinstance(entry.get('transformer_insights'), dict) else {}
         insights.update({
             'seedling_cluster': key or None,
             'seedling_seed': seeds.get(key),
             'seedling_cluster_size': len(clusters.get(key, [])) if isinstance(clusters.get(key), list) else 0,
+            'origins': list(result.get('origins') or [])[:16] if isinstance(result, dict) else [],
         })
         entry['transformer_insights'] = insights
     return entries

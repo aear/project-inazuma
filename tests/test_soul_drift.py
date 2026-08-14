@@ -1,5 +1,4 @@
-import numpy as np
-import pytest
+import math
 import os
 import sys
 
@@ -15,8 +14,8 @@ def _basic_state(num_symbols=3, non_uniform=False):
     else:
         symbols = {f"s{i}": 1.0 / num_symbols for i in range(num_symbols)}
     links = {k: {j: 1.0 for j in symbols if j != k} for k in symbols}
-    emotion = np.zeros(2)
-    entropy = -np.sum([w * np.log(w) for w in symbols.values()])
+    emotion = [0.0, 0.0]
+    entropy = -sum(w * math.log(w) for w in symbols.values())
     return DriftState(
         step=0,
         symbol_weights=symbols,
@@ -46,7 +45,7 @@ def test_trigger_resolves_weights_and_fuzz(tmp_path):
     prev_weights = transformer.state.symbol_weights.copy()
     focus = sorted(prev_weights, key=prev_weights.get, reverse=True)[:12]
     prev_sum = sum(prev_weights[s] for s in focus)
-    transformer.inject_trigger(np.array([1.0, 0.0]))
+    transformer.inject_trigger([1.0, 0.0])
     new_sum = sum(transformer.state.symbol_weights[s] for s in focus)
     assert new_sum > prev_sum
     assert transformer.state.fuzz_level < prev_fuzz
@@ -63,8 +62,8 @@ def test_fragmentation_capped(tmp_path):
     )
     symbols = {"A": 0.8, "B": 0.2}
     links = {"A": {"B": 1.0}, "B": {"A": 1.0}}
-    emotion = np.zeros(1)
-    entropy = -np.sum([w * np.log(w) for w in symbols.values()])
+    emotion = [0.0]
+    entropy = -sum(w * math.log(w) for w in symbols.values())
     state = DriftState(
         step=0,
         symbol_weights=symbols,

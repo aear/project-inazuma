@@ -199,9 +199,25 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 
 - Benchmarks may measure correctness, capability, quality, resource use, or performance as appropriate to the function.
 - Benchmark module versions explicitly (`V1`, `V2`, `V3`, and so on) so changes can be compared instead of merely described.
+- Materialize historical benchmark implementations from pinned Git revisions when possible; do not duplicate old source in the working tree merely to preserve a baseline.
+- Language benchmarks must use adversarial minimal pairs and score composition, morphology, constructions, pragmatics, discourse, uncertainty, whole-utterance alternatives, and reading-span continuity separately.
 - Prefer deterministic, reproducible cases with inspectable scoring and retained historical results.
 - Keep benchmarks bounded and explicitly invoked. Rule 34 does not authorize tight loops, continuous evaluation, or cognition that runs merely because time passed.
 - When touching an unbenchmarked function, add the smallest meaningful benchmark or record why measurement is currently blocked.
+- Tests must remain runnable without third-party pytest through `python native_test_runner.py`; use only the supported compatibility surface or extend it with a benchmark when new pytest behavior is needed.
+- A code change is not complete until each changed behaviour has an explicitly versioned benchmark entry (for example, retained `V1` and candidate `V2`) in the benchmark suite. Unit tests verify correctness but do not replace this comparison. If a meaningful comparison cannot yet run, record the blocker in the benchmark registry or change notes rather than silently omitting it.
+- Benchmark UI and export/reporting changes as user-facing capabilities too; measurement is not limited to numerical kernels.
+
+## Experiential action design
+
+- Experience Engine owns the optional domain-neutral cycle: intent, one bounded attempt, observation, evaluation, then keep/revise/revisit/stop. Attempts are retained, and revision/revisit cycles link to their parent cycle.
+- One cycle is the default. Autonomous continuation requires an explicit finite budget; absence or exhaustion of that budget means stop. Do not simulate experience with sleeps or force continued activity.
+- Domain payloads stay with their owning subsystem and are referenced by stable ID/path. Hindsight owns later lesson extraction.
+- Storage-affecting Experience Engine changes require a bounded, explicitly invoked historical comparison on both the configured durable HDD and fast NVMe when available. Record storage, latency, and memory overhead without using live experience stores.
+- Treat NVMe as a quota-bounded hot experiential workspace, HDD as the durable long-term store, and compact indexed/condensed structures as the quick-reach layer. Hot-tier writes must enforce byte/file ceilings and a free-space reserve; maintenance must hash-verify a bounded copy to HDD before retiring hot records.
+- Quick navigation must use the bounded cycle index or Hindsight-derived lessons rather than replaying raw history. The index locates experience; it does not extract lessons.
+- Apply the cycle to DAW, drawing, and non-reflex motor exploration. Safety reflexes may bypass deliberation but should remain observable where practical.
+- Virtual desktop file access is capability-scoped: media-source drives are read-only; Ina's private HDD drive is writable data storage. The explorer must never execute files or expose a generic process-launch surface.
 
 ## Adversarial testing isolation (NON-NEGOTIABLE)
 
@@ -244,6 +260,15 @@ When debugging, prefer:
 ### Reason
 This protects stability (RAM), performance, and avoids accidental “over-reading” of Ina’s internal history.
 
+
+## Federated memory continuity
+
+- Continuity coordinates memory stores as a **federation of witnesses**; it does not own or rewrite their modality traces.
+- Continuity may retain bounded links, confidence, recency, causal associations, recall rankings, and descriptive diversity measurements.
+- Original traces stay in the store where they were created. Coordination must not merge, edit, delete, or silently resolve conflicts between source witnesses.
+- Recall arbitration uses compact indexes and the bounded continuity core rather than replaying raw history. A deliberative recall is represented as an Experience Cycle with its plan referenced outside Experience Engine.
+- Bias reporting is read-only and descriptive. Concentration or selection skew may be surfaced for review, but must not trigger automatic memory rewriting or forced balancing.
+- Benchmark witness preservation, cross-store recall, diversity reporting, selection skew, storage, latency, and memory against the pinned historical implementation.
 
 ## Final Note
 

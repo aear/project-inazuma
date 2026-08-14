@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from gui_hook import log_to_statusbox
 from model_manager import seed_self_question
+from origin_record import make_origin
 
 # Simple map of conceptual opposites used to build paradoxes.
 OPPOSITES: Dict[str, str] = {
@@ -50,7 +51,8 @@ class BridgeTransformer:
         symbol: str,
         logic_tag: str,
         emotion_state: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, str]:
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Explore contradictions and seed self-questioning.
 
         Parameters
@@ -84,8 +86,20 @@ class BridgeTransformer:
                 else f"What links {symbol} and {logic_tag}?"
             )
 
-        seed_self_question(question)
+        source_context = source_context or {}
+        references = list(source_context.get("references") or [])[:32]
+        references.extend(source_context[key] for key in ("fragment_id", "event_id") if source_context.get(key))
+        references = list(dict.fromkeys(references))
+        origin = make_origin(
+            self.__class__.__name__, "V2", inputs={"symbol": symbol, "logic_tag": logic_tag},
+            references=references, trigger="contradiction", event_id=source_context.get("event_id"),
+            metadata={key: source_context[key] for key in ("capability", "context") if source_context.get(key)},
+        )
+        seed_self_question(question, origin=origin)
         self._trigger_pause()
         log_to_statusbox(f"[Bridge] Explored paradox between {symbol} and {logic_tag}.")
 
-        return {"fused_truth": fused, "question": question, "emotion": dominant}
+        return {
+            "fused_truth": fused, "question": question, "emotion": dominant,
+            "origins": [origin],
+        }

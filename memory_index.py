@@ -105,6 +105,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "timestamp TEXT, importance REAL, mtime_ns INTEGER, size_bytes INTEGER, tags_json TEXT)"
     )
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS fragment_tags (tag TEXT, frag_id TEXT, PRIMARY KEY(tag, frag_id))")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fragment_tags_tag ON fragment_tags(tag)")
 
 
 def index_is_current(json_path: Path, db_path: Path) -> bool:
@@ -115,7 +117,8 @@ def index_is_current(json_path: Path, db_path: Path) -> bool:
     try:
         with sqlite3.connect(str(db_path)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'source_mtime_ns'").fetchone()
-        return bool(row and int(row[0]) == int(json_path.stat().st_mtime_ns))
+            schema = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        return bool(row and schema and schema[0] == "2" and int(row[0]) == int(json_path.stat().st_mtime_ns))
     except Exception:
         return False
 
@@ -142,6 +145,7 @@ def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 
             conn.execute("PRAGMA synchronous=NORMAL")
             _ensure_schema(conn)
             rows = []
+            tag_rows = []
             for frag_id, meta in iter_json_object_items(json_path):
                 if not isinstance(meta, dict):
                     continue
@@ -149,6 +153,7 @@ def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 
                     importance = float(meta.get("importance", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     importance = 0.0
+                tags = [str(tag).lower() for tag in (meta.get("tags") or []) if tag]
                 rows.append(
                     (
                         str(frag_id),
@@ -162,24 +167,31 @@ def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 
                         json.dumps(meta.get("tags") or [], ensure_ascii=False),
                     )
                 )
+                tag_rows.extend((tag, str(frag_id)) for tag in tags)
                 if len(rows) >= max(1, int(batch_size)):
                     conn.executemany(
                         f"INSERT OR REPLACE INTO fragments({_SELECT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         rows,
                     )
+                    if tag_rows:
+                        conn.executemany("INSERT OR REPLACE INTO fragment_tags(tag, frag_id) VALUES (?, ?)", tag_rows)
                     conn.commit()
                     rows.clear()
+                    tag_rows.clear()
             if rows:
                 conn.executemany(
                     f"INSERT OR REPLACE INTO fragments({_SELECT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
+            if tag_rows:
+                conn.executemany("INSERT OR REPLACE INTO fragment_tags(tag, frag_id) VALUES (?, ?)", tag_rows)
             if int(json_path.stat().st_mtime_ns) != source_mtime:
                 raise RuntimeError("memory_map.json changed while its index was being built")
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('source_mtime_ns', ?)",
                 (str(source_mtime),),
             )
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')")
             conn.commit()
             conn.close()
             os.replace(temp_path, db_path)

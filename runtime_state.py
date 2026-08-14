@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from origin_record import normalize_origins
+
 from discord_runtime import typed_outbox_path
 from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json, file_lock
@@ -259,6 +261,9 @@ def _load_self_question_entries(child: Optional[str] = None) -> List[Dict[str, A
                 normalized["resolved_reason"] = entry.get("resolved_reason")
             if entry.get("resolution_history"):
                 normalized["resolution_history"] = entry.get("resolution_history")
+            provenance = normalize_origins(entry.get("origins") or entry.get("provenance"))
+            if provenance:
+                normalized["origins"] = provenance
             entries.append(normalized)
     return entries
 
@@ -270,7 +275,11 @@ def _save_self_question_entries(entries: List[Dict[str, Any]], child: Optional[s
         json.dump(entries, fh, indent=4)
 
 
-def seed_self_question(question: str, *, child: Optional[str] = None) -> None:
+def seed_self_question(
+    question: str, *, child: Optional[str] = None,
+    origin: Optional[Dict[str, Any]] = None,
+    provenance: Optional[Dict[str, Any]] = None,
+) -> None:
     if not question:
         return
     target_child = child or _current_child()
@@ -288,15 +297,22 @@ def seed_self_question(question: str, *, child: Optional[str] = None) -> None:
         existing["last_updated"] = now_iso
         existing.pop("resolved_at", None)
         existing.pop("resolved_reason", None)
+        supplied_origin = origin or provenance
+        if supplied_origin:
+            history = existing.setdefault("origins", [])
+            history.extend(normalize_origins(supplied_origin))
+            del history[:-16]
     else:
-        entries.append(
-            {
-                "question": normalized_question,
-                "first_asked": now_iso,
-                "last_updated": now_iso,
-                "count": 1,
-            }
-        )
+        entry = {
+            "question": normalized_question,
+            "first_asked": now_iso,
+            "last_updated": now_iso,
+            "count": 1,
+        }
+        bounded = normalize_origins(origin or provenance)
+        if bounded:
+            entry["origins"] = bounded
+        entries.append(entry)
 
     entries.sort(key=lambda item: item.get("first_asked", now_iso))
     entries = entries[-100:]

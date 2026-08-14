@@ -1,0 +1,48 @@
+{
+  "benchmark": "experience_cycle_storage",
+  "benchmark_version": "V1",
+  "historical_revision": "dc9f65a8a46d6d44957a44a29373488787d6d64e",
+  "run_at": "2026-08-14T10:17:31.967918+00:00",
+  "results": {
+    "hdd": {
+      "available": true,
+      "root": "/run/media/sakura/Ina HDD/Project Inazuma",
+      "V1": {
+        "samples": 9,
+        "median_latency_ms": 90.7992,
+        "p95_latency_ms": 3931.1047,
+        "mean_storage_bytes": 395.0
+      },
+      "V2": {
+        "samples": 9,
+        "median_latency_ms": 4533.4915,
+        "p95_latency_ms": 28030.3141,
+        "mean_storage_bytes": 21588.0
+      }
+    },
+    "nvme": {
+      "available": true,
+      "root": "/run/media/sakura/3b7828ff-4792-44b6-8d04-e370dda00fb1/Ina_Fast_Storage",
+      "V1": {
+        "samples": 9,
+        "median_latency_ms": 2.5985,
+        "p95_latency_ms": 6.1344,
+        "mean_storage_bytes": 395.0
+      },
+      "V2": {
+        "samples": 9,
+        "median_latency_ms": 17.6534,
+        "p95_latency_ms": 21.9448,
+        "mean_storage_bytes": 21588.0
+      }
+    },
+    "comparison": {
+      "V1": {
+        "nvme_vs_hdd_median_ratio": 0.0286
+      },
+      "V2": {
+        "nvme_vs_hdd_median_ratio": 0.0039
+      }
+    }
+  }
+}

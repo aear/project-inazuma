@@ -3807,16 +3807,12 @@ class _NeuralCustomTransformerRuntime:
         seed_weight = round(1.0 / max(1, len(symbols)), 6)
         weights = {symbol: seed_weight for symbol in symbols}
         links = {symbol: {} for symbol in symbols}
-        try:
-            import numpy as np  # local optional dependency
-        except Exception as exc:
-            return {"status": "unavailable", "error": str(exc)}
         cfg = drift_cfg_cls(log_history=False, max_history=64, rng_seed=0)
         state = drift_state_cls(
             step=0,
             symbol_weights=weights,
             symbol_links=links,
-            emotion_vector=np.zeros(2, dtype=float),
+            emotion_vector=[0.0, 0.0],
             fuzz_level=0.2,
             entropy_score=0.0,
             tags_active=("neural_map",),
@@ -3934,11 +3930,15 @@ def _persist_memory_index_db(child: str, index_data: Dict[str, Any], *, source_m
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("CREATE TABLE IF NOT EXISTS fragments (frag_id TEXT PRIMARY KEY, tier TEXT, filename TEXT, last_seen TEXT, timestamp TEXT, importance REAL, mtime_ns INTEGER, size_bytes INTEGER, tags_json TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS fragment_tags (tag TEXT, frag_id TEXT, PRIMARY KEY(tag, frag_id))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fragment_tags_tag ON fragment_tags(tag)")
         rows = []
+        tag_rows = []
         for frag_id, meta in index_data.items():
             if not frag_id or not isinstance(meta, dict):
                 continue
             tags = meta.get("tags") if isinstance(meta.get("tags"), list) else []
+            tag_rows.extend((str(tag).lower(), str(frag_id)) for tag in tags if tag)
             rows.append((
                 str(frag_id),
                 str(meta.get("tier") or ""),
@@ -3952,12 +3952,16 @@ def _persist_memory_index_db(child: str, index_data: Dict[str, Any], *, source_m
             ))
         with conn:
             conn.execute("DELETE FROM fragments")
+            conn.execute("DELETE FROM fragment_tags")
             if rows:
                 conn.executemany(
                     "INSERT OR REPLACE INTO fragments(frag_id, tier, filename, last_seen, timestamp, importance, mtime_ns, size_bytes, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
+            if tag_rows:
+                conn.executemany("INSERT OR REPLACE INTO fragment_tags(tag, frag_id) VALUES (?, ?)", tag_rows)
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('source_mtime_ns', ?)", (str(int(source_mtime_ns or 0)),))
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')")
     finally:
         conn.close()
 
@@ -3977,6 +3981,8 @@ class _MemoryIndexStore:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS fragments (frag_id TEXT PRIMARY KEY, tier TEXT, filename TEXT, last_seen TEXT, timestamp TEXT, importance REAL, mtime_ns INTEGER, size_bytes INTEGER, tags_json TEXT)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS fragment_tags (tag TEXT, frag_id TEXT, PRIMARY KEY(tag, frag_id))")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_fragment_tags_tag ON fragment_tags(tag)")
         self._ensure_current()
         row = self.conn.execute("SELECT COUNT(*) FROM fragments").fetchone()
         self._count = int(row[0] or 0) if row else 0
@@ -3995,8 +4001,9 @@ class _MemoryIndexStore:
         except OSError:
             return
         current = self._meta_value("source_mtime_ns")
+        schema_version = self._meta_value("schema_version")
         row = self.conn.execute("SELECT 1 FROM fragments LIMIT 1").fetchone()
-        if current == str(source_mtime_ns) and row is not None:
+        if current == str(source_mtime_ns) and schema_version == "2" and row is not None:
             return
         try:
             with self.json_path.open("r", encoding="utf-8") as fh:

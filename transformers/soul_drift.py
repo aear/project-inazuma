@@ -1,94 +1,84 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Tuple
-import json
-import hashlib
-import numpy as np
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import hashlib
+import json
+import random
+
+from ina_ml import coerce_vector, mean_center, normalize_distribution, shannon_entropy, vector_norm
+from origin_record import make_origin
 
 SymbolId = str
 
 
-def _vec(symbol_weights: Dict[SymbolId, float], symbols: List[SymbolId]) -> np.ndarray:
-    return np.array([symbol_weights.get(k, 0.0) for k in symbols], dtype=float)
+def _vec(symbol_weights: Dict[SymbolId, float], symbols: List[SymbolId]) -> list[float]:
+    return [float(symbol_weights.get(key, 0.0)) for key in symbols]
 
 
-def _to_dict(vec: np.ndarray, symbols: List[SymbolId]) -> Dict[SymbolId, float]:
-    return {k: float(v) for k, v in zip(symbols, vec)}
+def _to_dict(vector: Sequence[float], symbols: List[SymbolId]) -> Dict[SymbolId, float]:
+    return {key: float(value) for key, value in zip(symbols, vector)}
 
 
-def _normalize(vec: np.ndarray) -> np.ndarray:
-    total = vec.sum()
-    if total <= 0:
-        n = len(vec)
-        return np.full(n, 1.0 / n)
-    return vec / total
+def _normalize(vector: Iterable[float]) -> list[float]:
+    return normalize_distribution(vector)
 
 
-def _uniform_like(vec: np.ndarray) -> np.ndarray:
-    n = len(vec)
-    return np.full(n, 1.0 / n)
+def _uniform_like(vector: Sequence[float]) -> list[float]:
+    return [1.0 / len(vector)] * len(vector) if vector else []
 
 
-def _shannon_entropy(vec: np.ndarray) -> float:
-    vec = vec[vec > 0]
-    return -float(np.sum(vec * np.log(vec)))
+def _shannon_entropy(vector: Iterable[float]) -> float:
+    return shannon_entropy(vector)
 
 
-def _clamp(v: float, a: float, b: float) -> float:
-    return max(a, min(b, v))
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 def _has_any(tags: Tuple[str, ...], whitelist: Tuple[str, ...]) -> bool:
-    return any(t in whitelist for t in tags)
+    return any(tag in whitelist for tag in tags)
 
 
 def _fragment_along_links(
-    vec: np.ndarray,
-    symbols: List[SymbolId],
-    links: Dict[SymbolId, Dict[SymbolId, float]],
-    alpha: float,
-    cap: float,
-) -> np.ndarray:
+    vector: Sequence[float], symbols: List[SymbolId],
+    links: Dict[SymbolId, Dict[SymbolId, float]], alpha: float, cap: float,
+) -> list[float]:
     if alpha <= 0:
-        return vec
-    vec = vec.copy()
-    for i, sym in enumerate(symbols):
-        neigh = links.get(sym)
-        if not neigh:
+        return list(vector)
+    result = list(vector)
+    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+    for index, symbol in enumerate(symbols):
+        neighbours = links.get(symbol)
+        if not neighbours:
             continue
-        weight = vec[i]
+        weight = result[index]
         move = min(alpha * weight, cap)
         if move <= 0 or weight <= 0:
             continue
-        vec[i] -= move
-        total = sum(neigh.values())
+        result[index] -= move
+        total = sum(neighbours.values())
         if total <= 0:
-            vec[i] += move
+            result[index] += move
             continue
-        for j_sym, w in neigh.items():
-            if j_sym not in symbols:
-                continue
-            j = symbols.index(j_sym)
-            vec[j] += move * (w / total)
-    return vec
+        for neighbour, neighbour_weight in neighbours.items():
+            target = symbol_index.get(neighbour)
+            if target is not None:
+                result[target] += move * (neighbour_weight / total)
+    return result
 
 
-def _refocus(
-    weights: Dict[SymbolId, float],
-    focus: List[SymbolId],
-    boost: float,
-) -> Dict[SymbolId, float]:
+def _refocus(weights: Dict[SymbolId, float], focus: List[SymbolId], boost: float) -> Dict[SymbolId, float]:
     if not focus or boost <= 0:
         return weights
-    symbols = list(weights.keys())
-    vec = _vec(weights, symbols)
-    for i, sym in enumerate(symbols):
-        if sym in focus:
-            vec[i] *= (1.0 + boost)
-    vec = _normalize(vec)
-    return _to_dict(vec, symbols)
+    symbols = list(weights)
+    vector = _vec(weights, symbols)
+    focus_set = set(focus)
+    for index, symbol in enumerate(symbols):
+        if symbol in focus_set:
+            vector[index] *= 1.0 + boost
+    return _to_dict(_normalize(vector), symbols)
 
 
 def _topk_symbols_from_emotion(weights: Dict[SymbolId, float], k: int) -> List[SymbolId]:
@@ -101,6 +91,7 @@ class DriftConfig:
     fuzz_sigma: float = 0.03
     rng_seed: Optional[int] = None
     max_fragmentation: float = 0.25
+    emotion_bias_strength: float = 0.002
     decay_to_ambiguity: float = 0.001
     dream_tags_whitelist: Tuple[str, ...] = ("dreamstate", "meditation", "silence")
     resolve_boost: float = 0.5
@@ -115,17 +106,20 @@ class DriftState:
     step: int
     symbol_weights: Dict[SymbolId, float]
     symbol_links: Dict[SymbolId, Dict[SymbolId, float]]
-    emotion_vector: np.ndarray
+    emotion_vector: Sequence[float]
     fuzz_level: float
     entropy_score: float
     tags_active: Tuple[str, ...] = ()
 
 
 class SoulDriftTransformer:
-    def __init__(self, cfg: DriftConfig, init_state: DriftState):
+    VERSION = "V2"
+
+    def __init__(self, cfg: DriftConfig, init_state: DriftState) -> None:
         self.cfg = cfg
         self.state = init_state
-        self.rng = np.random.default_rng(cfg.rng_seed)
+        self.state.emotion_vector = coerce_vector(init_state.emotion_vector)
+        self.rng = random.Random(cfg.rng_seed)
         self._resolve_decay_counter = 0
         self._focus_symbols: List[SymbolId] = []
         self._history: List[DriftState] = []
@@ -135,117 +129,117 @@ class SoulDriftTransformer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.log_dir / "drift_log.ndjson"
 
-    # internal ---------------------------------------------------------------
     def _append_history(self, state: DriftState) -> None:
-        snap = replace(state)
-        self._history.append(snap)
+        snapshot = replace(state)
+        self._history.append(snapshot)
         if len(self._history) > self.cfg.max_history:
             self._history.pop(0)
         if self.cfg.log_history:
-            top = sorted(state.symbol_weights.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            top = sorted(state.symbol_weights.items(), key=lambda item: item[1], reverse=True)[:3]
             entry = {
-                "step": state.step,
-                "entropy": state.entropy_score,
-                "fuzz": state.fuzz_level,
-                "top_symbols": top,
-                "trigger": self._last_trigger,
+                "step": state.step, "entropy": state.entropy_score, "fuzz": state.fuzz_level,
+                "top_symbols": top, "trigger": self._last_trigger,
             }
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry) + "\n")
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
         self._last_trigger = None
 
-    # public ----------------------------------------------------------------
     def step(self, silence: bool = True) -> DriftState:
-        s = self.state
-        symbols = list(s.symbol_weights.keys())
-        vec = _vec(s.symbol_weights, symbols)
-        prev_entropy = s.entropy_score
-
-        noise = self.rng.normal(0, self.cfg.fuzz_sigma, size=len(vec))
-        if self._resolve_decay_counter > 0:
-            noise *= 0.5
-        vec = vec + noise * self.cfg.drift_rate
-
-        vec = (1 - self.cfg.decay_to_ambiguity) * vec + self.cfg.decay_to_ambiguity * _uniform_like(vec)
-
-        alpha = s.fuzz_level * self.cfg.drift_rate
-        vec = _fragment_along_links(vec, symbols, s.symbol_links, alpha, self.cfg.max_fragmentation)
-
+        state = self.state
+        symbols = list(state.symbol_weights)
+        vector = _vec(state.symbol_weights, symbols)
+        previous_entropy = state.entropy_score
+        noise_scale = 0.5 if self._resolve_decay_counter > 0 else 1.0
+        vector = [
+            value + self.rng.gauss(0.0, self.cfg.fuzz_sigma) * noise_scale * self.cfg.drift_rate
+            for value in vector
+        ]
+        uniform = _uniform_like(vector)
+        vector = [
+            (1.0 - self.cfg.decay_to_ambiguity) * value + self.cfg.decay_to_ambiguity * uniform[index]
+            for index, value in enumerate(vector)
+        ]
+        alpha = state.fuzz_level * self.cfg.drift_rate
+        vector = _fragment_along_links(vector, symbols, state.symbol_links, alpha, self.cfg.max_fragmentation)
         if self._resolve_decay_counter > 0 and self._focus_symbols:
             boost = (self._resolve_decay_counter / self.cfg.resolve_half_life_steps) * self.cfg.resolve_boost
-            vec = _vec(_refocus(_to_dict(vec, symbols), self._focus_symbols, boost), symbols)
+            vector = _vec(_refocus(_to_dict(vector, symbols), self._focus_symbols, boost), symbols)
 
-        if silence and _has_any(s.tags_active, self.cfg.dream_tags_whitelist):
-            pass  # placeholder for emotion bias
+        emotion_bias_applied = 0.0
+        emotion_values = coerce_vector(state.emotion_vector)
+        if silence and _has_any(state.tags_active, self.cfg.dream_tags_whitelist) and emotion_values:
+            bias = mean_center(emotion_values[index % len(emotion_values)] for index in range(len(vector)))
+            norm = vector_norm(bias)
+            if norm > 0 and self.cfg.emotion_bias_strength > 0:
+                scaled_bias = [(value / norm) * self.cfg.emotion_bias_strength for value in bias]
+                vector = [value + scaled_bias[index] for index, value in enumerate(vector)]
+                emotion_bias_applied = sum(abs(value) for value in scaled_bias)
 
-        vec = np.clip(vec, 0.0, None)
-        vec = _normalize(vec)
-        s.symbol_weights = _to_dict(vec, symbols)
-        s.entropy_score = _shannon_entropy(vec)
-        if silence:
-            s.fuzz_level = _clamp(s.fuzz_level + 0.01, 0.0, 1.0)
-        else:
-            s.fuzz_level = _clamp(s.fuzz_level - 0.02, 0.0, 1.0)
+        vector = _normalize(max(0.0, value) for value in vector)
+        state.symbol_weights = _to_dict(vector, symbols)
+        state.entropy_score = _shannon_entropy(vector)
+        state.fuzz_level = _clamp(state.fuzz_level + (0.01 if silence else -0.02), 0.0, 1.0)
         if self._resolve_decay_counter > 0:
-            s.fuzz_level = _clamp(s.fuzz_level - 0.02, 0.0, 1.0)
+            state.fuzz_level = _clamp(state.fuzz_level - 0.02, 0.0, 1.0)
             self._resolve_decay_counter -= 1
-        s.step += 1
+        state.step += 1
         if self.cfg.log_history:
-            self._append_history(s)
+            self._append_history(state)
 
-        try:
-            serialized = json.dumps(sorted(s.symbol_weights.items()), separators=(",", ":"))
-            delta_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-        except Exception:
-            delta_hash = "unknown"
-        entropy_bump = round(s.entropy_score - prev_entropy, 4)
+        serialized = json.dumps(sorted(state.symbol_weights.items()), separators=(",", ":"))
+        delta_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        origin = make_origin(
+            self.__class__.__name__, self.VERSION,
+            inputs={"step": state.step - 1, "silence": silence, "tags": state.tags_active},
+            trigger="dream_or_silence" if silence else "active_drift",
+            metadata={"emotion_bias_applied": round(emotion_bias_applied, 6)},
+        )
         self._last_telemetry = {
             "intent": "creative_entropy",
-            "entropy_bump": entropy_bump,
-            "fuzz_level": round(s.fuzz_level, 4),
-            "delta_graph_hash": delta_hash,
-            "step": s.step,
+            "entropy_bump": round(state.entropy_score - previous_entropy, 4),
+            "fuzz_level": round(state.fuzz_level, 4), "delta_graph_hash": delta_hash,
+            "step": state.step, "emotion_bias_applied": round(emotion_bias_applied, 6),
+            "numeric_backend": "ina_ml", "origins": [origin],
         }
-        return s
+        return state
 
     def run_session(self, steps: int, silence: bool = True) -> DriftState:
-        start_vec = self.snapshot()
-        start_entropy = start_vec.entropy_score
-        start_weights = start_vec.symbol_weights.copy()
-        for _ in range(steps):
+        start = self.snapshot()
+        start_weights = start.symbol_weights.copy()
+        for _ in range(max(0, int(steps))):
             self.step(silence=silence)
         end_state = self.state
         if self.cfg.log_history:
-            end_weights = end_state.symbol_weights
-            diff = {k: end_weights.get(k, 0) - start_weights.get(k, 0) for k in start_weights}
-            risen = sorted(diff.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            fallen = sorted(diff.items(), key=lambda kv: kv[1])[:3]
+            differences = {key: end_state.symbol_weights.get(key, 0.0) - start_weights.get(key, 0.0) for key in start_weights}
             summary = {
-                "start_entropy": start_entropy,
-                "end_entropy": end_state.entropy_score,
-                "steps": steps,
-                "symbols_risen": risen,
-                "symbols_fallen": fallen,
+                "start_entropy": start.entropy_score, "end_entropy": end_state.entropy_score,
+                "steps": max(0, int(steps)),
+                "symbols_risen": sorted(differences.items(), key=lambda item: item[1], reverse=True)[:3],
+                "symbols_fallen": sorted(differences.items(), key=lambda item: item[1])[:3],
             }
-            path = self.log_dir / "session_summary.json"
-            with path.open("w", encoding="utf-8") as fh:
-                json.dump(summary, fh)
+            (self.log_dir / "session_summary.json").write_text(json.dumps(summary), encoding="utf-8")
         return end_state
 
-    def inject_trigger(self, emotion_delta: np.ndarray, tag: str = "trigger") -> DriftState:
-        s = self.state
-        s.emotion_vector = s.emotion_vector + emotion_delta
-        focus = _topk_symbols_from_emotion(s.symbol_weights, k=12)
-        s.symbol_weights = _refocus(s.symbol_weights, focus, self.cfg.resolve_boost)
-        s.fuzz_level = _clamp(s.fuzz_level - 0.4, 0.0, 1.0)
+    def inject_trigger(self, emotion_delta: Iterable[float], tag: str = "trigger") -> DriftState:
+        state = self.state
+        current = coerce_vector(state.emotion_vector)
+        delta = coerce_vector(emotion_delta)
+        size = max(len(current), len(delta))
+        state.emotion_vector = [
+            (current[index] if index < len(current) else 0.0) + (delta[index] if index < len(delta) else 0.0)
+            for index in range(size)
+        ]
+        focus = _topk_symbols_from_emotion(state.symbol_weights, k=12)
+        state.symbol_weights = _refocus(state.symbol_weights, focus, self.cfg.resolve_boost)
+        state.fuzz_level = _clamp(state.fuzz_level - 0.4, 0.0, 1.0)
         self._resolve_decay_counter = self.cfg.resolve_half_life_steps
         self._focus_symbols = focus
-        s.tags_active += (tag,)
+        state.tags_active += (tag,)
         self._last_trigger = tag
-        s.entropy_score = _shannon_entropy(_vec(s.symbol_weights, list(s.symbol_weights.keys())))
+        state.entropy_score = _shannon_entropy(_vec(state.symbol_weights, list(state.symbol_weights)))
         if self.cfg.log_history:
-            self._append_history(s)
-        return s
+            self._append_history(state)
+        return state
 
     def snapshot(self) -> DriftState:
         return replace(self.state)

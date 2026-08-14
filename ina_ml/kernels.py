@@ -34,6 +34,31 @@ def normalize_vector(
     return [round(value, digits) for value in normalized] if digits is not None else normalized
 
 
+def normalize_distribution(values: Iterable[Any] | None) -> list[float]:
+    """Normalize non-negative weights by mass, falling back to uniform."""
+    vector = coerce_vector(values)
+    if not vector:
+        return []
+    total = sum(vector)
+    if total <= 0.0:
+        return [1.0 / len(vector)] * len(vector)
+    return [value / total for value in vector]
+
+
+def shannon_entropy(values: Iterable[Any] | None) -> float:
+    """Return natural-log entropy while ignoring zero/negative mass."""
+    return -sum(value * math.log(value) for value in coerce_vector(values) if value > 0.0)
+
+
+def mean_center(values: Iterable[Any] | None) -> list[float]:
+    """Subtract the arithmetic mean from a vector."""
+    vector = coerce_vector(values)
+    if not vector:
+        return []
+    mean = sum(vector) / len(vector)
+    return [value - mean for value in vector]
+
+
 def cosine_similarity(
     left: Sequence[float], right: Sequence[float], *,
     epsilon: float = 1e-8, overlap_norms: bool = False,

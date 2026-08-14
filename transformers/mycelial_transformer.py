@@ -1,109 +1,116 @@
-"""mycelial_transformer.py
-
-Mycelial Transformer
---------------------
-A lightweight cross-domain inference engine inspired by the lateral growth of
-mycelium.  Instead of building deep hierarchical representations it links
-"distant cousins" of symbolic memory sideways, encouraging non linear pathways
-useful for creative leaps and symbolic healing.
-
-The transformer accepts fragments from different modalities and attempts to
-weave small associative networks between them.  Integrations with optional
-subsystems are kept minimal so the component can operate in isolation during
-unit tests.
-"""
-
+"""Bounded, ranked cross-domain lateral association."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+import math
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from gui_hook import log_to_statusbox
+from origin_record import make_origin
 
-# Optional dependency to fetch symbol neighbours -------------------------------
-try:  # pragma: no cover - optional dependency
+try:  # pragma: no cover
     from meaning_map import get_symbol_neighbors
-except Exception:  # pragma: no cover - fallback used in tests
-    def get_symbol_neighbors(symbol_id: str | None = None,
-                             tags: Iterable[str] | None = None,
-                             k: int = 5) -> List[str]:
+except Exception:  # pragma: no cover
+    def get_symbol_neighbors(symbol_id: str | None = None, tags: Iterable[str] | None = None, k: int = 5) -> List[str]:
         return []
+
+
+def _tokens(value: str) -> set[str]:
+    text = str(value).lower()
+    words = set(re.findall(r"[a-z0-9]+", text))
+    chars = {text[index:index + 2] for index in range(max(0, len(text) - 1))}
+    return words | chars
 
 
 @dataclass
 class Pathway:
-    """Represents a sideways association between two symbolic items."""
-
     source: str
     target: str
+    score: float
+    factors: Dict[str, float] = field(default_factory=dict)
     relation: str = "lateral"
 
-    def as_dict(self) -> Dict[str, str]:
-        return {"from": self.source, "to": self.target, "relation": self.relation}
+    def as_dict(self) -> Dict[str, Any]:
+        return {"from": self.source, "to": self.target, "relation": self.relation, "score": self.score, "factors": self.factors}
 
 
 class MycelialTransformer:
-    """Build lateral symbolic pathways across modalities.
+    VERSION = "V2"
 
-    Parameters
-    ----------
-    max_links:
-        Maximum number of lateral links each item may form.  Keeps the network
-        small and manageable.
-    """
+    def __init__(self, max_links: int = 3, max_items: int = 256) -> None:
+        self.max_links = max(1, int(max_links))
+        self.max_items = max(2, min(2048, int(max_items)))
 
-    def __init__(self, max_links: int = 3):
-        self.max_links = max_links
-
-    # ------------------------------------------------------------------ utils
     def _expand_tags(self, tag: str, k: int) -> List[str]:
-        """Expand a tag sideways using the meaning map if available."""
         try:
             return get_symbol_neighbors(tags=[tag], k=k)
-        except Exception:  # pragma: no cover - extreme edge case
+        except Exception:
             return []
 
-    # ----------------------------------------------------------------- public
-    def weave(self, data: Dict[str, Iterable[str]],
-              emotional_vector: Dict[str, float] | None = None) -> Dict[str, List[Dict[str, str]]]:
-        """Link fragments from different domains into lateral pathways.
+    @staticmethod
+    def _score(
+        left: str, right: str, emotional_vector: Mapping[str, float],
+        usefulness: Mapping[str, float],
+    ) -> Tuple[float, Dict[str, float]]:
+        left_tokens, right_tokens = _tokens(left), _tokens(right)
+        union = left_tokens | right_tokens
+        overlap = len(left_tokens & right_tokens) / max(1, len(union))
+        semantic_distance = max(0.05, 1.0 - overlap)
+        novelty = max(0.05, 1.0 - min(1.0, overlap * 1.5))
+        emotion_keys = {str(key).lower() for key, value in emotional_vector.items() if abs(float(value or 0.0)) >= 0.2}
+        emotion_hit = bool((left_tokens | right_tokens) & emotion_keys)
+        emotional_relevance = 1.0 if emotion_hit else max(0.1, sum(abs(float(v or 0.0)) for v in emotional_vector.values()) / max(1, len(emotional_vector)))
+        history_key = f"{left}->{right}"
+        historical_usefulness = max(0.05, min(1.0, float(usefulness.get(history_key, usefulness.get(right, 0.5)) or 0.0)))
+        score = novelty * semantic_distance * emotional_relevance * historical_usefulness
+        factors = {
+            "novelty": round(novelty, 4), "semantic_distance": round(semantic_distance, 4),
+            "emotional_relevance": round(emotional_relevance, 4),
+            "historical_usefulness": round(historical_usefulness, 4),
+        }
+        return round(score, 6), factors
 
-        Parameters
-        ----------
-        data:
-            Mapping containing any of ``tags``, ``fragments``, ``visuals``,
-            ``audio`` or ``text``.  Each value should be an iterable of strings.
-        emotional_vector:
-            Optional mapping of emotion names to values.  When supplied, the
-            average is logged but otherwise not used.
-        """
-
-        domains = ["tags", "fragments", "visuals", "audio", "text"]
+    def weave(
+        self, data: Dict[str, Iterable[str]], emotional_vector: Dict[str, float] | None = None,
+        historical_usefulness: Mapping[str, float] | None = None,
+    ) -> Dict[str, Any]:
+        emotional_vector = emotional_vector or {}
+        historical_usefulness = historical_usefulness or {}
+        domains = ("tags", "fragments", "visuals", "audio", "text")
         items: List[Tuple[str, str]] = []
+        seen = set()
         for domain in domains:
             for value in data.get(domain, []) or []:
                 value_str = str(value)
-                items.append((domain, value_str))
-                # sideways growth: include neighbours that are not part of the
-                # provided data
-                for neigh in self._expand_tags(value_str, self.max_links):
-                    items.append((domain, neigh))
-
-        pathways: List[Pathway] = []
-        for i, (d1, v1) in enumerate(items):
-            links = 0
-            for d2, v2 in items[i + 1:]:
-                if d1 == d2:
-                    continue  # sideways only across domains
-                pathways.append(Pathway(f"{d1}:{v1}", f"{d2}:{v2}"))
-                links += 1
-                if links >= self.max_links:
+                for candidate in (value_str, *self._expand_tags(value_str, self.max_links)):
+                    key = (domain, str(candidate))
+                    if key not in seen:
+                        seen.add(key); items.append(key)
+                    if len(items) >= self.max_items:
+                        break
+                if len(items) >= self.max_items:
                     break
+            if len(items) >= self.max_items:
+                break
 
-        # optional emotional summary
-        if emotional_vector:
-            avg = round(sum(emotional_vector.values()) / len(emotional_vector), 4)
-            log_to_statusbox(f"[Mycelial] Emotional resonance average: {avg}")
-        log_to_statusbox(f"[Mycelial] Built {len(pathways)} lateral pathways.")
-
-        return {"pathways": [p.as_dict() for p in pathways]}
+        pathways = []
+        for index, (left_domain, left) in enumerate(items):
+            candidates = []
+            for right_domain, right in items[index + 1:]:
+                if left_domain == right_domain:
+                    continue
+                score, factors = self._score(left, right, emotional_vector, historical_usefulness)
+                candidates.append(Pathway(f"{left_domain}:{left}", f"{right_domain}:{right}", score, factors))
+            candidates.sort(key=lambda item: (-item.score, item.target))
+            pathways.extend(candidates[:self.max_links])
+        origin = make_origin(
+            self.__class__.__name__, self.VERSION,
+            inputs={domain: list(data.get(domain, []) or [])[:32] for domain in domains},
+            trigger="cross_domain_association", metadata={
+                "candidate_items": len(items), "retained_links": len(pathways),
+                "max_items": self.max_items, "input_truncated": len(items) >= self.max_items,
+            },
+        )
+        log_to_statusbox(f"[Mycelial] Retained {len(pathways)} ranked lateral pathways.")
+        return {"pathways": [pathway.as_dict() for pathway in pathways], "origins": [origin]}

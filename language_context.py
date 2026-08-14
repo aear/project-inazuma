@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 from discourse_context import build_discourse_context
+from language_intelligence import DiscourseEntityMemory, analyze_utterance
+from learned_media_lessons import load_output_guidance
 from io_utils import file_lock
 
 
@@ -257,8 +259,25 @@ def build_language_context_snapshot(
     reply_ids = _bounded_unique(
         [turn.get("reply_to_id") for turn in turns if turn.get("reply_to_id")], 8
     )
+    entity_memory = DiscourseEntityMemory(max_entities=64)
+    for turn_index, turn in enumerate(turns):
+        analyze_utterance(str(turn.get("text") or ""), discourse=entity_memory, turn=turn_index)
+    supplied_guidance = context.get("learned_media_guidance")
+    learned_media_guidance = (
+        dict(supplied_guidance) if isinstance(supplied_guidance, Mapping)
+        else load_output_guidance(child, "text")
+    )
+    linguistic_analysis = analyze_utterance(
+        current_text,
+        context={
+            "tone": signals.get("tone") or scene.get("tone"),
+            "sarcastic": signals.get("sarcastic", False),
+        },
+        discourse=entity_memory,
+        turn=len(turns),
+    )
     return {
-        "version": 1,
+        "version": 2,
         "enabled": True,
         "shadow_only": bool(policy["shadow_only"]),
         "captured_at": now.isoformat(),
@@ -272,6 +291,8 @@ def build_language_context_snapshot(
         },
         "recent_scene": turns,
         "reply_ancestry": reply_ids,
+        "linguistic_analysis": linguistic_analysis,
+        "learned_media_guidance": learned_media_guidance,
         "candidate_referents": referents,
         "active_memory_references": memories,
         "social_context": {
@@ -353,6 +374,14 @@ def score_mapping_candidate(
             memory_words.update(_words(memory.get("cue")))
             memory_words.update(_words(memory.get("tags")))
     memory_matches = sorted(tags & memory_words)
+    learned_words = set()
+    guidance = snapshot.get("learned_media_guidance")
+    if isinstance(guidance, Mapping):
+        for lesson in list(guidance.get("lessons") or ())[:4]:
+            if isinstance(lesson, Mapping):
+                learned_words.update(_words(lesson.get("tags")))
+                learned_words.update(_words(lesson.get("alignment_keys")))
+    learned_matches = sorted(tags & learned_words)
     occurrence_context = occurrence_context if isinstance(occurrence_context, Mapping) else {}
     neighbour_matches = sorted(tags & set(_words([
         occurrence_context.get("before"), occurrence_context.get("after")
@@ -367,6 +396,7 @@ def score_mapping_candidate(
     breakdown = {
         "topic_tag_overlap": len(tag_matches) * 3.0,
         "memory_tag_overlap": len(memory_matches) * 2.0,
+        "learned_media_overlap": len(learned_matches) * 1.5,
         "written_neighbour_overlap": len(neighbour_matches) * 4.0,
         "prediction_identity_match": 4.0 if prediction_match else 0.0,
     }
@@ -375,6 +405,7 @@ def score_mapping_candidate(
         "breakdown": breakdown,
         "matched_topic_tags": tag_matches,
         "matched_memory_tags": memory_matches,
+        "matched_learned_media": learned_matches,
         "matched_written_neighbours": neighbour_matches,
         "prediction_match": prediction_match,
     }

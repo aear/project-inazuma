@@ -229,6 +229,96 @@ def _continuity() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str,
     return cards, rows
 
 
+
+def _bias() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    """Report bounded recall diversity without treating observation as correction."""
+    path = _child_memory() / "continuity" / "memory_relationships.json"
+    payload = _safe_json(path, {})
+    payload = payload if isinstance(payload, dict) else {}
+    latest = payload.get("latest_arbitration")
+    latest = latest if isinstance(latest, dict) else {}
+    history = payload.get("recall_history")
+    history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+
+    def metric(container: dict[str, Any], key: str, field: str) -> float | None:
+        value = container.get(key)
+        value = value.get(field) if isinstance(value, dict) else None
+        return _unit_level(value)
+
+    def average(key: str, field: str) -> float | None:
+        values = [value for item in history if (value := metric(item, key, field)) is not None]
+        return sum(values) / len(values) if values else None
+
+    type_diversity = metric(latest, "selected_type_diversity", "score")
+    source_diversity = metric(latest, "selected_source_diversity", "score")
+    type_dominance = metric(latest, "selected_type_diversity", "dominance")
+    source_dominance = metric(latest, "selected_source_diversity", "dominance")
+    type_skew = metric(latest, "memory_type_selection_skew", "strength")
+    source_skew = metric(latest, "source_selection_skew", "strength")
+
+    rows = []
+    specs = (
+        ("Recall modality diversity", type_diversity, type_dominance, "selected_type_diversity",
+         "How varied the surfaced memory modalities were. Low diversity describes concentration; it does not establish unfairness."),
+        ("Recall source diversity", source_diversity, source_dominance, "selected_source_diversity",
+         "How varied the surfaced witness stores were. Original traces remain owned by their source stores."),
+    )
+    for label, diversity, dominance, key, explanation in specs:
+        state = "descriptive diversity"
+        if dominance is not None and dominance >= 0.75:
+            state += " · concentrated · highlight"
+        rows.append((
+            label, f"{_percent_level(diversity)} diversity · {_percent_level(dominance)} dominant",
+            state, _age(latest.get("timestamp")),
+            json.dumps({
+                "latest": latest.get(key), "rolling_diversity": average(key, "score"),
+                "rolling_dominance": average(key, "dominance"), "interpretation": explanation,
+            }, indent=2, default=str),
+        ))
+
+    for label, skew, key in (
+        ("Recall modality selection skew", type_skew, "memory_type_selection_skew"),
+        ("Recall source selection skew", source_skew, "source_selection_skew"),
+    ):
+        detail = latest.get(key) if isinstance(latest.get(key), dict) else {}
+        state = "selected share minus candidate share"
+        if skew is not None and skew >= 0.25:
+            state += " · concentrated · highlight"
+        rows.append((
+            label, _percent_level(skew), state, _age(latest.get("timestamp")),
+            json.dumps({
+                "latest": detail, "rolling_strength": average(key, "strength"),
+                "interpretation": "A strong delta shows what arbitration amplified or suppressed relative to available candidates. It is evidence for review, not an automatic correction.",
+            }, indent=2, default=str),
+        ))
+
+    selected_types = latest.get("selected_memory_types")
+    selected_types = selected_types if isinstance(selected_types, dict) else {}
+    selected_total = max(1, sum(int(value or 0) for value in selected_types.values()))
+    for memory_type, count in selected_types.items():
+        share = int(count or 0) / selected_total
+        rows.append((
+            f"Surfaced modality · {memory_type}", _percent_level(share), "latest recall share",
+            _age(latest.get("timestamp")), json.dumps({
+                "selected": count,
+                "available": (latest.get("candidate_memory_types") or {}).get(memory_type, 0),
+                "federation_rule": "Continuity coordinates rankings and links; it never rewrites modality traces.",
+            }, indent=2, default=str),
+        ))
+    if not latest:
+        rows.append((
+            "Recall bias evidence", "not reported", "waiting for a recall action",
+            _modified(path), "No recall arbitration has been observed yet. Missing evidence is not treated as zero bias or perfect diversity.",
+        ))
+
+    cards = [
+        ("Type diversity", _percent_level(type_diversity)),
+        ("Source diversity", _percent_level(source_diversity)),
+        ("Strongest skew", _percent_level(max(value for value in (type_skew, source_skew) if value is not None)) if any(value is not None for value in (type_skew, source_skew)) else "not reported"),
+        ("Recalls sampled", str(len(history))),
+    ]
+    return cards, rows
+
 def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     base = _child_memory()
     neural = base / 'neural'
@@ -752,6 +842,7 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
 COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]]] = {
     'Mind': _mind,
     'Continuity': _continuity,
+    'Bias': _bias,
     'Urges': _urges,
     'World': _world,
     'Memory': _memory,

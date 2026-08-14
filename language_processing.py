@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from runtime_state import load_config, seed_self_question
 from experience_logger import ExperienceLogger
+from learned_media_lessons import load_output_guidance
 from language_context import (
     attach_ambiguity_set,
     audit_counterfactual_expression,
@@ -2041,6 +2042,11 @@ def generate_symbolic_reply_from_text(
     if not tokens:
         return None
 
+    reply_context: Dict[str, Any] = dict(context) if isinstance(context, dict) else {}
+    guidance_consumer = "daw" if str(reply_context.get("source") or "").casefold() == "daw_window" else "speech"
+    learned_media_guidance = load_output_guidance(child, guidance_consumer, base_path=base_path)
+    reply_context.setdefault("learned_media_guidance", learned_media_guidance)
+
     links_payload = load_text_vocab_links(child, base_path=base_path)
     linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
     language_context_shadow = _shadow_audit_text_vocab_mappings(
@@ -2049,7 +2055,7 @@ def generate_symbolic_reply_from_text(
         links_payload,
         linked_word_to_symbol,
         child=child,
-        context=context,
+        context=reply_context,
     )
     lang_hint = guess_language_code(text)
     vocab: Dict[str, Any] = {}
@@ -2125,7 +2131,7 @@ def generate_symbolic_reply_from_text(
         return None
 
     symbol_limit = adaptive_symbol_limit(
-        text, max_symbols, child=child, available_symbols=len(matched), context=context
+        text, max_symbols, child=child, available_symbols=len(matched), context=reply_context
     )
     symbols_to_speak = matched[:symbol_limit]
     try:
@@ -2139,7 +2145,6 @@ def generate_symbolic_reply_from_text(
     except Exception:
         pass
 
-    reply_context: Dict[str, Any] = dict(context) if isinstance(context, dict) else {}
     reply_context.setdefault("source_text", text)
     reply_context.setdefault("tokens", tokens)
     reply_tags = ["symbolic_reply"]
@@ -2172,6 +2177,7 @@ def generate_symbolic_reply_from_text(
         "length_profile": text_length_profile(text),
         "symbol_limit": symbol_limit,
         "language_context_shadow": language_context_shadow,
+        "learned_media_guidance": learned_media_guidance,
     }
 
 

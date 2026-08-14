@@ -35,6 +35,8 @@ from memory_index import ensure_memory_index_db, index_is_current, touch_fragmen
 from resource_envelope import cgroup_status, desired_limits
 from discord_runtime import typed_outbox_path
 from self_read_policy import SELF_READ_FOCUS_ENV, self_read_focus_from_emotions
+from learned_media_lessons import load_output_guidance
+from creative_experience import begin_experience, record_experiment, experience_command_fields
 from runtime_state import (
     append_inastate_queue, get_inastate as _runtime_get_inastate,
     increment_inastate_metric as _runtime_increment_metric,
@@ -5255,8 +5257,13 @@ def _run_prediction_meta_analysis():
     log_to_statusbox(f"[Manager] Prediction meta-analysis flagged: {reason}")
     _last_meta_alert = now
 
-def seed_self_question(question: str) -> None:
-    return _runtime_seed_self_question(question, child=CHILD)
+def seed_self_question(
+    question: str, *, origin: Optional[Dict[str, Any]] = None,
+    provenance: Optional[Dict[str, Any]] = None,
+) -> None:
+    return _runtime_seed_self_question(
+        question, child=CHILD, origin=origin, provenance=provenance,
+    )
 
 
 def mark_self_question_resolved(question: str, reason: Optional[str] = None) -> None:
@@ -5999,6 +6006,17 @@ def _queue_autonomous_music_seed(emotions: Dict[str, Any]) -> int:
         "intensity": round(intensity, 3),
         "calm": round(calm, 3),
     }
+    experience = begin_experience(
+        "daw", "Explore one audible variation",
+        hypothesis=f"A {waveform} tone near MIDI {note} may fit the present feeling",
+        source="music_self_read",
+    )
+    experience = record_experiment(
+        experience, {"id": f"daw_seed_{stamp}", "kind": "daw_command_payload"},
+        observation="Awaiting Ina's listening and inspection before another variation.",
+    )
+    update_inastate("creative_experience_daw", experience)
+    experience_fields = experience_command_fields(experience)
     commands = [
         {
             "id": f"ina_music_track_{stamp}",
@@ -6008,6 +6026,7 @@ def _queue_autonomous_music_seed(emotions: Dict[str, Any]) -> int:
             "note": note,
             "gain": gain,
             "motivation": motivation,
+            **experience_fields,
         },
         {
             "id": f"ina_music_step_{stamp}",
@@ -6016,14 +6035,16 @@ def _queue_autonomous_music_seed(emotions: Dict[str, Any]) -> int:
             "position": position,
             "enabled": True,
             "note": note,
+            **experience_fields,
         },
         {
             "id": f"ina_music_preview_{stamp}",
             "action": "preview_note",
             "note": note,
             "waveform": waveform,
+            **experience_fields,
         },
-        {"id": f"ina_music_inspect_{stamp}", "action": "inspect"},
+        {"id": f"ina_music_inspect_{stamp}", "action": "inspect", **experience_fields},
     ]
 
     queued = 0
@@ -6117,7 +6138,25 @@ def _queue_autonomous_paint_seed(emotions: Dict[str, Any]) -> None:
     intensity = _coerce_float(emotions.get("intensity"), 0.0)
     color = "#d35400" if intensity > 0.65 else ("#27ae60" if joy > 0.35 else "#2980b9")
     pattern = "spiral" if curiosity > 0.75 else ("burst" if intensity > 0.7 else "wave")
+    visual_guidance = load_output_guidance(str(CHILD), "drawing")
+    visual_lessons = visual_guidance.get("lessons") or []
+    visual_reference = visual_lessons[0] if visual_lessons and isinstance(visual_lessons[0], dict) else None
+    if visual_reference and visual_reference.get("role") == "album_cover":
+        # A cover is usually a bounded central composition study; the source is
+        # a reference, never an instruction to reproduce it.
+        pattern = "burst"
     stamp = int(time.time() * 1000)
+    experience = begin_experience(
+        "drawing", "Explore one visual variation",
+        hypothesis=f"A {pattern} gesture may express the present feeling",
+        source="creative_urge",
+    )
+    experience = record_experiment(
+        experience, {"id": f"paint_seed_{stamp}", "kind": "paint_command_payload"},
+        observation="Awaiting Ina's inspection before another gesture.",
+    )
+    update_inastate("creative_experience_drawing", experience)
+    experience_fields = experience_command_fields(experience)
     commands = [
         {
             "id": f"ina_seed_{stamp}",
@@ -6134,9 +6173,17 @@ def _queue_autonomous_paint_seed(emotions: Dict[str, Any]) -> None:
                 "curiosity": round(curiosity, 3),
                 "joy": round(joy, 3),
                 "intensity": round(intensity, 3),
+                "learned_visual_reference": {
+                    "role": visual_reference.get("role"),
+                    "source": visual_reference.get("source"),
+                    "alignment_keys": visual_reference.get("alignment_keys") or [],
+                    "study_dimensions": visual_reference.get("study_dimensions") or [],
+                    "copying_required": False,
+                } if visual_reference else None,
             },
+            **experience_fields,
         },
-        {"id": f"ina_inspect_{stamp}", "action": "inspect"},
+        {"id": f"ina_inspect_{stamp}", "action": "inspect", **experience_fields},
     ]
     update_inastate("paint_command_queue", commands)
 
@@ -7848,9 +7895,21 @@ def _finalize_walk_to_marker_attempt(now: float) -> None:
         else:
             failure_bucket = "path_or_heading_mismatch"
 
+    motor_experience = attempt.get("experience") if isinstance(attempt.get("experience"), dict) else {}
+    if motor_experience:
+        motor_experience = dict(motor_experience)
+        motor_experience["stage"] = "evaluation"
+        motor_experience["reflection_prompt"] = "Keep, revise, revisit, or stop after sensing this step?"
+        motor_experience["observation"] = {
+            "success": success, "result": result, "failure_bucket": failure_bucket,
+            "movement_m": diagnostics["movement_m"], "progress_m": diagnostics["progress_m"],
+        }
+        motor_experience["updated_at"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        update_inastate("creative_experience_motor", motor_experience)
     _set_walk_to_marker_status(
         result,
         experiment_id=attempt.get("id"),
+        creative_experience=motor_experience,
         success=success,
         marker=attempt.get("marker"),
         start_position=[round(start_x, 4), round(start_y, 4), _coerce_float(start_pos[2], pose["z"]) if isinstance(start_pos, (list, tuple)) and len(start_pos) >= 3 else round(pose["z"], 4)],
@@ -8109,6 +8168,17 @@ def _maybe_run_walk_to_marker_experiment(
         "start_distance_m": round(distance_to_marker, 4),
         "step_only_if_wanted": True,
     }
+    motor_experience = begin_experience(
+        "motor", "Take one voluntary movement step",
+        hypothesis="This heading will move closer to the marker", source="motor_urge",
+    )
+    motor_experience["session_id"] = experiment_id
+    motor_experience = record_experiment(
+        motor_experience,
+        {"id": experiment_id, "kind": "motor_intent_payload"},
+        observation="Awaiting proprioceptive and world feedback before another step.",
+    )
+    update_inastate("creative_experience_motor", motor_experience)
     update_inastate(
         "motor_intent",
         {
@@ -8124,6 +8194,7 @@ def _maybe_run_walk_to_marker_experiment(
             "reason": "walk_to_marker_experiment",
             "urge_level": round(urge_level, 3),
             "experiment": marker_intent,
+            "experience": motor_experience,
         },
     )
     _last_motor_intent_ts = now
@@ -8137,6 +8208,7 @@ def _maybe_run_walk_to_marker_experiment(
         "marker": marker_payload,
         "min_movement": _coerce_float(policy.get("min_movement"), 0.12),
         "min_progress": _coerce_float(policy.get("min_progress"), 0.05),
+        "experience": motor_experience,
     }
     _set_walk_to_marker_status(
         "step_issued",

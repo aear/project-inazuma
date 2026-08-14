@@ -38,11 +38,11 @@ class SelfQuestionsWindow:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(
-            table_frame, columns=("question", "asked", "status", "updated"),
+            table_frame, columns=("question", "trigger", "asked", "status", "updated"),
             show="headings", selectmode="extended",
         )
         for key, title, width, stretch in (
-            ("question", "Question", 480, True), ("asked", "Count", 70, False),
+            ("question", "Question", 390, True), ("trigger", "Trigger", 150, True), ("asked", "Count", 70, False),
             ("status", "Status", 110, False), ("updated", "Updated", 190, True),
         ):
             self.tree.heading(key, text=title)
@@ -80,8 +80,11 @@ class SelfQuestionsWindow:
                 continue
             iid = str(index)
             self.visible_indices.append(index)
+            origins = entry.get("origins") or entry.get("provenance") or []
+            latest = origins[-1] if isinstance(origins, list) and origins else {}
+            trigger = latest.get("module") or latest.get("transformer") or latest.get("source") or ""
             self.tree.insert("", tk.END, iid=iid, values=(
-                entry.get("question"), int(entry.get("count", 1) or 1),
+                entry.get("question"), trigger, int(entry.get("count", 1) or 1),
                 "resolved" if resolved else "open",
                 entry.get("last_updated") or entry.get("first_asked") or "",
             ))

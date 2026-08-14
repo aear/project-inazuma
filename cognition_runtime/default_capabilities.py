@@ -209,6 +209,16 @@ def build_task_profiles(child: str) -> dict[str, dict[str, Any]]:
             "gpu_class": "none",
             "exclusive_group": "creative_ui",
         },
+        "file_explorer_open": {
+            "kind": "subprocess",
+            "command": ["python", "ina_file_explorer.py", "--child", str(child)],
+            "module": "ina_file_explorer",
+            "priority": 51,
+            "memory_class": "low",
+            "cpu_class": "low",
+            "gpu_class": "none",
+            "exclusive_group": "creative_ui",
+        },
         "daw_window_open": {
             "kind": "subprocess",
             "command": ["python", "daw_window.py", "--child", str(child)],

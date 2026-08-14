@@ -44,8 +44,9 @@ from daw_engine import (
     synthesize_note,
     write_wav,
 )
-from runtime_state import drain_inastate_queue, load_config, update_inastate
+from runtime_state import drain_inastate_queue, get_inastate, load_config, update_inastate
 from music_delivery import ensure_opus_sidecar
+from creative_experience import choose_next
 from stem_import import (
     StemImportResult,
     import_stem_zip,
@@ -95,6 +96,11 @@ def daw_control_api_payload() -> dict[str, Any]:
                 "action": "inspect",
                 "aliases": ["state", "snapshot"],
                 "arguments": {},
+            },
+            {
+                "action": "experience_choice",
+                "aliases": [],
+                "arguments": {"choice": "keep, revise, revisit, or stop", "reflection": "optional text"},
             },
             {
                 "action": "set_step",
@@ -2583,6 +2589,7 @@ class DawWindow(tk.Tk):
                 },
             },
             "control_api": daw_control_api_payload(),
+            "creative_experience": get_inastate("creative_experience_daw", child=self.child) or {},
             "tracks": [self._track_payload(index) for index in range(len(self.project.tracks))],
             "vocal_clips": [
                 {
@@ -2671,6 +2678,13 @@ class DawWindow(tk.Tk):
         try:
             if action in {"inspect", "state", "snapshot"}:
                 result = {"status": "ok", "workspace": self._publish_workspace("inspect")}
+            elif action == "experience_choice":
+                current = get_inastate("creative_experience_daw", child=self.child) or {}
+                if not isinstance(current, dict) or not current.get("cycle_id"):
+                    raise RuntimeError("no active DAW experience cycle")
+                updated = choose_next(current, command.get("choice"), reflection=command.get("reflection", ""))
+                update_inastate("creative_experience_daw", updated, child=self.child)
+                result = {"status": "ok", "creative_experience": updated}
             elif action == "set_step":
                 track_index = self._resolve_command_track(command.get("track", command.get("track_index", 0)))
                 position = _strict_int(command.get("position", command.get("step", 0)), "step", 0, STEP_COUNT - 1)
