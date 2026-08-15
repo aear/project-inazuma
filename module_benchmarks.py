@@ -773,6 +773,31 @@ def _codex_harness_v2() -> dict[str, Any]:
     ])
 
 
+def _codex_harness_v3() -> dict[str, Any]:
+    source = Path("codex_harness.py").read_text(encoding="utf-8")
+    ui = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "typed event condensation", "component": "console",
+         "correct": "_append_notification_event" in source and "work_status" in source},
+        {"case": "reasoning summary work status", "component": "status",
+         "correct": "item/reasoning/summaryTextDelta" in source and 'id="workStatus"' in ui},
+        {"case": "authoritative completion state", "component": "protocol",
+         "correct": "TERMINAL_TURN_STATUSES" in source and "thread/status/changed" in source},
+        {"case": "lazy raw protocol details", "component": "inspectability",
+         "correct": "Raw protocol details" in ui and '"raw": raw' in source},
+        {"case": "prominent user approval", "component": "safety",
+         "correct": 'id="approvals"' in ui and "item/permissions/requestApproval" in source},
+        {"case": "optional exact-prompt steering", "component": "control",
+         "correct": 'id="steering" type="checkbox" checked' in ui and "if steering and" in source},
+        {"case": "bounded browser transcript", "component": "memory",
+         "correct": "MAX_DOM_EVENTS" in ui and "deque(maxlen=self.maximum)" in source},
+        {"case": "lightweight resource telemetry", "component": "resources",
+         "correct": 'Path(f"/proc/{pid}/status")' in source and 'id="memoryStatus"' in ui},
+        {"case": "operator console, not editor", "component": "scope",
+         "correct": "Codex operator console" in ui and "contenteditable" not in ui.lower()},
+    ])
+
+
 def _thread_governor_v1() -> dict[str, Any]:
     source = _v1_text("AGENTS.md")
     return _capability([
@@ -909,6 +934,7 @@ _REGISTRY = {
     "codex_harness": (
         ModuleVersion("codex_harness", "V1", "Historical VS Code-hosted Codex workflow", _codex_harness_v1),
         ModuleVersion("codex_harness", "V2", "Standalone subscription-only app-server GUI", _codex_harness_v2),
+        ModuleVersion("codex_harness", "V3", "Bounded app-server operator console", _codex_harness_v3),
     ),
     "thread_governor": (
         ModuleVersion("thread_governor", "V1", "Historical unmanaged module thread pools", _thread_governor_v1),

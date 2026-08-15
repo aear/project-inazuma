@@ -23,6 +23,7 @@ import webbrowser
 
 MAX_EVENTS = 600
 MAX_EVENT_CHARS = 65536
+MAX_SUMMARY_CHARS = 12000
 MAX_PROMPT_CHARS = 100000
 REQUEST_TIMEOUT_SECONDS = 30.0
 BLOCKED_BILLING_ENV = {
@@ -41,7 +42,10 @@ APPROVAL_METHODS = {
     "item/fileChange/requestApproval",
     "execCommandApproval",
     "applyPatchApproval",
+    "item/permissions/requestApproval",
 }
+
+TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
 
 
 class SubscriptionAuthError(RuntimeError):
@@ -143,6 +147,13 @@ class AppServerClient:
         self.turn_id: str | None = None
         self.active_model: str | None = None
         self.running_turn = False
+        self.thread_status = "notLoaded"
+        self.turn_status = "idle"
+        self.work_status = "Ready"
+        self.started_monotonic = time.monotonic()
+        self.last_test_status = "not observed"
+        self.last_benchmark_status = "not observed"
+        self.diff_seen = False
         self.process = subprocess.Popen(
             [
                 config.codex_binary,
@@ -234,14 +245,54 @@ class AppServerClient:
             turn = params.get("turn") or {}
             self.turn_id = str(turn.get("id") or self.turn_id or "") or None
             self.running_turn = True
-        elif method in {"turn/completed", "turn/aborted"}:
-            self.running_turn = False
+            self.turn_status = str(turn.get("status") or "inProgress")
+        elif method == "turn/completed" and isinstance(params, dict):
+            turn = params.get("turn") or {}
+            status = str(turn.get("status") or "completed")
+            self.turn_status = status
+            self.running_turn = status not in TERMINAL_TURN_STATUSES
+            self.work_status = status.capitalize()
+        elif method == "thread/status/changed" and isinstance(params, dict):
+            status = params.get("status") or {}
+            self.thread_status = str(status.get("type") or self.thread_status)
+            self.running_turn = self.thread_status == "active"
         elif method == "account/login/completed":
             self.events.append("auth", params)
-        if method in {"item/agentMessage/delta", "agentMessage/delta"} and isinstance(params, dict):
-            self.events.append("assistant", params.get("delta") or params)
+        self._append_notification_event(method, params)
+
+    def _append_notification_event(self, method: str, params: Any) -> None:
+        data = params if isinstance(params, dict) else {}
+        raw = {"method": method, "params": params}
+        if method in {"item/agentMessage/delta", "agentMessage/delta"}:
+            kind, summary = "assistant", data.get("delta") or ""
+        elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"}:
+            summary = data.get("delta") or "Reasoning summary updated"
+            self.work_status = str(summary)[-MAX_SUMMARY_CHARS:]
+            kind = "work_status"
+        elif method == "turn/diff/updated":
+            kind, summary = "diff", data.get("diff") or "Workspace diff updated"
+            self.diff_seen = True
+        elif method in {"item/commandExecution/outputDelta", "item/mcpToolCall/progress"}:
+            kind, summary = "tool_output", data.get("delta") or data.get("message") or "Tool output updated"
+        elif method in {"item/started", "item/completed"}:
+            item = data.get("item") or {}
+            item_type = str(item.get("type") or "item")
+            status = str(item.get("status") or ("completed" if method.endswith("completed") else "started"))
+            kind, summary = "tool", f"{item_type}: {status}"
+            command = str(item.get("command") or "").lower()
+            if "test" in command or "pytest" in command:
+                self.last_test_status = status
+            if "benchmark" in command:
+                self.last_benchmark_status = status
+        elif method in {"turn/started", "turn/completed", "thread/status/changed"}:
+            kind, summary = "state", f"{method}: {self.turn_status if method.startswith('turn/') else self.thread_status}"
+        elif method in {"turn/plan/updated", "item/plan/delta"}:
+            kind, summary = "plan", data.get("delta") or data.get("plan") or "Plan updated"
+        elif method in {"error", "warning"} or method.endswith("/error"):
+            kind, summary = "diagnostic", data.get("message") or method
         else:
-            self.events.append("event", {"method": method, "params": params})
+            kind, summary = "protocol", method or "notification"
+        self.events.append(kind, {"summary": summary, "raw": raw})
 
     def account(self, refresh: bool = False) -> dict[str, Any]:
         result = self.request("account/read", {"refreshToken": bool(refresh)})
@@ -284,9 +335,10 @@ class AppServerClient:
     def send_prompt(
         self, prompt: str, *, model: str | None = None,
         effort: str | None = None, collaboration_mode: str = "default",
+        steering: bool = True,
     ) -> dict[str, Any]:
-        prompt = str(prompt or "").strip()
-        if not prompt:
+        prompt = str(prompt or "")
+        if not prompt.strip():
             raise ValueError("Prompt is empty.")
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ValueError(f"Prompt exceeds {MAX_PROMPT_CHARS} characters.")
@@ -306,7 +358,7 @@ class AppServerClient:
         if effort:
             params["effort"] = effort
         collaboration_model = model or self.active_model
-        if collaboration_mode in {"default", "plan"} and collaboration_model:
+        if steering and collaboration_mode in {"default", "plan"} and collaboration_model:
             params["collaborationMode"] = {
                 "mode": collaboration_mode,
                 "settings": {
@@ -315,22 +367,65 @@ class AppServerClient:
                     "developer_instructions": None,
                 },
             }
-        self.events.append("user", prompt)
+        self.events.append("user", {"summary": prompt, "raw": {"steering": bool(steering)}})
         result = self.request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else {}
         self.turn_id = str(turn.get("id") or "") or None
-        self.running_turn = True
+        self.turn_status = str(turn.get("status") or "inProgress")
+        self.running_turn = self.turn_status not in TERMINAL_TURN_STATUSES
         return self.status()
 
     def status(self) -> dict[str, Any]:
-        return {
+        result = {
             "server_running": self.process.poll() is None,
             "turn_running": self.running_turn,
             "thread_id": self.thread_id,
             "turn_id": self.turn_id,
             "root": str(self.config.root),
             "pid": self.process.pid if self.process.poll() is None else None,
+            "thread_status": self.thread_status,
+            "turn_status": self.turn_status,
+            "work_status": self.work_status,
+            "git": self._git_status(),
+            "tests": self.last_test_status,
+            "benchmarks": self.last_benchmark_status,
+            "diff": "changed" if self.diff_seen else "clean in this session",
         }
+        app_resources = self._resource_status(result["pid"])
+        harness_resources = self._resource_status(os.getpid())
+        result["resources"] = {
+            "rss_mib": f"{harness_resources['rss_mib'] or '?'} / {app_resources['rss_mib'] or '?'}",
+            "threads": f"{harness_resources['threads'] or '?'} / {app_resources['threads'] or '?'}",
+            "harness": harness_resources,
+            "app_server": app_resources,
+        }
+        return result
+
+    def _git_status(self) -> dict[str, Any]:
+        head = self.config.root / ".git" / "HEAD"
+        try:
+            value = head.read_text(encoding="utf-8").strip()
+            branch = value.rsplit("/", 1)[-1] if value.startswith("ref:") else value[:12]
+        except OSError:
+            branch = None
+        return {"branch": branch, "session_diff": self.diff_seen}
+
+    def _resource_status(self, pid: int | None) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "uptime_seconds": round(time.monotonic() - self.started_monotonic, 1),
+            "rss_mib": None, "threads": None,
+        }
+        if not pid:
+            return result
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    result["rss_mib"] = round(int(line.split()[1]) / 1024.0, 1)
+                elif line.startswith("Threads:"):
+                    result["threads"] = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return result
 
     def interrupt(self) -> bool:
         if not self.thread_id or not self.turn_id or not self.running_turn:
@@ -455,6 +550,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     payload.get("prompt", ""), model=payload.get("model"),
                     effort=payload.get("effort"),
                     collaboration_mode=str(payload.get("mode") or "default"),
+                    steering=bool(payload.get("steering", True)),
                 ))
                 return
             if parsed.path == "/api/new":
@@ -537,4 +633,3 @@ __all__ = [
     "SubscriptionAuthError", "build_config", "discover_codex",
     "subscription_environment",
 ]
-

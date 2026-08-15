@@ -12,9 +12,10 @@ from pathlib import Path
 from model_manager import load_config, get_inastate, seed_self_question, mark_self_question_resolved
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from logic_map_builder import extract_logic_vector, run_logic_map_builder
-from io_utils import atomic_write_json
-from streaming_json import iter_selected_array_objects
 from ina_ml import cosine_similarity
+from symbol_word_utils import load_compact_symbol_words
+# Retained as a monkeypatch-compatible name for historical index tests/tools.
+from streaming_json import iter_selected_array_objects
 
 try:
     from logic_memory_store import store_logic_entry
@@ -142,38 +143,7 @@ def load_symbol_words(child):
     raw_policy = config.get("logic_engine_policy") if isinstance(config, dict) else {}
     policy = raw_policy if isinstance(raw_policy, dict) else {}
     candidate_limit = max(32, int(policy.get("symbol_candidate_limit", 20_000)))
-    compact_path = path.with_name("symbol_words.logic_index.json")
-    source_mtime_ns = int(path.stat().st_mtime_ns)
-    try:
-        with compact_path.open("r", encoding="utf-8") as handle:
-            cached = json.load(handle)
-        if (
-            isinstance(cached, dict)
-            and int(cached.get("source_mtime_ns", -1)) == source_mtime_ns
-            and isinstance(cached.get("words"), list)
-        ):
-            return cached["words"][:candidate_limit]
-    except Exception:
-        pass
-
-    # Legacy entries can retain enormous component histories. Logic matching
-    # needs only compact semantic fields, so stream past component payloads.
-    fields = {"symbol_word_id", "summary", "tags", "vector", "symbol"}
-    try:
-        words = list(iter_selected_array_objects(path, "words", fields, limit=candidate_limit))
-    except Exception as exc:
-        print(f"[Logic] Failed to stream symbol candidates: {exc}")
-        return []
-    try:
-        atomic_write_json(
-            compact_path,
-            {"source_mtime_ns": source_mtime_ns, "candidate_limit": candidate_limit, "words": words},
-            indent=2,
-            ensure_ascii=True,
-        )
-    except Exception:
-        pass
-    return words
+    return load_compact_symbol_words(path, candidate_limit)
 
 
 def log_logic_event(child, logic_entry):

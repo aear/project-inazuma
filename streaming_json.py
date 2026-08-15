@@ -159,3 +159,95 @@ def iter_selected_array_objects(
                 return
             if separator != ",":
                 raise ValueError("expected top-level separator")
+
+
+def iter_selected_object_entries(
+    path: Path,
+    object_key: str,
+    fields: Set[str],
+    *,
+    limit: Optional[int] = None,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield keys and selected fields from one top-level object value.
+
+    This is the object-map counterpart to :func:`iter_selected_array_objects`.
+    Large unselected fields inside each mapped value are scanned, not retained.
+    """
+    with Path(path).open("r", encoding="utf-8") as handle:
+        reader = _Reader(handle)
+        if reader.nonspace() != "{":
+            raise ValueError("expected top-level JSON object")
+        while True:
+            token = reader.nonspace()
+            if token == "}":
+                return
+            key = _read_string(reader, token)
+            if reader.nonspace() != ":":
+                raise ValueError("expected ':'")
+            start = reader.nonspace()
+            if key != object_key:
+                reader.value_text(start, capture=False)
+            else:
+                if start != "{":
+                    raise ValueError(f"{object_key!r} is not an object")
+                count = 0
+                while True:
+                    item = reader.nonspace()
+                    if item == "}":
+                        return
+                    entry_key = _read_string(reader, item)
+                    if reader.nonspace() != ":":
+                        raise ValueError("expected ':'")
+                    reader.push(reader.nonspace())
+                    yield entry_key, _read_selected_object(reader, fields)
+                    count += 1
+                    if limit is not None and count >= max(0, int(limit)):
+                        return
+                    separator = reader.nonspace()
+                    if separator == "}":
+                        return
+                    if separator != ",":
+                        raise ValueError("expected object separator")
+            separator = reader.nonspace()
+            if separator == "}":
+                return
+            if separator != ",":
+                raise ValueError("expected top-level separator")
+
+
+def count_top_level_array(path: Path, array_key: str) -> int:
+    """Count direct items in a top-level array with constant retained memory."""
+    count = 0
+    with Path(path).open("r", encoding="utf-8") as handle:
+        reader = _Reader(handle)
+        if reader.nonspace() != "{":
+            raise ValueError("expected top-level JSON object")
+        while True:
+            token = reader.nonspace()
+            if token == "}":
+                return count
+            key = _read_string(reader, token)
+            if reader.nonspace() != ":":
+                raise ValueError("expected ':'")
+            start = reader.nonspace()
+            if key != array_key:
+                reader.value_text(start, capture=False)
+            else:
+                if start != "[":
+                    raise ValueError(f"{array_key!r} is not an array")
+                while True:
+                    item = reader.nonspace()
+                    if item == "]":
+                        return count
+                    reader.value_text(item, capture=False)
+                    count += 1
+                    separator = reader.nonspace()
+                    if separator == "]":
+                        return count
+                    if separator != ",":
+                        raise ValueError("expected array separator")
+            separator = reader.nonspace()
+            if separator == "}":
+                return count
+            if separator != ",":
+                raise ValueError("expected top-level separator")

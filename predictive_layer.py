@@ -5,19 +5,20 @@ import os
 import json
 import math
 import time
+import heapq
 from datetime import datetime, timezone
 from pathlib import Path
-from model_manager import (
-    load_config,
-    update_inastate,
-    seed_self_question,
-    get_inastate,
-)
+from config_layers import load_config
+from runtime_state import update_inastate, seed_self_question, get_inastate
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from precision_requests import precision_request
 from gui_hook import log_to_statusbox
-from symbol_word_utils import score_symbol_word_candidates
+from symbol_word_utils import (
+    load_compact_symbol_words,
+    score_symbol_word_candidates,
+)
 from storage_layout import fast_runtime_path
+from streaming_json import count_top_level_array
 
 def cosine_similarity(v1, v2):
     return shared_cosine_similarity(v1, v2)
@@ -25,10 +26,8 @@ def cosine_similarity(v1, v2):
 
 def _read_counts(path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        neurons = len(data.get("neurons", []))
-        synapses = len(data.get("synapses", []))
+        neurons = count_top_level_array(path, "neurons")
+        synapses = count_top_level_array(path, "synapses")
         return neurons, synapses
     except Exception:
         return 0, 0
@@ -65,11 +64,14 @@ def inspect_map_health(child):
 
 def load_recent_fragments(child, limit=10):
     frag_path = Path("AI_Children") / child / "memory" / "fragments"
-    all_fragments = list(frag_path.glob("frag_*.json"))
-    sorted_fragments = sorted(all_fragments, key=os.path.getmtime, reverse=True)
+    # Keep only the newest N directory entries instead of materialising and
+    # sorting hundreds of thousands of fragment paths.
+    sorted_fragments = heapq.nlargest(
+        max(0, int(limit)), frag_path.glob("frag_*.json"), key=os.path.getmtime,
+    )
     fragments = []
 
-    for file in sorted_fragments[:limit]:
+    for file in sorted_fragments:
         try:
             with open(file, "r", encoding="utf-8") as f:
                 frag = json.load(f)
@@ -189,9 +191,15 @@ def run_prediction():
             "base_clarity": clarity,
         }
 
-        # Match to known symbol words, including recurring paired structures.
-        word_state = load_symbol_word_state(child)
-        best_match = score_symbol_word_candidates(avg_vector, transformer, word_state)
+        # Match against the bounded semantic index shared with logic.
+        word_path = Path("AI_Children") / child / "memory" / "symbol_words.json"
+        best_match = None
+        if word_path.exists():
+            raw_prediction_policy = config.get("predictive_layer_policy", {})
+            prediction_policy = raw_prediction_policy if isinstance(raw_prediction_policy, dict) else {}
+            candidate_limit = max(32, int(prediction_policy.get("symbol_candidate_limit", 20_000)))
+            word_state = {"words": load_compact_symbol_words(word_path, candidate_limit)}
+            best_match = score_symbol_word_candidates(avg_vector, transformer, word_state)
         best_sim = float(best_match.get("confidence", 0.0) or 0.0) if best_match else 0.0
 
         if best_match:

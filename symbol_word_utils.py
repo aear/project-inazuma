@@ -1,6 +1,11 @@
 import math
+import json
 from ina_ml import coerce_vector, cosine_similarity as shared_cosine_similarity
 from typing import Any, Dict, Iterator, List, Optional
+from pathlib import Path
+
+from streaming_json import iter_selected_array_objects, iter_selected_object_entries
+from io_utils import atomic_write_json
 
 
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
@@ -130,3 +135,103 @@ def score_symbol_word_candidates(
         if best is None or float(enriched['confidence']) > float(best['confidence']):
             best = enriched
     return best
+
+
+_PREDICTION_FIELDS = {
+    'symbol_word_id', 'symbol', 'vector', 'summary', 'generated_word', 'word',
+    'labels', 'tags', 'sequence', 'confidence',
+}
+
+
+def iter_symbol_word_candidates_from_path(path: Path) -> Iterator[Dict[str, Any]]:
+    """Stream prediction candidates without expanding the full word store."""
+    for word in iter_selected_array_objects(path, 'words', _PREDICTION_FIELDS):
+        symbol_word_id = str(word.get('symbol_word_id') or '').strip()
+        if symbol_word_id:
+            yield {
+                'kind': 'word', 'key': symbol_word_id,
+                'symbol_word_id': symbol_word_id, 'sequence': [],
+                'symbol': word.get('symbol'), 'entry': word,
+            }
+    for store_name, kind in (
+        ('multi_symbol_words', 'multi_symbol_word'),
+        ('proto_words', 'proto_word'),
+    ):
+        for raw_key, entry in iter_selected_object_entries(path, store_name, _PREDICTION_FIELDS):
+            key = str(raw_key or '').strip()
+            if not key:
+                continue
+            sequence = sequence_from_entry(key, entry)
+            yield {
+                'kind': kind, 'key': key,
+                'symbol_word_id': key if key.startswith('pair:') else f'pair:{key}',
+                'sequence': sequence,
+                'symbol': sequence[0] if sequence else None,
+                'entry': entry,
+            }
+
+
+def score_symbol_word_candidate_iter(
+    pred_vec: List[float], transformer: Any, candidates: Iterator[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Score a candidate stream while retaining only the current winner."""
+    best: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        entry = candidate.get('entry') if isinstance(candidate.get('entry'), dict) else {}
+        vec = normalize_vector(entry.get('vector'))
+        if vec is None:
+            summary = candidate_summary(candidate)
+            if not summary:
+                continue
+            try:
+                encoded = transformer.encode({'summary': summary})
+            except Exception:
+                continue
+            vec = normalize_vector(encoded.get('vector') if isinstance(encoded, dict) else None)
+            if vec is None:
+                continue
+        score = cosine_similarity(pred_vec, vec)
+        if candidate.get('kind') != 'word':
+            try:
+                reliability = float(entry.get('confidence', 0.0) or 0.0)
+            except Exception:
+                reliability = 0.0
+            score = (score * 0.85) + (max(0.0, min(1.0, reliability)) * 0.15)
+        if best is None or score > float(best['confidence']):
+            best = dict(candidate)
+            best.update(summary=candidate_summary(candidate), vector=vec, confidence=float(score))
+    return best
+
+
+def load_compact_symbol_words(path: Path, candidate_limit: int = 20_000) -> List[Dict[str, Any]]:
+    """Load or build the shared bounded semantic index for a large word store."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    candidate_limit = max(1, int(candidate_limit))
+    compact_path = path.with_name("symbol_words.logic_index.json")
+    source_mtime_ns = int(path.stat().st_mtime_ns)
+    try:
+        with compact_path.open("r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if (isinstance(cached, dict)
+                and int(cached.get("source_mtime_ns", -1)) == source_mtime_ns
+                and isinstance(cached.get("words"), list)):
+            return cached["words"][:candidate_limit]
+    except Exception:
+        pass
+    try:
+        words = list(iter_selected_array_objects(
+            path, "words", _PREDICTION_FIELDS, limit=candidate_limit,
+        ))
+    except Exception:
+        return []
+    try:
+        atomic_write_json(compact_path, {
+            "source_mtime_ns": source_mtime_ns,
+            "candidate_limit": candidate_limit,
+            "words": words,
+        }, indent=2, ensure_ascii=True)
+    except Exception:
+        pass
+    return words

@@ -105,6 +105,68 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "Device code" in source
     assert "API-key billing is disabled" in source
     assert 'name="api_key"' not in source
+    assert 'id="steering" type="checkbox" checked' in source
+    assert "Raw protocol details" in source
+    assert "MAX_DOM_EVENTS" in source
+    assert 'id="workStatus"' in source
+
+
+def _notification_client(tmp_path):
+    client = object.__new__(AppServerClient)
+    client.config = HarnessConfig(Path(tmp_path), "/usr/bin/codex")
+    client.events = BoundedEvents()
+    client.thread_id = "thread-1"
+    client.turn_id = "turn-1"
+    client.active_model = "codex-test"
+    client.running_turn = False
+    client.thread_status = "idle"
+    client.turn_status = "idle"
+    client.work_status = "Ready"
+    client.last_test_status = "not observed"
+    client.last_benchmark_status = "not observed"
+    client.diff_seen = False
+    return client
+
+
+def test_reasoning_summary_is_live_status_and_raw_payload_stays_lazy(tmp_path):
+    client = _notification_client(tmp_path)
+    params = {"threadId": "thread-1", "turnId": "turn-1", "delta": "Checking tests"}
+    client._handle_notification("item/reasoning/summaryTextDelta", params)
+
+    event = client.events.wait_after(0, 0)[-1]
+    assert client.work_status == "Checking tests"
+    assert event["kind"] == "work_status"
+    assert event["payload"]["summary"] == "Checking tests"
+    assert event["payload"]["raw"]["params"] == params
+
+
+def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path):
+    client = _notification_client(tmp_path)
+    client._handle_notification("thread/status/changed", {
+        "threadId": "thread-1", "status": {"type": "active", "activeFlags": []},
+    })
+    assert client.running_turn is True
+    client._handle_notification("turn/completed", {
+        "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+    })
+    assert client.running_turn is False
+    assert client.turn_status == "completed"
+
+
+def test_steering_off_preserves_prompt_and_omits_collaboration_framing(tmp_path):
+    client = _notification_client(tmp_path)
+    captured = {}
+
+    def request(method, params):
+        captured.update(method=method, params=params)
+        return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+    client.request = request
+    client.status = lambda: {"turn_running": True}
+    client.send_prompt("  exact prompt\n", steering=False, collaboration_mode="plan")
+    assert captured["method"] == "turn/start"
+    assert captured["params"]["input"][0]["text"] == "  exact prompt\n"
+    assert "collaborationMode" not in captured["params"]
 
 
 def test_workspace_excludes_heavy_runtime_trees():

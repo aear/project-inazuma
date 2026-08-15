@@ -1,6 +1,8 @@
 import json
 
-from streaming_json import iter_selected_array_objects
+from streaming_json import (
+    count_top_level_array, iter_selected_array_objects, iter_selected_object_entries,
+)
 
 
 def test_selected_array_reader_skips_large_unselected_values(tmp_path):
@@ -40,4 +42,16 @@ def test_selected_array_reader_honours_limit(tmp_path):
     path.write_text(json.dumps({"words": [{"id": i} for i in range(10)]}), encoding="utf-8")
     assert list(iter_selected_array_objects(path, "words", {"id"}, limit=3)) == [
         {"id": 0}, {"id": 1}, {"id": 2}
+    ]
+
+
+def test_selected_object_reader_and_bounded_array_count(tmp_path):
+    path = tmp_path / "store.json"
+    path.write_text(json.dumps({
+        "words": [{"id": 1, "large": list(range(1000))}, {"id": 2}],
+        "proto_words": {"pair:a_b": {"sequence": ["a", "b"], "large": list(range(1000))}},
+    }), encoding="utf-8")
+    assert count_top_level_array(path, "words") == 2
+    assert list(iter_selected_object_entries(path, "proto_words", {"sequence"})) == [
+        ("pair:a_b", {"sequence": ["a", "b"]})
     ]
