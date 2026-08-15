@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import sqlite3
 import time
 import copy
 from dataclasses import dataclass
@@ -115,6 +116,9 @@ DEFAULT_BASELINE: Dict[str, float] = {
 AI_CHILDREN_ROOT = Path("AI_Children")
 BODY_INTENSITY_THRESHOLD = 0.6
 REFLECTION_INTENSITY_THRESHOLD = 0.75
+EMOTION_FRAGMENT_BATCH_LIMIT = 128
+EMOTION_FRAGMENT_TIME_LIMIT_SECONDS = 8.0
+_EMOTION_FRAGMENT_CURSOR_KEY = "emotion_fragment_tag_cursor"
 _PLAYFULNESS_STATE_KEY = "emotion_playfulness_state"
 _PLAYFULNESS_LEVEL_KEY = "emotion_playfulness_level"
 _PLAYFULNESS_HALF_LIFE_SECONDS = 240.0
@@ -704,23 +708,60 @@ def tag_all_fragments(
     child: str,
     snapshot: EmotionSnapshot,
     body_state: Optional[Dict[str, Dict[str, float]]] = None,
-) -> None:
+) -> Dict[str, Any]:
     """
-    Walk AI_Children/<child>/memory/fragments and tag any fragment JSON
-    that does not yet have an 'emotions' field.
+    Tag one bounded, resumable batch selected by the compact memory index.
 
-    This keeps disk impact modest and avoids rewriting everything constantly.
+    The fragments directory can contain hundreds of millions of entries.  It
+    must never be globbed from a routine emotion tick: CPython may materialise
+    a directory-sized name list before yielding the first path.  If the index
+    is absent or busy, defer the work rather than falling back to a tree scan.
     """
     fragments_dir = AI_CHILDREN_ROOT / child / "memory" / "fragments"
     if not fragments_dir.exists():
         _log(f"No fragments directory for {child} at {fragments_dir}")
-        return
+        return {"updated": 0, "skipped": 0, "inspected": 0, "deferred": "missing_fragments"}
+
+    memory_dir = fragments_dir.parent
+    index_path = memory_dir / "memory_map.sqlite"
+    cursor_state = get_inastate(_EMOTION_FRAGMENT_CURSOR_KEY) or {}
+    cursor = str(cursor_state.get("frag_id") or "") if isinstance(cursor_state, dict) else ""
+    batch_limit = EMOTION_FRAGMENT_BATCH_LIMIT
+    deadline = time.monotonic() + EMOTION_FRAGMENT_TIME_LIMIT_SECONDS
+
+    try:
+        uri = f"file:{index_path.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.25) as connection:
+            rows = connection.execute(
+                "SELECT frag_id, tier, filename FROM fragments "
+                "WHERE frag_id > ? ORDER BY frag_id LIMIT ?",
+                (cursor, batch_limit),
+            ).fetchall()
+            if not rows and cursor:
+                rows = connection.execute(
+                    "SELECT frag_id, tier, filename FROM fragments ORDER BY frag_id LIMIT ?",
+                    (batch_limit,),
+                ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        _log(f"Fragment emotion propagation deferred; bounded index unavailable: {exc}")
+        return {"updated": 0, "skipped": 0, "inspected": 0, "deferred": "index_unavailable"}
 
     updated = 0
     skipped = 0
     baseline_playfulness = get_playfulness_level()
 
-    for fpath in fragments_dir.glob("*.json"):
+    last_frag_id = cursor
+    for frag_id, tier, filename in rows:
+        if time.monotonic() >= deadline:
+            break
+        last_frag_id = str(frag_id)
+        name = str(filename or f"frag_{frag_id}.json")
+        tier_name = str(tier or "").strip()
+        candidates = ([fragments_dir / tier_name / name] if tier_name else []) + [fragments_dir / name]
+        fpath = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if fpath is None:
+            skipped += 1
+            continue
         try:
             with fpath.open("r", encoding="utf-8") as f:
                 frag = json.load(f)
@@ -746,7 +787,15 @@ def tag_all_fragments(
         except Exception as e:
             _log(f"Failed to write updated fragment {fpath.name}: {e}")
 
-    _log(f"Tagged fragments for {child}: updated={updated}, skipped={skipped}")
+    inspected = updated + skipped
+    if last_frag_id != cursor:
+        update_inastate(_EMOTION_FRAGMENT_CURSOR_KEY, {
+            "frag_id": last_frag_id,
+            "updated_at": _now_iso(),
+            "batch_limit": batch_limit,
+        })
+    _log(f"Tagged bounded fragment batch for {child}: updated={updated}, skipped={skipped}, inspected={inspected}")
+    return {"updated": updated, "skipped": skipped, "inspected": inspected, "deferred": None}
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,9 @@ def build_task_profiles(child: str) -> dict[str, dict[str, Any]]:
             "cpu_class": "medium",
             "gpu_class": "none",
             "exclusive_group": "",
+            # Normal ticks are small; this catches any regression into a
+            # whole-store materialisation before the service cgroup is at risk.
+            "memory_limit_gb": 1.5,
         },
         "instinct_engine_run": {
             "kind": "subprocess",

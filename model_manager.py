@@ -1930,6 +1930,7 @@ def _default_shed_patterns() -> List[str]:
     return [
         "dreamstate.py",
         "meditation_state.py",
+        "emotion_engine.py",
         "early_comm.py",
         "predictive_layer.py",
         "logic_engine.py",

@@ -241,6 +241,28 @@ def _shadow_v2() -> dict[str, Any]:
     return _capability([{"case": "candidate lookup uses tag index", "actual": [row.get("id") for row in candidates], "correct": len(candidates) == 1 and transformer._tag_index_used}])
 
 
+def _emotion_propagation_v1() -> dict[str, Any]:
+    source = _v1_text("emotion_engine.py")
+    bounded = "memory_map.sqlite" in source and "LIMIT ?" in source
+    return _capability([{
+        "case": "routine emotion propagation has bounded indexed discovery",
+        "component": "memory",
+        "actual": "indexed" if bounded else "full_directory_glob",
+        "correct": bounded,
+    }])
+
+
+def _emotion_propagation_v2() -> dict[str, Any]:
+    source = Path("emotion_engine.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "SQLite index selects candidates", "component": "discovery", "correct": "memory_map.sqlite" in source and "LIMIT ?" in source},
+        {"case": "candidate count is explicitly bounded", "component": "memory", "correct": "EMOTION_FRAGMENT_BATCH_LIMIT" in source},
+        {"case": "work has a wall-clock deadline", "component": "cadence", "correct": "EMOTION_FRAGMENT_TIME_LIMIT_SECONDS" in source},
+        {"case": "index failure defers instead of scanning", "component": "safety", "correct": '"index_unavailable"' in source and 'fragments_dir.glob("*.json")' not in source},
+        {"case": "progress cursor persists between ticks", "component": "continuity", "correct": "emotion_fragment_tag_cursor" in source},
+    ])
+
+
 def _soul_source_cases(source: str) -> dict[str, Any]:
     indexed = "symbol_index =" in source and "symbols.index(j_sym)" not in source
     emotion_directed = "emotion_bias_applied" in source and "placeholder for emotion bias" not in source
@@ -914,6 +936,7 @@ _REGISTRY = {
     "mycelial_links": (ModuleVersion("mycelial_links", "V1", "First available cross-domain links", _mycelial_v1), ModuleVersion("mycelial_links", "V2", "Ranked useful lateral links", _mycelial_v2)),
     "seedling_clusters": (ModuleVersion("seedling_clusters", "V1", "First-character grouping", _seedling_v1), ModuleVersion("seedling_clusters", "V2", "Profile and vector geometry", _seedling_v2)),
     "shadow_candidates": (ModuleVersion("shadow_candidates", "V1", "Full fragment directory scan", _shadow_v1), ModuleVersion("shadow_candidates", "V2", "Queue and SQLite tag lookup", _shadow_v2)),
+    "emotion_propagation": (ModuleVersion("emotion_propagation", "V1", "Full fragment directory glob on every tick", _emotion_propagation_v1), ModuleVersion("emotion_propagation", "V2", "Bounded resumable SQLite-indexed propagation", _emotion_propagation_v2)),
     "soul_drift": (ModuleVersion("soul_drift", "V1", "Link drift without emotion direction", _soul_v1), ModuleVersion("soul_drift", "V2", "Indexed links and emotion-directed drift", _soul_v2)),
     "self_question_origins": (ModuleVersion("self_question_origins", "V1", "Question metadata only", _question_origin_v1), ModuleVersion("self_question_origins", "V2", "Composable trigger chain export", _question_origin_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
