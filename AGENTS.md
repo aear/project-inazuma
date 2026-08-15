@@ -222,6 +222,11 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Start unmeasured background modules conservatively and interactive/audio-adjacent modules lower still. Choose the smallest measured count that preserves capability within the background-interference budget.
 - Learning advances only from explicitly invoked, bounded benchmarks with a finite exploration budget. The governor must not continuously probe, poll, or tune itself while Ina is running.
 - Preserve observations and the previous usable decision so a worse candidate can be rejected or rolled back. Separate allocated workers, runnable workers, and numerical-library pools in reports.
+- Prefer control-engineering behaviour over unconstrained optimisation for hardware and resource control: bounded excursions, operating envelopes, feedback, settling evidence, deadband, and hysteresis.
+- Opposing differential probes are logical and sequential: measure the current centre, then run at most one lower or higher challenger at a time. Never run competing challengers concurrently to measure contention.
+- Treat audio xruns, input/frame latency ceilings, writeback pressure, and runnable contention as hard operating limits. Throughput or capability gains cannot compensate for crossing them.
+- Changes inside the configured deadband are neutral: retain the accepted allocation. Require the additional hysteresis margin before reversing direction or accepting a positive-resource move.
+- A workload or hardware identity change may open a fresh finite exploration budget; time passing alone must not reopen learning.
 
 ### Standalone Codex harness
 

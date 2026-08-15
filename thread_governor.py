@@ -38,6 +38,10 @@ class ThreadObservation:
     capability_score: float
     interference_score: float
     measured_at: str
+    baseline_threads: int | None = None
+    direction: str = "baseline"
+    settled: bool = True
+    constraint_violations: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -48,7 +52,16 @@ class ThreadObservation:
         threads: int,
         capability_score: float,
         interference_score: float,
+        *,
+        baseline_threads: int | None = None,
+        direction: str = "baseline",
+        settled: bool = True,
+        constraint_violations: Sequence[str] = (),
     ) -> "ThreadObservation":
+        direction = str(direction or "baseline").strip().lower()
+        if direction not in {"baseline", "lower", "higher"}:
+            raise ValueError("Observation direction must be baseline, lower, or higher.")
+        baseline = None if baseline_threads is None else max(1, int(baseline_threads))
         return cls(
             module=_name(module),
             workload=_name(workload),
@@ -57,6 +70,10 @@ class ThreadObservation:
             capability_score=float(capability_score),
             interference_score=max(0.0, float(interference_score)),
             measured_at=datetime.now(timezone.utc).isoformat(),
+            baseline_threads=baseline,
+            direction=direction,
+            settled=bool(settled),
+            constraint_violations=tuple(sorted({str(item) for item in constraint_violations if str(item)})),
         )
 
 
@@ -69,6 +86,27 @@ class ThreadDecision:
     reason: str
     explored: int
     budget: int
+
+
+@dataclass(frozen=True)
+class ThreadChallenge:
+    module: str
+    workload: str
+    hardware: str
+    centre_threads: int
+    candidate_threads: int
+    direction: str
+    explored: int
+    budget_remaining: int
+
+
+@dataclass(frozen=True)
+class OperatingEnvelope:
+    minimum_capability: float
+    maximum_interference: float
+    deadband: float
+    hysteresis: float
+    requires_settled_measurement: bool = True
 
 
 def _name(value: str) -> str:
@@ -100,6 +138,8 @@ class AdaptiveThreadGovernor:
         maximum_interference: float = 1.0,
         conservative_default: int = 2,
         hard_ceiling: int | None = None,
+        deadband: float = 0.03,
+        hysteresis: float = 0.02,
     ) -> None:
         self.state_path = Path(state_path)
         cpu_ceiling = max(1, int(os.cpu_count() or 1))
@@ -111,6 +151,14 @@ class AdaptiveThreadGovernor:
         self.minimum_capability = float(minimum_capability)
         self.maximum_interference = max(0.0, float(maximum_interference))
         self.conservative_default = max(1, min(self.hard_ceiling, int(conservative_default)))
+        self.deadband = max(0.0, min(0.5, float(deadband)))
+        self.hysteresis = max(0.0, min(0.5, float(hysteresis)))
+        self.envelope = OperatingEnvelope(
+            self.minimum_capability,
+            self.maximum_interference,
+            self.deadband,
+            self.hysteresis,
+        )
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -127,6 +175,16 @@ class AdaptiveThreadGovernor:
     @staticmethod
     def _key(module: str, workload: str, hardware: str) -> str:
         return "\u241f".join((_name(module), _name(workload), _name(hardware)))
+
+    def _within_envelope(
+        self, observation: ThreadObservation, *, require_capability: bool = True,
+    ) -> bool:
+        return (
+            observation.settled
+            and not observation.constraint_violations
+            and observation.interference_score <= self.maximum_interference
+            and (not require_capability or observation.capability_score >= self.minimum_capability)
+        )
 
     def observations(
         self, module: str, workload: str = "default", hardware: str | None = None,
@@ -150,22 +208,41 @@ class AdaptiveThreadGovernor:
         workload = _name(workload)
         profile = hardware or hardware_profile()
         observations = self.observations(module, workload, profile)
+        stored = self._load().get("profiles", {}).get(self._key(module, workload, profile), {})
+        try:
+            accepted_threads = int(stored.get("accepted_threads"))
+        except (TypeError, ValueError):
+            accepted_threads = 0
         eligible = [
             item for item in observations
-            if item.capability_score >= self.minimum_capability
-            and item.interference_score <= self.maximum_interference
+            if self._within_envelope(item)
         ]
         if eligible:
-            chosen = min(eligible, key=lambda item: (item.threads, item.interference_score))
+            accepted = [item for item in eligible if item.threads == accepted_threads]
+            if accepted:
+                chosen = accepted[-1]
+                reason = "control_envelope_hold"
+            else:
+                chosen = min(eligible, key=lambda item: (item.threads, item.interference_score))
+                reason = "measured_smallest_sufficient"
             return ThreadDecision(
-                module, workload, profile, chosen.threads, "measured_smallest_sufficient",
+                module, workload, profile, chosen.threads, reason,
                 len(observations), self.exploration_budget,
             )
         if observations:
+            safe = [
+                item for item in observations
+                if self._within_envelope(item, require_capability=False)
+            ]
+            if not safe:
+                return ThreadDecision(
+                    module, workload, profile, self.conservative_default,
+                    "hold_conservative_no_safe_observation",
+                    len(observations), self.exploration_budget,
+                )
             previous = min(
-                observations,
+                safe,
                 key=lambda item: (
-                    item.interference_score > self.maximum_interference,
                     -item.capability_score,
                     item.interference_score,
                     item.threads,
@@ -181,14 +258,134 @@ class AdaptiveThreadGovernor:
             "conservative_unmeasured_default", 0, self.exploration_budget,
         )
 
+    def next_challenge(
+        self, module: str, workload: str = "default", hardware: str | None = None,
+    ) -> ThreadChallenge | None:
+        """Return one sequential lower/higher probe around the active centre."""
+        module = _name(module)
+        workload = _name(workload)
+        profile = hardware or hardware_profile()
+        observations = self.observations(module, workload, profile)
+        if len(observations) >= self.exploration_budget:
+            return None
+
+        decision = self.decide(module, workload, profile)
+        centre = decision.threads
+        measured = {item.threads for item in observations}
+
+        # Finish the opposite half before recentering on a successful lower probe.
+        for item in reversed(observations):
+            if item.direction != "lower" or item.baseline_threads is None:
+                continue
+            pending_centre = max(1, min(self.hard_ceiling, item.baseline_threads))
+            step = max(1, pending_centre // 2)
+            higher = min(self.hard_ceiling, pending_centre + step)
+            higher_done = any(
+                candidate.direction == "higher"
+                and candidate.baseline_threads == pending_centre
+                for candidate in observations
+            )
+            if higher != pending_centre and not higher_done and higher not in measured:
+                return ThreadChallenge(
+                    module, workload, profile, pending_centre, higher, "higher",
+                    len(observations), self.exploration_budget - len(observations),
+                )
+            break
+
+        # Measure the conservative operating point before moving either way.
+        if centre not in measured:
+            return ThreadChallenge(
+                module, workload, profile, centre, centre, "baseline",
+                len(observations), self.exploration_budget - len(observations),
+            )
+
+        step = max(1, centre // 2)
+        lower = max(1, centre - step)
+        higher = min(self.hard_ceiling, centre + step)
+        for candidate, direction in ((lower, "lower"), (higher, "higher")):
+            if candidate != centre and candidate not in measured:
+                return ThreadChallenge(
+                    module, workload, profile, centre, candidate, direction,
+                    len(observations), self.exploration_budget - len(observations),
+                )
+        return None
+
     def next_candidate(
         self, module: str, workload: str = "default", hardware: str | None = None,
     ) -> int | None:
-        observations = self.observations(module, workload, hardware)
-        if len(observations) >= self.exploration_budget:
-            return None
-        measured = {item.threads for item in observations}
-        return next((value for value in self.candidates if value not in measured), None)
+        """Compatibility view of the next sequential differential challenge."""
+        challenge = self.next_challenge(module, workload, hardware)
+        return None if challenge is None else challenge.candidate_threads
+
+    def _apply_transition(
+        self,
+        profile: dict[str, Any],
+        observation: ThreadObservation,
+        prior_records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Apply one settled differential without allowing limits to be traded away."""
+        transition: dict[str, Any] = {
+            "direction": observation.direction,
+            "candidate_threads": observation.threads,
+            "centre_threads": observation.baseline_threads,
+            "measured_at": observation.measured_at,
+        }
+        if not observation.settled:
+            transition["outcome"] = "hold_unsettled"
+        elif observation.constraint_violations:
+            transition["outcome"] = "reject_hard_limit"
+            transition["violations"] = list(observation.constraint_violations)
+        elif observation.interference_score > self.maximum_interference:
+            transition["outcome"] = "reject_interference_envelope"
+        elif observation.direction == "baseline" and observation.baseline_threads is not None:
+            profile["accepted_threads"] = observation.threads
+            transition["outcome"] = "establish_centre"
+        elif observation.direction in {"lower", "higher"} and observation.baseline_threads is not None:
+            baseline = None
+            for item in reversed(prior_records):
+                if int(item.get("threads", 0) or 0) == observation.baseline_threads:
+                    baseline = item
+                    break
+            if baseline is None:
+                transition["outcome"] = "hold_missing_centre"
+            else:
+                baseline_capability = float(baseline.get("capability_score", 0.0) or 0.0)
+                denominator = max(abs(baseline_capability), 1e-9)
+                capability_delta = (
+                    observation.capability_score - baseline_capability
+                ) / denominator
+                transition["capability_delta"] = round(capability_delta, 6)
+                transition["interference_delta"] = round(
+                    observation.interference_score
+                    - float(baseline.get("interference_score", 0.0) or 0.0),
+                    6,
+                )
+                if observation.direction == "lower":
+                    acceptable_loss = capability_delta >= -self.deadband
+                    accepted = (
+                        observation.capability_score >= self.minimum_capability
+                        and acceptable_loss
+                    )
+                    transition["outcome"] = (
+                        "accept_negative_differential" if accepted
+                        else "hold_below_negative_deadband"
+                    )
+                else:
+                    threshold = self.deadband + self.hysteresis
+                    accepted = (
+                        observation.capability_score >= self.minimum_capability
+                        and capability_delta >= threshold
+                    )
+                    transition["outcome"] = (
+                        "accept_positive_differential" if accepted
+                        else "hold_inside_positive_deadband"
+                    )
+                if accepted:
+                    profile["accepted_threads"] = observation.threads
+        else:
+            transition["outcome"] = "legacy_observation"
+
+        profile["last_transition"] = transition
 
     def record_observation(self, observation: ThreadObservation) -> ThreadDecision:
         if observation.threads > self.hard_ceiling:
@@ -206,10 +403,11 @@ class AdaptiveThreadGovernor:
             records = list(profile.get("observations") or [])
             if len(records) >= self.exploration_budget:
                 raise RuntimeError("Explicit exploration budget is exhausted.")
+            self._apply_transition(profile, observation, records)
             records.append(asdict(observation))
             profile["observations"] = records[-self.exploration_budget:]
             profile["updated_at"] = observation.measured_at
-            state["schema_version"] = 1
+            state["schema_version"] = 2
             self._save(state)
         return self.decide(observation.module, observation.workload, observation.hardware)
 
@@ -231,6 +429,34 @@ class AdaptiveThreadGovernor:
         return environment
 
 
+
+
+def observation_from_interference(
+    challenge: ThreadChallenge,
+    *,
+    capability_score: float,
+    benchmark_result: Mapping[str, Any],
+    interference_score: float = 0.0,
+    settled: bool = True,
+) -> ThreadObservation:
+    """Convert one bounded interference result into a differential observation."""
+    comparison = benchmark_result.get("comparison", {})
+    regressions = comparison.get("regressions", {}) if isinstance(comparison, Mapping) else {}
+    violations = tuple(
+        sorted(str(name) for name, failed in regressions.items() if bool(failed))
+    )
+    return ThreadObservation.create(
+        challenge.module,
+        challenge.workload,
+        challenge.hardware,
+        challenge.candidate_threads,
+        capability_score,
+        interference_score,
+        baseline_threads=challenge.centre_threads,
+        direction=challenge.direction,
+        settled=settled,
+        constraint_violations=violations,
+    )
 def governed_environment(
     module: str,
     *,
@@ -240,6 +466,8 @@ def governed_environment(
     interactive: bool = False,
 ) -> dict[str, str]:
     """Return module-scoped pool limits without starting any learning activity."""
+
+
     ceiling = 2 if interactive else 4
     governor = AdaptiveThreadGovernor(
         default_state_path(project_root),
@@ -254,9 +482,12 @@ __all__ = [
     "DEFAULT_CANDIDATES",
     "DEFAULT_EXPLORATION_BUDGET",
     "NUMERICAL_THREAD_VARIABLES",
+    "OperatingEnvelope",
+    "ThreadChallenge",
     "ThreadDecision",
     "ThreadObservation",
     "default_state_path",
     "governed_environment",
     "hardware_profile",
+    "observation_from_interference",
 ]

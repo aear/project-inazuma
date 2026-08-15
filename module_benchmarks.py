@@ -801,6 +801,72 @@ def _thread_governor_v2() -> dict[str, Any]:
         {"case": "module-scoped numerical pools", "component": "launch", "correct": environment.get("INA_THREAD_GOVERNOR_MODULE") == "meaning_map" and environment.get("OMP_NUM_THREADS") == "2"},
     ])
 
+
+
+def _thread_governor_v3() -> dict[str, Any]:
+    import json
+    import tempfile
+    from thread_governor import AdaptiveThreadGovernor, ThreadObservation
+
+    def observed(threads, capability, interference, direction, centre, **kwargs):
+        return ThreadObservation.create(
+            "meaning_map", "background", "control-benchmark",
+            threads, capability, interference,
+            direction=direction, baseline_threads=centre, **kwargs,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ina_differential_governor_benchmark_") as directory:
+        path = Path(directory) / "state.json"
+        governor = AdaptiveThreadGovernor(
+            path, exploration_budget=4, conservative_default=4, hard_ceiling=8,
+            deadband=0.03, hysteresis=0.02,
+        )
+        baseline_probe = governor.next_challenge("meaning_map", "background", "control-benchmark")
+        governor.record_observation(observed(4, 100.0, 0.4, "baseline", 4))
+        lower_probe = governor.next_challenge("meaning_map", "background", "control-benchmark")
+        governor.record_observation(observed(2, 98.0, 0.2, "lower", 4))
+        higher_probe = governor.next_challenge("meaning_map", "background", "control-benchmark")
+        neutral = governor.record_observation(observed(6, 104.9, 0.5, "higher", 4))
+        changed_workload = governor.next_challenge("meaning_map", "video", "control-benchmark")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        transition = next(iter(state["profiles"].values()))["last_transition"]
+
+        limited = AdaptiveThreadGovernor(
+            Path(directory) / "limited.json", conservative_default=4, hard_ceiling=8,
+        )
+        limited.record_observation(observed(4, 100.0, 0.4, "baseline", 4))
+        hard_reject = limited.record_observation(observed(
+            6, 200.0, 0.2, "higher", 4,
+            constraint_violations=("audio_xrun",),
+        ))
+
+        settling = AdaptiveThreadGovernor(
+            Path(directory) / "settling.json", conservative_default=4, hard_ceiling=8,
+        )
+        settling.record_observation(observed(4, 100.0, 0.4, "baseline", 4))
+        unsettled = settling.record_observation(observed(
+            2, 100.0, 0.1, "lower", 4, settled=False,
+        ))
+
+    return _capability([
+        {"case": "baseline measured before excursions", "component": "control",
+         "correct": baseline_probe.direction == "baseline" and baseline_probe.candidate_threads == 4},
+        {"case": "negative differential probes lower allocation", "component": "differential",
+         "correct": (lower_probe.centre_threads, lower_probe.candidate_threads) == (4, 2)},
+        {"case": "positive differential remains tied to original centre", "component": "differential",
+         "correct": (higher_probe.centre_threads, higher_probe.candidate_threads) == (4, 6)},
+        {"case": "deadband and hysteresis prevent neutral oscillation", "component": "stability",
+         "correct": neutral.threads == 2 and transition["outcome"] == "hold_inside_positive_deadband"},
+        {"case": "audio and interactive limits are non-tradeable", "component": "envelope",
+         "correct": hard_reject.threads == 4},
+        {"case": "unsettled measurements cannot move allocation", "component": "settling",
+         "correct": unsettled.threads == 4},
+        {"case": "workload change receives a fresh finite budget", "component": "adaptation",
+         "correct": changed_workload.direction == "baseline" and changed_workload.budget_remaining == 4},
+        {"case": "only one challenger is issued at a time", "component": "bounds",
+         "correct": higher_probe.direction == "higher" and higher_probe.candidate_threads != lower_probe.candidate_threads},
+    ])
+
 _HISTORY_BACKED_MODULES = {
     "q_decoder", "bridge_origin", "mirror_audience", "hindsight_claims",
     "mycelial_links", "seedling_clusters", "shadow_candidates", "soul_drift",
@@ -847,6 +913,7 @@ _REGISTRY = {
     "thread_governor": (
         ModuleVersion("thread_governor", "V1", "Historical unmanaged module thread pools", _thread_governor_v1),
         ModuleVersion("thread_governor", "V2", "Bounded per-module observation-driven thread selection", _thread_governor_v2),
+        ModuleVersion("thread_governor", "V3", "Opposing differential control with deadband and hard operating envelopes", _thread_governor_v3),
     ),
 }
 
