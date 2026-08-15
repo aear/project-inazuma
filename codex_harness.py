@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +27,11 @@ MAX_EVENTS = 600
 MAX_EVENT_CHARS = 65536
 MAX_SUMMARY_CHARS = 12000
 MAX_PROMPT_CHARS = 100000
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_REQUEST_BYTES = MAX_PROMPT_CHARS + ((MAX_IMAGE_TOTAL_BYTES + 2) // 3 * 4) + 65536
+IMAGE_MEDIA_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
 REQUEST_TIMEOUT_SECONDS = 30.0
 BLOCKED_BILLING_ENV = {
     "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "CODEX_API_KEY",
@@ -50,6 +57,42 @@ TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
 
 class SubscriptionAuthError(RuntimeError):
     pass
+
+
+def image_inputs(images: Any) -> list[dict[str, str]]:
+    """Validate bounded browser data URLs and produce app-server image inputs."""
+    if images is None:
+        return []
+    if not isinstance(images, list):
+        raise ValueError("Images must be a list.")
+    if len(images) > MAX_IMAGES:
+        raise ValueError(f"At most {MAX_IMAGES} images may be attached.")
+    result: list[dict[str, str]] = []
+    total_bytes = 0
+    for image in images:
+        if not isinstance(image, dict):
+            raise ValueError("Each image attachment must be an object.")
+        url = image.get("url")
+        if not isinstance(url, str) or not url.startswith("data:"):
+            raise ValueError("Image attachments must use data URLs.")
+        header, separator, encoded = url.partition(",")
+        media_type = header[5:].split(";", 1)[0].lower()
+        if not separator or ";base64" not in header.lower() or media_type not in IMAGE_MEDIA_TYPES:
+            raise ValueError("Images must be base64 PNG, JPEG, WebP, or GIF data URLs.")
+        try:
+            decoded_size = len(base64.b64decode(encoded, validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Image attachment contains invalid base64 data.") from exc
+        if decoded_size == 0 or decoded_size > MAX_IMAGE_BYTES:
+            raise ValueError(f"Each image must be between 1 byte and {MAX_IMAGE_BYTES // (1024 * 1024)} MiB.")
+        total_bytes += decoded_size
+        if total_bytes > MAX_IMAGE_TOTAL_BYTES:
+            raise ValueError(f"Image attachments exceed the {MAX_IMAGE_TOTAL_BYTES // (1024 * 1024)} MiB total limit.")
+        detail = str(image.get("detail") or "auto")
+        if detail not in {"auto", "low", "high", "original"}:
+            raise ValueError("Image detail must be auto, low, high, or original.")
+        result.append({"type": "image", "url": url, "detail": detail})
+    return result
 
 
 def subscription_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -264,7 +307,9 @@ class AppServerClient:
         data = params if isinstance(params, dict) else {}
         raw = {"method": method, "params": params}
         if method in {"item/agentMessage/delta", "agentMessage/delta"}:
-            kind, summary = "assistant", data.get("delta") or ""
+            # The completed agentMessage item is authoritative; deltas can be
+            # revised and otherwise produce one fragmented UI card per token.
+            return
         elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"}:
             summary = data.get("delta") or "Reasoning summary updated"
             self.work_status = str(summary)[-MAX_SUMMARY_CHARS:]
@@ -277,6 +322,13 @@ class AppServerClient:
         elif method in {"item/started", "item/completed"}:
             item = data.get("item") or {}
             item_type = str(item.get("type") or "item")
+            if item_type == "agentMessage":
+                if method == "item/completed":
+                    self.events.append("assistant", {
+                        "summary": str(item.get("text") or ""),
+                        "raw": raw,
+                    })
+                return
             status = str(item.get("status") or ("completed" if method.endswith("completed") else "started"))
             kind, summary = "tool", f"{item_type}: {status}"
             command = str(item.get("command") or "").lower()
@@ -335,11 +387,12 @@ class AppServerClient:
     def send_prompt(
         self, prompt: str, *, model: str | None = None,
         effort: str | None = None, collaboration_mode: str = "default",
-        steering: bool = True,
+        steering: bool = True, images: Any = None,
     ) -> dict[str, Any]:
         prompt = str(prompt or "")
-        if not prompt.strip():
-            raise ValueError("Prompt is empty.")
+        attached_images = image_inputs(images)
+        if not prompt.strip() and not attached_images:
+            raise ValueError("Prompt and image attachments are empty.")
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ValueError(f"Prompt exceeds {MAX_PROMPT_CHARS} characters.")
         if self.running_turn:
@@ -348,7 +401,7 @@ class AppServerClient:
             self.new_thread(model=model)
         params: dict[str, Any] = {
             "threadId": self.thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": ([{"type": "text", "text": prompt}] if prompt.strip() else []) + attached_images,
             "approvalPolicy": "on-request",
             "approvalsReviewer": "user",
             "cwd": str(self.config.root),
@@ -367,7 +420,11 @@ class AppServerClient:
                     "developer_instructions": None,
                 },
             }
-        self.events.append("user", {"summary": prompt, "raw": {"steering": bool(steering)}})
+        summary = prompt or f"{len(attached_images)} image attachment(s)"
+        self.events.append("user", {
+            "summary": summary,
+            "raw": {"steering": bool(steering), "image_count": len(attached_images)},
+        })
         result = self.request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else {}
         self.turn_id = str(turn.get("id") or "") or None
@@ -481,6 +538,20 @@ class AppServerClient:
 class HarnessHandler(BaseHTTPRequestHandler):
     server: "HarnessServer"
 
+    def handle(self) -> None:
+        """Treat a browser abandoning an HTTP request as normal cancellation.
+
+        Event polling deliberately leaves requests open for up to 20 seconds, so
+        reloads and replacement polls can close the socket before a response is
+        written.  Catch only the disconnect errors raised by the socket layer;
+        unexpected handler failures must still reach ``socketserver``'s normal
+        error reporting.
+        """
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
     def log_message(self, _format: str, *_args: Any) -> None:
         return
 
@@ -543,7 +614,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         try:
-            length = min(MAX_PROMPT_CHARS + 8192, int(self.headers.get("Content-Length", "0")))
+            declared_length = int(self.headers.get("Content-Length", "0"))
+            if declared_length > MAX_REQUEST_BYTES:
+                self._json({"error": "request body is too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            length = min(MAX_REQUEST_BYTES, declared_length)
             payload = json.loads(self.rfile.read(length) or b"{}")
             if parsed.path == "/api/run":
                 self._json(self.server.client.send_prompt(
@@ -551,6 +626,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     effort=payload.get("effort"),
                     collaboration_mode=str(payload.get("mode") or "default"),
                     steering=bool(payload.get("steering", True)),
+                    images=payload.get("images"),
                 ))
                 return
             if parsed.path == "/api/new":
@@ -629,7 +705,8 @@ if __name__ == "__main__":
 
 __all__ = [
     "APPROVAL_METHODS", "AppServerClient", "BLOCKED_BILLING_ENV", "BoundedEvents",
-    "HarnessConfig", "HarnessServer", "MAX_EVENTS", "MAX_PROMPT_CHARS",
+    "HarnessConfig", "HarnessServer", "MAX_EVENTS", "MAX_IMAGES", "MAX_IMAGE_BYTES",
+    "MAX_IMAGE_TOTAL_BYTES", "MAX_PROMPT_CHARS", "image_inputs",
     "SubscriptionAuthError", "build_config", "discover_codex",
     "subscription_environment",
 ]

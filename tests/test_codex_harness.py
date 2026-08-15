@@ -8,8 +8,10 @@ from codex_harness import (
     BLOCKED_BILLING_ENV,
     BoundedEvents,
     HarnessConfig,
+    MAX_IMAGES,
     MAX_EVENT_CHARS,
     SubscriptionAuthError,
+    image_inputs,
     subscription_environment,
 )
 
@@ -109,6 +111,40 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "Raw protocol details" in source
     assert "MAX_DOM_EVENTS" in source
     assert 'id="workStatus"' in source
+    assert 'id="imagePicker"' in source
+    assert "clipboardData" in source
+    assert "MAX_IMAGE_TOTAL_BYTES" in source
+
+
+def test_client_disconnect_benchmark_v1_raises_and_v2_is_quiet(monkeypatch):
+    """V2 makes an abandoned long poll quiet without hiding other failures."""
+    import codex_harness
+
+    handler = object.__new__(codex_harness.HarnessHandler)
+
+    def abandoned_request(_handler):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    # V1: BaseHTTPRequestHandler.handle exposed the socket error to socketserver.
+    with pytest.raises(BrokenPipeError):
+        abandoned_request(handler)
+
+    # V2: the harness boundary recognizes the same error as client cancellation.
+    monkeypatch.setattr(codex_harness.BaseHTTPRequestHandler, "handle", abandoned_request)
+    assert handler.handle() is None
+
+
+def test_client_disconnect_handler_does_not_hide_unexpected_errors(monkeypatch):
+    import codex_harness
+
+    handler = object.__new__(codex_harness.HarnessHandler)
+
+    def broken_handler(_handler):
+        raise RuntimeError("real handler failure")
+
+    monkeypatch.setattr(codex_harness.BaseHTTPRequestHandler, "handle", broken_handler)
+    with pytest.raises(RuntimeError, match="real handler failure"):
+        handler.handle()
 
 
 def _notification_client(tmp_path):
@@ -138,6 +174,58 @@ def test_reasoning_summary_is_live_status_and_raw_payload_stays_lazy(tmp_path):
     assert event["kind"] == "work_status"
     assert event["payload"]["summary"] == "Checking tests"
     assert event["payload"]["raw"]["params"] == params
+
+
+def test_assistant_message_benchmark_v1_delta_is_ignored_and_v2_item_is_authoritative(tmp_path):
+    client = _notification_client(tmp_path)
+
+    client._handle_notification("item/agentMessage/delta", {
+        "itemId": "message-1", "delta": "draft fragment",
+    })
+    assert not [event for event in client.events.wait_after(0, 0) if event["kind"] == "assistant"]
+
+    client._handle_notification("item/completed", {
+        "item": {
+            "id": "message-1", "type": "agentMessage",
+            "text": "Authoritative complete message", "phase": "final_answer",
+        },
+    })
+    assistant = [event for event in client.events.wait_after(0, 0) if event["kind"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["payload"]["summary"] == "Authoritative complete message"
+
+
+def test_image_inputs_are_bounded_native_app_server_payloads():
+    tiny_png = "data:image/png;base64,iVBORw0KGgo="
+    assert image_inputs([{"url": tiny_png, "detail": "high"}]) == [{
+        "type": "image", "url": tiny_png, "detail": "high",
+    }]
+
+    with pytest.raises(ValueError, match=f"At most {MAX_IMAGES}"):
+        image_inputs([{"url": tiny_png}] * (MAX_IMAGES + 1))
+    with pytest.raises(ValueError, match="PNG, JPEG, WebP, or GIF"):
+        image_inputs([{"url": "data:text/plain;base64,aGk="}])
+    with pytest.raises(ValueError, match="invalid base64"):
+        image_inputs([{"url": "data:image/png;base64,not-valid!"}])
+
+
+def test_image_only_prompt_reaches_turn_start_without_persistence(tmp_path):
+    client = _notification_client(tmp_path)
+    captured = {}
+    tiny_png = "data:image/png;base64,iVBORw0KGgo="
+
+    def request(method, params):
+        captured.update(method=method, params=params)
+        return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+    client.request = request
+    client.status = lambda: {"turn_running": True}
+    client.send_prompt("", images=[{"url": tiny_png}])
+
+    assert captured["method"] == "turn/start"
+    assert captured["params"]["input"] == [{
+        "type": "image", "url": tiny_png, "detail": "auto",
+    }]
 
 
 def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path):
