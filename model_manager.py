@@ -239,8 +239,8 @@ _BUNDLE_POLICY_DEFAULTS = {
     "exclude_dirs": [],
 }
 _FRAGMENT_REPAIR_DEFAULTS = {
-    "enabled": False,
-    "mode": "quarantine",  # quarantine | delete | repair | inspect
+    "enabled": True,
+    "mode": "repair",  # quarantine | delete | repair | inspect
     "require_intent": True,
     "consume_intent": True,
     "cooldown_seconds": 900.0,
@@ -4207,22 +4207,9 @@ def _sample_fragment_ids_for_reflection(child: str, limit: int = 12) -> List[str
                 except Exception:
                     pass
 
-    fragments_root = Path("AI_Children") / child / "memory" / "fragments"
-    skip_dirs = {"pending", "archived", "pending_delete"}
-    sample: List[str] = []
-    seen = 0
-    for frag_path in fragments_root.rglob("frag_*.json"):
-        if any(part in skip_dirs for part in frag_path.parts):
-            continue
-        seen += 1
-        frag_id = frag_path.stem
-        if len(sample) < limit:
-            sample.append(frag_id)
-            continue
-        pick = random.randrange(seen)
-        if pick < limit:
-            sample[pick] = frag_id
-    return sample
+    # A missing sidecar must never turn a small recall sample into a recursive
+    # walk over a million-fragment store. Index maintenance can retry later.
+    return []
 
 
 class _FragmentMemoryBackend:
@@ -4319,20 +4306,6 @@ class _FragmentMemoryBackend:
                         "tags": entry.get("tags", []),
                         "filename": entry.get("filename") or f"{frag_id}.json",
                     }
-
-        if not meta:
-            skip_dirs = {"pending", "archived", "pending_delete"}
-            for frag_path in self.fragments_root.rglob("frag_*.json"):
-                if any(part in skip_dirs for part in frag_path.parts):
-                    continue
-                frag_id = self._derive_fragment_id(frag_path)
-                meta[frag_id] = {
-                    "tier": self._tier_from_path(frag_path),
-                    "filename": frag_path.name,
-                    "last_seen": None,
-                    "importance": None,
-                    "tags": [],
-                }
 
         self._json_meta = meta
 
@@ -9208,14 +9181,39 @@ def _scan_fragment_health():
     def _worker():
         global _last_fragment_health_scan, _fragment_health_thread
         try:
-            summary = scan_fragment_integrity(CHILD, max_samples=6, preview_chars=220)
+            prior_discovered = []
+            if _FRAGMENT_HEALTH_PATH.exists():
+                try:
+                    prior_summary = json.loads(_FRAGMENT_HEALTH_PATH.read_text(encoding="utf-8"))
+                    if isinstance(prior_summary, dict):
+                        prior_discovered = prior_summary.get("corrupt_entries") or prior_summary.get("corrupted_samples") or []
+                except Exception:
+                    prior_discovered = []
+            summary = scan_fragment_integrity(
+                CHILD, max_samples=6, preview_chars=220, max_records=2048, max_seconds=8.0,
+            )
             if summary:
                 try:
-                    with _FRAGMENT_HEALTH_PATH.open("w", encoding="utf-8") as handle:
-                        json.dump(summary, handle, indent=2, ensure_ascii=False)
+                    atomic_write_json(_FRAGMENT_HEALTH_PATH, summary, indent=2, ensure_ascii=False)
                 except Exception as exc:
                     log_to_statusbox(f"[Manager] Failed to persist fragment integrity summary: {exc}")
                 update_inastate("fragment_integrity", summary)
+                discovered = summary.get("corrupt_entries") if isinstance(summary, dict) else []
+                discovered = list(prior_discovered if isinstance(prior_discovered, list) else []) + list(
+                    discovered if isinstance(discovered, list) else []
+                )
+                if isinstance(discovered, list) and discovered:
+                    existing = get_inastate("corrupt_fragments") or []
+                    existing = existing if isinstance(existing, list) else []
+                    by_path = {
+                        str(entry.get("path")): dict(entry)
+                        for entry in existing
+                        if isinstance(entry, dict) and entry.get("path")
+                    }
+                    for entry in discovered:
+                        if isinstance(entry, dict) and entry.get("path"):
+                            by_path[str(entry.get("path"))] = dict(entry)
+                    update_inastate("corrupt_fragments", list(by_path.values())[-4096:])
         except Exception as exc:
             log_to_statusbox(f"[Manager] Fragment integrity scan failed: {exc}")
         finally:

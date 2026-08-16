@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from io_utils import atomic_write_json
 
 
 def _now_iso() -> str:
@@ -59,9 +63,11 @@ def scan_fragment_integrity(
     *,
     max_samples: int = 6,
     preview_chars: int = 200,
+    max_records: int = 2048,
+    max_seconds: float = 8.0,
 ) -> Optional[Dict[str, Any]]:
     """
-    Scan the child's fragment directory for corrupted JSON fragments.
+    Check one bounded, resumable batch selected by the fragment index.
 
     Returns a summary dict suitable for publishing into inastate, or None
     if no fragments were found.
@@ -71,23 +77,68 @@ def scan_fragment_integrity(
         if not root.exists():
             return None
 
-        fragment_paths = sorted(root.rglob("frag_*.json"))
-        if not fragment_paths:
+        memory_root = root.parent
+        index_path = memory_root / "memory_map.sqlite"
+        cursor_path = memory_root / "fragment_integrity_cursor.json"
+        try:
+            cursor_state = json.loads(cursor_path.read_text(encoding="utf-8")) if cursor_path.exists() else {}
+        except Exception:
+            cursor_state = {}
+        cursor = str(cursor_state.get("frag_id") or "") if isinstance(cursor_state, dict) else ""
+        try:
+            with sqlite3.connect(f"file:{index_path.resolve()}?mode=ro", uri=True, timeout=0.25) as connection:
+                rows = connection.execute(
+                    "SELECT frag_id, tier, filename FROM fragments "
+                    "WHERE frag_id > ? ORDER BY frag_id LIMIT ?",
+                    (cursor, max(1, int(max_records))),
+                ).fetchall()
+                wrapped = bool(cursor and not rows)
+                if wrapped:
+                    rows = connection.execute(
+                        "SELECT frag_id, tier, filename FROM fragments ORDER BY frag_id LIMIT ?",
+                        (max(1, int(max_records)),),
+                    ).fetchall()
+        except (OSError, sqlite3.Error) as exc:
             return {
                 "child": child,
                 "scanned_at": _now_iso(),
+                "checked_this_pass": 0,
+                "corrupted_this_pass": 0,
+                "total_fragments_checked": 0,
+                "corrupted_count": 0,
+                "status": "deferred",
+                "reason": "index_unavailable",
+                "error": str(exc),
+            }
+
+        if not rows:
+            return {
+                "child": child,
+                "scanned_at": _now_iso(),
+                "checked_this_pass": 0,
+                "corrupted_this_pass": 0,
                 "total_fragments_checked": 0,
                 "corrupted_count": 0,
                 "status": "empty",
-                "note": "No fragment files found to scan.",
+                "note": "The fragment index contains no records.",
             }
 
+        deadline = time.monotonic() + max(0.01, float(max_seconds))
         total = 0
         corrupted = 0
         samples: List[Dict[str, Any]] = []
+        corrupt_entries: List[Dict[str, Any]] = []
+        last_frag_id = "" if wrapped else cursor
 
-        for path in fragment_paths:
-            if not path.is_file():
+        for frag_id, tier, filename in rows:
+            if time.monotonic() >= deadline:
+                break
+            last_frag_id = str(frag_id)
+            name = str(filename or f"frag_{frag_id}.json")
+            tier_name = str(tier or "").strip()
+            candidates = ([root / tier_name / name] if tier_name else []) + [root / name]
+            path = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if path is None:
                 continue
 
             total += 1
@@ -96,39 +147,56 @@ def scan_fragment_integrity(
                     json.load(handle)
             except Exception as exc:
                 corrupted += 1
+                try:
+                    stats = path.stat()
+                    size_bytes = stats.st_size
+                    modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
+                except Exception:
+                    size_bytes = None
+                    modified = None
+                entry = {
+                    "id": str(frag_id),
+                    "path": str(path),
+                    "filename": path.name,
+                    "tier": _tier_label(root, path),
+                    "error": str(exc),
+                    "reason": "invalid_json",
+                    "size_bytes": size_bytes,
+                    "modified": modified,
+                    "preview": _preview_fragment(path, preview_chars),
+                    "recommendation": _recommend_action(str(exc), size_bytes),
+                    "detected_at": _now_iso(),
+                }
+                corrupt_entries.append(entry)
                 if len(samples) < max_samples:
-                    try:
-                        stats = path.stat()
-                        size_bytes = stats.st_size
-                        modified = datetime.fromtimestamp(stats.st_mtime, timezone.utc).isoformat()
-                    except Exception:
-                        size_bytes = None
-                        modified = None
+                    samples.append(entry)
 
-                    samples.append(
-                        {
-                            "path": str(path),
-                            "filename": path.name,
-                            "tier": _tier_label(root, path),
-                            "error": str(exc),
-                            "size_bytes": size_bytes,
-                            "modified": modified,
-                            "preview": _preview_fragment(path, preview_chars),
-                            "recommendation": _recommend_action(str(exc), size_bytes),
-                        }
-                    )
+        if last_frag_id:
+            atomic_write_json(cursor_path, {
+                "frag_id": last_frag_id,
+                "updated_at": _now_iso(),
+                "batch_limit": max(1, int(max_records)),
+            }, indent=2)
 
         summary: Dict[str, Any] = {
             "child": child,
             "scanned_at": _now_iso(),
+            "checked_this_pass": total,
+            "corrupted_this_pass": corrupted,
+            # Compatibility aliases now describe this bounded pass, not an
+            # exhaustive directory-wide scan.
             "total_fragments_checked": total,
             "corrupted_count": corrupted,
             "status": "attention_needed" if corrupted else "ok",
+            "cursor": last_frag_id,
+            "wrapped": wrapped,
+            "bounded": True,
         }
 
         if corrupted:
             summary["corrupted_samples"] = samples
             summary["sampled_count"] = len(samples)
+            summary["corrupt_entries"] = corrupt_entries
         else:
             summary["note"] = "All scanned fragments loaded cleanly."
 

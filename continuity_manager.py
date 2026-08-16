@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from io_utils import atomic_write_json
 from continuity_recall import ContinuityRecallCoordinator
+from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 
 # Evidence channels rather than personality requirements. A dimension can stay
@@ -407,20 +408,17 @@ class ContinuityManager:
             if candidate.is_file() and candidate not in pinned:
                 pinned.append(candidate)
 
-        files = []
-        for path in self.fragments_root.rglob("frag_*.json"):
-            resolved_path = path.resolve()
-            if resolved_path in pinned:
-                continue
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            files.append((mtime, resolved_path))
-        files.sort(reverse=True)
         pinned = pinned[: self.max_fragments]
         remaining = max(0, self.max_fragments - len(pinned))
-        return pinned + [path for _, path in files[:remaining]]
+        db_path = self.fragments_root.parent / "memory_map.sqlite"
+        indexed = []
+        for row in indexed_fragment_rows(db_path, limit=remaining + len(pinned)):
+            path = resolve_indexed_fragment(self.fragments_root, row)
+            if path is not None and path not in pinned:
+                indexed.append(path)
+            if len(indexed) >= remaining:
+                break
+        return pinned + indexed
 
     @staticmethod
     def _classify_dimensions(fragment: Dict[str, object]) -> List[str]:

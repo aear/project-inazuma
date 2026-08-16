@@ -499,6 +499,45 @@ def catalog_path_is_current(
     return row is not None
 
 
+def verified_payload_for_path(
+    child: str,
+    kind: str,
+    path: Path,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a verified last-good payload without trusting the source file."""
+    db_path = mirror_db_path(child, config)
+    if not db_path.exists():
+        return None
+    source = Path(path)
+    path_candidates = {str(source), str(source.resolve())}
+    try:
+        path_candidates.add(str(source.resolve().relative_to(Path.cwd().resolve())))
+    except ValueError:
+        pass
+    try:
+        with sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=0.25) as conn:
+            row = conn.execute(
+                "SELECT payload_json, payload_sha256 FROM mirrored_json "
+                f"WHERE child = ? AND kind = ? AND source_path IN ({','.join('?' for _ in path_candidates)}) "
+                "AND verified_at IS NOT NULL LIMIT 1",
+                (str(child), str(kind), *sorted(path_candidates)),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if not row:
+        return None
+    try:
+        payload_text = str(row[0])
+        if hashlib.sha256(payload_text.encode("utf-8")).hexdigest() != str(row[1]):
+            return None
+        payload = json.loads(payload_text)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _ensure_schema(conn: sqlite3.Connection, *, configure: bool = True) -> None:
     if configure:
         conn.execute("PRAGMA journal_mode=WAL")

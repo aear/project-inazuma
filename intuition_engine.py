@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from gui_hook import log_to_statusbox
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from transformers.QTransformer import QTransformer
+from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 # Local copy of the 24D emotion axes so we avoid importing emotion_engine
 EMOTION_SLIDERS: Tuple[str, ...] = (
@@ -227,14 +228,13 @@ class AkashicMemory:
     def _recent_fragment_paths(self) -> List[Path]:
         if not self.fragments_root.exists():
             return []
-        entries: List[Tuple[float, Path]] = []
-        for frag in self.fragments_root.rglob("frag_*.json"):
-            try:
-                entries.append((frag.stat().st_mtime, frag))
-            except OSError:
-                continue
-        entries.sort(reverse=True)
-        return [path for _, path in entries[: self.limit]]
+        db_path = self.fragments_root.parent / "memory_map.sqlite"
+        paths = []
+        for row in indexed_fragment_rows(db_path, limit=self.limit):
+            path = resolve_indexed_fragment(self.fragments_root, row)
+            if path is not None:
+                paths.append(path)
+        return paths
 
     def _rebuild_from_fragments(self) -> List[ReservoirEntry]:
         entries: List[ReservoirEntry] = []

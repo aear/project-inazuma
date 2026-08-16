@@ -6,7 +6,7 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from io_utils import file_lock
 
@@ -220,3 +220,83 @@ def touch_fragments(db_path: Path, fragment_ids: list[str], last_seen: str) -> i
         )
         conn.commit()
         return int(conn.total_changes - before)
+
+
+def indexed_fragment_rows(
+    db_path: Path,
+    *,
+    limit: int,
+    tags: Sequence[str] = (),
+    newest_first: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return a bounded fragment selection without walking the fragment tree."""
+    limit = max(0, int(limit))
+    if limit <= 0 or not Path(db_path).exists():
+        return []
+    wanted_tags = sorted({str(tag).strip().lower() for tag in tags if str(tag).strip()})
+    order = "f.mtime_ns DESC, f.frag_id DESC" if newest_first else "f.frag_id"
+    params: List[Any] = []
+    if wanted_tags:
+        placeholders = ",".join("?" for _ in wanted_tags)
+        sql = (
+            "SELECT DISTINCT f.frag_id, f.tier, f.filename, f.mtime_ns, f.tags_json "
+            "FROM fragments f JOIN fragment_tags t ON t.frag_id = f.frag_id "
+            f"WHERE t.tag IN ({placeholders}) ORDER BY {order} LIMIT ?"
+        )
+        params.extend(wanted_tags)
+    else:
+        sql = (
+            "SELECT f.frag_id, f.tier, f.filename, f.mtime_ns, f.tags_json "
+            f"FROM fragments f ORDER BY {order} LIMIT ?"
+        )
+    params.append(limit)
+    try:
+        uri = f"file:{Path(db_path).resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.25) as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+    return [
+        {"frag_id": str(row[0]), "tier": str(row[1] or ""),
+         "filename": str(row[2] or ""), "mtime_ns": _int_value(row[3]),
+         "tags_json": str(row[4] or "[]")}
+        for row in rows
+    ]
+
+
+def indexed_fragment_count(db_path: Path, *, at_least: Optional[int] = None) -> int:
+    """Read a catalogue count, optionally stopping once a small threshold is met."""
+    if not Path(db_path).exists():
+        return 0
+    try:
+        uri = f"file:{Path(db_path).resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.25) as conn:
+            if at_least is not None and int(at_least) > 0:
+                threshold = int(at_least)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM fragments LIMIT ?)", (threshold,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM fragments").fetchone()
+        return int(row[0] or 0) if row else 0
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
+def resolve_indexed_fragment(fragments_root: Path, row: Dict[str, Any]) -> Optional[Path]:
+    """Resolve one indexed row inside the configured fragment root."""
+    root = Path(fragments_root)
+    frag_id = str(row.get("frag_id") or "")
+    filename = str(row.get("filename") or f"frag_{frag_id}.json")
+    tier = str(row.get("tier") or "").strip()
+    candidates = ([root / tier / filename] if tier else []) + [root / filename]
+    resolved_root = root.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(resolved_root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None

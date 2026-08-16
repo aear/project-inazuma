@@ -261,6 +261,12 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 ### Avoid memory tree scans
 - Do not run recursive searches (rg/find/ls -R) under `AI_Children/` unless explicitly required.
 - If a memory file is needed, open only the specific file and keep reads minimal.
+- Runtime cognition must select fragments through `memory_map.sqlite` with an
+  explicit row limit. If the index is unavailable, defer the work; never fall
+  back to a fragment-directory glob or recursive walk.
+- Integrity checking is a resumable indexed pass. Feed invalid records into the
+  bounded repair queue, retain the corrupt original, and restore only from a
+  hash-verified mirror or an explicitly inspectable salvage result.
 - Routine cognitive ticks must never glob the fragments directory. Use the compact
   SQLite index with an explicit batch and time budget, persist a resume cursor,
   and defer safely when the index is unavailable.

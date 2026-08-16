@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import sqlite3
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -17,6 +18,15 @@ def _write_fragment(memory_root, fragment_id, summary, tags):
         "timestamp": "2026-01-01T00:00:00+00:00",
         "source": "test",
     }), encoding="utf-8")
+    db = memory_root / "memory_map.sqlite"
+    with sqlite3.connect(str(db)) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS fragments(frag_id TEXT PRIMARY KEY, tier TEXT, filename TEXT, mtime_ns INTEGER, tags_json TEXT)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO fragments VALUES (?, '', ?, ?, ?)",
+            (fragment_id, path.name, path.stat().st_mtime_ns, json.dumps(tags)),
+        )
     return path
 
 

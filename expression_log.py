@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from math import sqrt
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from model_manager import load_config
+from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 def emotion_distance(e1, e2):
     keys = set(e1.keys()).union(set(e2.keys()))
@@ -85,7 +86,12 @@ def build_memory_graph(child):
     fragments = []
     transformer = FractalTransformer()
 
-    for f in memory_path.glob("frag_*.json"):
+    # This legacy standalone builder is quadratic after discovery, so keep its
+    # candidate set deliberately small as well as index-backed.
+    for row in indexed_fragment_rows(memory_path.parent / "memory_map.sqlite", limit=512):
+        f = resolve_indexed_fragment(memory_path, row)
+        if f is None:
+            continue
         try:
             with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)

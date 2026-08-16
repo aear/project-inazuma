@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from io_utils import atomic_write_json
+from memory_mirror_db import verified_payload_for_path
+from storage_layout import load_config
 
 
 _ACTION_LOG_LIMIT = 20
@@ -17,7 +20,7 @@ def _now_iso() -> str:
 
 def _is_relative_to(path: Path, base: Path) -> bool:
     try:
-        path.relative_to(base)
+        path.resolve().relative_to(base.resolve())
         return True
     except ValueError:
         return False
@@ -108,6 +111,16 @@ def _safe_move(path: Path, dest_dir: Path) -> Path:
     return dest
 
 
+def _safe_copy(path: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / path.name
+    if dest.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        dest = dest_dir / f"{path.stem}_{stamp}{path.suffix}"
+    shutil.copy2(path, dest)
+    return dest
+
+
 def _append_action_log(child: str, payload: Dict[str, Any]) -> None:
     log_path = _memory_root(child) / "fragment_repair_log.jsonl"
     try:
@@ -181,6 +194,26 @@ def process_corrupt_queue(
             salvage_status = None
             salvage_obj = None
             if mode == "repair":
+                mirror_payload = verified_payload_for_path(
+                    child, "fragment", path, config=load_config(),
+                )
+                if mirror_payload is not None:
+                    try:
+                        backup = _safe_copy(path, quarantine_path / "pre_repair")
+                        atomic_write_json(path, mirror_payload, indent=2, ensure_ascii=True)
+                        summary["counts"]["repaired"] += 1
+                        actions_taken += 1
+                        action = {
+                            "action": "repaired_from_verified_mirror",
+                            "path": str(path),
+                            "backup": str(backup),
+                            "timestamp": _now_iso(),
+                        }
+                        summary["actions"].append(action)
+                        _append_action_log(child, action)
+                        continue
+                    except Exception:
+                        pass
                 salvage_status, salvage_obj = _attempt_salvage(path, max_repair_bytes)
                 if salvage_status == "valid":
                     summary["counts"]["valid"] += 1

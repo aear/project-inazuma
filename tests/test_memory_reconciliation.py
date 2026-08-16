@@ -19,6 +19,10 @@ class MemoryReconciliationTests(unittest.TestCase):
         self.events = Path("AI_Children/Ina/memory/experiences/events")
         self.events.mkdir(parents=True)
         self.config = {
+            "memory_reconciliation_policy": {
+                "include_legacy_events": True,
+                "scan_fragments": False,
+            },
             "memory_mirror_policy": {
                 "enabled": True,
                 "mirror_on_read": True,

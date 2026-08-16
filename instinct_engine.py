@@ -10,6 +10,7 @@ except Exception:  # pragma: no cover - optional during standalone runs
 from gui_hook import log_to_statusbox
 from movement_drive import calculate_movement_urge
 from transformers.fractal_multidimensional_transformers import FractalTransformer
+from memory_index import indexed_fragment_count, indexed_fragment_rows, resolve_indexed_fragment
 
 CONFIG_FILE = "config.json"
 
@@ -329,13 +330,14 @@ class InstinctEngine:
         return False
 
     def detect_fragment_growth(self):
-        frag_dir = self.memory_path / "fragments"
-        if not frag_dir.exists(): return False
-        return len(list(frag_dir.glob("frag_*.json"))) > 5
+        return indexed_fragment_count(
+            self.memory_path / "memory_map.sqlite", at_least=6
+        ) >= 6
 
     def should_predict(self):
-        frag_dir = self.memory_path / "fragments"
-        return frag_dir.exists() and len(list(frag_dir.glob("frag_*.json"))) >= 2
+        return indexed_fragment_count(
+            self.memory_path / "memory_map.sqlite", at_least=2
+        ) >= 2
 
     def poll(self):
         dreaming = get_inastate("dreaming", False)
@@ -478,16 +480,16 @@ class InstinctEngine:
 
         frag_dir = self.memory_path / "fragments"
         identity_fragments = []
-
-        if frag_dir.exists():
-            for f in frag_dir.glob("frag_*.json"):
-                try:
-                    with open(f, "r", encoding="utf-8") as file:
-                        frag = json.load(file)
-                        if "identity" in frag.get("tags", []):
-                            identity_fragments.append(frag)
-                except:
-                    continue
+        db_path = self.memory_path / "memory_map.sqlite"
+        for row in indexed_fragment_rows(db_path, limit=128, tags=("identity",)):
+            f = resolve_indexed_fragment(frag_dir, row)
+            if f is None:
+                continue
+            try:
+                with open(f, "r", encoding="utf-8") as file:
+                    identity_fragments.append(json.load(file))
+            except Exception:
+                continue
 
         if identity_fragments:
             unclear = [f for f in identity_fragments if f.get("clarity", 0.0) < 0.7]
@@ -496,14 +498,17 @@ class InstinctEngine:
 
                 # === Curiosity Instinct ===
         curiosity_fragments = []
-        for f in frag_dir.glob("frag_*.json"):
+        for row in indexed_fragment_rows(db_path, limit=256):
+            f = resolve_indexed_fragment(frag_dir, row)
+            if f is None:
+                continue
             try:
                 with open(f, "r", encoding="utf-8") as file:
                     frag = json.load(file)
                     emotions = frag.get("emotions", {})
                     if emotions.get("curiosity", 0.0) > 0.5 and frag.get("clarity", 1.0) < 0.7:
                         curiosity_fragments.append(frag)
-            except:
+            except Exception:
                 continue
 
         if len(curiosity_fragments) >= 2:

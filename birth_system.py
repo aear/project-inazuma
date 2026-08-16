@@ -18,6 +18,8 @@ from gui_hook import log_to_statusbox
 from safe_popen import safe_popen
 from runtime_services import ensure_runtime_service_supervisor
 from who_am_i import run_reflection
+from io_utils import atomic_write_json
+from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 
 def update_birth_metrics(child, key, data):
@@ -65,9 +67,14 @@ def log_birth_event(message, child=None):
 
 
 def trigger_birth_flickers(child):
-    log_to_statusbox("[Birth] ─── Scanning Memory Fragments ───")
+    log_to_statusbox("[Birth] ─── Loading Bounded Memory Flickers ───")
     frag_path = Path(f"AI_Children/{child}/memory/fragments")
-    frag_files = list(frag_path.glob("frag_*.json"))
+    policy = load_config().get("birth_memory_policy") or {}
+    limit = max(1, min(1024, int(policy.get("max_flicker_fragments", 256))))
+    rows = indexed_fragment_rows(
+        frag_path.parent / "memory_map.sqlite", limit=limit, tags=("dream", "flicker")
+    )
+    frag_files = [path for row in rows if (path := resolve_indexed_fragment(frag_path, row))]
     total = len(frag_files)
 
     dream_ids = []
@@ -87,14 +94,13 @@ def trigger_birth_flickers(child):
             if "dream" in tags or "flicker" in tags:
                 dream_ids.append(data["id"])
                 outpath = frag_path / f"frag_flicker_{data['id']}.json"
-                with open(outpath, "w") as f_out:
-                    json.dump(data, f_out, indent=4)
+                atomic_write_json(outpath, data, indent=4)
                 matched += 1
         except Exception as e:
             print(f"[Birth] Skipped fragment {frag_file.name}: {e}")
 
         if scanned % max(1, total // 100) == 0 or scanned == total:
-            progress = scanned / total
+            progress = scanned / max(1, total)
             bar = render_bar(progress)
             log_to_statusbox(f"[Birth] Fragment scan {scanned}/{total} [{bar}] {progress:.1%}")
 

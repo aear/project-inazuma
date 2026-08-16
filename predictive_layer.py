@@ -5,7 +5,6 @@ import os
 import json
 import math
 import time
-import heapq
 from datetime import datetime, timezone
 from pathlib import Path
 from config_layers import load_config
@@ -19,6 +18,7 @@ from symbol_word_utils import (
 )
 from storage_layout import fast_runtime_path
 from streaming_json import count_top_level_array
+from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 def cosine_similarity(v1, v2):
     return shared_cosine_similarity(v1, v2)
@@ -64,14 +64,14 @@ def inspect_map_health(child):
 
 def load_recent_fragments(child, limit=10):
     frag_path = Path("AI_Children") / child / "memory" / "fragments"
-    # Keep only the newest N directory entries instead of materialising and
-    # sorting hundreds of thousands of fragment paths.
-    sorted_fragments = heapq.nlargest(
-        max(0, int(limit)), frag_path.glob("frag_*.json"), key=os.path.getmtime,
-    )
     fragments = []
-
-    for file in sorted_fragments:
+    rows = indexed_fragment_rows(
+        frag_path.parent / "memory_map.sqlite", limit=max(0, int(limit))
+    )
+    for row in rows:
+        file = resolve_indexed_fragment(frag_path, row)
+        if file is None:
+            continue
         try:
             with open(file, "r", encoding="utf-8") as f:
                 frag = json.load(f)

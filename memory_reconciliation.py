@@ -55,10 +55,10 @@ def _reconciliation_policy(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # Flat legacy directories can contain millions of files. They require an
         # explicit migration/audit pass; walking them in the live cognitive lane
         # can block in the kernel before a Python time budget can be checked.
-        "include_legacy_events": bool(raw.get("include_legacy_events", True)),
+        "include_legacy_events": bool(raw.get("include_legacy_events", False)),
         # Fragments already have memory_map.json/SQLite as their authoritative
         # catalogue and are mirrored on access. Avoid a second filesystem walk.
-        "scan_fragments": bool(raw.get("scan_fragments", True)),
+        "scan_fragments": bool(raw.get("scan_fragments", False)),
     }
 
 

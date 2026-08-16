@@ -263,6 +263,116 @@ def _emotion_propagation_v2() -> dict[str, Any]:
     ])
 
 
+def _fragment_runtime_sweep_v1() -> dict[str, Any]:
+    targets = (
+        "continuity_manager.py", "intuition_engine.py", "birth_system.py",
+        "instinct_engine.py", "language_processing.py", "predictive_layer.py",
+        "expression_log.py", "memory_graph.py", "model_manager.py",
+    )
+    legacy = {name: _v1_text(name) for name in targets}
+    offenders = [
+        name for name, source in legacy.items()
+        if 'glob("frag_' in source or "rglob(\"frag_" in source
+    ]
+    return _capability([{
+        "case": "routine fragment discovery avoids filesystem-wide enumeration",
+        "component": "memory",
+        "actual": offenders,
+        "correct": not offenders,
+    }])
+
+
+def _fragment_runtime_sweep_v2() -> dict[str, Any]:
+    import sqlite3
+    import tempfile
+    from memory_index import indexed_fragment_rows
+    targets = (
+        "continuity_manager.py", "intuition_engine.py", "birth_system.py",
+        "instinct_engine.py", "language_processing.py", "predictive_layer.py",
+        "expression_log.py", "model_manager.py",
+    )
+    current = {name: Path(name).read_text(encoding="utf-8") for name in targets}
+    offenders = [
+        name for name, source in current.items()
+        if 'glob("frag_' in source or "rglob(\"frag_" in source
+    ]
+    with tempfile.TemporaryDirectory(prefix="ina_fragment_sweep_") as directory:
+        db = Path(directory) / "memory_map.sqlite"
+        with sqlite3.connect(str(db)) as connection:
+            connection.execute(
+                "CREATE TABLE fragments(frag_id TEXT, tier TEXT, filename TEXT, mtime_ns INTEGER, tags_json TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO fragments VALUES (?, '', ?, ?, '[]')",
+                [(str(i), f"frag_{i}.json", i) for i in range(10000)],
+            )
+        rows = indexed_fragment_rows(db, limit=17)
+    return _capability([
+        {"case": "audited runtime modules use indexed discovery", "component": "discovery", "actual": offenders, "correct": not offenders},
+        {"case": "large catalogue selection respects requested cap", "component": "memory", "actual": len(rows), "correct": len(rows) == 17},
+        {"case": "selection retains newest-first semantics", "component": "continuity", "actual": rows[0]["frag_id"] if rows else None, "correct": bool(rows) and rows[0]["frag_id"] == "9999"},
+    ])
+
+
+def _fragment_repair_v1() -> dict[str, Any]:
+    source = _v1_text("fragment_repair.py")
+    verified_restore = "verified_payload_for_path" in source and "pre_repair" in source
+    return _capability([{
+        "case": "corrupt fragment can be restored from a verified last-good witness",
+        "component": "recovery",
+        "actual": verified_restore,
+        "correct": verified_restore,
+    }])
+
+
+def _fragment_repair_v2() -> dict[str, Any]:
+    import json
+    import os
+    import tempfile
+    import fragment_repair
+    import memory_mirror_db as mirror
+    with tempfile.TemporaryDirectory(prefix="ina_fragment_repair_") as directory:
+        root = Path(directory)
+        old_cwd = Path.cwd()
+        cfg = {"memory_mirror_policy": {
+            "enabled": True, "mirror_on_read": True,
+            "db_root": str(root / "mirror"), "db_filename": "catalog.sqlite3",
+            "batch_records": 1, "batch_bytes": 1024, "batch_seconds": 0,
+            "remove_json_after_verified": False, "quarantine_json_after_verified": False,
+        }}
+        original_loader = fragment_repair.load_config
+        mirror.flush_mirror_writes(close=True)
+        try:
+            os.chdir(root)
+            path = Path("AI_Children/Ina/memory/fragments/frag_bench.json")
+            path.parent.mkdir(parents=True)
+            good = {"id": "bench", "summary": "last good"}
+            path.write_text(json.dumps(good), encoding="utf-8")
+            mirror.mirror_json_file("Ina", "fragment", path, payload=good, config=cfg)
+            mirror.flush_mirror_writes(mirror.mirror_db_path("Ina", cfg))
+            path.write_text('{"id":"bench","summary":', encoding="utf-8")
+            fragment_repair.load_config = lambda: cfg
+            remaining, summary = fragment_repair.process_corrupt_queue(
+                "Ina", [{"path": str(path), "reason": "invalid_json"}],
+                {"mode": "repair", "max_actions_per_pass": 1,
+                 "max_repair_bytes": 1024, "quarantine_dir": "fragments/corrupt"},
+            )
+            restored = json.loads(path.read_text(encoding="utf-8")) == good
+            backup = Path(summary["actions"][0].get("backup", "")) if summary.get("actions") else Path()
+            preserved = bool(summary.get("actions")) and backup.is_file()
+        finally:
+            fragment_repair.load_config = original_loader
+            mirror.flush_mirror_writes(close=True)
+            os.chdir(old_cwd)
+    manager_source = Path("model_manager.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "verified mirror restores corrupt JSON", "component": "recovery", "correct": restored and not remaining},
+        {"case": "corrupt original is retained before rewrite", "component": "reversibility", "correct": preserved},
+        {"case": "repair remains one-action bounded", "component": "bounds", "correct": summary["counts"]["repaired"] == 1},
+        {"case": "previously detected samples seed the repair queue", "component": "continuity", "correct": 'prior_summary.get("corrupt_entries") or prior_summary.get("corrupted_samples")' in manager_source},
+    ])
+
+
 def _soul_source_cases(source: str) -> dict[str, Any]:
     indexed = "symbol_index =" in source and "symbols.index(j_sym)" not in source
     emotion_directed = "emotion_bias_applied" in source and "placeholder for emotion bias" not in source
@@ -920,7 +1030,7 @@ _HISTORY_BACKED_MODULES = {
     "self_question_origins", "ina_ml_distribution", "language_components",
     "discord_retention", "native_test_support", "self_read_language",
     "experience_cycle", "virtual_file_explorer", "continuity_recall", "background_interference",
-    "codex_harness", "thread_governor",
+    "codex_harness", "thread_governor", "fragment_runtime_sweep", "fragment_repair",
 }
 
 
@@ -937,6 +1047,8 @@ _REGISTRY = {
     "seedling_clusters": (ModuleVersion("seedling_clusters", "V1", "First-character grouping", _seedling_v1), ModuleVersion("seedling_clusters", "V2", "Profile and vector geometry", _seedling_v2)),
     "shadow_candidates": (ModuleVersion("shadow_candidates", "V1", "Full fragment directory scan", _shadow_v1), ModuleVersion("shadow_candidates", "V2", "Queue and SQLite tag lookup", _shadow_v2)),
     "emotion_propagation": (ModuleVersion("emotion_propagation", "V1", "Full fragment directory glob on every tick", _emotion_propagation_v1), ModuleVersion("emotion_propagation", "V2", "Bounded resumable SQLite-indexed propagation", _emotion_propagation_v2)),
+    "fragment_runtime_sweep": (ModuleVersion("fragment_runtime_sweep", "V1", "Legacy runtime modules enumerate fragment directories", _fragment_runtime_sweep_v1), ModuleVersion("fragment_runtime_sweep", "V2", "Shared bounded SQLite fragment selection", _fragment_runtime_sweep_v2)),
+    "fragment_repair": (ModuleVersion("fragment_repair", "V1", "Legacy salvage or quarantine without mirror recovery", _fragment_repair_v1), ModuleVersion("fragment_repair", "V2", "Intent-gated verified mirror recovery with retained original", _fragment_repair_v2)),
     "soul_drift": (ModuleVersion("soul_drift", "V1", "Link drift without emotion direction", _soul_v1), ModuleVersion("soul_drift", "V2", "Indexed links and emotion-directed drift", _soul_v2)),
     "self_question_origins": (ModuleVersion("self_question_origins", "V1", "Question metadata only", _question_origin_v1), ModuleVersion("self_question_origins", "V2", "Composable trigger chain export", _question_origin_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),

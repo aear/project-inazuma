@@ -2605,27 +2605,13 @@ def load_fragments(child, limit: Optional[int] = None) -> Tuple[List[Dict[str, A
         except (TypeError, ValueError):
             limit_val = 0
 
-    selected_paths: List[Path] = []
-    total = 0
-    if limit_val > 0:
-        heap: List[tuple] = []
-        for path in _iter_fragment_files(base):
-            total += 1
-            try:
-                mtime = path.stat().st_mtime
-            except Exception:
-                continue
-            entry = (mtime, path)
-            if len(heap) < limit_val:
-                heapq.heappush(heap, entry)
-            else:
-                if entry[0] > heap[0][0]:
-                    heapq.heapreplace(heap, entry)
-        heap.sort()
-        selected_paths = [item[1] for item in heap]
-    else:
-        selected_paths = list(_iter_fragment_files(base))
-        total = len(selected_paths)
+    from memory_index import indexed_fragment_count, indexed_fragment_rows, resolve_indexed_fragment
+    # Callers without an explicit cap are legacy maintenance paths. Bound them
+    # rather than silently turning an index failure into a complete tree walk.
+    selection_limit = limit_val if limit_val > 0 else 2048
+    rows = indexed_fragment_rows(base.parent / "memory_map.sqlite", limit=selection_limit)
+    selected_paths = [path for row in rows if (path := resolve_indexed_fragment(base, row))]
+    total = indexed_fragment_count(base.parent / "memory_map.sqlite")
 
     seen: Set[str] = set()
 

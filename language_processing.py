@@ -651,7 +651,11 @@ def persist_sound_features(
 def load_fragments(child, base_path: Optional[Path] = None):
     frag_path = _memory_root(child, base_path) / "fragments"
     fragments = []
-    for f in frag_path.glob("frag_*.json"):
+    from memory_index import indexed_fragment_rows, resolve_indexed_fragment
+    for row in indexed_fragment_rows(frag_path.parent / "memory_map.sqlite", limit=512):
+        f = resolve_indexed_fragment(frag_path, row)
+        if f is None:
+            continue
         try:
             with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)

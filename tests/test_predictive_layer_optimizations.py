@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from benchmark_predictive_memory import RESULTS_END, RESULTS_START, update_markdown_report
 
@@ -46,6 +47,14 @@ def test_recent_fragment_selection_is_bounded_and_newest_first(tmp_path, monkeyp
         path.touch()
         import os
         os.utime(path, (index, index))
+    with sqlite3.connect(str(root.parent / "memory_map.sqlite")) as connection:
+        connection.execute(
+            "CREATE TABLE fragments(frag_id TEXT, tier TEXT, filename TEXT, mtime_ns INTEGER, tags_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO fragments VALUES (?, ?, ?, ?, ?)",
+            [(str(index), "", f"frag_{index}.json", index, "[]") for index in range(20)],
+        )
     assert [item["id"] for item in load_recent_fragments("Ina", limit=3)] == [19, 18, 17]
 
 
