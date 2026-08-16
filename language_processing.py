@@ -2042,11 +2042,19 @@ def generate_symbolic_reply_from_text(
     Try to reply to a text prompt using Ina's known symbol vocabulary.
     Returns a dict with {"text", "symbols", "unknown"} or None if no match found.
     """
-    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text)]
+    surface_tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text)]
+    tokens = list(surface_tokens)
     if not tokens:
         return None
 
     reply_context: Dict[str, Any] = dict(context) if isinstance(context, dict) else {}
+    from semantic_event import build_native_intent, build_semantic_event
+    semantic_event = reply_context.get("semantic_event")
+    if not isinstance(semantic_event, dict):
+        semantic_event = build_semantic_event(text, reply_context.get("discourse"))
+        reply_context["semantic_event"] = semantic_event
+    native_intent = build_native_intent(semantic_event)
+    reply_context["native_intent"] = native_intent
     guidance_consumer = "daw" if str(reply_context.get("source") or "").casefold() == "daw_window" else "speech"
     learned_media_guidance = load_output_guidance(child, guidance_consumer, base_path=base_path)
     reply_context.setdefault("learned_media_guidance", learned_media_guidance)
@@ -2182,6 +2190,8 @@ def generate_symbolic_reply_from_text(
         "symbol_limit": symbol_limit,
         "language_context_shadow": language_context_shadow,
         "learned_media_guidance": learned_media_guidance,
+        "semantic_event": semantic_event,
+        "native_intent": native_intent,
     }
 
 

@@ -1,4 +1,5 @@
-from discourse_context import build_discourse_context, resolution_for, role_alignment
+from discourse_context import build_discourse_context, render_referent_gloss, resolution_for, retrieval_routes, role_alignment
+from semantic_event import build_native_intent, build_semantic_event
 from module_benchmarks import benchmark_module, list_benchmark_modules
 from neural_taxonomy import count_node_types, normalize_node_type
 from self_questions_format import format_questions
@@ -30,14 +31,46 @@ def test_historical_i_remains_bound_to_episode_speaker():
     assert alignment["recalled_referents"] == ["rowan"]
 
 
+def test_deictic_routes_and_ambiguous_glosses_preserve_uncertainty():
+    context = build_discourse_context(
+        "They remember your garden.", speaker="Sakura",
+        addressee={"id": "ina", "name": "Ina", "is_self": True},
+        mentioned_entities=("Rowan", "Mira"),
+    )
+    routes = retrieval_routes(context)
+    your = next(route for route in routes if route["surface"] == "your")
+    they = resolution_for(context, "they")
+    rendered, ambiguity = render_referent_gloss("they", they)
+    assert your["retrieval_terms"] == ["ina"]
+    assert your["status"] == "resolved"
+    assert rendered == "they[?=Rowan/Mira]"
+    assert ambiguity["confidence"] == 0.45
+
+
+def test_semantic_event_precedes_rendering_and_keeps_constructions():
+    discourse = build_discourse_context(
+        "I did not give you the key.", speaker="Sakura",
+        addressee={"id": "ina", "name": "Ina", "is_self": True},
+    )
+    event = build_semantic_event("I did not give you the key.", discourse)
+    assert event["events"][0]["agent"]["id"] == "sakura"
+    assert event["events"][0]["predicate"] == "give"
+    assert event["events"][0]["negated"] is True
+    assert event["events"][0]["arguments"]["recipient"]["referent"]["id"] == "self"
+    assert {"agent", "arguments", "negation"} <= set(event["construction_features"])
+    intent = build_native_intent(event)
+    assert intent["lexical_realizations"][:3] == ["i", "give", "you"]
+    assert {item["construction"] for item in intent["grammar"]} == {"tense", "negation"}
+
+
 def test_module_benchmark_compares_retained_versions_deterministically():
-    assert [spec.version for spec in list_benchmark_modules()["discourse"]] == ["V1", "V2"]
+    assert [spec.version for spec in list_benchmark_modules()["discourse"]] == ["V1", "V2", "V3"]
     first = benchmark_module("discourse")
     second = benchmark_module("discourse")
     assert [(row.version, row.accuracy, row.correct, row.total) for row in first] == [
-        ("V1", 0.0, 0, 8), ("V2", 1.0, 8, 8),
+        ("V1", 0.0, 0, 8), ("V2", 1.0, 8, 8), ("V3", 1.0, 5, 5),
     ]
-    assert [(row.version, row.accuracy) for row in second] == [("V1", 0.0), ("V2", 1.0)]
+    assert [(row.version, row.accuracy) for row in second] == [("V1", 0.0), ("V2", 1.0), ("V3", 1.0)]
 
 
 def test_neural_taxonomy_exposes_typed_logic_and_memory_nodes():

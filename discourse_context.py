@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 MODULE_NAME = "discourse"
-MODULE_VERSION = "V2"
+MODULE_VERSION = "V3"
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -79,14 +79,69 @@ def build_discourse_context(
             referent = subject if role == "current_referent" else prior
             referents = [referent] if referent else []
             ambiguous = referent is None
+        confidence = 1.0 if len(referents) == 1 and not ambiguous else (0.45 if referents else 0.0)
+        retrieval_terms = []
+        for referent in referents:
+            if not isinstance(referent, Mapping):
+                continue
+            for value in (referent.get("name"), referent.get("id")):
+                term = str(value or "").strip().casefold()
+                if term and term not in {"self", "unknown"} and term not in retrieval_terms:
+                    retrieval_terms.append(term)
         resolutions.append({
             "surface": surface, "token_index": index, "role": role,
             "possessive": possessive, "referents": referents[:8], "ambiguous": ambiguous,
+            "confidence": confidence, "retrieval_terms": retrieval_terms[:8],
         })
+    referent_table = {
+        "speaker": speaker_entity,
+        "addressee": addressee_entity,
+        "self": self_entity,
+        "current_referent": subject,
+        "prior_referent": prior,
+        "mentioned_entities": mentioned,
+    }
     return {
-        "version": 1, "speaker": speaker_entity, "addressee": addressee_entity,
+        "version": 2, "speaker": speaker_entity, "addressee": addressee_entity,
         "self": self_entity, "current_subject": subject,
-        "mentioned_entities": mentioned, "resolutions": resolutions[:32],
+        "mentioned_entities": mentioned, "referent_table": referent_table,
+        "resolutions": resolutions[:32],
+    }
+
+
+def retrieval_routes(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Expose bounded deictic routes without treating pronouns as concepts."""
+    routes = []
+    for item in list(context.get("resolutions") or ())[:32]:
+        if not isinstance(item, Mapping):
+            continue
+        referents = [dict(ref) for ref in item.get("referents") or () if isinstance(ref, Mapping)]
+        routes.append({
+            "surface": str(item.get("surface") or ""),
+            "token_index": item.get("token_index"),
+            "role": item.get("role"),
+            "possessive": bool(item.get("possessive")),
+            "status": "resolved" if len(referents) == 1 and not item.get("ambiguous") else "ambiguous",
+            "referents": referents[:8],
+            "retrieval_terms": list(item.get("retrieval_terms") or ())[:8],
+            "confidence": float(item.get("confidence") or 0.0),
+        })
+    return routes
+
+
+def render_referent_gloss(gloss: str, resolution: Mapping[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
+    """Mark an uncertain referent without pretending the guess is grounded."""
+    if not isinstance(resolution, Mapping) or not resolution.get("ambiguous"):
+        return str(gloss), None
+    alternatives = [
+        str(item.get("name") or item.get("id"))
+        for item in resolution.get("referents") or ()
+        if isinstance(item, Mapping) and (item.get("name") or item.get("id"))
+    ][:4]
+    suffix = "?" if not alternatives else "?=" + "/".join(alternatives)
+    return f"{gloss}[{suffix}]", {
+        "role": resolution.get("role"), "alternatives": alternatives,
+        "confidence": float(resolution.get("confidence") or 0.0),
     }
 
 
@@ -114,4 +169,4 @@ def role_alignment(current: Mapping[str, Any], recalled: Mapping[str, Any], surf
     }
 
 
-__all__ = ["DISCOURSE_TERMS", "build_discourse_context", "resolution_for", "role_alignment"]
+__all__ = ["DISCOURSE_TERMS", "build_discourse_context", "render_referent_gloss", "resolution_for", "retrieval_routes", "role_alignment"]

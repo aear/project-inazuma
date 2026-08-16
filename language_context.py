@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 from discourse_context import build_discourse_context
+from semantic_event import build_semantic_event
 from language_intelligence import DiscourseEntityMemory, analyze_utterance
 from learned_media_lessons import load_output_guidance
 from io_utils import file_lock
@@ -276,6 +277,7 @@ def build_language_context_snapshot(
         discourse=entity_memory,
         turn=len(turns),
     )
+    semantic_event = build_semantic_event(current_text, supplied_discourse)
     return {
         "version": 2,
         "enabled": True,
@@ -292,6 +294,8 @@ def build_language_context_snapshot(
         "recent_scene": turns,
         "reply_ancestry": reply_ids,
         "linguistic_analysis": linguistic_analysis,
+        "semantic_event": semantic_event,
+        "referent_table": dict(supplied_discourse.get("referent_table") or {}),
         "learned_media_guidance": learned_media_guidance,
         "candidate_referents": referents,
         "active_memory_references": memories,

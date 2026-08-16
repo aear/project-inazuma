@@ -198,3 +198,45 @@ def test_retrieval_declines_when_graph_exceeds_bound(tmp_path) -> None:
     adapter._relevance_cache = None
 
     assert adapter.recall_relevant("anything", max_graph_bytes=16) == []
+
+
+def test_pronoun_retrieval_routes_through_referent_not_surface_word(tmp_path) -> None:
+    graph_path = tmp_path / "Ina" / "memory" / "experiences" / "experience_graph.json"
+    graph_path.parent.mkdir(parents=True)
+    graph_path.write_text(json.dumps({
+        "events": [{"id": "ina_event", "narrative": "Ina guarded the memory.", "speaker": "Sakura"}],
+        "words_index": {"ina": ["ina_event"], "your": ["wrong_event"]},
+    }), encoding="utf-8")
+    adapter = object.__new__(LMStudioAdapter)
+    adapter.child = "Ina"
+    adapter._base_path = tmp_path
+    adapter._relevance_cache_signature = None
+    adapter._relevance_cache = None
+    scene = {"discourse": {
+        "resolutions": [{
+            "surface": "your", "role": "addressee", "possessive": True,
+            "referents": [{"id": "self", "name": "Ina", "is_self": True}],
+            "retrieval_terms": ["ina"], "confidence": 1.0, "ambiguous": False,
+        }]
+    }}
+
+    recalled = adapter.recall_relevant("your memory", scene=scene, max_items=2)
+
+    assert [item["event_id"] for item in recalled] == ["ina_event"]
+    assert recalled[0]["cue"] == "ina"
+    assert recalled[0]["surface_cue"] == "your"
+    assert recalled[0]["retrieval_route"]["kind"] == "deictic_referent"
+
+
+def test_core_recall_description_names_witness_instead_of_empty_cue() -> None:
+    adapter = object.__new__(LMStudioAdapter)
+    adapter.child = "Ina"
+    considered = adapter.consider_recalled_memories(
+        "living memory",
+        [{"event_id": "anchor", "cue": "", "summary": "living memory", "source": "continuity_core"}],
+        scene={"topic_terms": ["living", "memory"], "signals": {}},
+        threshold=0.9,
+    )
+    description = considered["rejected"][0]["consideration"]["description"]
+    assert "through ''" not in description
+    assert "continuity_core" in description

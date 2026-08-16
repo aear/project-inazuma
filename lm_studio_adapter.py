@@ -20,7 +20,7 @@ from language_processing import (
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
 from model_manager import load_config, seed_self_question
-from discourse_context import DISCOURSE_TERMS, build_discourse_context, role_alignment
+from discourse_context import DISCOURSE_TERMS, build_discourse_context, retrieval_routes, role_alignment
 from continuity_manager import ContinuityManager
 
 
@@ -168,6 +168,7 @@ class LMStudioAdapter:
         self,
         prompt: str,
         *,
+        scene: Optional[Dict[str, Any]] = None,
         max_items: int = 3,
         max_chars: int = 800,
         max_graph_bytes: int = 8 * 1024 * 1024,
@@ -207,8 +208,31 @@ class LMStudioAdapter:
         remaining = max(0, int(max_chars))
         references: List[Dict[str, Any]] = []
         seen_events = set()
-        cues = list(dict.fromkeys(self._tokenize(prompt)))
-        for cue in cues:
+        scene = scene if isinstance(scene, dict) else {}
+        present_discourse = scene.get("discourse") if isinstance(scene.get("discourse"), dict) else {}
+        cue_routes = []
+        for cue in list(dict.fromkeys(self._tokenize(prompt))):
+            if cue not in DISCOURSE_TERMS:
+                cue_routes.append({"surface": cue, "lookup_term": cue, "kind": "lexical", "status": "resolved"})
+        for route in retrieval_routes(present_discourse):
+            for term in route.get("retrieval_terms") or ():
+                cue_routes.append({
+                    "surface": route.get("surface"), "lookup_term": str(term),
+                    "kind": "deictic_referent", "status": route.get("status"),
+                    "role": route.get("role"), "referents": route.get("referents") or [],
+                    "confidence": route.get("confidence"),
+                })
+        unique_routes = []
+        seen_routes = set()
+        for route in cue_routes:
+            key = (route.get("surface"), route.get("lookup_term"), route.get("kind"))
+            if key not in seen_routes:
+                unique_routes.append(route)
+                seen_routes.add(key)
+        for route in unique_routes[:32]:
+            cue = str(route.get("lookup_term") or "").casefold()
+            if not cue or route.get("status") == "ambiguous":
+                continue
             event_ids = words_index.get(cue) or []
             if not isinstance(event_ids, list):
                 continue
@@ -225,6 +249,7 @@ class LMStudioAdapter:
                 references.append({
                     "event_id": str(event_id),
                     "cue": cue,
+                    "surface_cue": route.get("surface"),
                     "summary": summary,
                     "tags": list(event.get("situation_tags") or [])[:8],
                     "source": "experience_graph.words_index",
@@ -233,6 +258,12 @@ class LMStudioAdapter:
                     "path": str(path),
                     "speaker": str(event.get("speaker") or (event.get("internal_state") or {}).get("speaker") or "unknown")[:80],
                     "discourse": self._episode_discourse(event),
+                    "retrieval_route": {
+                        **route,
+                        "lookup_term": cue,
+                        "witness": "experience_graph.words_index",
+                        "event_id": str(event_id),
+                    },
                 })
                 seen_events.add(str(event_id))
                 remaining -= len(summary)
@@ -273,6 +304,7 @@ class LMStudioAdapter:
                 continue
             candidate = dict(raw)
             cue = str(candidate.get("cue") or "").lower()
+            surface_cue = str(candidate.get("surface_cue") or cue).lower()
             summary_terms = set(self._tokenize(str(candidate.get("summary") or ""))) - _STOPWORDS
             tag_terms = {
                 token
@@ -289,8 +321,8 @@ class LMStudioAdapter:
             discourse_alignment = role_alignment(
                 present_discourse,
                 candidate.get("discourse") if isinstance(candidate.get("discourse"), dict) else {},
-                cue,
-            ) if cue in DISCOURSE_TERMS else {
+                surface_cue,
+            ) if surface_cue in DISCOURSE_TERMS else {
                 "available": False, "matched": False, "score": 0.0,
             }
             if discourse_alignment.get("available"):
@@ -303,11 +335,23 @@ class LMStudioAdapter:
                 "threshold": round(bounded_threshold, 4),
                 "support_terms": support_terms[:8],
                 "discourse_alignment": discourse_alignment,
+                "retrieval_route": dict(candidate.get("retrieval_route") or {
+                    "kind": "continuity_core" if not cue else "lexical",
+                    "lookup_term": cue or None,
+                    "surface": surface_cue or None,
+                    "witness": candidate.get("source") or "unknown",
+                }),
             }
+            route = candidate["consideration"]["retrieval_route"]
+            route_label = (
+                f"{route.get('surface')!r} → {route.get('role')}:{route.get('lookup_term')}"
+                if route.get("kind") == "deictic_referent"
+                else str(route.get("lookup_term") or route.get("witness") or "continuity core")
+            )
             if score >= bounded_threshold:
                 candidate["consideration"]["decision"] = "accepted"
                 candidate["consideration"]["description"] = (
-                    f"I recalled this through {cue!r} and decided it fits this scene: "
+                    f"I recalled this via {route_label} and decided it fits this scene: "
                     + str(candidate.get("summary") or "")
                 )[:420]
                 accepted.append(candidate)
@@ -315,7 +359,7 @@ class LMStudioAdapter:
                 candidate["consideration"]["decision"] = "rejected"
                 candidate["consideration"]["reason"] = "insufficient_scene_support"
                 candidate["consideration"]["description"] = (
-                    f"I recalled this through {cue!r}: "
+                    f"I recalled this via {route_label}: "
                     + str(candidate.get("summary") or "")
                     + " I decided not to use it because the present scene did not support it enough."
                 )[:420]

@@ -983,13 +983,28 @@ def encode_selected_text_expression(
     selected_text = str(text or "").strip()
     if not selected_text:
         return "", {"effective_language_mode": "none"}
+    context = context if isinstance(context, dict) else {}
+    from discourse_context import build_discourse_context, render_referent_gloss, resolution_for
+    from semantic_event import build_semantic_event
+    supplied_discourse = context.get("discourse") if isinstance(context.get("discourse"), dict) else {}
+    if not supplied_discourse:
+        supplied_discourse = build_discourse_context(
+            selected_text,
+            speaker=context.get("speaker") or {"id": child, "name": child, "is_self": True},
+            addressee=context.get("addressee") or "unknown",
+            self_identity={"id": child, "name": child, "is_self": True},
+            mentioned_entities=context.get("mentioned_entities") or (),
+        )
+    semantic_event = build_semantic_event(selected_text, supplied_discourse)
     encoded = generate_symbolic_reply_from_text(
         selected_text,
         child=child,
         base_path=Path("AI_Children"),
         max_symbols=max_symbols,
         context={
-            **(context if isinstance(context, dict) else {}),
+            **context,
+            "discourse": supplied_discourse,
+            "semantic_event": semantic_event,
             "source": "discord_selected_expression",
             "source_text": selected_text,
             "tokens": _extract_tokens(selected_text),
@@ -1045,6 +1060,7 @@ def encode_selected_text_expression(
     resolved_native_tokens = []
     resolved_gloss_tokens = []
     literal_gloss_tokens = []
+    ambiguity_glosses = []
     unresolved_linguistic_tokens = []
     emotion_sound_tokens = []
     for index, symbol in enumerate(symbols):
@@ -1052,7 +1068,16 @@ def encode_selected_text_expression(
             continue
         native_token = str(aligned_native_tokens[index])
         if index < len(aligned_gloss_tokens) and symbol in gloss_sources:
-            literal_gloss_tokens.append(str(aligned_gloss_tokens[index]))
+            gloss = str(aligned_gloss_tokens[index])
+            surface = response_tokens[index].casefold() if index < len(response_tokens) else ""
+            resolution = resolution_for(supplied_discourse, surface) if surface else None
+            if resolution and resolution.get("ambiguous"):
+                gloss, ambiguity = render_referent_gloss(gloss, resolution)
+                ambiguity_glosses.append({
+                    "token_index": index, "surface": surface,
+                    **(ambiguity or {}),
+                })
+            literal_gloss_tokens.append(gloss)
         if index in paralinguistic_indexes:
             emotion_sound_tokens.append(str(symbol))
             continue
@@ -1113,6 +1138,10 @@ def encode_selected_text_expression(
         "selected_expression_emotion_sound_signal": emotion_sound_text or None,
         "native_translation_token_count": len(response_tokens),
         "native_translation_symbol_count": len(symbols),
+        "semantic_event": semantic_event,
+        "native_intent": dict((encoded or {}).get("native_intent") or {}),
+        "discourse": supplied_discourse,
+        "ambiguity_glosses": ambiguity_glosses,
     }
     if not translation_complete:
         _, requested_mode = select_symbolic_message_text(
@@ -1729,12 +1758,23 @@ def process_inbound_message(msg) -> CommsResponse:
             memory_limit = max(0, min(8, int(root_cfg.get("conversation_scene_memory_limit", 3))))
             memory_chars = max(0, min(2400, int(root_cfg.get("conversation_scene_memory_chars", 800))))
             memory_graph_bytes = max(1024, int(root_cfg.get("conversation_scene_memory_graph_max_bytes", 8 * 1024 * 1024)))
-            retrieved_candidates = recall_relevant(
-                user_text,
-                max_items=memory_limit,
-                max_chars=memory_chars,
-                max_graph_bytes=memory_graph_bytes,
-            )
+            try:
+                retrieved_candidates = recall_relevant(
+                    user_text,
+                    scene=conversation_scene,
+                    max_items=memory_limit,
+                    max_chars=memory_chars,
+                    max_graph_bytes=memory_graph_bytes,
+                )
+            except TypeError as exc:
+                if "scene" not in str(exc):
+                    raise
+                retrieved_candidates = recall_relevant(
+                    user_text,
+                    max_items=memory_limit,
+                    max_chars=memory_chars,
+                    max_graph_bytes=memory_graph_bytes,
+                )
             candidate_by_key = {}
             for candidate in [*prior_memory_candidates, *retrieved_candidates]:
                 if not isinstance(candidate, dict):
@@ -2157,6 +2197,8 @@ def process_inbound_message(msg) -> CommsResponse:
                 metadata["code_pointer_signal"] = code_pointer_signal
 
     if reply_text:
+        inbound_discourse = conversation_scene.get("discourse") if isinstance(conversation_scene.get("discourse"), dict) else {}
+        inbound_speaker = inbound_discourse.get("speaker") or {"id": "unknown", "name": "unknown"}
         reply_text, encoding_metadata = encode_selected_text_expression(
             reply_text,
             child=child,
@@ -2169,6 +2211,9 @@ def process_inbound_message(msg) -> CommsResponse:
                 "tags": ["discord", "selected_expression", selected_strategy],
                 "channel": msg.channel.name,
                 "expression_drive": urge_level,
+                "speaker": {"id": child, "name": child, "is_self": True},
+                "addressee": inbound_speaker,
+                "mentioned_entities": conversation_scene.get("participants") or (),
             },
         )
         metadata.update(encoding_metadata)

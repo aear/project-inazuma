@@ -86,6 +86,32 @@ def _role_aware_discourse() -> dict[str, Any]:
     return {"correct": sum(row["correct"] for row in rows), "total": len(rows), "cases": rows}
 
 
+def _referent_event_discourse() -> dict[str, Any]:
+    from discourse_context import render_referent_gloss, retrieval_routes
+    from semantic_event import build_native_intent, build_semantic_event
+    context = build_discourse_context(
+        "They did not give your key back.", speaker={"id": "sakura", "name": "Sakura"},
+        addressee={"id": "ina", "name": "Ina", "is_self": True},
+        mentioned_entities=("Rowan", "Mira"),
+    )
+    routes = retrieval_routes(context)
+    your = next((route for route in routes if route.get("surface") == "your"), {})
+    they = resolution_for(context, "they") or {}
+    gloss, ambiguity = render_referent_gloss("they", they)
+    event = build_semantic_event("I did not give you the key.", build_discourse_context(
+        "I did not give you the key.", speaker="Sakura",
+        addressee={"id": "ina", "name": "Ina", "is_self": True},
+    ))
+    intent = build_native_intent(event)
+    return _capability([
+        {"case": "pronoun retrieval uses resolved entity term", "component": "retrieval", "correct": your.get("retrieval_terms") == ["ina"]},
+        {"case": "ambiguous gloss retains alternatives", "component": "rendering", "correct": gloss == "they[?=Rowan/Mira]" and ambiguity.get("confidence") == 0.45},
+        {"case": "semantic event retains predicate and negation scope", "component": "event_graph", "correct": event["events"][0]["predicate"] == "give" and event["events"][0]["negated"] is True},
+        {"case": "referent table is shared explicitly", "component": "discourse", "correct": context.get("referent_table", {}).get("addressee", {}).get("name") == "Ina"},
+        {"case": "native intent carries grammatical constructions before symbols", "component": "native_intent", "correct": {item.get("construction") for item in intent.get("grammar", [])} == {"tense", "negation"}},
+    ])
+
+
 def _capability(cases: list[dict[str, Any]]) -> dict[str, Any]:
     return {"correct": sum(bool(case.get("correct")) for case in cases), "total": len(cases), "cases": cases}
 
@@ -1038,6 +1064,7 @@ _REGISTRY = {
     "discourse": (
         ModuleVersion("discourse", "V1", "Legacy lexical stopword behavior", _legacy_discourse),
         ModuleVersion("discourse", "V2", "Speaker/addressee and deictic role resolution", _role_aware_discourse),
+        ModuleVersion("discourse", "V3", "Unified referents, retrieval routes, semantic events, and uncertain glosses", _referent_event_discourse),
     ),
     "q_decoder": (ModuleVersion("q_decoder", "V1", "Fixed bit tables", _q_decoder_v1), ModuleVersion("q_decoder", "V2", "Experience-adaptive bit meanings", _q_decoder_v2)),
     "bridge_origin": (ModuleVersion("bridge_origin", "V1", "Question text without origin", _bridge_origin_v1), ModuleVersion("bridge_origin", "V2", "Composable contradiction origin", _bridge_origin_v2)),

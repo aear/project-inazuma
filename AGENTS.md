@@ -169,6 +169,20 @@ Tune behaviour through the `neural_map_policy` block in `config.json`:
 This keeps neuron/synapse maps adaptive and slow-drifting so Ina refines structure
 over time instead of tearing it down every cycle.
 
+## Language meaning pipeline
+
+- Preserve the ordered boundary: conversation scene -> authoritative referents
+  -> semantic event -> memory candidates -> native intent -> native symbols ->
+  human rendering.
+- Pronouns and deixis are retrieval routes to resolved entities, never ordinary
+  lexical memory concepts. Preserve their surface form as provenance.
+- English glosses must expose unresolved referents and alternatives instead of
+  presenting one guess as grounded translation.
+- Keep retrieval-route provenance bounded and inspectable through witness,
+  lookup term, referent role, candidate score, and final decision.
+- Extend native grammar from semantic roles and constructions. Do not rebuild
+  native utterances by translating English words out and back again.
+
 ## Development principles
 
 ### Prefer reuse over reimplementation

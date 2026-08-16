@@ -298,9 +298,16 @@ def bound_memory_references(
         result.append({
             "event_id": str(raw.get("event_id") or "") or None,
             "cue": cue or None,
+            "surface_cue": _bounded_text(raw.get("surface_cue"), 80) or None,
             "summary": summary,
             "tags": [str(tag)[:64] for tag in (raw.get("tags") or [])[:8]],
             "source": str(raw.get("source") or "grounded_experience")[:80],
+            "retrieval_route": {
+                key: raw.get("retrieval_route", {}).get(key)
+                for key in ("kind", "surface", "lookup_term", "role", "status", "witness", "event_id")
+                if isinstance(raw.get("retrieval_route"), Mapping)
+                and raw.get("retrieval_route", {}).get(key) is not None
+            },
         })
         remaining -= len(summary)
     return result
