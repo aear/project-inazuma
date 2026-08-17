@@ -8,10 +8,12 @@ from tkinter import messagebox, ttk
 from typing import Any, Mapping
 
 from self_questions_format import format_question, format_questions
+from runtime_state import set_self_question_hidden
 
 class SelfQuestionsWindow:
-    def __init__(self, parent: tk.Misc, path: Path) -> None:
+    def __init__(self, parent: tk.Misc, path: Path, *, child: str | None = None) -> None:
         self.path = Path(path)
+        self.child = child
         self.entries: list[dict[str, Any]] = []
         self.visible_indices: list[int] = []
         self.window = tk.Toplevel(parent)
@@ -27,10 +29,14 @@ class SelfQuestionsWindow:
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self.show_resolved = tk.BooleanVar(value=True)
+        self.show_hidden = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="Show resolved", variable=self.show_resolved, command=self._render).pack(side=tk.LEFT)
+        ttk.Checkbutton(toolbar, text="Show hidden", variable=self.show_hidden, command=self._render).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Reload", command=self.reload).pack(side=tk.RIGHT)
         ttk.Button(toolbar, text="Copy all", command=self.copy_all).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(toolbar, text="Copy selected", command=self.copy_selected).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(toolbar, text="Reveal selected", command=lambda: self.set_selected_hidden(False)).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(toolbar, text="Hide selected", command=lambda: self.set_selected_hidden(True)).pack(side=tk.RIGHT, padx=(0, 6))
 
         panes = ttk.Panedwindow(outer, orient=tk.VERTICAL)
         panes.grid(row=1, column=0, sticky="nsew")
@@ -78,14 +84,18 @@ class SelfQuestionsWindow:
             resolved = bool(entry.get("resolved_at"))
             if resolved and not self.show_resolved.get():
                 continue
+            if entry.get("hidden") and not self.show_hidden.get():
+                continue
             iid = str(index)
             self.visible_indices.append(index)
             origins = entry.get("origins") or entry.get("provenance") or []
             latest = origins[-1] if isinstance(origins, list) and origins else {}
-            trigger = latest.get("module") or latest.get("transformer") or latest.get("source") or ""
+            triggers = entry.get("trigger_history") or []
+            latest_trigger = triggers[-1] if isinstance(triggers, list) and triggers else {}
+            trigger = latest_trigger.get("trigger") or latest.get("trigger") or latest.get("module") or latest.get("transformer") or latest.get("source") or ""
             self.tree.insert("", tk.END, iid=iid, values=(
                 entry.get("question"), trigger, int(entry.get("count", 1) or 1),
-                "resolved" if resolved else "open",
+                "hidden" if entry.get("hidden") else ("resolved" if resolved else "open"),
                 entry.get("last_updated") or entry.get("first_asked") or "",
             ))
         self.status.set(f"{len(self.visible_indices)} visible · {len(self.entries)} total")
@@ -115,6 +125,15 @@ class SelfQuestionsWindow:
 
     def copy_all(self) -> None:
         self._copy([self.entries[index] for index in self.visible_indices])
+
+    def set_selected_hidden(self, hidden: bool) -> None:
+        selected = self._selected_entries()
+        if not selected:
+            messagebox.showinfo("Self Questions", "Nothing is selected.", parent=self.window)
+            return
+        changed = sum(bool(set_self_question_hidden(entry["question"], hidden, child=self.child)) for entry in selected)
+        self.reload()
+        self.status.set(f"{'Hidden' if hidden else 'Revealed'} {changed} question(s)")
 
 
 __all__ = ["SelfQuestionsWindow", "format_question", "format_questions"]

@@ -261,6 +261,12 @@ def _load_self_question_entries(child: Optional[str] = None) -> List[Dict[str, A
                 normalized["resolved_reason"] = entry.get("resolved_reason")
             if entry.get("resolution_history"):
                 normalized["resolution_history"] = entry.get("resolution_history")
+            if entry.get("hidden"):
+                normalized["hidden"] = True
+            if entry.get("hidden_at"):
+                normalized["hidden_at"] = entry.get("hidden_at")
+            if entry.get("trigger_history"):
+                normalized["trigger_history"] = list(entry.get("trigger_history") or [])[-32:]
             provenance = normalize_origins(entry.get("origins") or entry.get("provenance"))
             if provenance:
                 normalized["origins"] = provenance
@@ -279,6 +285,7 @@ def seed_self_question(
     question: str, *, child: Optional[str] = None,
     origin: Optional[Dict[str, Any]] = None,
     provenance: Optional[Dict[str, Any]] = None,
+    trigger: Optional[str] = None,
 ) -> None:
     if not question:
         return
@@ -286,6 +293,16 @@ def seed_self_question(
     entries = _load_self_question_entries(target_child)
     now_iso = datetime.now(timezone.utc).isoformat()
     normalized_question = question.strip()
+    supplied_origin = origin or provenance
+    normalized_origins = normalize_origins(supplied_origin)
+    latest_origin = normalized_origins[-1] if normalized_origins else {}
+    trigger_record = {
+        "timestamp": now_iso,
+        "trigger": str(trigger or latest_origin.get("trigger") or "question_seeded")[:160],
+        "source": str(latest_origin.get("module") or "runtime_state")[:160],
+    }
+    if latest_origin.get("event_id"):
+        trigger_record["event_id"] = str(latest_origin.get("event_id"))[:240]
     existing = None
     for entry in entries:
         if entry.get("question") == normalized_question:
@@ -297,10 +314,12 @@ def seed_self_question(
         existing["last_updated"] = now_iso
         existing.pop("resolved_at", None)
         existing.pop("resolved_reason", None)
-        supplied_origin = origin or provenance
-        if supplied_origin:
+        history = existing.setdefault("trigger_history", [])
+        history.append(trigger_record)
+        del history[:-32]
+        if normalized_origins:
             history = existing.setdefault("origins", [])
-            history.extend(normalize_origins(supplied_origin))
+            history.extend(normalized_origins)
             del history[:-16]
     else:
         entry = {
@@ -308,16 +327,42 @@ def seed_self_question(
             "first_asked": now_iso,
             "last_updated": now_iso,
             "count": 1,
+            "trigger_history": [trigger_record],
         }
-        bounded = normalize_origins(origin or provenance)
-        if bounded:
-            entry["origins"] = bounded
+        if normalized_origins:
+            entry["origins"] = normalized_origins
         entries.append(entry)
 
     entries.sort(key=lambda item: item.get("first_asked", now_iso))
     entries = entries[-100:]
     _save_self_question_entries(entries, target_child)
     log_to_statusbox(f"[Manager] Self-question seeded: {normalized_question}")
+
+
+def set_self_question_hidden(
+    question: str, hidden: bool = True, *, child: Optional[str] = None,
+) -> bool:
+    """Durably hide or reveal a question without resolving or deleting it."""
+    if not question:
+        return False
+    target_child = child or _current_child()
+    entries = _load_self_question_entries(target_child)
+    lower = question.strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = False
+    for entry in entries:
+        if str(entry.get("question") or "").strip().lower() != lower:
+            continue
+        if hidden:
+            entry["hidden"] = True
+            entry["hidden_at"] = now_iso
+        else:
+            entry.pop("hidden", None)
+            entry.pop("hidden_at", None)
+        updated = True
+    if updated:
+        _save_self_question_entries(entries, target_child)
+    return updated
 
 
 def mark_self_question_resolved(

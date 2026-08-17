@@ -114,6 +114,8 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert 'id="imagePicker"' in source
     assert "clipboardData" in source
     assert "MAX_IMAGE_TOTAL_BYTES" in source
+    assert 'id="threadPicker"' in source
+    assert "/api/thread/resume" in source
 
 
 def test_client_disconnect_benchmark_v1_raises_and_v2_is_quiet(monkeypatch):
@@ -226,6 +228,44 @@ def test_image_only_prompt_reaches_turn_start_without_persistence(tmp_path):
     assert captured["params"]["input"] == [{
         "type": "image", "url": tiny_png, "detail": "auto",
     }]
+
+
+def test_thread_navigation_is_workspace_local_bounded_and_restores_transcript(tmp_path):
+    client = _notification_client(tmp_path)
+    calls = []
+
+    def request(method, params):
+        calls.append((method, params))
+        if method == "thread/list":
+            return {"data": [{
+                "id": "thread-2", "name": "Earlier work", "preview": "A preview",
+                "updatedAt": 42, "status": {"type": "idle"}, "threadSource": "vscode",
+            }]}
+        if method == "thread/resume":
+            return {"model": "codex-test", "thread": {
+                "id": "thread-2", "name": "Earlier work", "status": {"type": "idle"},
+                "turns": [{"items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "hello"}]},
+                    {"type": "agentMessage", "text": "hi there"},
+                    {"type": "commandExecution", "command": "ignored"},
+                ]}],
+            }}
+        raise AssertionError(method)
+
+    client.request = request
+    client.account = lambda refresh=False: {"type": "chatgpt"}
+    listed = client.list_threads(999)
+    resumed = client.resume_thread("thread-2")
+
+    assert listed["threads"][0]["name"] == "Earlier work"
+    assert calls[0][1]["cwd"] == str(Path(tmp_path))
+    assert calls[0][1]["limit"] == 50
+    assert calls[0][1]["useStateDbOnly"] is True
+    assert resumed["transcript"] == [
+        {"kind": "user", "summary": "hello"},
+        {"kind": "assistant", "summary": "hi there"},
+    ]
+    assert client.thread_id == "thread-2"
 
 
 def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path):

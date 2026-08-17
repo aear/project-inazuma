@@ -14,6 +14,19 @@ def format_question(entry: Mapping[str, Any]) -> str:
         lines.append(f"Resolved: {entry.get('resolved_at')}")
     if entry.get("resolved_reason"):
         lines.append(f"Reason: {entry.get('resolved_reason')}")
+    if entry.get("hidden"):
+        lines.append(f"Hidden from display: {entry.get('hidden_at') or 'yes'}")
+    triggers = entry.get("trigger_history")
+    if isinstance(triggers, list):
+        for index, item in enumerate(triggers[-32:], 1):
+            if not isinstance(item, Mapping):
+                continue
+            summary = str(item.get("trigger") or "unknown")
+            if item.get("source"):
+                summary += f" from {item.get('source')}"
+            if item.get("event_id"):
+                summary += f" (event {item.get('event_id')})"
+            lines.append(f"Trigger {index}: {summary} at {item.get('timestamp') or 'unknown'}")
     origins = entry.get("origins") or entry.get("provenance")
     if isinstance(origins, Mapping):
         origins = [origins]

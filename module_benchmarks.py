@@ -454,6 +454,28 @@ def _question_origin_v2() -> dict[str, Any]:
     return _capability([{"case": "clipboard exposes trigger chain", "actual": rendered, "correct": "BridgeTransformer@V2" in rendered and "frag-7" in rendered}])
 
 
+def _question_display_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "each occurrence retains its trigger", "correct": False},
+        {"case": "question can be hidden without deletion", "correct": False},
+        {"case": "hidden state is reversible", "correct": False},
+    ])
+
+
+def _question_display_v2() -> dict[str, Any]:
+    from self_questions_format import format_question
+    rendered = format_question({
+        "question": "What changed?", "hidden": True, "hidden_at": "t2",
+        "trigger_history": [{"timestamp": "t1", "trigger": "prediction_mismatch", "source": "logic"}],
+    })
+    source = Path("runtime_state.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "each occurrence retains its trigger", "correct": "Trigger 1: prediction_mismatch" in rendered},
+        {"case": "question can be hidden without deletion", "correct": "set_self_question_hidden" in source and "Hidden from display" in rendered},
+        {"case": "hidden state is reversible", "correct": 'entry.pop("hidden", None)' in source},
+    ])
+
+
 def _language_v1() -> dict[str, Any]:
     source = _v1_text("language_context.py")
     components = ("composition", "morphology", "constructions", "pragmatics", "discourse", "uncertainty", "counterfactuals", "reading_spans")
@@ -956,6 +978,21 @@ def _codex_harness_v3() -> dict[str, Any]:
     ])
 
 
+def _codex_harness_v4() -> dict[str, Any]:
+    source = Path("codex_harness.py").read_text(encoding="utf-8")
+    ui = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "workspace-local bounded thread list", "component": "threads",
+         "correct": '"thread/list"' in source and "MAX_THREAD_LIST = 50" in source and '"cwd": str(self.config.root)' in source},
+        {"case": "thread resume preserves approval policy", "component": "safety",
+         "correct": '"thread/resume"' in source and '"approvalsReviewer": "user"' in source},
+        {"case": "bounded transcript restoration", "component": "memory",
+         "correct": "MAX_TRANSCRIPT_EVENTS" in source and "data.transcript" in ui},
+        {"case": "thread navigation remains an operator control", "component": "scope",
+         "correct": 'id="threadPicker"' in ui and "contenteditable" not in ui.lower()},
+    ])
+
+
 def _thread_governor_v1() -> dict[str, Any]:
     source = _v1_text("AGENTS.md")
     return _capability([
@@ -1078,6 +1115,7 @@ _REGISTRY = {
     "fragment_repair": (ModuleVersion("fragment_repair", "V1", "Legacy salvage or quarantine without mirror recovery", _fragment_repair_v1), ModuleVersion("fragment_repair", "V2", "Intent-gated verified mirror recovery with retained original", _fragment_repair_v2)),
     "soul_drift": (ModuleVersion("soul_drift", "V1", "Link drift without emotion direction", _soul_v1), ModuleVersion("soul_drift", "V2", "Indexed links and emotion-directed drift", _soul_v2)),
     "self_question_origins": (ModuleVersion("self_question_origins", "V1", "Question metadata only", _question_origin_v1), ModuleVersion("self_question_origins", "V2", "Composable trigger chain export", _question_origin_v2)),
+    "self_question_display": (ModuleVersion("self_question_display", "V1", "Latest timestamp and resolved state only", _question_display_v1), ModuleVersion("self_question_display", "V2", "Bounded trigger history and reversible display hiding", _question_display_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
     "language_components": (ModuleVersion("language_components", "V1", "Historical language context", _language_v1), ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2)),
     "discord_retention": (ModuleVersion("discord_retention", "V1", "Unbounded delivery history", _discord_retention_v1), ModuleVersion("discord_retention", "V2", "Bounded history and buffers", _discord_retention_v2)),
@@ -1097,6 +1135,7 @@ _REGISTRY = {
         ModuleVersion("codex_harness", "V1", "Historical VS Code-hosted Codex workflow", _codex_harness_v1),
         ModuleVersion("codex_harness", "V2", "Standalone subscription-only app-server GUI", _codex_harness_v2),
         ModuleVersion("codex_harness", "V3", "Bounded app-server operator console", _codex_harness_v3),
+        ModuleVersion("codex_harness", "V4", "Bounded workspace thread navigation", _codex_harness_v4),
     ),
     "thread_governor": (
         ModuleVersion("thread_governor", "V1", "Historical unmanaged module thread pools", _thread_governor_v1),

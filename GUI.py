@@ -1807,7 +1807,7 @@ def open_logs():
     if not log_path.exists():
         messagebox.showinfo("Log", "No log found.")
         return
-    SelfQuestionsWindow(root, log_path)
+    SelfQuestionsWindow(root, log_path, child=str(child))
 
 
 def open_module_benchmarks():

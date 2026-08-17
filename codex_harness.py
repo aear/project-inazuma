@@ -31,6 +31,8 @@ MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_PROMPT_CHARS + ((MAX_IMAGE_TOTAL_BYTES + 2) // 3 * 4) + 65536
+MAX_THREAD_LIST = 50
+MAX_TRANSCRIPT_EVENTS = 240
 IMAGE_MEDIA_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
 REQUEST_TIMEOUT_SECONDS = 30.0
 BLOCKED_BILLING_ENV = {
@@ -384,6 +386,87 @@ class AppServerClient:
         self.events.append("status", {"new_thread": self.thread_id})
         return {"thread_id": self.thread_id, "model": self.active_model}
 
+    @staticmethod
+    def _thread_summary(thread: Any) -> dict[str, Any] | None:
+        if not isinstance(thread, dict) or not thread.get("id"):
+            return None
+        status = thread.get("status")
+        if isinstance(status, dict):
+            status = status.get("type")
+        return {
+            "id": str(thread["id"]),
+            "name": str(thread.get("name") or thread.get("preview") or "Untitled thread")[:240],
+            "preview": str(thread.get("preview") or "")[:500],
+            "updated_at": thread.get("updatedAt") or thread.get("recencyAt") or thread.get("createdAt"),
+            "status": str(status or "idle"),
+            "source": thread.get("threadSource") or thread.get("source"),
+        }
+
+    def list_threads(self, limit: int = MAX_THREAD_LIST) -> dict[str, Any]:
+        """Return a bounded, workspace-local thread picker without rollout scans."""
+        result = self.request("thread/list", {
+            "cwd": str(self.config.root),
+            "limit": max(1, min(MAX_THREAD_LIST, int(limit))),
+            "sortKey": "recency_at",
+            "sortDirection": "desc",
+            "sourceKinds": ["appServer", "vscode", "cli"],
+            "useStateDbOnly": True,
+        })
+        rows = result.get("data") if isinstance(result, dict) else []
+        threads = [summary for row in (rows or []) if (summary := self._thread_summary(row))]
+        return {"threads": threads, "current_thread_id": self.thread_id}
+
+    @staticmethod
+    def _thread_transcript(thread: Any) -> list[dict[str, str]]:
+        transcript: list[dict[str, str]] = []
+        turns = thread.get("turns") if isinstance(thread, dict) else []
+        for turn in turns or []:
+            for item in (turn.get("items") if isinstance(turn, dict) else []) or []:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+                kind = "assistant" if item_type == "agentMessage" else "user" if item_type == "userMessage" else ""
+                if not kind:
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    pieces = item.get("content") or []
+                    text = "\n".join(
+                        str(piece.get("text")) for piece in pieces
+                        if isinstance(piece, dict) and piece.get("text")
+                    )
+                if text:
+                    transcript.append({"kind": kind, "summary": str(text)[:MAX_EVENT_CHARS]})
+        return transcript[-MAX_TRANSCRIPT_EVENTS:]
+
+    def resume_thread(self, thread_id: str) -> dict[str, Any]:
+        if self.running_turn:
+            raise RuntimeError("Interrupt or finish the active turn before switching threads.")
+        thread_id = str(thread_id or "").strip()
+        if not thread_id or len(thread_id) > 160:
+            raise ValueError("A valid bounded thread id is required.")
+        self.account(refresh=False)
+        result = self.request("thread/resume", {
+            "threadId": thread_id,
+            "cwd": str(self.config.root),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": "workspace-write",
+        })
+        thread = result.get("thread") if isinstance(result, dict) else {}
+        summary = self._thread_summary(thread)
+        if summary is None or summary["id"] != thread_id:
+            raise RuntimeError("Codex did not resume the requested thread.")
+        self.thread_id = thread_id
+        self.turn_id = None
+        self.active_model = str(result.get("model") or "") or None
+        self.thread_status = summary["status"]
+        self.turn_status = "idle"
+        self.running_turn = False
+        self.work_status = "Ready"
+        self.events.append("status", {"resumed_thread": thread_id})
+        return {"thread": summary, "transcript": self._thread_transcript(thread), "model": self.active_model}
+
     def send_prompt(
         self, prompt: str, *, model: str | None = None,
         effort: str | None = None, collaboration_mode: str = "default",
@@ -603,6 +686,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/capabilities":
                 self._json(self.server.client.capabilities())
                 return
+            if parsed.path == "/api/threads":
+                query = parse_qs(parsed.query)
+                limit = int((query.get("limit") or [str(MAX_THREAD_LIST)])[0])
+                self._json(self.server.client.list_threads(limit))
+                return
         except (ValueError, RuntimeError, TimeoutError) as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -631,6 +719,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/new":
                 self._json(self.server.client.new_thread(model=payload.get("model")))
+                return
+            if parsed.path == "/api/thread/resume":
+                self._json(self.server.client.resume_thread(str(payload.get("thread_id") or "")))
                 return
             if parsed.path == "/api/interrupt":
                 self._json({"interrupted": self.server.client.interrupt()})
@@ -706,7 +797,7 @@ if __name__ == "__main__":
 __all__ = [
     "APPROVAL_METHODS", "AppServerClient", "BLOCKED_BILLING_ENV", "BoundedEvents",
     "HarnessConfig", "HarnessServer", "MAX_EVENTS", "MAX_IMAGES", "MAX_IMAGE_BYTES",
-    "MAX_IMAGE_TOTAL_BYTES", "MAX_PROMPT_CHARS", "image_inputs",
+    "MAX_IMAGE_TOTAL_BYTES", "MAX_PROMPT_CHARS", "MAX_THREAD_LIST", "image_inputs",
     "SubscriptionAuthError", "build_config", "discover_codex",
     "subscription_environment",
 ]

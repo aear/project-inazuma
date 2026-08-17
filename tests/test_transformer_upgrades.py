@@ -47,6 +47,34 @@ def test_self_question_store_composes_and_bounds_origin_history(tmp_path):
     assert entries[0]["count"] == 20
     assert len(entries[0]["origins"]) == 16
     assert entries[0]["origins"][-1]["event_id"] == "event-19"
+    assert len(entries[0]["trigger_history"]) == 20
+    assert entries[0]["trigger_history"][-1]["trigger"] == "question_seeded"
+
+
+def test_self_question_trigger_history_and_display_hiding_are_bounded_and_reversible(tmp_path):
+    store = tmp_path / "self_questions.json"
+    prior = runtime_state._self_questions_path
+    runtime_state._self_questions_path = lambda child=None: store
+    try:
+        for index in range(40):
+            runtime_state.seed_self_question("What changed?", child="tester", trigger=f"signal-{index}")
+        assert runtime_state.set_self_question_hidden("What changed?", child="tester") is True
+        hidden = runtime_state._load_self_question_entries("tester")[0]
+        assert hidden["hidden"] is True
+        assert len(hidden["trigger_history"]) == 32
+        assert hidden["trigger_history"][0]["trigger"] == "signal-8"
+        assert "Hidden from display" in format_question(hidden)
+        assert runtime_state.set_self_question_hidden("What changed?", False, child="tester") is True
+        revealed = runtime_state._load_self_question_entries("tester")[0]
+        assert "hidden" not in revealed
+    finally:
+        runtime_state._self_questions_path = prior
+
+
+def test_self_question_display_benchmark_compares_retained_versions():
+    v1, v2 = benchmark_module("self_question_display")
+    assert (v1.version, v1.correct, v1.total) == ("V1", 0, 3)
+    assert (v2.version, v2.correct, v2.total) == ("V2", 3, 3)
 
 
 def test_q_decoder_learns_from_experience_statistics():

@@ -42,6 +42,7 @@ from runtime_state import (
     increment_inastate_metric as _runtime_increment_metric,
     set_inastate_metric as _runtime_set_metric, update_inastate as _runtime_update_inastate,
     seed_self_question as _runtime_seed_self_question,
+    set_self_question_hidden as _runtime_set_self_question_hidden,
     mark_self_question_resolved as _runtime_mark_self_question_resolved,
     append_typed_outbox_entry as _runtime_append_typed_outbox_entry,
 )
@@ -5234,14 +5235,20 @@ def _run_prediction_meta_analysis():
 def seed_self_question(
     question: str, *, origin: Optional[Dict[str, Any]] = None,
     provenance: Optional[Dict[str, Any]] = None,
+    trigger: Optional[str] = None,
 ) -> None:
     return _runtime_seed_self_question(
-        question, child=CHILD, origin=origin, provenance=provenance,
+        question, child=CHILD, origin=origin, provenance=provenance, trigger=trigger,
     )
 
 
 def mark_self_question_resolved(question: str, reason: Optional[str] = None) -> None:
     return _runtime_mark_self_question_resolved(question, reason, child=CHILD)
+
+
+def set_self_question_hidden(question: str, hidden: bool = True) -> bool:
+    """Let Ina suppress a question from display without erasing it."""
+    return _runtime_set_self_question_hidden(question, hidden, child=CHILD)
 
 
 def _load_symbol_map():
