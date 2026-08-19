@@ -219,3 +219,25 @@ def test_whole_written_message_is_retained_and_shapes_ambiguous_words():
     assert bank["mapping_confidence_unchanged"] is True
     assert audit["snapshot_summary"]["reread_converged"] == 1
     assert audit["snapshot_summary"]["reread_helpful"] == 1
+
+
+def test_polysemous_word_is_selected_by_surrounding_activation():
+    links = {"schema_version": 2, "links": [
+        {"word": "bank", "symbol": "sym_finance", "strength": 0.8,
+         "contexts": ["money"], "usage_count": 4},
+        {"word": "bank", "symbol": "sym_river", "strength": 0.8,
+         "contexts": ["river"], "usage_count": 3},
+    ]}
+    snapshot = {
+        "enabled": True,
+        "topic_continuity": {"topic_terms": ["river"], "continuity_terms": ["river"]},
+        "candidate_referents": ["river"], "active_memory_references": [], "prediction": {},
+    }
+    resolved = lp.resolve_text_vocab_meanings(
+        "sat on the bank beside the river", links, child="TestChild",
+        context={"language_context_snapshot": snapshot},
+    )
+    bank = next(item for item in resolved if item["token"] == "bank")
+    assert bank["symbol"] == "sym_river"
+    assert bank["candidate_count"] == 2
+    assert bank["contexts"] == ["river"]

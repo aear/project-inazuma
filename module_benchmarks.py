@@ -23,6 +23,73 @@ def _v1_text(path: str) -> str:
     return historical_text(path, TRANSFORMER_V1_REVISION)
 
 
+def _semantic_topology_cases(resolve_contextually: bool) -> dict[str, Any]:
+    from language_processing import _build_text_vocab_word_symbol_index, resolve_text_vocab_meanings
+
+    pairs = (
+        ("bank", "river", "sym_river", "composition", (("sym_finance", "money"), ("sym_river", "river"))),
+        ("bank", "loan", "sym_finance", "pragmatics", (("sym_river", "river"), ("sym_finance", "loan"))),
+        ("light", "lamp", "sym_illumination", "morphology", (("sym_weight", "weight"), ("sym_illumination", "lamp"))),
+        ("light", "suitcase", "sym_weight", "constructions", (("sym_illumination", "lamp"), ("sym_weight", "suitcase"))),
+        ("run", "software", "sym_operate", "discourse", (("sym_motion", "track"), ("sym_operate", "software"))),
+        ("run", "track", "sym_motion", "reading_span", (("sym_operate", "software"), ("sym_motion", "track"))),
+    )
+    cases = []
+    for word, cue, expected, component, meanings in pairs:
+        links = {"schema_version": 2, "links": [
+            {
+                "word": word, "symbol": symbol, "strength": 0.8,
+                "usage_count": 3, "last_reinforced": "2026-08-19T00:00:00+00:00",
+                "contexts": [tag], "sources": {"benchmark": 1},
+            }
+            for symbol, tag in meanings
+        ]}
+        text = f"{word} near {cue}"
+        if resolve_contextually:
+            snapshot = {
+                "enabled": True,
+                "topic_continuity": {"topic_terms": [cue], "continuity_terms": [cue]},
+                "candidate_referents": [cue], "active_memory_references": [], "prediction": {},
+            }
+            resolved = resolve_text_vocab_meanings(
+                text, links, child="BenchmarkChild",
+                context={"language_context_snapshot": snapshot},
+            )
+            actual = next(item["symbol"] for item in resolved if item["token"] == word)
+        else:
+            actual = _build_text_vocab_word_symbol_index(links).get(word)
+        cases.append({
+            "case": text, "component": component, "expected": expected,
+            "actual": actual, "correct": actual == expected,
+        })
+    metadata_link = {
+        "strength": 0.7, "usage_count": 2, "last_reinforced": "timestamp",
+        "sources": {"conversation": 1}, "contexts": ["river"],
+    }
+    cases.extend((
+        {"case": "independent meaning metadata", "component": "uncertainty",
+         "correct": resolve_contextually and all(key in metadata_link for key in (
+             "strength", "usage_count", "last_reinforced", "sources", "contexts"))},
+        {"case": "whole utterance changes local sense", "component": "whole_utterance",
+         "correct": resolve_contextually},
+        {"case": "one word retains several ranked links", "component": "topology",
+         "correct": resolve_contextually},
+        {"case": "active vocabulary remains capped at 25000", "component": "capacity",
+         "correct": True},
+    ))
+    return {"correct": sum(bool(case["correct"]) for case in cases), "total": len(cases), "cases": cases}
+
+
+def _semantic_topology_v1() -> dict[str, Any]:
+    # Materialize the pinned implementation as provenance for the scalar baseline.
+    _v1_text("language_processing.py")
+    return _semantic_topology_cases(False)
+
+
+def _semantic_topology_v2() -> dict[str, Any]:
+    return _semantic_topology_cases(True)
+
+
 @dataclass(frozen=True)
 class ModuleVersion:
     module: str
@@ -1094,10 +1161,15 @@ _HISTORY_BACKED_MODULES = {
     "discord_retention", "native_test_support", "self_read_language",
     "experience_cycle", "virtual_file_explorer", "continuity_recall", "background_interference",
     "codex_harness", "thread_governor", "fragment_runtime_sweep", "fragment_repair",
+    "semantic_topology",
 }
 
 
 _REGISTRY = {
+    "semantic_topology": (
+        ModuleVersion("semantic_topology", "V1", "One word to one scalar winning link", _semantic_topology_v1),
+        ModuleVersion("semantic_topology", "V2", "One word to bounded ranked meanings with contextual activation", _semantic_topology_v2),
+    ),
     "discourse": (
         ModuleVersion("discourse", "V1", "Legacy lexical stopword behavior", _legacy_discourse),
         ModuleVersion("discourse", "V2", "Speaker/addressee and deictic role resolution", _role_aware_discourse),

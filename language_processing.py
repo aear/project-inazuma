@@ -953,6 +953,97 @@ def _build_text_vocab_word_symbol_index(links_payload: Any) -> Dict[str, str]:
     return index
 
 
+def _build_text_vocab_word_candidate_index(links_payload: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Retain bounded, independently scored meanings for each surface word."""
+    index: Dict[str, List[Dict[str, Any]]] = {}
+
+    def consider(candidate: Any):
+        if not isinstance(candidate, dict):
+            return
+        word = _candidate_word(candidate).lower()
+        symbols = _candidate_symbols(candidate)
+        if not word or not symbols:
+            return
+        normalized = dict(candidate)
+        normalized["symbol"] = symbols[0]
+        bucket = index.setdefault(word, [])
+        if any(item.get("symbol") == symbols[0] for item in bucket):
+            return
+        bucket.append(normalized)
+
+    if isinstance(links_payload, list):
+        for entry in links_payload:
+            consider(entry)
+    elif isinstance(links_payload, dict):
+        for key in ("links", "items", "candidates"):
+            for entry in links_payload.get(key) or []:
+                consider(entry)
+        vocab = links_payload.get("vocab")
+        if isinstance(vocab, dict):
+            for word, entry in vocab.items():
+                candidate = dict(entry) if isinstance(entry, dict) else {}
+                candidate.setdefault("word", word)
+                consider(candidate)
+    for candidates in index.values():
+        candidates.sort(
+            key=lambda item: (
+                -_numeric_candidate_value(item, "strength", "mapping_score", "similarity"),
+                -_numeric_candidate_value(item, "usage_count", "evidence_count", "count"),
+                str(item.get("symbol") or ""),
+            )
+        )
+        del candidates[24:]
+    return index
+
+
+def resolve_text_vocab_meanings(
+    text: str,
+    links_payload: Any,
+    *,
+    child: str = "Inazuma_Yagami",
+    context: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Resolve polysemous words from surrounding activation, with provenance."""
+    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9']+", text or "")]
+    candidate_index = _build_text_vocab_word_candidate_index(links_payload)
+    supplied = context.get("language_context_snapshot") if isinstance(context, dict) else None
+    snapshot_context = dict(context) if isinstance(context, dict) else {}
+    snapshot_context["source_text"] = text
+    snapshot = supplied if isinstance(supplied, dict) else build_language_context_snapshot(
+        snapshot_context, child=child, config=load_config()
+    )
+    resolved = []
+    for token_index, token in enumerate(tokens):
+        candidates = candidate_index.get(token) or []
+        if not candidates:
+            continue
+        occurrence = {
+            "index": token_index,
+            "before": tokens[max(0, token_index - 4):token_index],
+            "after": tokens[token_index + 1:token_index + 5],
+        }
+        ranked = []
+        for candidate in candidates:
+            baseline = _score_text_vocab_candidate(candidate, {"words": set(), "tags": set()})
+            contextual = score_mapping_candidate(candidate, snapshot, occurrence_context=occurrence)
+            ranked.append((baseline + float(contextual["score"]), candidate, contextual))
+        score, selected, contextual = max(ranked, key=lambda item: item[0])
+        resolved.append({
+            "token": token,
+            "token_index": token_index,
+            "symbol": str(selected.get("symbol") or ""),
+            "score": round(score, 4),
+            "candidate_count": len(ranked),
+            "strength": _numeric_candidate_value(selected, "strength", "mapping_score", "similarity"),
+            "usage_count": int(_numeric_candidate_value(selected, "usage_count", "evidence_count")),
+            "last_reinforced": selected.get("last_reinforced"),
+            "sources": selected.get("sources") or {},
+            "contexts": selected.get("contexts") or [],
+            "context_breakdown": contextual,
+        })
+    return resolved
+
+
 def _shadow_audit_text_vocab_mappings(
     text: str,
     tokens: List[str],
@@ -2061,6 +2152,10 @@ def generate_symbolic_reply_from_text(
 
     links_payload = load_text_vocab_links(child, base_path=base_path)
     linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
+    resolved_meanings = resolve_text_vocab_meanings(
+        text, links_payload, child=child, context=reply_context
+    ) if links_payload else []
+    resolved_by_index = {item["token_index"]: item for item in resolved_meanings}
     language_context_shadow = _shadow_audit_text_vocab_mappings(
         text,
         tokens,
@@ -2100,8 +2195,9 @@ def generate_symbolic_reply_from_text(
     unknown: List[str] = []
     seen = set()
 
-    for tok in tokens:
-        sym = linked_word_to_symbol.get(tok)
+    for token_index, tok in enumerate(tokens):
+        resolved_meaning = resolved_by_index.get(token_index)
+        sym = (resolved_meaning or {}).get("symbol") or linked_word_to_symbol.get(tok)
         if sym:
             if sym not in seen:
                 matched.append(sym)
@@ -2189,6 +2285,7 @@ def generate_symbolic_reply_from_text(
         "length_profile": text_length_profile(text),
         "symbol_limit": symbol_limit,
         "language_context_shadow": language_context_shadow,
+        "resolved_meanings": resolved_meanings,
         "learned_media_guidance": learned_media_guidance,
         "semantic_event": semantic_event,
         "native_intent": native_intent,

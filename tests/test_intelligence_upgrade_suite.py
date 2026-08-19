@@ -73,6 +73,18 @@ def test_module_benchmark_compares_retained_versions_deterministically():
     assert [(row.version, row.accuracy) for row in second] == [("V1", 0.0), ("V2", 1.0), ("V3", 1.0)]
 
 
+def test_semantic_topology_benchmark_compares_scalar_and_contextual_versions():
+    v1, v2 = benchmark_module("semantic_topology")
+    assert (v1.version, v2.version) == ("V1", "V2")
+    assert v1.source_revision != "working-tree"
+    assert v2.accuracy > v1.accuracy
+    assert v2.accuracy == 1.0
+    assert {
+        "composition", "morphology", "constructions", "pragmatics", "discourse",
+        "uncertainty", "whole_utterance", "reading_span", "topology", "capacity",
+    } <= set(v2.component_scores)
+
+
 def test_neural_taxonomy_exposes_typed_logic_and_memory_nodes():
     nodes = [
         {"id": "a", "type": "sound"},

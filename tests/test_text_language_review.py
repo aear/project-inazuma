@@ -159,3 +159,31 @@ def test_mapping_queue_reports_source_and_new_batch(tmp_path, monkeypatch):
         "new_mappings": 1,
         "revisited_mappings": 0,
     }
+
+
+def test_mapper_retains_ranked_meanings_with_independent_metadata(tmp_path, monkeypatch):
+    _disable_runtime_metrics(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    memory = tmp_path / "AI_Children" / "TestChild" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "symbol_to_token.json").write_text(json.dumps({
+        "sym_finance": {"word": "money", "embedding": ["a"], "confidence": 0.8},
+        "sym_river": {"word": "river", "embedding": ["b"], "confidence": 0.7},
+    }), encoding="utf-8")
+    tm.update_text_vocab(
+        "bank", child="TestChild", tags=["river", "money"],
+        symbols=["sym_finance", "sym_river"], source="conversation",
+    )
+    monkeypatch.setattr(tm, "_EMBEDDER", _MutableEmbedder())
+
+    assert tm.build_text_symbol_links("TestChild", mapping_batch=1)
+    payload = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
+    meanings = [link for link in payload["links"] if link["word"] == "bank"]
+
+    assert payload["schema_version"] == 2
+    assert {link["symbol"] for link in meanings} == {"sym_finance", "sym_river"}
+    assert all(link["usage_count"] == 1 for link in meanings)
+    assert all(link["reinforcement_count"] == 1 for link in meanings)
+    assert all(link["last_reinforced"] for link in meanings)
+    assert all(link["sources"] == {"conversation": 1} for link in meanings)
+    assert all(set(link["contexts"]) == {"river", "money"} for link in meanings)

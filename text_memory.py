@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
 
 DEFAULT_TEXT_VOCAB_LIMIT = 25_000  # realistic active vocabulary; configurable
 DEFAULT_LINK_BATCH_SIZE = 500   # bounded work per meaning-map pass
+DEFAULT_MEANING_LINKS = 4       # bounded senses retained per surface word
 TEXT_VOCAB_LIMIT = DEFAULT_TEXT_VOCAB_LIMIT  # compatibility alias
 MAX_FRAGMENT_BODY = 1200        # cap stored text per fragment
 MAX_FRAGMENT_SUMMARY = 240      # short preview for scans
@@ -38,7 +39,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _text_memory_policy() -> Dict[str, int]:
+def _text_memory_policy() -> Dict[str, Any]:
     raw: Dict[str, Any] = {}
     try:
         config = json.loads(Path("config.json").read_text(encoding="utf-8"))
@@ -54,7 +55,20 @@ def _text_memory_policy() -> Dict[str, int]:
         link_batch_size = max(1, int(raw.get("link_batch_size", DEFAULT_LINK_BATCH_SIZE)))
     except (TypeError, ValueError):
         link_batch_size = DEFAULT_LINK_BATCH_SIZE
-    return {"vocab_limit": vocab_limit, "link_batch_size": link_batch_size}
+    try:
+        meaning_links = min(MAX_SYMBOL_LINKS, max(1, int(raw.get("meaning_links", DEFAULT_MEANING_LINKS))))
+    except (TypeError, ValueError):
+        meaning_links = DEFAULT_MEANING_LINKS
+    try:
+        meaning_slack = min(1.0, max(0.0, float(raw.get("meaning_slack", 0.22))))
+    except (TypeError, ValueError):
+        meaning_slack = 0.22
+    return {
+        "vocab_limit": vocab_limit,
+        "link_batch_size": link_batch_size,
+        "meaning_links": meaning_links,
+        "meaning_slack": meaning_slack,
+    }
 
 
 def _safe_child(child: Optional[str]) -> str:
@@ -575,10 +589,13 @@ def build_text_symbol_links(
     if str(prior.get("symbol_source_revision") or "") != symbol_revision:
         evaluated = {}
     vocab_words = set(str(word) for word in vocab)
-    links_by_word = {
-        str(link.get("word")): link for link in (prior.get("links") or [])
-        if isinstance(link, dict) and link.get("word") and str(link.get("word")) in vocab_words
-    }
+    links_by_word: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for link in prior.get("links") or []:
+        if not isinstance(link, dict) or not link.get("word") or not link.get("symbol"):
+            continue
+        word = str(link["word"])
+        if word in vocab_words:
+            links_by_word.setdefault(word, {})[str(link["symbol"])] = link
     evaluated = {
         str(word): value for word, value in evaluated.items()
         if str(word) in vocab_words
@@ -616,7 +633,7 @@ def build_text_symbol_links(
     if revisit_existing > 0 and len(batch) < batch_limit:
         pending_names = {word for word, _meta in pending_words}
         links_by_priority = sorted(
-            links_by_word.values(),
+            (link for meanings in links_by_word.values() for link in meanings.values()),
             key=lambda link: (
                 float(link.get("similarity", 0.0) or 0.0),
                 float(link.get("symbol_confidence", 0.0) or 0.0),
@@ -624,11 +641,11 @@ def build_text_symbol_links(
                 str(link.get("word") or ""),
             ),
         )
-        revisit_names = [
+        revisit_names = list(dict.fromkeys(
             str(link.get("word"))
             for link in links_by_priority
             if link.get("word") in vocab and str(link.get("word")) not in pending_names
-        ][:max(0, int(revisit_existing))]
+        ))[:max(0, int(revisit_existing))]
         room = max(0, batch_limit - len(batch))
         revisited = revisit_names[:room]
         batch.extend((word, vocab[word]) for word in revisited)
@@ -637,11 +654,7 @@ def build_text_symbol_links(
     for word, meta in batch:
         lang = guess_language_code(word)
         w_emb = _get_embedder().embed_text(word, language=lang)
-        best = None
-        best_sim = 0.0
-        best_word = None
-        best_conf = None
-        best_score = 0.0
+        candidates = []
         symbol_evidence = meta.get("symbols") if isinstance(meta, dict) else {}
         symbol_evidence = symbol_evidence if isinstance(symbol_evidence, dict) else {}
         for sid, emb, symbol_word, symbol_confidence in sym_entries:
@@ -651,26 +664,52 @@ def build_text_symbol_links(
             )
             evidence_bonus = min(0.35, 0.12 * evidence_count)
             score = sim + evidence_bonus
-            if score > best_score:
-                best_sim = sim
-                best_score = score
-                best = sid
-                best_word = symbol_word
-                best_conf = symbol_confidence
-        if best and best_score >= similarity_threshold:
-            links_by_word[word] = {
+            candidates.append((score, sim, str(sid), symbol_word, symbol_confidence, evidence_count))
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        best_score = candidates[0][0] if candidates else 0.0
+        policy = _text_memory_policy()
+        retained = [
+            item for item in candidates
+            if item[0] >= similarity_threshold
+            and (item[0] >= best_score - float(policy["meaning_slack"]) or item[5] > 0)
+        ][:int(policy["meaning_links"])]
+        old_meanings = links_by_word.get(word, {})
+        new_meanings: Dict[str, Dict[str, Any]] = {}
+        reviewed_at = _now_iso()
+        sources = dict(meta.get("sources") or {}) if isinstance(meta, dict) and isinstance(meta.get("sources"), dict) else {}
+        contexts = [str(tag) for tag in (meta.get("tags") or []) if tag][:6] if isinstance(meta, dict) else []
+        for score, sim, sid, symbol_word, symbol_confidence, evidence_count in retained:
+            old = old_meanings.get(sid, {})
+            prior_strength = float(old.get("strength", old.get("mapping_score", score)) or 0.0)
+            observed_strength = max(0.0, min(1.0, score))
+            strength = observed_strength if not old else (prior_strength * 0.85) + (observed_strength * 0.15)
+            reinforcement_count = int(old.get("reinforcement_count", old.get("usage_count", 0)) or 0)
+            last_reinforced = old.get("last_reinforced") or old.get("last_seen")
+            if evidence_count > int(old.get("evidence_count", 0) or 0):
+                reinforcement_count += 1
+                last_reinforced = reviewed_at
+            new_meanings[sid] = {
                 "word": word,
                 "count": int(meta.get("count", 0)),
                 "last_seen": meta.get("last_seen"),
-                "symbol": best,
-                "symbol_word": best_word,
-                "symbol_confidence": best_conf,
-                "similarity": round(best_sim, 4),
-                "mapping_score": round(best_score, 4),
-                "evidence_count": int(
-                    symbol_evidence.get(best, symbol_evidence.get(best_word, 0)) or 0
-                ),
+                "symbol": sid,
+                "symbol_word": symbol_word,
+                "symbol_confidence": symbol_confidence,
+                "similarity": round(sim, 4),
+                "mapping_score": round(score, 4),
+                "strength": round(strength, 4),
+                "usage_count": int(evidence_count),
+                "reinforcement_count": reinforcement_count,
+                "last_reinforced": last_reinforced,
+                "last_reviewed": reviewed_at,
+                "created_at": old.get("created_at") or reviewed_at,
+                "sources": sources,
+                "contexts": contexts,
+                "decay_policy": "event_driven_review",
+                "evidence_count": int(evidence_count),
             }
+        if new_meanings:
+            links_by_word[word] = new_meanings
         else:
             links_by_word.pop(word, None)
         evaluated[word] = {
@@ -679,7 +718,10 @@ def build_text_symbol_links(
         }
 
     rank = {word: index for index, (word, _meta) in enumerate(ranked_words)}
-    links = sorted(links_by_word.values(), key=lambda link: rank.get(str(link.get("word")), len(rank)))
+    links = sorted(
+        (link for meanings in links_by_word.values() for link in meanings.values()),
+        key=lambda link: (rank.get(str(link.get("word")), len(rank)), -float(link.get("strength", 0.0))),
+    )
     remaining_words = pending_words[new_batch_count:]
     remaining = len(remaining_words)
     queue_by_source: Dict[str, int] = {}
@@ -703,6 +745,8 @@ def build_text_symbol_links(
     else:
         batch_mode = "idle"
     payload = {
+        "schema_version": 2,
+        "meaning_model": "one_word_to_ranked_links",
         "generated": _now_iso(),
         "symbol_source_revision": symbol_revision,
         "evaluated": evaluated,
