@@ -110,6 +110,8 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "API-key billing is disabled" in source
     assert 'name="api_key"' not in source
     assert 'id="steering" type="checkbox" checked' in source
+    assert "status.turn_running?'/api/steer':'/api/run'" in source
+    assert "status.turn_running?'Add context':'Send'" in source
     assert "Raw protocol details" in source
     assert "MAX_DOM_EVENTS" in source
     assert 'id="workStatus"' in source
@@ -327,6 +329,36 @@ def test_steering_off_preserves_prompt_and_omits_collaboration_framing(tmp_path)
     assert captured["method"] == "turn/start"
     assert captured["params"]["input"][0]["text"] == "  exact prompt\n"
     assert "collaborationMode" not in captured["params"]
+
+
+def test_active_turn_steering_targets_expected_turn_without_interrupt(tmp_path):
+    client = _notification_client(tmp_path)
+    client.thread_id = "thread-1"
+    client.turn_id = "turn-active"
+    client.running_turn = True
+    captured = {}
+
+    def request(method, params):
+        captured.update(method=method, params=params)
+        return {"turnId": "turn-active"}
+
+    client.request = request
+    client.status = lambda: {"turn_running": True}
+    client.steer_prompt("more detail")
+
+    assert captured["method"] == "turn/steer"
+    assert captured["params"] == {
+        "threadId": "thread-1",
+        "expectedTurnId": "turn-active",
+        "input": [{"type": "text", "text": "more detail"}],
+    }
+    assert client.running_turn is True
+
+
+def test_active_turn_steering_rejects_stale_or_missing_turn(tmp_path):
+    client = _notification_client(tmp_path)
+    with pytest.raises(RuntimeError, match="no active Codex turn"):
+        client.steer_prompt("more detail")
 
 
 def test_workspace_excludes_heavy_runtime_trees():

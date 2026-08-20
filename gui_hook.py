@@ -2,6 +2,7 @@ import errno
 import os
 import platform
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,19 +12,65 @@ from self_read_reporting import report_self_read_broken_pipe
 IS_WINDOWS = platform.system() == "Windows"
 STATUS_PIPE_PATH = r"\\.\pipe\ina_status" if IS_WINDOWS else "/tmp/ina_status.pipe"
 STATUS_LOG_PATH = Path(os.environ.get("INA_STATUS_LOG", "logs/ina_status.log"))
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+STATUS_LOG_MAX_BYTES = _bounded_env_int(
+    "INA_STATUS_LOG_MAX_BYTES", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024,
+)
+STATUS_LOG_BACKUPS = _bounded_env_int("INA_STATUS_LOG_BACKUPS", 6, 1, 24)
 STATUS_PIPE_RETRY_DELAY_SECONDS = 30.0
 STATUS_PIPE_REPORT_COOLDOWN_SECONDS = 180.0 * 60.0
 
 _status_pipe_disabled_until = 0.0
 _last_status_pipe_report_at = None
+_status_log_thread_lock = threading.Lock()
+
+
+def _rotate_status_log(incoming_bytes: int) -> None:
+    try:
+        current_bytes = STATUS_LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        return
+    if current_bytes + max(0, incoming_bytes) <= STATUS_LOG_MAX_BYTES:
+        return
+    oldest = STATUS_LOG_PATH.with_name(f"{STATUS_LOG_PATH.name}.{STATUS_LOG_BACKUPS}")
+    try:
+        oldest.unlink()
+    except FileNotFoundError:
+        pass
+    for index in range(STATUS_LOG_BACKUPS - 1, 0, -1):
+        source = STATUS_LOG_PATH.with_name(f"{STATUS_LOG_PATH.name}.{index}")
+        target = STATUS_LOG_PATH.with_name(f"{STATUS_LOG_PATH.name}.{index + 1}")
+        try:
+            source.replace(target)
+        except FileNotFoundError:
+            pass
+    STATUS_LOG_PATH.replace(STATUS_LOG_PATH.with_name(f"{STATUS_LOG_PATH.name}.1"))
 
 
 def _write_disk_log(message: str) -> None:
     try:
         STATUS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).isoformat()
-        with STATUS_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"{timestamp} {message}\n")
+        line = f"{timestamp} {message}\n"
+        lock_path = STATUS_LOG_PATH.with_name(f"{STATUS_LOG_PATH.name}.lock")
+        with _status_log_thread_lock, lock_path.open("a", encoding="utf-8") as lock_file:
+            try:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+            _rotate_status_log(len(line.encode("utf-8")))
+            with STATUS_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line)
     except Exception:
         # Avoid recursive logging failures
         pass
@@ -152,7 +199,6 @@ def fallback_log(message: str, *, announce: bool = True):
     """
     if announce:
         print(f"[LogHook] Logging to fallback method: {message}")
-    _write_disk_log(message)
     try:
         with open("/tmp/ina_status_fallback.log", "a") as f:
             f.write(message + "\n")

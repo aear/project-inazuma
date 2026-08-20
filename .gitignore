@@ -9,6 +9,9 @@ logs/
 
 
 # --- SENSITIVE MEDIA ---
+.secrets/*
+!.secrets/README.md
+!.secrets/*.example
 *.wav
 *.mp3
 *.flac
@@ -56,3 +59,5 @@ build/
 logs/comms_core.jsonl
 logic_pause.flag
 Project Inazuma.code-workspace
+.secrets/github_token.example
+.secrets/README.md

@@ -547,6 +547,34 @@ class AppServerClient:
         self.running_turn = self.turn_status not in TERMINAL_TURN_STATUSES
         return self.status()
 
+    def steer_prompt(self, prompt: str, *, images: Any = None) -> dict[str, Any]:
+        """Add bounded user context to the active turn without interrupting it."""
+        prompt = str(prompt or "")
+        attached_images = image_inputs(images)
+        if not prompt.strip() and not attached_images:
+            raise ValueError("Steering prompt and image attachments are empty.")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ValueError(f"Prompt exceeds {MAX_PROMPT_CHARS} characters.")
+        if not self.thread_id or not self.turn_id or not self.running_turn:
+            raise RuntimeError("There is no active Codex turn to steer.")
+        active_turn_id = self.turn_id
+        inputs = ([{"type": "text", "text": prompt}] if prompt.strip() else []) + attached_images
+        result = self.request("turn/steer", {
+            "threadId": self.thread_id,
+            "expectedTurnId": active_turn_id,
+            "input": inputs,
+        })
+        returned_turn_id = str(result.get("turnId") or "") if isinstance(result, dict) else ""
+        if returned_turn_id and returned_turn_id != active_turn_id:
+            raise RuntimeError("Codex steered a different turn than the active turn.")
+        summary = prompt or f"{len(attached_images)} image attachment(s)"
+        self.events.append("user", {
+            "summary": summary,
+            "raw": {"steered": True, "image_count": len(attached_images)},
+        })
+        self.events.append("status", "Context added to the active turn.")
+        return self.status()
+
     def status(self) -> dict[str, Any]:
         result = {
             "server_running": self.process.poll() is None,
@@ -747,6 +775,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     collaboration_mode=str(payload.get("mode") or "default"),
                     steering=bool(payload.get("steering", True)),
                     images=payload.get("images"),
+                ))
+                return
+            if parsed.path == "/api/steer":
+                self._json(self.server.client.steer_prompt(
+                    payload.get("prompt", ""), images=payload.get("images"),
                 ))
                 return
             if parsed.path == "/api/new":
