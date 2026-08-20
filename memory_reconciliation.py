@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
-from experience_storage import iter_event_paths
 from io_utils import atomic_write_json
 from memory_mirror_db import (
     catalog_path_known,
@@ -59,33 +59,125 @@ def _reconciliation_policy(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # Fragments already have memory_map.json/SQLite as their authoritative
         # catalogue and are mirrored on access. Avoid a second filesystem walk.
         "scan_fragments": bool(raw.get("scan_fragments", False)),
+        "max_directory_entries": max(100, int(raw.get("max_directory_entries", 10000) or 10000)),
     }
+
+
+class ReconciliationDirectoryTooLarge(RuntimeError):
+    pass
+
+
+def _source_specs(
+    child: str,
+    *,
+    include_legacy_events: bool = False,
+    scan_fragments: bool = False,
+) -> list[Tuple[str, str, Path, bool, Callable[[str], bool]]]:
+    memory = _memory_root(child)
+    events = memory / "experiences" / "events"
+    specs: list[Tuple[str, str, Path, bool, Callable[[str], bool]]] = []
+    if include_legacy_events:
+        specs.append(("events_legacy", "experience_event", events, False, lambda name: name.startswith("evt_") and name.endswith(".json")))
+    specs.extend([
+        ("events_time", "experience_event", events / "by_time", True, lambda name: name.startswith("evt_") and name.endswith(".json")),
+        ("events_hash", "experience_event", events / "by_hash", True, lambda name: name.endswith(".json")),
+        ("episodes", "experience_episode", memory / "experiences" / "episodes", False, lambda name: name.endswith(".json")),
+    ])
+    fragments = memory / "fragments"
+    if scan_fragments:
+        matcher = lambda name: name.startswith("frag_") and name.endswith(".json")
+        specs.append(("fragments_root", "fragment", fragments, False, matcher))
+        for tier in ("short", "working", "long", "cold"):
+            specs.append((f"fragments_{tier}", "fragment", fragments / tier, False, matcher))
+    return specs
+
+
+def _bounded_sorted_entries(path: Path, limit: int) -> list[os.DirEntry[str]]:
+    try:
+        with os.scandir(path) as iterator:
+            entries = []
+            for entry in iterator:
+                entries.append(entry)
+                if len(entries) > limit:
+                    raise ReconciliationDirectoryTooLarge(f"directory exceeds {limit} direct entries: {path}")
+    except FileNotFoundError:
+        return []
+    return sorted(entries, key=lambda entry: entry.name)
+
+
+def _iter_source_paths(
+    root: Path,
+    *,
+    recursive: bool,
+    matches: Callable[[str], bool],
+    resume_after: Optional[str],
+    max_directory_entries: int,
+) -> Iterator[Path]:
+    resume_parts = Path(resume_after).parts if resume_after else ()
+
+    def walk(directory: Path, relative_parts: Tuple[str, ...], on_resume_branch: bool) -> Iterator[Path]:
+        target = resume_parts[len(relative_parts)] if on_resume_branch and len(relative_parts) < len(resume_parts) else None
+        for entry in _bounded_sorted_entries(directory, max_directory_entries):
+            if target is not None and entry.name < target:
+                continue
+            child_parts = relative_parts + (entry.name,)
+            child_on_branch = bool(target is not None and entry.name == target)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir and recursive:
+                yield from walk(Path(entry.path), child_parts, child_on_branch)
+            elif is_file and matches(entry.name):
+                relative = Path(*child_parts).as_posix()
+                if resume_after is None or relative > resume_after:
+                    yield Path(entry.path)
+
+    if root.is_dir():
+        yield from walk(root, (), bool(resume_parts))
+
+
+def _legacy_cursor(child: str, last_path: Any, specs: list[Tuple[str, str, Path, bool, Callable[[str], bool]]]) -> Dict[str, str]:
+    text = str(last_path or "").strip()
+    if not text:
+        return {}
+    candidate = Path(text)
+    for source, _kind, root, _recursive, _matches in specs:
+        try:
+            relative = candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        return {"source": source, "relative_path": relative}
+    return {}
 
 
 def _sources(
     child: str,
     *,
+    cursor: Optional[Dict[str, Any]] = None,
     include_legacy_events: bool = False,
     scan_fragments: bool = False,
-) -> Iterator[Tuple[str, Path]]:
-    memory = _memory_root(child)
-    events = memory / "experiences" / "events"
-    if events.exists():
-        for path in iter_event_paths(events, include_legacy=include_legacy_events):
-            yield "experience_event", path
-    episodes = memory / "experiences" / "episodes"
-    if episodes.exists():
-        for path in episodes.glob("*.json"):
-            yield "experience_episode", path
-    fragments = memory / "fragments"
-    if scan_fragments and fragments.exists():
-        for path in fragments.glob("frag_*.json"):
-            yield "fragment", path
-        for tier in ("short", "working", "long", "cold"):
-            tier_root = fragments / tier
-            if tier_root.exists():
-                for path in tier_root.glob("frag_*.json"):
-                    yield "fragment", path
+    max_directory_entries: int = 10000,
+) -> Iterator[Tuple[str, str, Path]]:
+    specs = _source_specs(child, include_legacy_events=include_legacy_events, scan_fragments=scan_fragments)
+    cursor = cursor if isinstance(cursor, dict) else {}
+    cursor_source = str(cursor.get("source") or "")
+    reached_cursor = not cursor_source
+    for source, kind, root, recursive, matches in specs:
+        if not reached_cursor:
+            if source != cursor_source:
+                continue
+            reached_cursor = True
+        resume_after = str(cursor.get("relative_path") or "") if source == cursor_source else None
+        for path in _iter_source_paths(
+            root,
+            recursive=recursive,
+            matches=matches,
+            resume_after=resume_after or None,
+            max_directory_entries=max_directory_entries,
+        ):
+            yield source, kind, path
 
 
 def reconcile_step(
@@ -105,6 +197,10 @@ def reconcile_step(
     if generation <= 0:
         generation = 1
 
+    specs = _source_specs(child, include_legacy_events=policy["include_legacy_events"], scan_fragments=policy["scan_fragments"])
+    cursor = {} if prior.get("completed") else (prior.get("cursor") if isinstance(prior.get("cursor"), dict) else {})
+    if not cursor:
+        cursor = _legacy_cursor(child, prior.get("last_path"), specs)
     stats: Dict[str, Any] = {
         "generation": generation,
         "status": "running",
@@ -116,39 +212,48 @@ def reconcile_step(
         "unchanged_this_step": 0,
         "invalid_this_step": 0,
         "last_path": prior.get("last_path"),
+        "cursor": cursor or None,
     }
 
     exhausted = True
-    for kind, path in _sources(child, **policy):
-        stats["paths_seen_this_step"] += 1
-        if max_seconds > 0 and time.monotonic() - started >= float(max_seconds):
-            exhausted = False
-            break
+    try:
+        source_iterator = _sources(child, cursor=cursor, **policy)
+        for source, kind, path in source_iterator:
+            stats["paths_seen_this_step"] += 1
+            if max_seconds > 0 and time.monotonic() - started >= float(max_seconds):
+                exhausted = False
+                break
 
-        stats["last_path"] = str(path)
-        if catalog_path_known(child, kind, path, config=cfg):
-            stats["unchanged_this_step"] += 1
-            continue
+            relative = next((path.relative_to(root).as_posix() for spec_source, _kind, root, _recursive, _matches in specs if spec_source == source), path.name)
+            stats["last_path"] = str(path)
+            stats["cursor"] = {"source": source, "relative_path": relative}
+            if catalog_path_known(child, kind, path, config=cfg):
+                stats["unchanged_this_step"] += 1
+                continue
 
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            stats["invalid_this_step"] += 1
-            continue
-        if not isinstance(payload, dict):
-            stats["invalid_this_step"] += 1
-            continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                stats["invalid_this_step"] += 1
+                continue
+            if not isinstance(payload, dict):
+                stats["invalid_this_step"] += 1
+                continue
 
-        result = mirror_json_file(child, kind, path, payload=payload, config=cfg)
-        if result.get("status") not in {"missing", "invalid_json", "unreadable", "too_large"}:
-            stats["catalogued_this_step"] += 1
+            result = mirror_json_file(child, kind, path, payload=payload, config=cfg)
+            if result.get("status") not in {"missing", "invalid_json", "unreadable", "too_large"}:
+                stats["catalogued_this_step"] += 1
 
-        if stats["catalogued_this_step"] >= max(1, int(max_new_records)):
-            exhausted = False
-            break
-        if max_seconds > 0 and time.monotonic() - started >= float(max_seconds):
-            exhausted = False
-            break
+            if stats["catalogued_this_step"] >= max(1, int(max_new_records)):
+                exhausted = False
+                break
+            if max_seconds > 0 and time.monotonic() - started >= float(max_seconds):
+                exhausted = False
+                break
+    except ReconciliationDirectoryTooLarge as exc:
+        exhausted = False
+        stats["blocked_reason"] = "directory_too_large"
+        stats["blocked_detail"] = str(exc)
 
     verified = flush_mirror_writes(mirror_db_path(child, cfg))
     stats["verified_this_step"] = verified
@@ -156,6 +261,8 @@ def reconcile_step(
     stats["updated_at"] = datetime.now(timezone.utc).isoformat()
     stats["completed"] = exhausted
     stats["status"] = "completed" if exhausted else "paused"
+    if exhausted:
+        stats["cursor"] = None
 
     totals = dict(prior.get("totals") or {}) if not prior.get("completed") else {}
     for key in ("paths_seen", "catalogued", "unchanged", "invalid", "verified"):

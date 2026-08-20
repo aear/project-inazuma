@@ -10,7 +10,9 @@ from codex_harness import (
     HarnessConfig,
     MAX_IMAGES,
     MAX_EVENT_CHARS,
+    MAX_DIFF_CHARS,
     SubscriptionAuthError,
+    diff_event_payload,
     image_inputs,
     subscription_environment,
 )
@@ -116,6 +118,36 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "MAX_IMAGE_TOTAL_BYTES" in source
     assert 'id="threadPicker"' in source
     assert "/api/thread/resume" in source
+    assert "Show unified diff" in source
+    assert "diff-add" in source
+    assert "diff-del" in source
+
+
+def test_diff_rendering_benchmark_v4_raw_text_vs_v5_bounded_collapsible_payload():
+    diff = "\n".join([
+        "diff --git a/old.py b/new.py", "--- a/old.py", "+++ b/new.py",
+        "@@ -1,2 +1,2 @@", "-old", "+new",
+    ])
+    payload = diff_event_payload(diff)
+    assert payload["summary"] == "Workspace diff · 1 file · +1 −1"
+    assert payload["files"] == ["new.py"]
+    assert payload["diff"] == diff
+    assert payload["truncated"] is False
+
+    large = diff_event_payload("+x\n" * (MAX_DIFF_CHARS // 2))
+    assert large["truncated"] is True
+    assert len(large["diff"]) < MAX_EVENT_CHARS
+
+
+def test_diff_notification_emits_structured_lazy_detail(tmp_path):
+    client = _notification_client(tmp_path)
+    client._handle_notification("turn/diff/updated", {
+        "threadId": "thread-1", "turnId": "turn-1", "diff": "--- a/a.py\n+++ b/a.py\n-old\n+new",
+    })
+    event = client.events.wait_after(0, 0)[-1]
+    assert event["kind"] == "diff"
+    assert event["payload"]["summary"] == "Workspace diff · 1 file · +1 −1"
+    assert event["payload"]["diff"].endswith("+new")
 
 
 def test_client_disconnect_benchmark_v1_raises_and_v2_is_quiet(monkeypatch):

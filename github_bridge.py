@@ -23,9 +23,11 @@ from github_submission import (
     load_submitted_count_for_day,
     log_history,
     maybe_queue_submission_discord_notice,
+    note_github_auth_health,
     read_pending_entries,
     resolve_github_token,
     submit_issue,
+    GitHubAuthError,
 )
 
 logger = logging.getLogger("github_bridge")
@@ -108,6 +110,7 @@ def process_once() -> int:
     try:
         resolve_github_token(cfg, policy)
     except Exception as exc:
+        note_github_auth_health(child, available=False, reason="missing_token", cfg=cfg)
         logger.warning("GitHub submission skipped: token unavailable: %s", exc)
         return 0
 
@@ -135,6 +138,10 @@ def process_once() -> int:
             break
         try:
             result = submit_issue(entry, cfg=cfg)
+        except GitHubAuthError as exc:
+            note_github_auth_health(child, available=False, reason="rejected", cfg=cfg)
+            logger.warning("GitHub issue submission authentication failed for %s: %s", entry_id, exc)
+            break
         except Exception as exc:
             logger.warning("GitHub issue submission failed for %s: %s", entry_id, exc)
             log_history(child, entry_id, "failed", reason=str(exc)[:400])
@@ -155,6 +162,7 @@ def process_once() -> int:
             title=result.get("title"),
         )
         notice_entry_id = maybe_queue_submission_discord_notice(child, entry, result, cfg=cfg)
+        note_github_auth_health(child, available=True, reason="issue_submitted", cfg=cfg)
         submitted += 1
         submitted_today += 1
         logger.info("Submitted %s to GitHub issue %s", entry_id, result.get("issue_url") or result.get("issue_number"))

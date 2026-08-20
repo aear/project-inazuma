@@ -462,6 +462,7 @@ def _memory() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
         ('Self questions', base / 'self_questions.json'),
         ('GitHub exploration queue', base / 'github_outbox.jsonl'),
         ('GitHub submission state', base / 'github_submission_state.json'),
+        ('GitHub authentication health', base / 'github_auth_health.json'),
         ('Fragment integrity', base / 'fragment_integrity.json'),
         ('Deep recall', base / 'deep_recall_state.json'),
     ]

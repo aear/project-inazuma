@@ -3083,6 +3083,7 @@ def append_github_proposal_entry(
     metadata: Optional[Dict[str, Any]] = None,
     attachment_path: Optional[str] = None,
     patch_text: Optional[str] = None,
+    delivery_choice: str = "submit",
 ) -> Optional[str]:
     entry_id = append_github_issue_entry(
         CHILD,
@@ -3093,9 +3094,12 @@ def append_github_proposal_entry(
         metadata=metadata,
         attachment_path=attachment_path,
         patch_text=patch_text,
+        delivery_choice=delivery_choice,
     )
     if entry_id:
-        request_github_delivery(CHILD, reason="proposal_queued", cfg=load_config())
+        normalized_choice = str(delivery_choice or "submit").strip().lower()
+        if normalized_choice == "submit":
+            request_github_delivery(CHILD, reason="proposal_queued", cfg=load_config())
         update_inastate(
             "last_github_submission",
             {
@@ -3104,6 +3108,7 @@ def append_github_proposal_entry(
                 "kind": str(kind or "request").strip().lower() or "request",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "metadata": metadata or {},
+                "delivery_choice": normalized_choice,
             },
         )
     return entry_id
@@ -3129,6 +3134,7 @@ def queue_github_submission(
     patch_text: Optional[str] = None,
     attachment_path: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    delivery_choice: str = "submit",
 ) -> Optional[str]:
     cfg = load_config()
     title_text = str(title or "").strip()
@@ -3173,6 +3179,7 @@ def queue_github_submission(
         metadata=meta,
         attachment_path=attachment_path,
         patch_text=patch_text,
+        delivery_choice=delivery_choice,
     )
     if entry_id:
         log_to_statusbox(f"[Manager] Queued GitHub {normalized_kind} proposal {entry_id} ({normalized_mode}).")
@@ -3193,6 +3200,7 @@ def queue_github_optimization_request(
     patch_text: Optional[str] = None,
     attachment_path: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    delivery_choice: str = "submit",
 ) -> Optional[str]:
     meta = dict(metadata or {})
     meta.setdefault("source", "resource_vitals")
@@ -3211,6 +3219,7 @@ def queue_github_optimization_request(
         patch_text=patch_text,
         attachment_path=attachment_path,
         metadata=meta,
+        delivery_choice=delivery_choice,
     )
 
 
@@ -3230,13 +3239,14 @@ def queue_github_bug_report(
     touched_files: Optional[List[str]] = None,
     dedupe_key: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    delivery_choice: str = "submit",
 ) -> Dict[str, Any]:
     """Public runtime hook for any subsystem that discovers a defect."""
     result = report_github_finding(
         CHILD, title, problem, kind="bug", component=component, severity=severity,
         confidence=confidence, evidence=evidence, reproduction_steps=reproduction_steps,
         expected=expected, actual=actual, impact=impact, suggestion=suggestion,
-        touched_files=touched_files, dedupe_key=dedupe_key, metadata=metadata, cfg=load_config(),
+        touched_files=touched_files, dedupe_key=dedupe_key, metadata=metadata, cfg=load_config(), delivery_choice=delivery_choice,
     )
     if result.get("queued"):
         update_inastate("last_github_submission", {"id": result.get("entry_id"), "title": title, "kind": "bug_report", "timestamp": datetime.now(timezone.utc).isoformat(), "metadata": metadata or {}})
@@ -3272,6 +3282,7 @@ def queue_github_feature_request(
     patch_text: Optional[str] = None,
     attachment_path: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    delivery_choice: str = "submit",
 ) -> Optional[str]:
     meta = dict(metadata or {})
     meta.setdefault("source", "feature_request")
@@ -3290,6 +3301,7 @@ def queue_github_feature_request(
         patch_text=patch_text,
         attachment_path=attachment_path,
         metadata=meta,
+        delivery_choice=delivery_choice,
     )
 
 

@@ -39,6 +39,11 @@ def test_get_github_submission_config_parses_overrides():
     assert policy["min_resource_trend_pressure"] == 0.61
 
 
+def test_token_env_rejects_credential_values():
+    policy = gs.get_github_submission_config({"github_submission": {"token_env": "github_pat_secret"}})
+    assert policy["token_env"] == "GITHUB_TOKEN"
+
+
 def test_labels_for_kind_select_feature_and_optimization_defaults():
     cfg = {
         "github_submission": {
@@ -134,6 +139,47 @@ def test_read_pending_entries_skips_completed_history_ids():
         assert second_id in ids
     finally:
         _cleanup_child(child)
+
+
+def test_read_pending_entries_respects_inas_delivery_choice():
+    child = "TestGitHubChoice"
+    _cleanup_child(child)
+    try:
+        held_id = gs.append_github_issue_entry(child, "Think first", "Keep this local.", delivery_choice="hold")
+        submit_id = gs.append_github_issue_entry(child, "Share this", "Send this issue.", delivery_choice="submit")
+        pending = gs.read_pending_entries(child, cfg={"github_submission": {"max_batch": 10}})
+        assert held_id not in [entry["id"] for entry in pending]
+        assert submit_id in [entry["id"] for entry in pending]
+    finally:
+        _cleanup_child(child)
+
+
+def test_github_auth_health_notifies_only_on_failure_and_recovery_transitions():
+    child = "TestGitHubAuthHealth"
+    _cleanup_child(child)
+    try:
+        first = gs.note_github_auth_health(child, available=False, reason="rejected")
+        repeated = gs.note_github_auth_health(child, available=False, reason="rejected")
+        recovered = gs.note_github_auth_health(child, available=True, reason="feedback_checked")
+        stable = gs.note_github_auth_health(child, available=True, reason="issue_submitted")
+
+        assert first["notice_id"] and first["changed"]
+        assert repeated["notice_id"] is None and not repeated["changed"]
+        assert recovered["notice_id"] and recovered["changed"]
+        assert stable["notice_id"] is None and not stable["changed"]
+        notices = [json.loads(line) for line in gs.typed_outbox_path(child).read_text().splitlines()]
+        assert len(notices) == 2
+        assert "stopped working" in notices[0]["text"]
+        assert "working again" in notices[1]["text"]
+        assert "token" not in json.dumps(notices).lower()
+    finally:
+        _cleanup_child(child)
+
+
+def test_github_auth_health_monitoring_benchmark_v1_hidden_v2_inspectable():
+    source = Path("monitoring_dashboard.py").read_text(encoding="utf-8")
+    assert "GitHub authentication health" in source
+    assert "github_auth_health.json" in source
 
 
 def test_maybe_queue_submission_discord_notice_writes_owner_dm():

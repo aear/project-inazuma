@@ -25,6 +25,7 @@ import webbrowser
 
 MAX_EVENTS = 600
 MAX_EVENT_CHARS = 65536
+MAX_DIFF_CHARS = 48000
 MAX_SUMMARY_CHARS = 12000
 MAX_PROMPT_CHARS = 100000
 MAX_IMAGES = 4
@@ -55,6 +56,32 @@ APPROVAL_METHODS = {
 }
 
 TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
+
+
+def diff_event_payload(diff: Any) -> dict[str, Any]:
+    """Condense a unified diff while retaining bounded detail for lazy UI display."""
+    text = str(diff or "")
+    files: list[str] = []
+    additions = deletions = 0
+    for line in text.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            if path != "/dev/null":
+                path = path[2:] if path.startswith("b/") else path
+                if path and path not in files:
+                    files.append(path)
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    if not text:
+        summary = "Workspace diff updated"
+    else:
+        file_label = f"{len(files)} file" + ("" if len(files) == 1 else "s")
+        summary = f"Workspace diff · {file_label} · +{additions} −{deletions}"
+    truncated = len(text) > MAX_DIFF_CHARS
+    retained = text[:MAX_DIFF_CHARS].rstrip() + ("\n\n[diff truncated by bounded harness]" if truncated else "")
+    return {"summary": summary, "diff": retained, "files": files[:50], "additions": additions, "deletions": deletions, "truncated": truncated}
 
 
 class SubscriptionAuthError(RuntimeError):
@@ -317,7 +344,7 @@ class AppServerClient:
             self.work_status = str(summary)[-MAX_SUMMARY_CHARS:]
             kind = "work_status"
         elif method == "turn/diff/updated":
-            kind, summary = "diff", data.get("diff") or "Workspace diff updated"
+            kind, summary = "diff", diff_event_payload(data.get("diff"))
             self.diff_seen = True
         elif method in {"item/commandExecution/outputDelta", "item/mcpToolCall/progress"}:
             kind, summary = "tool_output", data.get("delta") or data.get("message") or "Tool output updated"
@@ -346,7 +373,12 @@ class AppServerClient:
             kind, summary = "diagnostic", data.get("message") or method
         else:
             kind, summary = "protocol", method or "notification"
-        self.events.append(kind, {"summary": summary, "raw": raw})
+        payload = summary if kind == "diff" and isinstance(summary, dict) else {"summary": summary}
+        if kind == "diff":
+            payload["raw"] = {"method": method, "params": {key: value for key, value in data.items() if key != "diff"}}
+        else:
+            payload["raw"] = raw
+        self.events.append(kind, payload)
 
     def account(self, refresh: bool = False) -> dict[str, Any]:
         result = self.request("account/read", {"refreshToken": bool(refresh)})

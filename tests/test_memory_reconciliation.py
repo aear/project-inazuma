@@ -66,7 +66,9 @@ class MemoryReconciliationTests(unittest.TestCase):
 
         self.assertEqual(first["catalogued_this_step"], 2)
         self.assertFalse(first["completed"])
+        self.assertEqual(first["paths_seen_this_step"], 2)
         self.assertEqual(second["catalogued_this_step"], 1)
+        self.assertEqual(second["paths_seen_this_step"], 1)
         self.assertTrue(second["completed"])
         for path in paths:
             self.assertTrue(
@@ -74,6 +76,33 @@ class MemoryReconciliationTests(unittest.TestCase):
                     "Ina", "experience_event", path, config=self.config
                 )
             )
+
+    def test_reconciliation_cursor_benchmark_v1_replays_prefix_v2_seeks_after_it(self):
+        for index in range(5):
+            self._event(index)
+        first = reconciliation.reconcile_step("Ina", max_new_records=2, max_seconds=30, config=self.config)
+        second = reconciliation.reconcile_step("Ina", max_new_records=2, max_seconds=30, config=self.config)
+
+        historical_v1_paths_seen = 4
+        self.assertEqual(first["paths_seen_this_step"], 2)
+        self.assertEqual(second["paths_seen_this_step"], 2)
+        self.assertLess(second["paths_seen_this_step"], historical_v1_paths_seen)
+        self.assertEqual(second["cursor"]["relative_path"], "evt_20260101T000003Z.json")
+
+    def test_oversized_flat_source_pauses_without_unbounded_listing(self):
+        limited = dict(self.config)
+        limited["memory_reconciliation_policy"] = {
+            "include_legacy_events": True,
+            "scan_fragments": False,
+            "max_directory_entries": 100,
+        }
+        for index in range(101):
+            path = self.events / f"evt_{index:04d}.json"
+            path.write_text("{}", encoding="utf-8")
+        result = reconciliation.reconcile_step("Ina", max_new_records=1000, max_seconds=30, config=limited)
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["blocked_reason"], "directory_too_large")
+        self.assertEqual(result["paths_seen_this_step"], 0)
 
     def test_catalogue_supplies_graph_candidates_without_directory_walk(self):
         self._event(0)
@@ -94,3 +123,58 @@ class MemoryReconciliationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_reconciliation_cursor_native_benchmark():
+    mirror.flush_mirror_writes(close=True)
+    mirror._SESSION_CACHE.clear()
+    with tempfile.TemporaryDirectory() as tempdir:
+        root = Path(tempdir)
+        original_cwd = Path.cwd()
+        os.chdir(root)
+        try:
+            events = Path("AI_Children/Ina/memory/experiences/events")
+            events.mkdir(parents=True)
+            for index in range(3):
+                (events / f"evt_{index}.json").write_text(json.dumps({"id": f"evt_{index}"}), encoding="utf-8")
+            cfg = {
+                "memory_reconciliation_policy": {"include_legacy_events": True},
+                "memory_mirror_policy": {
+                    "enabled": True, "db_root": str(root / "mirror"), "db_filename": "catalog.sqlite3",
+                    "batch_records": 2, "batch_bytes": 1024 * 1024, "batch_seconds": 60,
+                },
+            }
+            first = reconciliation.reconcile_step("Ina", max_new_records=2, max_seconds=30, config=cfg)
+            second = reconciliation.reconcile_step("Ina", max_new_records=2, max_seconds=30, config=cfg)
+            assert first["paths_seen_this_step"] == 2
+            assert second["paths_seen_this_step"] == 1
+            assert second["completed"] is True
+        finally:
+            mirror.flush_mirror_writes(close=True)
+            mirror._SESSION_CACHE.clear()
+            os.chdir(original_cwd)
+
+
+def test_reconciliation_oversized_directory_guard_native():
+    mirror.flush_mirror_writes(close=True)
+    mirror._SESSION_CACHE.clear()
+    with tempfile.TemporaryDirectory() as tempdir:
+        root = Path(tempdir)
+        original_cwd = Path.cwd()
+        os.chdir(root)
+        try:
+            events = Path("AI_Children/Ina/memory/experiences/events")
+            events.mkdir(parents=True)
+            for index in range(101):
+                (events / f"evt_{index:04d}.json").write_text("{}", encoding="utf-8")
+            cfg = {
+                "memory_reconciliation_policy": {"include_legacy_events": True, "max_directory_entries": 100},
+                "memory_mirror_policy": {"enabled": True, "db_root": str(root / "mirror")},
+            }
+            result = reconciliation.reconcile_step("Ina", max_new_records=1000, max_seconds=30, config=cfg)
+            assert result["blocked_reason"] == "directory_too_large"
+            assert result["paths_seen_this_step"] == 0
+        finally:
+            mirror.flush_mirror_writes(close=True)
+            mirror._SESSION_CACHE.clear()
+            os.chdir(original_cwd)

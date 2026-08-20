@@ -5,13 +5,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib import parse as urlparse
+from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from github_submission import (
     get_current_child,
+    GitHubAuthError,
     get_github_submission_config,
     github_outbox_history_path,
     load_config,
+    note_github_auth_health,
     resolve_github_token,
 )
 
@@ -170,8 +173,13 @@ def _github_get_json(url: str, token: str) -> Any:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urlrequest.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlrequest.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urlerror.HTTPError as exc:
+        if exc.code == 401:
+            raise GitHubAuthError("GitHub authentication was rejected") from exc
+        raise
 
 
 def fetch_issue_comments(
@@ -254,6 +262,7 @@ def sync_issue_feedback(
     try:
         token = resolve_github_token(payload, submission_policy)
     except RuntimeError:
+        note_github_auth_health(child, available=False, reason="missing_token", cfg=payload)
         return {"checked": False, "reason": "missing_token", "new_comments": 0}
 
     refs = list(issue_refs) if issue_refs is not None else load_submitted_issue_refs(
@@ -283,13 +292,18 @@ def sync_issue_feedback(
             continue
         issue_key = str(issue_number)
         seen_for_issue = {str(item) for item in seen_comments.get(issue_key, []) if str(item)}
-        comments = fetch_issue_comments(
-            repo_full_name=repo_full_name,
-            issue_number=issue_number,
-            token=token,
-            api_base=str(submission_policy.get("api_base") or "https://api.github.com"),
-            per_page=int(feedback_policy["max_comments_per_issue"]),
-        )
+        try:
+            comments = fetch_issue_comments(
+                repo_full_name=repo_full_name,
+                issue_number=issue_number,
+                token=token,
+                api_base=str(submission_policy.get("api_base") or "https://api.github.com"),
+                per_page=int(feedback_policy["max_comments_per_issue"]),
+            )
+        except GitHubAuthError:
+            note_github_auth_health(child, available=False, reason="rejected", cfg=payload)
+            return {"checked": False, "reason": "authentication_rejected", "new_comments": new_comments}
+        note_github_auth_health(child, available=True, reason="feedback_checked", cfg=payload)
         checked_issues += 1
         for comment in comments:
             if not isinstance(comment, dict):

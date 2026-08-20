@@ -42,3 +42,14 @@ def test_low_confidence_and_disabled_kind_are_not_queued():
         assert low["reason"] == "low_confidence" and disabled["reason"] == "kind_disabled"
         assert not gs.github_outbox_path(child).exists()
     finally: cleanup(child)
+
+def test_structured_finding_can_be_held_by_ina():
+    child = "TestInaHeldFinding"; cleanup(child)
+    try:
+        result = gs.report_github_finding(child, "A thought", "Keep this local for now.", kind="feature", confidence=.8, delivery_choice="hold", cfg=policy())
+        assert result["queued"] and result["delivery_choice"] == "hold"
+        entry = json.loads(gs.github_outbox_path(child).read_text().splitlines()[0])
+        assert entry["delivery_choice"] == "hold"
+        assert gs.read_pending_entries(child, cfg=policy()) == []
+        assert not gs.github_delivery_request_path(child).exists()
+    finally: cleanup(child)

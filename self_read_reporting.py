@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from github_submission import get_current_child, get_github_submission_config, load_config
+from github_submission import get_current_child, get_github_submission_config, load_completed_history_ids, load_config
 
 INCIDENT_LOG_FILENAME = "self_read_incidents.jsonl"
 INCIDENT_STATE_FILENAME = "self_read_incident_state.json"
@@ -209,7 +209,9 @@ def report_self_read_broken_pipe(
     should_queue_issue = True
     if isinstance(prior, dict):
         prior_ts = _parse_timestamp(prior.get("last_reported_at"))
-        if prior_ts and (now - prior_ts) < timedelta(minutes=BROKEN_PIPE_COOLDOWN_MINUTES):
+        prior_entry_id = str(prior.get("last_issue_entry_id") or "").strip()
+        unresolved_entry = bool(prior_entry_id and prior_entry_id not in load_completed_history_ids(child_name))
+        if unresolved_entry or (prior_ts and (now - prior_ts) < timedelta(minutes=BROKEN_PIPE_COOLDOWN_MINUTES)):
             should_queue_issue = False
 
     issue_entry_id = None

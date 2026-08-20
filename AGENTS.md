@@ -248,6 +248,7 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Authentication is ChatGPT-subscription-only: force `forced_login_method = "chatgpt"`, reuse Codex's cached login or device/browser login, and reject API-key, access-token, custom-base-URL, or automatic fallback paths that could create usage-based charges.
 - Use Codex app-server rather than reimplementing model/tool behavior. Keep command and file-change approvals user-routed; never add an automatic approve-for-me path.
 - Bind the GUI to localhost with a per-launch access token. Keep transcript/events bounded and fetch optional capability catalogs on demand.
+- Render turn diffs as a compact file/addition/deletion summary with the bounded unified diff collapsed by default. Keep raw protocol details separate and lazy; do not duplicate the full diff in both payloads.
 - Cached authentication is private local state: never copy it into this repository, logs, benchmark fixtures, or exported reports. VS Code does not need to be running for cached CLI/app-server authentication to work.
 - Benchmark the historical VS Code-hosted workflow against the standalone harness for capability coverage, startup/runtime resources, latency, isolation, and authentication safety.
 
@@ -281,6 +282,7 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Integrity checking is a resumable indexed pass. Feed invalid records into the
   bounded repair queue, retain the corrupt original, and restore only from a
   hash-verified mirror or an explicitly inspectable salvage result.
+- Orphan reconciliation must persist both its source phase and relative-path cursor. Resume within sharded directories instead of replaying the known prefix, and pause on unexpectedly flat oversized directories.
 - Routine cognitive ticks must never glob the fragments directory. Use the compact
   SQLite index with an explicit batch and time budget, persist a resume cursor,
   and defer safely when the index is unavailable.

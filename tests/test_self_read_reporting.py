@@ -60,3 +60,28 @@ def test_explain_self_read_broken_pipe_mentions_status_pipe():
     explanation = srr.explain_self_read_broken_pipe("status_pipe", "status_log_write")
     assert "GUI status pipe" in explanation
     assert "reader had already closed it" in explanation
+
+
+def test_unresolved_broken_pipe_entry_stays_deduplicated_after_cooldown(monkeypatch):
+    child = "TestSelfReadPendingIssue"
+    _cleanup_child(child)
+    calls = []
+    try:
+        monkeypatch.setattr(srr, "_queue_broken_pipe_issue", lambda **kwargs: calls.append(kwargs) or "github_pending")
+        first = srr.report_self_read_broken_pipe(
+            child=child, component="status_pipe", operation="status_log_write", error=BrokenPipeError(32, "Broken pipe")
+        )
+        state_path = srr.self_read_incident_state_path(child)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["broken_pipe"][first["fingerprint"]]["last_reported_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        second = srr.report_self_read_broken_pipe(
+            child=child, component="status_pipe", operation="status_log_write", error=BrokenPipeError(32, "Broken pipe")
+        )
+
+        assert len(calls) == 1
+        assert second["issue_entry_id"] is None
+        assert second["duplicate_within_cooldown"] is True
+    finally:
+        _cleanup_child(child)

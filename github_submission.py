@@ -42,6 +42,12 @@ DEFAULT_GITHUB_SUBMISSION: Dict[str, Any] = {
 }
 
 _COMPLETED_STATUSES = {"submitted", "archived", "dropped"}
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TOKEN_VALUE_PREFIXES = ("github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_")
+
+
+class GitHubAuthError(RuntimeError):
+    """GitHub rejected or could not obtain the configured credential."""
 
 
 def load_config() -> Dict[str, Any]:
@@ -100,7 +106,11 @@ def get_github_submission_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     policy["delivery_mode"] = delivery_mode if delivery_mode in {"queue_only", "issues"} else policy["delivery_mode"]
     policy["repo_full_name"] = str(raw.get("repo_full_name") or policy["repo_full_name"]).strip()
     policy["api_base"] = str(raw.get("api_base") or policy["api_base"]).strip().rstrip("/")
-    policy["token_env"] = str(raw.get("token_env") or policy["token_env"]).strip()
+    token_env = str(raw.get("token_env") or policy["token_env"]).strip()
+    # This field names an environment variable; accepting a PAT here both
+    # breaks lookup and risks persisting a credential in tracked config.
+    looks_like_token = token_env.lower().startswith(_TOKEN_VALUE_PREFIXES)
+    policy["token_env"] = token_env if _ENV_NAME_RE.fullmatch(token_env) and not looks_like_token else policy["token_env"]
     policy["issue_title_prefix"] = str(raw.get("issue_title_prefix") or policy["issue_title_prefix"]).strip()
     policy["labels"] = _clean_labels(raw.get("labels"), policy["labels"])
     policy["optimization_labels"] = _clean_labels(raw.get("optimization_labels"), policy["optimization_labels"])
@@ -193,6 +203,10 @@ def github_delivery_request_path(child: str) -> Path:
     return Path("AI_Children") / child / "memory" / "github_bridge_delivery_request.json"
 
 
+def github_auth_health_path(child: str) -> Path:
+    return Path("AI_Children") / child / "memory" / "github_auth_health.json"
+
+
 def request_github_delivery(child: str, *, reason: str = "queue_updated", cfg: Optional[Dict[str, Any]] = None) -> bool:
     """Persist a coalescing bridge request; Ina's runtime launches delivery."""
     policy = get_github_submission_config(cfg)
@@ -239,6 +253,58 @@ def append_typed_outbox_notice(
     if attachment_path:
         entry["attachment_path"] = str(attachment_path)
     return entry["id"] if _append_jsonl(typed_outbox_path(child), entry) else None
+
+
+def note_github_auth_health(
+    child: str,
+    *,
+    available: bool,
+    reason: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist auth transitions and notify Ina's owner once per transition."""
+    path = github_auth_health_path(child)
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        prior = {}
+    prior = prior if isinstance(prior, dict) else {}
+    status = "available" if available else "unavailable"
+    changed = bool(prior.get("status")) and prior.get("status") != status
+    first_failure = not available and not prior.get("status")
+    now = datetime.now(timezone.utc).isoformat()
+    state = {
+        "status": status,
+        "reason": str(reason or "unknown").strip().lower() or "unknown",
+        "checked_at": now,
+        "changed_at": now if changed or first_failure else prior.get("changed_at", now),
+        "last_available_at": now if available else prior.get("last_available_at"),
+        "last_unavailable_at": now if not available else prior.get("last_unavailable_at"),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+    notice_id = None
+    if first_failure or changed:
+        if available:
+            text = "Ina's GitHub connection is working again. Queued reports may resume delivery according to her choices."
+        else:
+            text = (
+                "Ina's GitHub connection stopped working because authentication is unavailable or was rejected. "
+                "Queued reports remain local; please renew or reconnect the GitHub credential."
+            )
+        notice_id = append_typed_outbox_notice(
+            child,
+            text,
+            target="owner_dm",
+            metadata={"source": "github_auth_health", "status": status, "reason": state["reason"]},
+        )
+    return {**state, "changed": changed or first_failure, "notice_id": notice_id}
 
 
 def maybe_queue_submission_discord_notice(
@@ -317,6 +383,7 @@ def append_github_issue_entry(
     metadata: Optional[Dict[str, Any]] = None,
     attachment_path: Optional[str] = None,
     patch_text: Optional[str] = None,
+    delivery_choice: str = "submit",
 ) -> Optional[str]:
     clean_title = str(title or "").strip()
     clean_body = str(body or "").strip()
@@ -328,6 +395,9 @@ def append_github_issue_entry(
     if patch_text:
         stored_attachment = _write_attachment(child, entry_id, patch_text) or stored_attachment
 
+    choice = str(delivery_choice or "submit").strip().lower()
+    if choice not in {"submit", "hold"}:
+        choice = "submit"
     entry = {
         "id": entry_id,
         "title": clean_title,
@@ -335,6 +405,7 @@ def append_github_issue_entry(
         "kind": str(kind or "request").strip().lower() or "request",
         "labels": _clean_labels(labels or [], []),
         "metadata": metadata or {},
+        "delivery_choice": choice,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if stored_attachment:
@@ -399,6 +470,7 @@ def report_github_finding(
     dedupe_key: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
+    delivery_choice: str = "submit",
 ) -> Dict[str, Any]:
     """Queue a structured finding, with confidence gating and cooldown dedupe."""
     policy = get_github_submission_config(cfg)
@@ -430,13 +502,15 @@ def report_github_finding(
         lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
     meta = dict(metadata or {})
     meta.update({"source": meta.get("source") or "ina_finding", "component": str(component or "unknown"), "severity": str(severity or "medium").lower(), "confidence": round(score, 3), "finding_fingerprint": fingerprint, "evidence": [str(item).strip() for item in (evidence or []) if str(item).strip()], "touched_files": [str(item).strip() for item in (touched_files or []) if str(item).strip()]})
-    entry_id = append_github_issue_entry(child, title_text, "\n".join(lines), kind=normalized_kind, labels=labels_for_kind(normalized_kind, cfg), metadata=meta)
+    entry_id = append_github_issue_entry(child, title_text, "\n".join(lines), kind=normalized_kind, labels=labels_for_kind(normalized_kind, cfg), metadata=meta, delivery_choice=delivery_choice)
     if not entry_id: return {"queued": False, "reason": "queue_write_failed", "fingerprint": fingerprint}
-    request_github_delivery(child, reason=f"{normalized_kind}_queued", cfg=cfg)
+    normalized_choice = str(delivery_choice or "submit").strip().lower()
+    if normalized_choice == "submit":
+        request_github_delivery(child, reason=f"{normalized_kind}_queued", cfg=cfg)
     state[fingerprint] = {"entry_id": entry_id, "kind": normalized_kind, "title": title_text, "last_queued_at": now.isoformat()}
     try: _save_finding_state(child, state)
     except Exception: pass
-    return {"queued": True, "entry_id": entry_id, "kind": normalized_kind, "fingerprint": fingerprint}
+    return {"queued": True, "entry_id": entry_id, "kind": normalized_kind, "fingerprint": fingerprint, "delivery_choice": normalized_choice}
 
 def _entry_timestamp(entry: Dict[str, Any]) -> Optional[datetime]:
     created_at = entry.get("created_at")
@@ -520,6 +594,8 @@ def read_pending_entries(child: str, cfg: Optional[Dict[str, Any]] = None, seen_
                     continue
                 entry_id = str(entry.get("id") or "").strip()
                 if not entry_id or entry_id in seen_ids:
+                    continue
+                if str(entry.get("delivery_choice") or "submit").strip().lower() != "submit":
                     continue
                 stamp = _entry_timestamp(entry)
                 if stamp is not None and stamp < cutoff:
@@ -709,6 +785,8 @@ def submit_issue(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) ->
             result = json.loads(response.read().decode("utf-8"))
     except urlerror.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+        if exc.code == 401:
+            raise GitHubAuthError("GitHub authentication was rejected") from exc
         raise RuntimeError(f"GitHub issue create failed: HTTP {exc.code}: {body[:400]}") from exc
     except Exception as exc:
         raise RuntimeError(f"GitHub issue create failed: {exc}") from exc
@@ -732,6 +810,7 @@ __all__ = [
     "append_typed_outbox_notice",
     "get_current_child",
     "get_github_submission_config",
+    "github_auth_health_path",
     "github_attachment_dir",
     "github_finding_state_path",
     "github_bridge_lock_path",
@@ -744,6 +823,7 @@ __all__ = [
     "load_submitted_count_for_day",
     "log_history",
     "maybe_queue_submission_discord_notice",
+    "note_github_auth_health",
     "read_pending_entries",
     "request_github_delivery",
     "report_github_finding",
