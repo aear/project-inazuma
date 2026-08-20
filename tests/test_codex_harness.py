@@ -15,6 +15,7 @@ from codex_harness import (
     diff_event_payload,
     image_inputs,
     subscription_environment,
+    token_usage_payload,
 )
 
 
@@ -115,6 +116,10 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "Raw protocol details" in source
     assert "MAX_DOM_EVENTS" in source
     assert 'id="workStatus"' in source
+    assert 'id="usageStatus"' in source
+    assert "APPROVAL_PREFS_KEY" in source
+    assert "Approval always requires your click" in source
+    assert "localStorage.removeItem(APPROVAL_PREFS_KEY)" in source
     assert 'id="imagePicker"' in source
     assert "clipboardData" in source
     assert "MAX_IMAGE_TOTAL_BYTES" in source
@@ -313,6 +318,22 @@ def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path
     })
     assert client.running_turn is False
     assert client.turn_status == "completed"
+
+
+def test_usage_notification_updates_bounded_authoritative_meter(tmp_path):
+    client = _notification_client(tmp_path)
+    client.token_usage = token_usage_payload({})
+    client._handle_notification("thread/tokenUsage/updated", {
+        "threadId": "thread-1", "turnId": "turn-1",
+        "tokenUsage": {
+            "last": {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20, "reasoningOutputTokens": 5, "totalTokens": 120},
+            "total": {"inputTokens": 1000, "cachedInputTokens": 400, "outputTokens": 200, "reasoningOutputTokens": 50, "totalTokens": 1200},
+            "modelContextWindow": 200000,
+        },
+    })
+    assert client.token_usage["last"]["totalTokens"] == 120
+    assert client.token_usage["total"]["totalTokens"] == 1200
+    assert client.token_usage["modelContextWindow"] == 200000
 
 
 def test_steering_off_preserves_prompt_and_omits_collaboration_framing(tmp_path):

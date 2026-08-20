@@ -231,6 +231,15 @@ def _append_entry(entry: Dict[str, Any], *, child: Optional[str] = None, base_pa
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        from witness_event_store import record_witness_event, witness_database_path
+
+        record_witness_event(
+            store="reflection", payload=entry, database=witness_database_path(path)
+        )
+    except Exception:
+        # JSONL remains the compatibility authority during the staged migration.
+        pass
     return entry
 
 

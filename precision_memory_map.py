@@ -287,6 +287,15 @@ def log_event(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        from witness_event_store import record_witness_event, witness_database_path
+
+        record_witness_event(
+            store="precision", payload=entry, database=witness_database_path(path)
+        )
+    except Exception:
+        # JSONL remains the compatibility authority during the staged migration.
+        pass
     _maybe_write_reflection_note(entry, child=child, base_path=base_path)
     return entry
 

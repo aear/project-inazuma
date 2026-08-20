@@ -70,11 +70,13 @@ from io_pressure import pressure_signal
 from music_delivery import ensure_opus_sidecar
 from discord_runtime import (
     load_root_config as load_layered_root_config,
+    resolve_discord_token,
     typed_outbox_path,
     typed_outbox_history_path,
     typed_outbox_archive_path,
 )
 from discord_retention import BoundedIdSet, compact_jsonl_tail, prune_buffer_files, tail_jsonl_entries
+from outbox_event_store import record_configured_event
 try:
     from lm_studio_adapter import LMStudioAdapter
 except Exception:
@@ -3100,6 +3102,14 @@ class InaDiscordClient(discord.Bot):
                 fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             logger.exception("Failed to append typed outbox history for entry %s", entry_id)
+        else:
+            try:
+                record_configured_event(
+                    child=get_current_child(), channel="typed", event_type="history",
+                    payload=payload, typed_path=self._typed_outbox_path,
+                )
+            except Exception:
+                logger.exception("Typed outbox SQLite compatibility write failed for %s", entry_id)
         self._typed_outbox_seen.add(entry_id)
 
     def _entry_timestamp(self, entry: dict) -> Optional[datetime]:
@@ -3134,6 +3144,14 @@ class InaDiscordClient(discord.Bot):
             logger.info("Archived typed outbox entry %s (%s)", entry_id or "<unknown>", reason)
         except Exception:
             logger.exception("Failed to archive typed outbox entry %s", entry_id or "<unknown>")
+        else:
+            try:
+                record_configured_event(
+                    child=get_current_child(), channel="typed", event_type="archived",
+                    payload=archived, typed_path=self._typed_outbox_path,
+                )
+            except Exception:
+                logger.exception("Typed archive SQLite compatibility write failed for %s", entry_id or "<unknown>")
         if entry.get("text"):
             try:
                 self.history_bridge.log_conversation_turn(
@@ -4068,20 +4086,18 @@ class InaDiscordClient(discord.Bot):
 
 def get_discord_token() -> str:
     """
-    Load the Discord bot token from either:
-    - config.json -> discord.bot_token
-    - environment variable DISCORD_BOT_TOKEN
-    - secrets.json file in the working directory: {"DISCORD_BOT_TOKEN": "..."}
+    Load the Discord bot token from an environment variable, token file, or
+    the legacy inline/secrets.json compatibility paths.
     """
     cfg = get_discord_config()
-    token = cfg.get("bot_token") if cfg else None
+    token_env = str(cfg.get("token_env") or "DISCORD_BOT_TOKEN").strip()
+    token = resolve_discord_token({"discord": cfg})
     if not token:
-        token = load_secret("DISCORD_BOT_TOKEN")
+        token = load_secret("DISCORD_BOT_TOKEN", env_name=token_env or "DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError(
-            "Discord token not found. Set discord.bot_token in config.json, set "
-            "DISCORD_BOT_TOKEN in the environment, or create a secrets.json file "
-            "with {'DISCORD_BOT_TOKEN': '...'}"
+            f"Discord token not found. Set {token_env or 'DISCORD_BOT_TOKEN'} or configure "
+            "discord.token_file; discord.bot_token remains a legacy compatibility path."
         )
     return token
 

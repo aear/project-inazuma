@@ -16,6 +16,7 @@ from experience_storage import sharded_event_path
 
 READ_CHUNK_SIZE = 1024 * 1024
 MANAGED_COPY_CHUNK_SIZE = 64 * 1024 * 1024
+MANAGED_MOVE_CHOICES = ("inspect", "copy_verified", "move_and_link", "defer", "decline")
 
 
 def _load_config() -> Dict[str, Any]:
@@ -516,6 +517,99 @@ def managed_migration_active(child: str) -> bool:
     return str(request.get("status") or "").lower() in {"requested", "copying", "verifying"}
 
 
+def _path_within(path: Path, roots: Iterable[Path]) -> bool:
+    resolved = path.resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(Path(root).expanduser().resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def managed_move_capabilities(child: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
+    """Return operator-configured roots; never expose a generic filesystem mover."""
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    source_roots = [Path("AI_Children") / child]
+    target_roots: List[Path] = []
+    policy = cfg.get("storage_migration_policy") if isinstance(cfg.get("storage_migration_policy"), dict) else {}
+    for raw in policy.get("move_target_roots", []) if isinstance(policy.get("move_target_roots"), list) else []:
+        if isinstance(raw, str) and raw.strip():
+            target_roots.append(Path(_format_child_path(raw, child)).expanduser())
+    discord = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else {}
+    for key in ("typed_outbox_path", "typed_outbox_history_path", "typed_outbox_archive_path", "runtime_log_dir"):
+        raw = discord.get(key)
+        if isinstance(raw, str) and raw.strip():
+            resolved = Path(_format_child_path(raw, child)).expanduser()
+            target_roots.append(resolved if key == "runtime_log_dir" else resolved.parent)
+    mirror = cfg.get("memory_mirror_policy") if isinstance(cfg.get("memory_mirror_policy"), dict) else {}
+    if isinstance(mirror.get("db_root"), str) and mirror["db_root"].strip():
+        target_roots.append(Path(_format_child_path(mirror["db_root"], child)).expanduser())
+    unique_targets = list(dict.fromkeys(str(path.resolve()) for path in target_roots))
+    return {
+        "source_roots": [str(path.resolve()) for path in source_roots],
+        "target_roots": unique_targets,
+    }
+
+
+def request_managed_file_move(
+    child: str, source: Path | str, target: Path | str, *, choice: str = "inspect",
+    chunk_bytes: int = MANAGED_COPY_CHUNK_SIZE, cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Plan or request one resumable, capability-scoped file move."""
+    selected = str(choice or "inspect").strip().lower()
+    if selected not in MANAGED_MOVE_CHOICES:
+        raise ValueError(f"choice must be one of: {', '.join(MANAGED_MOVE_CHOICES)}")
+    source = Path(source).expanduser()
+    target = Path(target).expanduser()
+    capabilities = managed_move_capabilities(child, cfg)
+    source_roots = [Path(path) for path in capabilities["source_roots"]]
+    target_roots = [Path(path) for path in capabilities["target_roots"]]
+    report: Dict[str, Any] = {
+        "choice": selected, "source": str(source), "target": str(target),
+        "capabilities": capabilities, "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if selected in {"defer", "decline"}:
+        report["status"] = "deferred" if selected == "defer" else "declined"
+        return report
+    if not source.is_file() or source.is_symlink():
+        report["status"] = "source_unavailable"
+        return report
+    if not _path_within(source, source_roots):
+        report["status"] = "source_outside_capability"
+        return report
+    if not target_roots or not _path_within(target, target_roots):
+        report["status"] = "target_outside_capability"
+        return report
+    if source.resolve() == target.resolve():
+        report["status"] = "source_equals_target"
+        return report
+    if target.exists() or target.is_symlink():
+        report["status"] = "target_exists"
+        return report
+    stat = source.stat()
+    report.update({"status": "planned", "bytes": stat.st_size, "source_mtime_ns": stat.st_mtime_ns})
+    if selected == "inspect":
+        return report
+    request = {
+        "operation": "move_file_verified", "status": "requested",
+        "source": str(source.resolve()), "target": str(target.resolve()),
+        "chunk_bytes": max(1024 * 1024, min(256 * 1024 * 1024, int(chunk_bytes))),
+        "link_original": selected == "move_and_link",
+        "allowed_source_roots": capabilities["source_roots"],
+        "allowed_target_roots": capabilities["target_roots"],
+        "requested_at": report["requested_at"], "requested_by": "ina_choice",
+    }
+    _atomic_write_json(managed_migration_request_path(child), request)
+    _atomic_write_json(managed_migration_state_path(child), {
+        **request, "source_size": stat.st_size, "source_mtime_ns": stat.st_mtime_ns,
+        "bytes_copied": 0, "progress": 0.0,
+    })
+    report["status"] = "requested"
+    return report
+
+
 def _sqlite_quick_check(path: Path) -> tuple[bool, str]:
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
@@ -556,7 +650,8 @@ def managed_migration_step(child: str, *, chunk_bytes: Optional[int] = None) -> 
         _atomic_write_json(state_path, payload)
         _atomic_write_json(request_path, request)
         return payload
-    if str(request.get("operation") or "") != "promote_mirror_database":
+    operation = str(request.get("operation") or "")
+    if operation not in {"promote_mirror_database", "move_file_verified"}:
         return fail("unsupported_operation")
 
     source = Path(str(request.get("source") or "")).expanduser()
@@ -566,6 +661,15 @@ def managed_migration_step(child: str, *, chunk_bytes: Optional[int] = None) -> 
         return fail("source_unavailable", source=str(source))
     if source.resolve() == target.resolve():
         return fail("source_equals_target")
+    if target.exists() and not partial.exists():
+        return fail("target_appeared_after_request")
+    if operation == "move_file_verified":
+        source_roots = [Path(path) for path in request.get("allowed_source_roots", []) if isinstance(path, str)]
+        target_roots = [Path(path) for path in request.get("allowed_target_roots", []) if isinstance(path, str)]
+        if not source_roots or not _path_within(source, source_roots):
+            return fail("source_outside_capability")
+        if not target_roots or not _path_within(target, target_roots):
+            return fail("target_outside_capability")
 
     source_stat = source.stat()
     state = _load_json_dict(state_path)
@@ -623,23 +727,53 @@ def managed_migration_step(child: str, *, chunk_bytes: Optional[int] = None) -> 
     if offset < expected_size:
         return state
 
-    ok, detail = _sqlite_quick_check(partial)
+    if operation == "promote_mirror_database":
+        ok, detail = _sqlite_quick_check(partial)
+    else:
+        source_hash = _hash_file(source)
+        target_hash = _hash_file(partial)
+        ok, detail = bool(source_hash and source_hash == target_hash), "sha256_match" if source_hash == target_hash else "sha256_mismatch"
+        state.update({"sha256": source_hash, "target_sha256": target_hash})
     if not ok:
-        state.update({"status": "failed", "error": "sqlite_quick_check_failed", "verification": detail, "updated_at": datetime.now(timezone.utc).isoformat()})
+        state.update({"status": "failed", "error": "final_verification_failed", "verification": detail, "updated_at": datetime.now(timezone.utc).isoformat()})
         request.update({"status": "failed", "error": state["error"], "updated_at": state["updated_at"]})
         _atomic_write_json(state_path, state)
         _atomic_write_json(request_path, request)
         return state
 
+    shutil.copystat(source, partial, follow_symlinks=False)
     os.replace(partial, target)
-    _activate_mirror_target(Path("config.json"), target)
+    cutover = False
+    backup = None
+    if operation == "promote_mirror_database":
+        _activate_mirror_target(Path("config.json"), target)
+        cutover = True
+    elif bool(request.get("link_original")):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = source.with_name(f"{source.name}.ina-migration-backup-{stamp}")
+        try:
+            source.rename(backup)
+            pending = source.with_name(f".{source.name}.ina-link-{stamp}")
+            pending.symlink_to(os.path.relpath(target, source.parent), target_is_directory=False)
+            pending.replace(source)
+            cutover = True
+        except Exception as exc:
+            try:
+                if source.is_symlink():
+                    source.unlink()
+                if backup.exists() and not source.exists():
+                    backup.rename(source)
+            except Exception as rollback_exc:
+                return fail("cutover_and_rollback_failed", cutover_error=str(exc), rollback_error=str(rollback_exc))
+            return fail("cutover_failed_rolled_back", cutover_error=str(exc), rolled_back=True)
     completed_at = datetime.now(timezone.utc).isoformat()
-    state.update({"status": "complete", "verification": detail, "completed_at": completed_at, "updated_at": completed_at, "source_retained": True})
-    request.update({"status": "complete", "completed_at": completed_at, "updated_at": completed_at, "source_retained": True})
+    source_retained = source.exists() and not source.is_symlink()
+    state.update({"status": "complete", "verification": detail, "completed_at": completed_at, "updated_at": completed_at, "source_retained": source_retained, "cutover": cutover, "backup": str(backup) if backup else None})
+    request.update({"status": "complete", "completed_at": completed_at, "updated_at": completed_at, "source_retained": source_retained, "cutover": cutover, "backup": str(backup) if backup else None})
     _atomic_write_json(state_path, state)
     _atomic_write_json(request_path, request)
-    _record_migration_summary(child, "managed_mirror_database_promotion", {
-        "apply": True, "status": "ok", "verified": 1, "copied": 1, "bytes": expected_size, "cutover": True,
+    _record_migration_summary(child, operation, {
+        "apply": True, "status": "ok", "verified": 1, "copied": 1, "bytes": expected_size, "cutover": cutover,
     })
     return state
 

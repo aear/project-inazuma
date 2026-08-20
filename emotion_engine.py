@@ -425,8 +425,18 @@ def log_emotion_snapshot(child: str, snapshot: EmotionSnapshot) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(snapshot.to_dict(), ensure_ascii=False))
+            payload = snapshot.to_dict()
+            f.write(json.dumps(payload, ensure_ascii=False))
             f.write("\n")
+        try:
+            from witness_event_store import record_witness_event, witness_database_path
+
+            record_witness_event(
+                store="emotion", payload=payload, database=witness_database_path(path)
+            )
+        except Exception:
+            # JSONL remains the compatibility authority during the staged migration.
+            pass
     except Exception as e:
         _log(f"Failed to log emotion snapshot for {child}: {e}")
 

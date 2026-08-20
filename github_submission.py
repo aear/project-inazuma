@@ -12,6 +12,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from discord_runtime import typed_outbox_path as resolve_typed_outbox_path
+from outbox_event_store import record_configured_event
 
 DEFAULT_GITHUB_SUBMISSION: Dict[str, Any] = {
     "enabled": False,
@@ -410,7 +411,17 @@ def append_github_issue_entry(
     }
     if stored_attachment:
         entry["attachment_path"] = stored_attachment
-    return entry_id if _append_jsonl(github_outbox_path(child), entry) else None
+    written = _append_jsonl(github_outbox_path(child), entry)
+    cfg = load_config()
+    if written and child == get_current_child(cfg):
+        try:
+            record_configured_event(
+                child=child, channel="github", event_type="queued", payload=entry,
+                typed_path=resolve_typed_outbox_path(child, cfg),
+            )
+        except Exception:
+            pass
+    return entry_id if written else None
 
 
 
@@ -618,7 +629,17 @@ def log_history(child: str, entry_id: str, status: str, **extra: Any) -> bool:
     payload.update({key: value for key, value in extra.items() if value is not None})
     if not payload["id"]:
         return False
-    return _append_jsonl(github_outbox_history_path(child), payload)
+    written = _append_jsonl(github_outbox_history_path(child), payload)
+    cfg = load_config()
+    if written and child == get_current_child(cfg):
+        try:
+            record_configured_event(
+                child=child, channel="github", event_type="history", payload=payload,
+                typed_path=resolve_typed_outbox_path(child, cfg),
+            )
+        except Exception:
+            pass
+    return written
 
 
 def archive_entry(child: str, entry: Dict[str, Any], reason: str, **extra: Any) -> bool:
@@ -626,7 +647,17 @@ def archive_entry(child: str, entry: Dict[str, Any], reason: str, **extra: Any) 
     payload["archive_reason"] = str(reason or "").strip().lower()
     payload["archived_at"] = datetime.now(timezone.utc).isoformat()
     payload.update({key: value for key, value in extra.items() if value is not None})
-    return _append_jsonl(github_outbox_archive_path(child), payload)
+    written = _append_jsonl(github_outbox_archive_path(child), payload)
+    cfg = load_config()
+    if written and child == get_current_child(cfg):
+        try:
+            record_configured_event(
+                child=child, channel="github", event_type="archived", payload=payload,
+                typed_path=resolve_typed_outbox_path(child, cfg),
+            )
+        except Exception:
+            pass
+    return written
 
 
 def _truncate_text(text: str, limit: int) -> str:

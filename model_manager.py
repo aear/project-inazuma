@@ -2444,6 +2444,7 @@ memory_manager = MemoryManager(CHILD, autoload=False)
 continuity_manager = ContinuityManager(CHILD)
 intuition_engine = QuantumIntuitionEngine(CHILD)
 _last_opportunities = set()
+_storage_maintenance_checked = False
 _last_boredom_launch = 0.0
 _BOREDOM_COOLDOWN = 30  # seconds
 _last_paint_launch = 0.0
@@ -5437,11 +5438,91 @@ def _check_self_adjustment():
 
     update_inastate("self_adjustment_opportunities", opportunities)
     update_inastate("introspection_prompts", prompts)
+    _update_storage_maintenance_opportunity()
 
     new_keys = set(opportunities.keys()) - _last_opportunities
     if new_keys:
         log_to_statusbox(f"[Manager] Optional introspection windows: {', '.join(sorted(new_keys))}")
     _last_opportunities = set(opportunities.keys())
+
+
+def request_storage_maintenance(choice: str = "inspect", *, refresh: bool = False) -> None:
+    """Let Ina explicitly inspect, perform, defer, or decline one maintenance action."""
+    from storage_maintenance import CHOICES
+
+    selected = str(choice or "").strip().lower()
+    if selected not in CHOICES:
+        raise ValueError(f"choice must be one of: {', '.join(CHOICES)}")
+    update_inastate(
+        "storage_maintenance_request",
+        {
+            "choice": selected,
+            "refresh": bool(refresh),
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "source": "ina_choice",
+        },
+    )
+
+
+def request_file_move(source: str, target: str, *, choice: str = "inspect") -> Dict[str, Any]:
+    """Expose Ina's capability-scoped, resumable file-migration choice."""
+    from storage_migration import request_managed_file_move
+
+    result = request_managed_file_move(
+        CHILD, Path(source), Path(target), choice=choice, cfg=load_config(),
+    )
+    update_inastate("last_file_move_choice", result)
+    if result.get("status") == "requested":
+        log_to_statusbox("[Manager] Ina requested one bounded verified file migration.")
+    return result
+
+
+def _update_storage_maintenance_opportunity() -> None:
+    """Publish threshold-triggered maintenance once; act only on an explicit choice."""
+    global _storage_maintenance_checked
+    request = get_inastate("storage_maintenance_request")
+    request = request if isinstance(request, dict) else None
+    stored = get_inastate("storage_maintenance_opportunity")
+    stored = stored if isinstance(stored, dict) else {}
+    if not request and stored.get("status") in {"deferred", "declined"}:
+        _storage_maintenance_checked = True
+        return
+    if _storage_maintenance_checked and not request:
+        return
+
+    from storage_maintenance import maintenance_opportunity, perform_choice
+
+    if request:
+        choice = str(request.get("choice") or "inspect").strip().lower()
+        try:
+            project_root = Path(__file__).resolve().parent
+            result = perform_choice(project_root, choice)
+            update_inastate("storage_maintenance_result", result)
+            opportunity = maintenance_opportunity(project_root)
+            opportunity["status"] = result.get("status")
+            opportunity["last_choice"] = choice
+            update_inastate("storage_maintenance_opportunity", opportunity)
+            log_to_statusbox(f"[Manager] Storage maintenance choice '{choice}': {result.get('status')}.")
+        except Exception as exc:
+            update_inastate(
+                "storage_maintenance_result",
+                {
+                    "status": "failed", "choice": choice, "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            log_to_statusbox(f"[Manager] Storage maintenance choice failed: {exc}")
+        finally:
+            update_inastate("storage_maintenance_request", None)
+            _storage_maintenance_checked = True
+        return
+
+    opportunity = maintenance_opportunity(Path(__file__).resolve().parent)
+    opportunity["status"] = "offered" if opportunity.get("available") else "nothing_eligible"
+    update_inastate("storage_maintenance_opportunity", opportunity)
+    if opportunity.get("available"):
+        log_to_statusbox("[Manager] Optional storage-maintenance opportunity is available for Ina's choice.")
+    _storage_maintenance_checked = True
 
 def launch_background_loops():
     if not _is_process_running("ina_client.py"):

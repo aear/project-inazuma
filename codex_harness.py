@@ -58,6 +58,27 @@ APPROVAL_METHODS = {
 TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
 
 
+def token_usage_payload(value: Any) -> dict[str, Any]:
+    """Retain only bounded numeric app-server usage telemetry."""
+    data = value if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for scope in ("last", "total"):
+        row = data.get(scope) if isinstance(data.get(scope), dict) else {}
+        result[scope] = {
+            key: max(0, int(row.get(key) or 0))
+            for key in (
+                "inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+                "outputTokens", "reasoningOutputTokens", "totalTokens",
+            )
+        }
+    window = data.get("modelContextWindow")
+    try:
+        result["modelContextWindow"] = max(0, int(window)) if window is not None else None
+    except (TypeError, ValueError):
+        result["modelContextWindow"] = None
+    return result
+
+
 def diff_event_payload(diff: Any) -> dict[str, Any]:
     """Condense a unified diff while retaining bounded detail for lazy UI display."""
     text = str(diff or "")
@@ -226,6 +247,7 @@ class AppServerClient:
         self.last_test_status = "not observed"
         self.last_benchmark_status = "not observed"
         self.diff_seen = False
+        self.token_usage = token_usage_payload({})
         self.process = subprocess.Popen(
             [
                 config.codex_binary,
@@ -330,6 +352,8 @@ class AppServerClient:
             self.running_turn = self.thread_status == "active"
         elif method == "account/login/completed":
             self.events.append("auth", params)
+        elif method == "thread/tokenUsage/updated" and isinstance(params, dict):
+            self.token_usage = token_usage_payload(params.get("tokenUsage"))
         self._append_notification_event(method, params)
 
     def _append_notification_event(self, method: str, params: Any) -> None:
@@ -590,6 +614,7 @@ class AppServerClient:
             "tests": self.last_test_status,
             "benchmarks": self.last_benchmark_status,
             "diff": "changed" if self.diff_seen else "clean in this session",
+            "token_usage": self.token_usage,
         }
         app_resources = self._resource_status(result["pid"])
         harness_resources = self._resource_status(os.getpid())

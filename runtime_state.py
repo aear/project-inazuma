@@ -10,6 +10,7 @@ from discord_runtime import typed_outbox_path
 from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json, file_lock
 from config_layers import load_config
+from outbox_event_store import record_configured_event
 
 
 def _current_child() -> str:
@@ -421,6 +422,15 @@ def append_typed_outbox_entry(
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        active_child = _current_child()
+        if (child or active_child) == active_child:
+            try:
+                record_configured_event(
+                    child=active_child, channel="typed", event_type="queued",
+                    payload=entry, typed_path=path,
+                )
+            except Exception as db_exc:
+                log_to_statusbox(f"[Manager] Typed outbox SQLite compatibility write deferred: {db_exc}")
         return entry["id"]
     except Exception as exc:
         log_to_statusbox(f"[Manager] Failed to append typed outbox entry: {exc}")

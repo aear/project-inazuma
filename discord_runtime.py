@@ -1,6 +1,7 @@
 """Resolve hot Discord bridge files without moving durable memory."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -79,3 +80,21 @@ def discord_log_path(config: Optional[Dict[str, Any]] = None) -> Path:
             directory = Path(raw.replace("{child}", child)).expanduser()
         return directory / "comms_core.jsonl"
     return Path("logs") / "comms_core.jsonl"
+
+
+def resolve_discord_token(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve Discord auth without logging or exposing the credential."""
+    cfg = config if isinstance(config, dict) else load_root_config()
+    section = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else {}
+    token_env = str(section.get("token_env") or "DISCORD_BOT_TOKEN").strip()
+    token = os.environ.get(token_env, "").strip() if token_env else ""
+    if not token:
+        token_path = str(section.get("token_file") or section.get("token_path") or "").strip()
+        if token_path:
+            try:
+                token = Path(token_path).expanduser().read_text(encoding="utf-8").strip()
+            except OSError:
+                token = ""
+    if not token:
+        token = str(section.get("bot_token") or "").strip()
+    return token or None
