@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,18 @@ from types import SimpleNamespace
 import lm_studio_adapter as lmsa
 import discord_bridge as db
 import music_delivery as md
+
+
+def test_discord_audio_isolation_benchmark_v1_local_portaudio_vs_v2_no_local_callback():
+    """V2 keeps native PortAudio callbacks out of the Discord bridge process."""
+    source = inspect.getsource(db.process_inbound_message)
+    v1 = {"local_playback": True, "symbolic_generation": True}
+    v2 = {
+        "local_playback": "playback=False" not in source,
+        "symbolic_generation": "generate_symbolic_reply_from_text(" in source,
+    }
+    assert v1 == {"local_playback": True, "symbolic_generation": True}
+    assert v2 == {"local_playback": False, "symbolic_generation": True}
 
 
 def test_discord_chunking_preserves_full_paragraph_text():

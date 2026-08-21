@@ -1,4 +1,4 @@
-from benchmark_experience_cycle_storage import run_benchmark
+from benchmarks.benchmark_experience_cycle_storage import run_benchmark
 
 
 def test_storage_benchmark_compares_history_and_cycle_on_both_devices(tmp_path):

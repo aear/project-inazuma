@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from algorithm_portfolio import AlgorithmPortfolio, EmpiricalCostModel, GalacticSearch, LocalSearch, SolarSearch
-from benchmark_algorithm_portfolio import sample_real_fragments
+from benchmarks.benchmark_algorithm_portfolio import sample_real_fragments
 
 
 class AlgorithmPortfolioTests(unittest.TestCase):

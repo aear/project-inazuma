@@ -18,7 +18,7 @@ from cognitive_benchmarks.core import load_cases, run_benchmark
 from cognitive_benchmarks.schedule import MonthlyCadence
 from cognitive_benchmarks.procedural import PROCEDURAL_VERSION, generate_cases
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES = ROOT / "benchmarks" / "persistent_cognition_v1.jsonl"
 DEFAULT_OUTPUT = ROOT / "benchmark_results"
 STANDARD_SUITES = ("hellaswag", "piqa", "winogrande", "boolq", "lambada")

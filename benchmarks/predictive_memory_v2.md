@@ -64,7 +64,7 @@ observation rather than presented as a fresh controlled measurement.
 Run the bounded V2 lookup explicitly:
 
 ```bash
-python benchmark_predictive_memory.py PATH_TO_SYMBOL_WORDS_JSON --version V2 \
+python -m benchmarks.benchmark_predictive_memory PATH_TO_SYMBOL_WORDS_JSON --version V2 \
   --update-report benchmarks/predictive_memory_v2.md
 ```
 
@@ -75,7 +75,7 @@ result artifact or includes the private source path in the report.
 V1 remains available for small synthetic fixtures:
 
 ```bash
-python benchmark_predictive_memory.py PATH_TO_SYNTHETIC_SYMBOL_WORDS_JSON --version V1
+python -m benchmarks.benchmark_predictive_memory PATH_TO_SYNTHETIC_SYMBOL_WORDS_JSON --version V1
 ```
 
 Do not invoke V1 on a large live store merely to reproduce the historical

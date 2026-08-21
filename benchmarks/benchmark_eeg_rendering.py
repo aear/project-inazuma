@@ -3,7 +3,7 @@
 This deliberately does not read Ina's memory. It uses only the standard library,
 so it can run on development machines that do not have the Qt EEG stack loaded.
 
-    python3 benchmark_eeg_rendering.py --sizes 10000,50000 --edge-ratio 5
+    python3 -m benchmarks.benchmark_eeg_rendering --sizes 10000,50000 --edge-ratio 5
 """
 from __future__ import annotations
 

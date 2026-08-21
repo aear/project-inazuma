@@ -111,7 +111,7 @@ preflight passed and did not write benchmark history or advance monthly cadence.
 
 Procedural scoring invokes a smaller form of this preflight automatically and
 refuses to continue if shallow cues exceed the validity threshold. A manual audit
-is available with `python benchmark_cognition.py --procedural --audit-only`.
+is available with `python -m benchmarks.benchmark_cognition --procedural --audit-only`.
 
 ## Live Ina attempt and current blocker
 

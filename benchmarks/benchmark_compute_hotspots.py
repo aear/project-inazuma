@@ -3,7 +3,7 @@
 This benchmark uses generated inputs only.  It does not read Ina's memories and
 does not write project state.  Run it from the repository root:
 
-    python3 benchmark_compute_hotspots.py
+    python3 -m benchmarks.benchmark_compute_hotspots
 
 The cases intentionally avoid matches so clustering and graph construction scan
 their full candidate sets.  This makes changes in quadratic hot paths visible.

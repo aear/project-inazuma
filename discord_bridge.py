@@ -1601,6 +1601,57 @@ def _find_channel_by_name(client: discord.Client, name: str, channel_type) -> di
     return None
 
 
+def discord_space_identity(message: discord.Message, *, roleplay_mode: Optional[str] = None) -> dict:
+    """Expose same-named Discord spaces as distinct, inspectable identities."""
+    guild = getattr(message, "guild", None)
+    channel = getattr(message, "channel", None)
+    guild_id = str(getattr(guild, "id", "")) if guild is not None else None
+    guild_name = str(getattr(guild, "name", "")).strip() if guild is not None else "Direct message"
+    channel_id = str(getattr(channel, "id", ""))
+    channel_name = str(getattr(channel, "name", "") or "dm").strip()
+    mode = "roleplay" if roleplay_mode else ("direct" if guild is None else "conversation")
+    return {
+        "identity": f"discord:{guild_id or 'dm'}:{channel_id}",
+        "label": f"{guild_name} / #{channel_name}" if guild is not None else f"Direct message / {channel_name}",
+        "guild_id": guild_id,
+        "guild_name": guild_name,
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "conversation_mode": mode,
+        "roleplay_access": roleplay_mode,
+    }
+
+
+def autonomous_voice_join_decision(
+    discord_cfg: dict,
+    *,
+    urge_level: float,
+    channel_id: object,
+    trusted_member_present: bool,
+    now: float,
+    last_join_at: float = 0.0,
+) -> dict:
+    """Make one bounded, deterministic decision about urge-led voice entry."""
+    policy = discord_cfg.get("autonomous_voice_join") or {}
+    if not isinstance(policy, dict) or policy.get("enabled", False) is not True:
+        return {"allowed": False, "reason": "disabled"}
+    threshold = max(0.0, min(1.0, _coerce_nonnegative_float(policy.get("min_urge"), 0.8)))
+    if urge_level < threshold:
+        return {"allowed": False, "reason": "urge_below_threshold", "threshold": threshold}
+    allowed_ids = {str(value) for value in policy.get("channel_ids", []) if str(value)}
+    configured_id = str(discord_cfg.get("voice_channel_id") or "")
+    if not allowed_ids and configured_id:
+        allowed_ids.add(configured_id)
+    if not allowed_ids or str(channel_id) not in allowed_ids:
+        return {"allowed": False, "reason": "channel_not_allowlisted"}
+    if policy.get("require_trusted_presence", True) and not trusted_member_present:
+        return {"allowed": False, "reason": "no_trusted_person_present"}
+    cooldown = _coerce_nonnegative_float(policy.get("cooldown_seconds"), 900.0)
+    if last_join_at and now - last_join_at < cooldown:
+        return {"allowed": False, "reason": "cooldown", "retry_after": cooldown - (now - last_join_at)}
+    return {"allowed": True, "reason": "high_urge_social_opportunity", "threshold": threshold}
+
+
 def resolve_configured_channels(client: discord.Client):
     """
     Resolve text/voice channel targets using IDs when present, otherwise by name.
@@ -1916,6 +1967,11 @@ def process_inbound_message(msg) -> CommsResponse:
             DEFAULT_MAX_REPLY_SYMBOLS,
         ),
         context=symbolic_context,
+        # Starting local sounddevice playback here also starts a PortAudio
+        # callback thread in the bridge process; a retained SIGILL core
+        # identified that callback as the crashing thread. Keep local rig
+        # playback owned by early_comm and Discord playback owned by its outbox.
+        playback=False,
     )
     if isinstance(symbolic, dict):
         shadow = symbolic.get("language_context_shadow")
@@ -2337,6 +2393,8 @@ class InaDiscordClient(discord.Bot):
         self._discord_send_lock = asyncio.Lock()
         self._next_discord_send_at = 0.0
         self._voice_playback_lock = asyncio.Lock()
+        self._last_autonomous_voice_join_at = 0.0
+        self._autonomous_voice_session = False
         self._load_outbox_history()
         self._typed_outbox_task = None
         self._language_review_task = None
@@ -2654,6 +2712,7 @@ class InaDiscordClient(discord.Bot):
         await self._note_language_review_stimulus(message)
 
     async def _handle_voice_join(self, message: discord.Message) -> None:
+        self._autonomous_voice_session = False
         target_channel = self.voice_channel
         author_voice = getattr(message.author, "voice", None)
         if target_channel is None and author_voice and author_voice.channel:
@@ -2857,6 +2916,8 @@ class InaDiscordClient(discord.Bot):
             self_user_id=getattr(self.user, "id", None),
         )
         channel = make_channel_info_from_discord(message, backend_name=BACKEND_NAME)
+        roleplay_mode = self._roleplay_mode(message) if roleplay else None
+        space = discord_space_identity(message, roleplay_mode=roleplay_mode)
         metadata = {
             "discord_author_id": str(message.author.id),
             "discord_channel_id": str(message.channel.id),
@@ -2866,6 +2927,11 @@ class InaDiscordClient(discord.Bot):
             "author_is_bot": bool(getattr(message.author, "bot", False)),
             "conversation_context": list(conversation_context or []),
             "is_roleplay_context": roleplay,
+            "discord_guild_name": space["guild_name"],
+            "discord_space": space,
+            "space_identity": space["identity"],
+            "space_label": space["label"],
+            "conversation_mode": space["conversation_mode"],
         }
         if edit_analysis:
             metadata["message_edit"] = edit_analysis
@@ -3350,7 +3416,42 @@ class InaDiscordClient(discord.Bot):
         timeout = _coerce_nonnegative_float(cfg.get("voice_playback_timeout_seconds"), 120.0) or 120.0
         async with self._voice_playback_lock:
             try:
-                voice_client = await self.ensure_voice_connected(self.voice_channel)
+                already_connected = bool(self.voice_client and self.voice_client.is_connected())
+                if not already_connected:
+                    metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+                    urge_level = _coerce_nonnegative_float(metadata.get("urge_to_voice"), 0.0)
+                    trusted_present = any(
+                        not getattr(member, "bot", False)
+                        and (
+                            getattr(member, "id", None) == SAKURA_USER_ID
+                            or is_owner_friend(getattr(member, "id", None))
+                            or is_high_trust(getattr(member, "id", None))
+                        )
+                        for member in getattr(self.voice_channel, "members", [])
+                    )
+                    decision = autonomous_voice_join_decision(
+                        cfg,
+                        urge_level=urge_level,
+                        channel_id=getattr(self.voice_channel, "id", None),
+                        trusted_member_present=trusted_present,
+                        now=time.time(),
+                        last_join_at=self._last_autonomous_voice_join_at,
+                    )
+                    if not decision["allowed"]:
+                        logger.info("Autonomous Discord voice entry declined: %s", decision)
+                        return False
+                    self._last_autonomous_voice_join_at = time.time()
+                    self._autonomous_voice_session = True
+                    update_inastate("last_discord_voice_entry", {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "channel_id": str(getattr(self.voice_channel, "id", "")),
+                        "urge_level": urge_level,
+                        "reason": decision["reason"],
+                    })
+                voice_client = await self.ensure_voice_connected(
+                    self.voice_channel,
+                    capture=already_connected and not self._autonomous_voice_session,
+                )
                 while voice_client.is_playing() or voice_client.is_paused():
                     await asyncio.sleep(0.25)
 
@@ -3381,6 +3482,10 @@ class InaDiscordClient(discord.Bot):
                     pass
             except Exception:
                 logger.exception("Failed to play Discord voice attachment %s.", path)
+            finally:
+                policy = cfg.get("autonomous_voice_join") or {}
+                if self._autonomous_voice_session and policy.get("leave_after_playback", True):
+                    await self._reset_voice_client()
         return False
 
     async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:
@@ -3917,7 +4022,7 @@ class InaDiscordClient(discord.Bot):
                 continue
         return None
 
-    async def ensure_voice_connected(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
+    async def ensure_voice_connected(self, channel: discord.VoiceChannel, *, capture: bool = True) -> discord.VoiceClient:
         """
         Connect or move Ina to the desired voice channel.
         """
@@ -3927,7 +4032,8 @@ class InaDiscordClient(discord.Bot):
 
         if self.voice_client and self.voice_client.is_connected():
             if self.voice_client.channel and self.voice_client.channel.id == channel.id:
-                await self._ensure_voice_capture()
+                if capture:
+                    await self._ensure_voice_capture()
                 return self.voice_client
             await self.voice_client.move_to(channel)
         else:
@@ -3941,7 +4047,8 @@ class InaDiscordClient(discord.Bot):
                 else:
                     raise
         self.voice_channel = channel
-        await self._ensure_voice_capture()
+        if capture:
+            await self._ensure_voice_capture()
         return self.voice_client
 
     async def _ensure_voice_capture(self) -> None:
@@ -4012,6 +4119,7 @@ class InaDiscordClient(discord.Bot):
 
         self.voice_client = None
         self.voice_channel = None
+        self._autonomous_voice_session = False
         self._recording_active = False
         self._active_sink = None
 

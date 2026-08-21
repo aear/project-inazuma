@@ -1,7 +1,7 @@
 import json
 import sqlite3
 
-from benchmark_predictive_memory import RESULTS_END, RESULTS_START, update_markdown_report
+from benchmarks.benchmark_predictive_memory import RESULTS_END, RESULTS_START, update_markdown_report
 
 from predictive_layer import load_recent_fragments
 from symbol_word_utils import (

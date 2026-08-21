@@ -45,10 +45,10 @@ python3 build_native.py
 Commands:
 
 ```text
-python3 benchmark_compute_hotspots.py --sizes 100,250,500,1000 --dimensions 64 --repeats 3
+python3 -m benchmarks.benchmark_compute_hotspots --sizes 100,250,500,1000 --dimensions 64 --repeats 3
 g++ -O3 -march=native -std=c++20 benchmark_cpp_vector_scan.cpp -o /tmp/ina-vector-bench
 /tmp/ina-vector-bench 1000 64 5
-python3 benchmark_memory_graph.py --root /tmp --records 2000 --payload-bytes 1024
+python3 -m benchmarks.benchmark_memory_graph --root /tmp --records 2000 --payload-bytes 1024
 ```
 
 Median wall time on the audit machine:

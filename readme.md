@@ -37,7 +37,7 @@ This repo shares the **runtime, transformers, and GUI**, not the private dataset
 
 ## Persistent cognitive benchmarks
 
-`benchmark_cognition.py` runs a small, frozen cognitive suite and appends each
+`benchmarks.benchmark_cognition` runs a small, frozen cognitive suite and appends each
 result to `benchmark_results/history.jsonl`. The initial suite covers continuity,
 temporal order, contradiction detection, belief revision, and causal tracking.
 
@@ -45,14 +45,14 @@ Run the GPT-2 baseline (requires optional Hugging Face `transformers` and
 `torch`, plus local or downloadable model weights):
 
 ```sh
-python benchmark_cognition.py --model gpt2
+python -m benchmarks.benchmark_cognition --model gpt2
 ```
 
 For Ina or another local model, provide a command that reads one JSON object
 from stdin (`prompt` and `choices`) and writes `{"scores": [...]}` to stdout:
 
 ```sh
-python benchmark_cognition.py --backend command --model ina \
+python -m benchmarks.benchmark_cognition --backend command --model ina \
   --command "python path/to/ina_benchmark_adapter.py"
 ```
 
@@ -61,13 +61,13 @@ suite/model pair last completed. This is an eligibility check on explicit
 invocation, not a background timer. `--force` bypasses the due check.
 
 HellaSwag, PIQA, WinoGrande, BoolQ, and LAMBADA are recorded as planned suites
-and can be seen with `python benchmark_cognition.py --list-suites`; their
+and can be seen with `python -m benchmarks.benchmark_cognition --list-suites`; their
 dataset adapters are intentionally deferred until those datasets are adopted.
 
 For the primary Ina benchmark, generate fresh instances on every run:
 
 ```sh
-python benchmark_cognition.py --procedural --monthly --backend command \
+python -m benchmarks.benchmark_cognition --procedural --monthly --backend command \
   --model ina --command "python path/to/ina_benchmark_adapter.py"
 ```
 
@@ -107,10 +107,10 @@ that fits a caller's memory budget. These names are separate from the
 short/working/long/cold retention tiers.
 
 ```sh
-python benchmark_algorithm_portfolio.py --sizes 100,1000,10000 \
+python -m benchmarks.benchmark_algorithm_portfolio --sizes 100,1000,10000 \
   --output benchmark_results/algorithm_portfolio.json
 
-python benchmark_algorithm_portfolio.py --real --child Inazuma_Yagami \
+python -m benchmarks.benchmark_algorithm_portfolio --real --child Inazuma_Yagami \
   --real-limit 10000 --scan-limit 50000 \
   --output benchmark_results/algorithm_portfolio_ina.json
 ```

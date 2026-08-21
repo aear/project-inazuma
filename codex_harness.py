@@ -79,6 +79,32 @@ def token_usage_payload(value: Any) -> dict[str, Any]:
     return result
 
 
+def rate_limit_payload(value: Any, previous: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Merge one sparse app-server rate-limit snapshot into bounded telemetry."""
+    data = value if isinstance(value, dict) else {}
+    prior = previous if isinstance(previous, Mapping) else {}
+    result: dict[str, Any] = {}
+    for key in ("limitId", "limitName", "planType", "rateLimitReachedType", "spendControlReached"):
+        if key in data and data[key] is not None:
+            result[key] = data[key]
+        elif key in prior:
+            result[key] = prior[key]
+    for key in ("primary", "secondary"):
+        current = data.get(key) if isinstance(data.get(key), dict) else {}
+        old = prior.get(key) if isinstance(prior.get(key), Mapping) else {}
+        if current or old:
+            window: dict[str, Any] = {}
+            for field in ("usedPercent", "windowDurationMins", "resetsAt"):
+                raw = current.get(field) if field in current else old.get(field)
+                if raw is not None:
+                    try:
+                        window[field] = max(0, int(raw))
+                    except (TypeError, ValueError):
+                        pass
+            result[key] = window
+    return result
+
+
 def diff_event_payload(diff: Any) -> dict[str, Any]:
     """Condense a unified diff while retaining bounded detail for lazy UI display."""
     text = str(diff or "")
@@ -247,7 +273,10 @@ class AppServerClient:
         self.last_test_status = "not observed"
         self.last_benchmark_status = "not observed"
         self.diff_seen = False
+        self.latest_diff: dict[str, Any] | None = None
         self.token_usage = token_usage_payload({})
+        self.rate_limits = rate_limit_payload({})
+        self._rate_limits_loaded = False
         self.process = subprocess.Popen(
             [
                 config.codex_binary,
@@ -354,6 +383,10 @@ class AppServerClient:
             self.events.append("auth", params)
         elif method == "thread/tokenUsage/updated" and isinstance(params, dict):
             self.token_usage = token_usage_payload(params.get("tokenUsage"))
+            return
+        elif method == "account/rateLimits/updated" and isinstance(params, dict):
+            self.rate_limits = rate_limit_payload(params.get("rateLimits"), self.rate_limits)
+            return
         self._append_notification_event(method, params)
 
     def _append_notification_event(self, method: str, params: Any) -> None:
@@ -366,10 +399,11 @@ class AppServerClient:
         elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"}:
             summary = data.get("delta") or "Reasoning summary updated"
             self.work_status = str(summary)[-MAX_SUMMARY_CHARS:]
-            kind = "work_status"
+            kind, summary = "reasoning", {"summary": "Reasoning…", "status": "active"}
         elif method == "turn/diff/updated":
-            kind, summary = "diff", diff_event_payload(data.get("diff"))
+            self.latest_diff = diff_event_payload(data.get("diff"))
             self.diff_seen = True
+            return
         elif method in {"item/commandExecution/outputDelta", "item/mcpToolCall/progress"}:
             kind, summary = "tool_output", data.get("delta") or data.get("message") or "Tool output updated"
         elif method in {"item/started", "item/completed"}:
@@ -382,26 +416,36 @@ class AppServerClient:
                         "raw": raw,
                     })
                 return
-            status = str(item.get("status") or ("completed" if method.endswith("completed") else "started"))
-            kind, summary = "tool", f"{item_type}: {status}"
-            command = str(item.get("command") or "").lower()
-            if "test" in command or "pytest" in command:
-                self.last_test_status = status
-            if "benchmark" in command:
-                self.last_benchmark_status = status
+            if item_type == "reasoning":
+                kind, summary = "reasoning", {
+                    "summary": "Reasoning complete." if method == "item/completed" else "Reasoning…",
+                    "status": "completed" if method == "item/completed" else "active",
+                }
+            else:
+                status = str(item.get("status") or ("completed" if method.endswith("completed") else "started"))
+                kind, summary = "tool", f"{item_type}: {status}"
+                command = str(item.get("command") or "").lower()
+                if "test" in command or "pytest" in command:
+                    self.last_test_status = status
+                if "benchmark" in command:
+                    self.last_benchmark_status = status
         elif method in {"turn/started", "turn/completed", "thread/status/changed"}:
-            kind, summary = "state", f"{method}: {self.turn_status if method.startswith('turn/') else self.thread_status}"
+            if method == "thread/status/changed":
+                return
+            completed = method == "turn/completed"
+            kind, summary = "task_state", {
+                "summary": "Task complete" if completed else "Task running…",
+                "status": "completed" if completed else "active",
+                "diff": self.latest_diff if completed else None,
+            }
         elif method in {"turn/plan/updated", "item/plan/delta"}:
             kind, summary = "plan", data.get("delta") or data.get("plan") or "Plan updated"
         elif method in {"error", "warning"} or method.endswith("/error"):
             kind, summary = "diagnostic", data.get("message") or method
         else:
             kind, summary = "protocol", method or "notification"
-        payload = summary if kind == "diff" and isinstance(summary, dict) else {"summary": summary}
-        if kind == "diff":
-            payload["raw"] = {"method": method, "params": {key: value for key, value in data.items() if key != "diff"}}
-        else:
-            payload["raw"] = raw
+        payload = dict(summary) if isinstance(summary, dict) else {"summary": summary}
+        payload["raw"] = raw
         self.events.append(kind, payload)
 
     def account(self, refresh: bool = False) -> dict[str, Any]:
@@ -409,6 +453,15 @@ class AppServerClient:
         account = result.get("account") if isinstance(result, dict) else None
         if not isinstance(account, dict) or account.get("type") != "chatgpt":
             raise SubscriptionAuthError("ChatGPT subscription login is required; API-key mode is disabled.")
+        if not getattr(self, "_rate_limits_loaded", True):
+            self._rate_limits_loaded = True
+            try:
+                limits = self.request("account/rateLimits/read", {})
+                if isinstance(limits, dict):
+                    self.rate_limits = rate_limit_payload(limits.get("rateLimits"), self.rate_limits)
+            except (RuntimeError, TimeoutError):
+                # Rolling notifications may still populate this optional meter.
+                pass
         return {
             "type": "chatgpt",
             "plan_type": account.get("planType"),
@@ -615,6 +668,7 @@ class AppServerClient:
             "benchmarks": self.last_benchmark_status,
             "diff": "changed" if self.diff_seen else "clean in this session",
             "token_usage": self.token_usage,
+            "rate_limits": self.rate_limits,
         }
         app_resources = self._resource_status(result["pid"])
         harness_resources = self._resource_status(os.getpid())
@@ -889,5 +943,5 @@ __all__ = [
     "HarnessConfig", "HarnessServer", "MAX_EVENTS", "MAX_IMAGES", "MAX_IMAGE_BYTES",
     "MAX_IMAGE_TOTAL_BYTES", "MAX_PROMPT_CHARS", "MAX_THREAD_LIST", "image_inputs",
     "SubscriptionAuthError", "build_config", "discover_codex",
-    "subscription_environment",
+    "rate_limit_payload", "subscription_environment", "token_usage_payload",
 ]

@@ -14,6 +14,7 @@ from codex_harness import (
     SubscriptionAuthError,
     diff_event_payload,
     image_inputs,
+    rate_limit_payload,
     subscription_environment,
     token_usage_payload,
 )
@@ -116,18 +117,47 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "Raw protocol details" in source
     assert "MAX_DOM_EVENTS" in source
     assert 'id="workStatus"' in source
-    assert 'id="usageStatus"' in source
+    assert 'id="tokenUsageStatus"' in source
+    assert 'id="rateLimitStatus"' in source
     assert "APPROVAL_PREFS_KEY" in source
     assert "Approval always requires your click" in source
     assert "localStorage.removeItem(APPROVAL_PREFS_KEY)" in source
     assert 'id="imagePicker"' in source
     assert "clipboardData" in source
     assert "MAX_IMAGE_TOTAL_BYTES" in source
+    assert 'id="imagePreview"' in source
+    assert "openImagePreview(item)" in source
+    assert "dialog.showModal()" in source
+    assert "preview.tabIndex=0" in source
+    assert "images.splice(index,1)" in source
     assert 'id="threadPicker"' in source
     assert "/api/thread/resume" in source
     assert "Show unified diff" in source
     assert "diff-add" in source
     assert "diff-del" in source
+    assert "upsertLifecycleEvent" in source
+    assert "target.dataset.diffAttached" in source
+
+
+def test_image_attachment_preview_benchmark_v1_remove_only_vs_v2_persistent_zoom():
+    """V2 adds inspectable zoom while retaining V1's explicit removal control."""
+    source = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    v1 = {
+        "thumbnail": "className='attachment'" in source,
+        "explicit_remove": "images.splice(index,1)" in source,
+        "click_to_zoom": False,
+        "keyboard_zoom": False,
+        "attachment_retained_on_close": False,
+    }
+    v2 = {
+        **v1,
+        "click_to_zoom": "preview.onclick=()=>openImagePreview(item)" in source,
+        "keyboard_zoom": "preview.tabIndex=0" in source and "event.key==='Enter'" in source,
+        "attachment_retained_on_close": "function closeImagePreview()" in source
+        and "images.splice" not in source.split("function closeImagePreview()", 1)[1].split("function renderImages()", 1)[0],
+    }
+    assert sum(v1.values()) == 2
+    assert sum(v2.values()) == 5
 
 
 def test_diff_rendering_benchmark_v4_raw_text_vs_v5_bounded_collapsible_payload():
@@ -151,10 +181,17 @@ def test_diff_notification_emits_structured_lazy_detail(tmp_path):
     client._handle_notification("turn/diff/updated", {
         "threadId": "thread-1", "turnId": "turn-1", "diff": "--- a/a.py\n+++ b/a.py\n-old\n+new",
     })
+    assert client.events.wait_after(0, 0) == []
+    assert client.latest_diff["summary"] == "Workspace diff · 1 file · +1 −1"
+    assert client.latest_diff["diff"].endswith("+new")
+
+    client._handle_notification("turn/completed", {
+        "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+    })
     event = client.events.wait_after(0, 0)[-1]
-    assert event["kind"] == "diff"
-    assert event["payload"]["summary"] == "Workspace diff · 1 file · +1 −1"
-    assert event["payload"]["diff"].endswith("+new")
+    assert event["kind"] == "task_state"
+    assert event["payload"]["summary"] == "Task complete"
+    assert event["payload"]["diff"]["diff"].endswith("+new")
 
 
 def test_client_disconnect_benchmark_v1_raises_and_v2_is_quiet(monkeypatch):
@@ -202,6 +239,9 @@ def _notification_client(tmp_path):
     client.last_test_status = "not observed"
     client.last_benchmark_status = "not observed"
     client.diff_seen = False
+    client.latest_diff = None
+    client.token_usage = token_usage_payload({})
+    client.rate_limits = rate_limit_payload({})
     return client
 
 
@@ -212,9 +252,17 @@ def test_reasoning_summary_is_live_status_and_raw_payload_stays_lazy(tmp_path):
 
     event = client.events.wait_after(0, 0)[-1]
     assert client.work_status == "Checking tests"
-    assert event["kind"] == "work_status"
-    assert event["payload"]["summary"] == "Checking tests"
+    assert event["kind"] == "reasoning"
+    assert event["payload"]["summary"] == "Reasoning…"
+    assert event["payload"]["status"] == "active"
     assert event["payload"]["raw"]["params"] == params
+
+    client._handle_notification("item/completed", {
+        "item": {"id": "reason-1", "type": "reasoning", "status": "completed"},
+    })
+    complete = client.events.wait_after(event["sequence"], 0)[-1]
+    assert complete["kind"] == "reasoning"
+    assert complete["payload"]["summary"] == "Reasoning complete."
 
 
 def test_assistant_message_benchmark_v1_delta_is_ignored_and_v2_item_is_authoritative(tmp_path):
@@ -318,6 +366,9 @@ def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path
     })
     assert client.running_turn is False
     assert client.turn_status == "completed"
+    events = client.events.wait_after(0, 0)
+    assert [event["kind"] for event in events] == ["task_state"]
+    assert events[0]["payload"]["summary"] == "Task complete"
 
 
 def test_usage_notification_updates_bounded_authoritative_meter(tmp_path):
@@ -334,6 +385,35 @@ def test_usage_notification_updates_bounded_authoritative_meter(tmp_path):
     assert client.token_usage["last"]["totalTokens"] == 120
     assert client.token_usage["total"]["totalTokens"] == 1200
     assert client.token_usage["modelContextWindow"] == 200000
+    assert client.events.wait_after(0, 0) == []
+
+
+def test_rate_limit_updates_are_sparse_merged_telemetry_not_conversation(tmp_path):
+    client = _notification_client(tmp_path)
+    client.rate_limits = rate_limit_payload({
+        "limitName": "Codex", "primary": {"usedPercent": 20, "resetsAt": 1000},
+        "secondary": {"usedPercent": 40},
+    })
+    client._handle_notification("account/rateLimits/updated", {
+        "rateLimits": {"primary": {"usedPercent": 25}},
+    })
+    assert client.rate_limits["limitName"] == "Codex"
+    assert client.rate_limits["primary"] == {"usedPercent": 25, "resetsAt": 1000}
+    assert client.rate_limits["secondary"] == {"usedPercent": 40}
+    assert client.events.wait_after(0, 0) == []
+
+
+def test_harness_event_reduction_benchmark_v5_cards_vs_v6_coalesced_summary():
+    source = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    v5 = {"metric_cards": 2, "lifecycle_cards": 2, "reasoning_cards": 2, "diff_cards": 1}
+    v6 = {
+        "metric_cards": int('id="tokenUsageStatus"' in source) + int('id="rateLimitStatus"' in source),
+        "lifecycle_cards": 1 if "data-live=\"'+key+'\"" in source else 0,
+        "reasoning_cards": 1 if "event.kind==='reasoning'" in source else 0,
+        "diff_cards": 0 if "target.dataset.diffAttached" in source else 1,
+    }
+    assert v5 == {"metric_cards": 2, "lifecycle_cards": 2, "reasoning_cards": 2, "diff_cards": 1}
+    assert v6 == {"metric_cards": 2, "lifecycle_cards": 1, "reasoning_cards": 1, "diff_cards": 0}
 
 
 def test_steering_off_preserves_prompt_and_omits_collaboration_framing(tmp_path):
