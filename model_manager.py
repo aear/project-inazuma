@@ -44,6 +44,8 @@ from runtime_state import (
     seed_self_question as _runtime_seed_self_question,
     set_self_question_hidden as _runtime_set_self_question_hidden,
     mark_self_question_resolved as _runtime_mark_self_question_resolved,
+    create_self_question_help_request as _runtime_create_self_question_help_request,
+    record_self_question_evidence as _runtime_record_self_question_evidence,
     append_typed_outbox_entry as _runtime_append_typed_outbox_entry,
 )
 from ina_desktop.client import workspace_command_environment
@@ -5249,19 +5251,47 @@ def seed_self_question(
     question: str, *, origin: Optional[Dict[str, Any]] = None,
     provenance: Optional[Dict[str, Any]] = None,
     trigger: Optional[str] = None,
+    question_type: Optional[str] = None,
+    evidence: Any = None,
+    evidence_references: Optional[List[Any]] = None,
+    candidate_symbols: Optional[List[Any]] = None,
 ) -> None:
     return _runtime_seed_self_question(
         question, child=CHILD, origin=origin, provenance=provenance, trigger=trigger,
+        question_type=question_type, evidence=evidence,
+        evidence_references=evidence_references, candidate_symbols=candidate_symbols,
     )
 
 
-def mark_self_question_resolved(question: str, reason: Optional[str] = None) -> None:
-    return _runtime_mark_self_question_resolved(question, reason, child=CHILD)
+def mark_self_question_resolved(
+    question: str, reason: Optional[str] = None, *, evidence: Any = None,
+    evidence_references: Optional[List[Any]] = None,
+) -> None:
+    return _runtime_mark_self_question_resolved(
+        question, reason, child=CHILD, evidence=evidence,
+        evidence_references=evidence_references,
+    )
 
 
 def set_self_question_hidden(question: str, hidden: bool = True) -> bool:
     """Let Ina suppress a question from display without erasing it."""
     return _runtime_set_self_question_hidden(question, hidden, child=CHILD)
+
+
+def create_self_question_help_request(question: str) -> Optional[str]:
+    return _runtime_create_self_question_help_request(question, child=CHILD)
+
+
+def record_self_question_evidence(
+    question: str, evidence: Any, *, references: Optional[List[Any]] = None,
+    uncertainty_changed: bool = False, resolved: bool = False,
+    evaluation: Optional[Dict[str, Any]] = None,
+) -> bool:
+    return _runtime_record_self_question_evidence(
+        question, evidence, references=references,
+        uncertainty_changed=uncertainty_changed, resolved=resolved,
+        evaluation=evaluation, child=CHILD,
+    )
 
 
 def _load_symbol_map():

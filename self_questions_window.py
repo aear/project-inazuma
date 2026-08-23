@@ -8,7 +8,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Mapping
 
 from self_questions_format import format_question, format_questions
-from runtime_state import set_self_question_hidden
+from runtime_state import create_self_question_help_request, set_self_question_hidden
 
 class SelfQuestionsWindow:
     def __init__(self, parent: tk.Misc, path: Path, *, child: str | None = None) -> None:
@@ -35,6 +35,7 @@ class SelfQuestionsWindow:
         ttk.Button(toolbar, text="Reload", command=self.reload).pack(side=tk.RIGHT)
         ttk.Button(toolbar, text="Copy all", command=self.copy_all).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(toolbar, text="Copy selected", command=self.copy_selected).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(toolbar, text="Copy help request", command=self.copy_help_request).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(toolbar, text="Reveal selected", command=lambda: self.set_selected_hidden(False)).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(toolbar, text="Hide selected", command=lambda: self.set_selected_hidden(True)).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -44,11 +45,12 @@ class SelfQuestionsWindow:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(
-            table_frame, columns=("question", "trigger", "asked", "status", "updated"),
+            table_frame, columns=("question", "type", "triggered", "asked", "status", "updated"),
             show="headings", selectmode="extended",
         )
         for key, title, width, stretch in (
-            ("question", "Question", 390, True), ("trigger", "Trigger", 150, True), ("asked", "Count", 70, False),
+            ("question", "Question", 330, True), ("type", "Type", 130, False),
+            ("triggered", "Triggers", 70, False), ("asked", "Asks", 55, False),
             ("status", "Status", 110, False), ("updated", "Updated", 190, True),
         ):
             self.tree.heading(key, text=title)
@@ -94,7 +96,9 @@ class SelfQuestionsWindow:
             latest_trigger = triggers[-1] if isinstance(triggers, list) and triggers else {}
             trigger = latest_trigger.get("trigger") or latest.get("trigger") or latest.get("module") or latest.get("transformer") or latest.get("source") or ""
             self.tree.insert("", tk.END, iid=iid, values=(
-                entry.get("question"), trigger, int(entry.get("count", 1) or 1),
+                entry.get("question"), entry.get("question_type") or "unclassified",
+                int(entry.get("trigger_count", entry.get("count", 1)) or 1),
+                int(entry.get("ask_count", 0) or 0),
                 "hidden" if entry.get("hidden") else ("resolved" if resolved else "open"),
                 entry.get("last_updated") or entry.get("first_asked") or "",
             ))
@@ -125,6 +129,20 @@ class SelfQuestionsWindow:
 
     def copy_all(self) -> None:
         self._copy([self.entries[index] for index in self.visible_indices])
+
+    def copy_help_request(self) -> None:
+        selected = self._selected_entries()
+        if len(selected) != 1:
+            messagebox.showinfo("Self Questions", "Select exactly one question.", parent=self.window)
+            return
+        request = create_self_question_help_request(selected[0]["question"], child=self.child)
+        if not request:
+            messagebox.showinfo("Self Questions", "The request could not be prepared.", parent=self.window)
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(request)
+        self.reload()
+        self.status.set("Copied one specific help request")
 
     def set_selected_hidden(self, hidden: bool) -> None:
         selected = self._selected_entries()

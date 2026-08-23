@@ -543,6 +543,30 @@ def _question_display_v2() -> dict[str, Any]:
     ])
 
 
+def _question_resolution_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "questions route to evidence sources", "correct": False},
+        {"case": "repeat trigger differs from operator ask", "correct": False},
+        {"case": "resolution survives identical reproduction", "correct": False},
+        {"case": "symmetric relation keys canonicalise", "correct": False},
+        {"case": "routing and ask telemetry are inspectable in UI export", "correct": False},
+    ])
+
+
+def _question_resolution_v2() -> dict[str, Any]:
+    from self_question_loop import make_resolution_plan, question_key
+    source = Path("runtime_state.py").read_text(encoding="utf-8")
+    display_source = Path("self_questions_format.py").read_text(encoding="utf-8")
+    plan = make_resolution_plan("What experience grounds the word 'farm'?")
+    return _capability([
+        {"case": "questions route to evidence sources", "correct": plan["next_source"] == "own_memory" and "human_operator" in plan["sources"]},
+        {"case": "repeat trigger differs from operator ask", "correct": "trigger_count" in source and "ask_count" in source},
+        {"case": "resolution survives identical reproduction", "correct": "Reopen only" in source and "resolution_evidence_hash" in source},
+        {"case": "symmetric relation keys canonicalise", "correct": question_key("What links text and vision?") == question_key("What links vision and text?")},
+        {"case": "routing and ask telemetry are inspectable in UI export", "correct": "Next evidence source" in display_source and "Operator asks" in display_source},
+    ])
+
+
 def _language_v1() -> dict[str, Any]:
     source = _v1_text("language_context.py")
     components = ("composition", "morphology", "constructions", "pragmatics", "discourse", "uncertainty", "counterfactuals", "reading_spans")
@@ -1162,6 +1186,7 @@ _HISTORY_BACKED_MODULES = {
     "experience_cycle", "virtual_file_explorer", "continuity_recall", "background_interference",
     "codex_harness", "thread_governor", "fragment_runtime_sweep", "fragment_repair",
     "semantic_topology",
+    "self_question_resolution",
 }
 
 
@@ -1188,6 +1213,7 @@ _REGISTRY = {
     "soul_drift": (ModuleVersion("soul_drift", "V1", "Link drift without emotion direction", _soul_v1), ModuleVersion("soul_drift", "V2", "Indexed links and emotion-directed drift", _soul_v2)),
     "self_question_origins": (ModuleVersion("self_question_origins", "V1", "Question metadata only", _question_origin_v1), ModuleVersion("self_question_origins", "V2", "Composable trigger chain export", _question_origin_v2)),
     "self_question_display": (ModuleVersion("self_question_display", "V1", "Latest timestamp and resolved state only", _question_display_v1), ModuleVersion("self_question_display", "V2", "Bounded trigger history and reversible display hiding", _question_display_v2)),
+    "self_question_resolution": (ModuleVersion("self_question_resolution", "V1", "Questions accumulate without evidence routing", _question_resolution_v1), ModuleVersion("self_question_resolution", "V2", "Typed evidence routing and evaluated lifecycle", _question_resolution_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
     "language_components": (ModuleVersion("language_components", "V1", "Historical language context", _language_v1), ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2)),
     "discord_retention": (ModuleVersion("discord_retention", "V1", "Unbounded delivery history", _discord_retention_v1), ModuleVersion("discord_retention", "V2", "Bounded history and buffers", _discord_retention_v2)),

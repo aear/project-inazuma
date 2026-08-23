@@ -8,8 +8,24 @@ def format_question(entry: Mapping[str, Any]) -> str:
     question = str(entry.get("question") or "unknown")
     first = str(entry.get("first_asked") or entry.get("timestamp") or "")
     updated = str(entry.get("last_updated") or first)
-    count = int(entry.get("count", entry.get("times", 1)) or 1)
-    lines = [question, f"First asked: {first or 'unknown'}", f"Last updated: {updated or 'unknown'}", f"Asked: {count} time(s)"]
+    trigger_count = int(entry.get("trigger_count", entry.get("count", entry.get("times", 1))) or 1)
+    ask_count = int(entry.get("ask_count", 0) or 0)
+    lines = [question, f"Type: {entry.get('question_type') or 'unclassified'}",
+             f"First asked: {first or 'unknown'}", f"Last updated: {updated or 'unknown'}",
+             f"Triggered: {trigger_count} time(s)", f"Operator asks: {ask_count}"]
+    if "trigger_count" not in entry:  # legacy export label compatibility
+        lines.append(f"Asked: {trigger_count} time(s)")
+    plan = entry.get("resolution_plan")
+    if isinstance(plan, Mapping):
+        lines.append(f"Next evidence source: {plan.get('next_source') or 'unresolved'}")
+        if plan.get("sources"):
+            lines.append(f"Candidate sources: {', '.join(str(source) for source in plan.get('sources', []))}")
+    if entry.get("help_request"):
+        lines.append(f"Help request: {entry.get('help_request')}")
+    if entry.get("candidate_symbols"):
+        lines.append(f"Candidate symbols: {entry.get('candidate_symbols')}")
+    if entry.get("evidence_references"):
+        lines.append(f"Evidence references: {entry.get('evidence_references')}")
     if entry.get("resolved_at"):
         lines.append(f"Resolved: {entry.get('resolved_at')}")
     if entry.get("resolved_reason"):

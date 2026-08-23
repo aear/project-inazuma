@@ -332,7 +332,15 @@ def build_emotion_map(child="Inazuma_Yagami", samples=100, similarity_threshold=
         else:
             save_emotion_map(child, existing + new_symbols)
             log_to_statusbox(f"[EmotionMap] Saved {len(new_symbols)} new symbolic emotions.")
-        seed_self_question("Which of these symbols feels most like me?")
+        seed_self_question(
+            "Which of these symbols feels most like me?",
+            question_type="self_reflection",
+            candidate_symbols=[{
+                "symbol_word_id": row.get("symbol_word_id"), "symbol": row.get("symbol"),
+                "summary": row.get("summary"),
+            } for row in new_symbols],
+            evidence_references=[row.get("symbol_word_id") for row in new_symbols],
+        )
     else:
         log_to_statusbox("[EmotionMap] No new symbolic states added — existing set is dense.")
 

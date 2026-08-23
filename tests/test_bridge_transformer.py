@@ -23,3 +23,21 @@ def test_bridge_creates_pause_file(tmp_path):
     assert result["question"] == "How can violence be love?"
     assert result["emotion"] == "care"
     assert flag.exists()
+
+
+def test_bridge_does_not_turn_arbitrary_tag_pair_into_contradiction(tmp_path):
+    flag = tmp_path / "pause.flag"
+    seeded = []
+    prior = bridge_module.seed_self_question
+    bridge_module.seed_self_question = seeded.append
+    try:
+        result = BridgeTransformer(pause_flag=flag).bridge(
+            "text", "self_read", source_context={"relation_type": "consumes", "fragment_id": "frag-1"},
+        )
+    finally:
+        bridge_module.seed_self_question = prior
+    assert result["question"] is None
+    assert result["contradiction_evidence"] is False
+    assert result["relation_candidate"]["relation_type"] == "consumes"
+    assert seeded == []
+    assert not flag.exists()

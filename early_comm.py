@@ -1246,12 +1246,12 @@ def identify_devices_from_config():
     devices = {
         "headset": config.get("mic_headset_name", "unknown"),
         "webcam": config.get("mic_webcam_name", "unknown"),
-        "pulse": config.get("pulse_audio_name", "unknown"),
         "camera": config.get("camera_name", "unknown"),
         "display": config.get("display_input_name", "unknown")
     }
 
-    # Optional: Ask Ina to reflect on any missing or unusual names
+    # Resolve configured roles first. Pulse monitoring uses the newer runtime
+    # probe below; the legacy pulse_audio_name must not create a question loop.
     for key, val in devices.items():
         if val == "unknown":
             log_to_statusbox(f"[Comms] Unknown device role: {key}")
@@ -1273,6 +1273,11 @@ def identify_devices_from_config():
         update_inastate("pulse_monitor_name", pulse_monitor)
     else:
         devices["pulse_monitor"] = "unknown"
+        seed_self_question(
+            "What is my pulse monitor device called?",
+            question_type="environment_grounding",
+            evidence={"probe": "detect_pulse_monitor", "headset_hint": headset_hint, "result": "none"},
+        )
 
     return devices
 

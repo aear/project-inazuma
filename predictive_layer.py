@@ -220,7 +220,15 @@ def run_prediction():
                     f"logic {map_status['logic_neurons']}n/{map_status['logic_synapses']}s)?"
                 )
             elif best_sim > 0.9:
-                seed_self_question(f"Do I understand what '{best_match['symbol_word_id']}' means?")
+                # A strong in-sample match is supporting evidence, not itself
+                # uncertainty.  A validation question belongs to a held-out
+                # prediction/classification comparison performed by a learner.
+                update_inastate("semantic_validation_candidate", {
+                    "symbol_word_id": best_match["symbol_word_id"],
+                    "confidence": round(best_sim, 4),
+                    "status": "awaiting_held_out_evidence",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
         else:
             log_to_statusbox("[Predict] No symbol word match found.")
             seed_self_question("What am I feeling right now?")

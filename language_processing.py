@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from runtime_state import load_config, seed_self_question
+from self_question_loop import semantic_text_candidate
 from experience_logger import ExperienceLogger
 from learned_media_lessons import load_output_guidance
 from language_context import (
@@ -1475,9 +1476,11 @@ def associate_symbol_with_word(
             f"[LangLearn] Grounded '{word}' in experience event {grounding['event_id']} (speaker: {grounding.get('speaker', 'system')})."
         )
     else:
-        seed_self_question(
-            f"What experience grounds the word '{word}' for symbol {symbol_id}?"
-        )
+        lexical_word = semantic_text_candidate(word)
+        if lexical_word:
+            seed_self_question(
+                f"What experience grounds the word '{lexical_word}' for symbol {symbol_id}?"
+            )
 
 def backprop_symbol_confidence(child, predicted_word, expressed_symbol, base_path: Optional[Path] = None):
     vocab = load_symbol_to_token(child, base_path)
@@ -2300,6 +2303,9 @@ def ensure_word_grounded(
 ) -> bool:
     """Ensure that a word is backed by experiential memory before use."""
 
+    word = semantic_text_candidate(word)
+    if not word:
+        return False
     if is_word_grounded(child, word, base_path=base_path):
         return True
 

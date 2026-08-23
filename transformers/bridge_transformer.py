@@ -74,7 +74,8 @@ class BridgeTransformer:
         emotion_state = emotion_state or {}
         dominant = max(emotion_state, key=emotion_state.get, default="")
 
-        if OPPOSITES.get(symbol) == logic_tag or OPPOSITES.get(logic_tag) == symbol:
+        contradictory = OPPOSITES.get(symbol) == logic_tag or OPPOSITES.get(logic_tag) == symbol
+        if contradictory:
             fused = f"{symbol} as {logic_tag}"
             question = f"How can {symbol} be {logic_tag}?"
         else:
@@ -92,14 +93,29 @@ class BridgeTransformer:
         references = list(dict.fromkeys(references))
         origin = make_origin(
             self.__class__.__name__, "V2", inputs={"symbol": symbol, "logic_tag": logic_tag},
-            references=references, trigger="contradiction", event_id=source_context.get("event_id"),
-            metadata={key: source_context[key] for key in ("capability", "context") if source_context.get(key)},
+            references=references, trigger="contradiction" if contradictory else "relation_observation",
+            event_id=source_context.get("event_id"),
+            metadata={
+                **{key: source_context[key] for key in ("capability", "context") if source_context.get(key)},
+                "relation_type": source_context.get("relation_type") or "associated_with",
+            },
         )
-        seed_self_question(question, origin=origin)
-        self._trigger_pause()
-        log_to_statusbox(f"[Bridge] Explored paradox between {symbol} and {logic_tag}.")
+        if contradictory:
+            seed_self_question(question, origin=origin, evidence=source_context,
+                               evidence_references=references)
+            self._trigger_pause()
+            log_to_statusbox(f"[Bridge] Explored evidenced paradox between {symbol} and {logic_tag}.")
+        else:
+            # Association is a relation-learning candidate, not contradiction
+            # evidence and therefore must not force a pause or question.
+            question = None
+            log_to_statusbox(f"[Bridge] Retained relation candidate between {symbol} and {logic_tag}.")
 
         return {
             "fused_truth": fused, "question": question, "emotion": dominant,
-            "origins": [origin],
+            "origins": [origin], "contradiction_evidence": contradictory,
+            "relation_candidate": {
+                "subject": symbol, "relation_type": source_context.get("relation_type") or "associated_with",
+                "object": logic_tag, "references": references,
+            },
         }

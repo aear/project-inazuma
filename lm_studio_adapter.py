@@ -20,6 +20,7 @@ from language_processing import (
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
 from model_manager import load_config, seed_self_question
+from self_question_loop import semantic_text_candidate
 from discourse_context import DISCOURSE_TERMS, build_discourse_context, retrieval_routes, role_alignment
 from continuity_manager import ContinuityManager
 
@@ -431,6 +432,9 @@ class LMStudioAdapter:
         if unknown_words and seed_questions:
             speaker_name = str(speaker or "unknown speaker").strip()[:80]
             for word in unknown_words:
+                word = semantic_text_candidate(word)
+                if not word:
+                    continue
                 seed_self_question(
                     f"What experience grounds the word '{word}' mentioned by {speaker_name}?"
                 )

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from origin_record import normalize_origins
+from self_question_loop import evidence_hash, formulate_help_request, make_resolution_plan, question_key
 
 from discord_runtime import typed_outbox_path
 from gui_hook import log_to_statusbox
@@ -255,7 +256,14 @@ def _load_self_question_entries(child: Optional[str] = None) -> List[Dict[str, A
                 "first_asked": first,
                 "last_updated": last,
                 "count": count,
+                "trigger_count": int(entry.get("trigger_count", count) or count),
+                "ask_count": int(entry.get("ask_count", 0) or 0),
             }
+            for key in ("question_key", "question_type", "resolution_plan", "evidence_hash",
+                        "resolution_evidence_hash", "evidence_references", "candidate_symbols",
+                        "help_request", "last_asked_at", "evidence_history"):
+                if key in entry:
+                    normalized[key] = entry[key]
             if entry.get("resolved_at"):
                 normalized["resolved_at"] = entry.get("resolved_at")
             if entry.get("resolved_reason"):
@@ -287,6 +295,10 @@ def seed_self_question(
     origin: Optional[Dict[str, Any]] = None,
     provenance: Optional[Dict[str, Any]] = None,
     trigger: Optional[str] = None,
+    question_type: Optional[str] = None,
+    evidence: Any = None,
+    evidence_references: Optional[List[Any]] = None,
+    candidate_symbols: Optional[List[Any]] = None,
 ) -> None:
     if not question:
         return
@@ -294,6 +306,9 @@ def seed_self_question(
     entries = _load_self_question_entries(target_child)
     now_iso = datetime.now(timezone.utc).isoformat()
     normalized_question = question.strip()
+    plan = make_resolution_plan(normalized_question, question_type)
+    key = question_key(normalized_question, plan["question_type"])
+    incoming_hash = evidence_hash(evidence, evidence_references) if evidence is not None or evidence_references else None
     supplied_origin = origin or provenance
     normalized_origins = normalize_origins(supplied_origin)
     latest_origin = normalized_origins[-1] if normalized_origins else {}
@@ -306,15 +321,30 @@ def seed_self_question(
         trigger_record["event_id"] = str(latest_origin.get("event_id"))[:240]
     existing = None
     for entry in entries:
-        if entry.get("question") == normalized_question:
+        entry_key = entry.get("question_key") or question_key(str(entry.get("question") or ""), entry.get("question_type"))
+        if entry_key == key:
             existing = entry
             break
 
     if existing:
         existing["count"] = int(existing.get("count", 1) or 1) + 1
+        existing["trigger_count"] = int(existing.get("trigger_count", existing["count"] - 1) or 0) + 1
         existing["last_updated"] = now_iso
-        existing.pop("resolved_at", None)
-        existing.pop("resolved_reason", None)
+        existing["question_key"] = key
+        existing["question_type"] = plan["question_type"]
+        existing["resolution_plan"] = plan
+        # Repeated production is telemetry, not new uncertainty.  Reopen only
+        # when evidence materially differs from that used for resolution.
+        if incoming_hash and existing.get("resolved_at") and incoming_hash != existing.get("resolution_evidence_hash"):
+            existing.pop("resolved_at", None)
+            existing.pop("resolved_reason", None)
+            existing["reopened_at"] = now_iso
+        if incoming_hash:
+            existing["evidence_hash"] = incoming_hash
+        if evidence_references:
+            existing["evidence_references"] = list(dict.fromkeys(str(v) for v in evidence_references))[-32:]
+        if candidate_symbols:
+            existing["candidate_symbols"] = list(candidate_symbols)[:24]
         history = existing.setdefault("trigger_history", [])
         history.append(trigger_record)
         del history[:-32]
@@ -328,8 +358,19 @@ def seed_self_question(
             "first_asked": now_iso,
             "last_updated": now_iso,
             "count": 1,
+            "trigger_count": 1,
+            "ask_count": 0,
+            "question_key": key,
+            "question_type": plan["question_type"],
+            "resolution_plan": plan,
             "trigger_history": [trigger_record],
         }
+        if incoming_hash:
+            entry["evidence_hash"] = incoming_hash
+        if evidence_references:
+            entry["evidence_references"] = list(dict.fromkeys(str(v) for v in evidence_references))[-32:]
+        if candidate_symbols:
+            entry["candidate_symbols"] = list(candidate_symbols)[:24]
         if normalized_origins:
             entry["origins"] = normalized_origins
         entries.append(entry)
@@ -368,6 +409,7 @@ def set_self_question_hidden(
 
 def mark_self_question_resolved(
     question: str, reason: Optional[str] = None, *, child: Optional[str] = None,
+    evidence: Any = None, evidence_references: Optional[List[Any]] = None,
 ) -> None:
     if not question:
         return
@@ -380,6 +422,7 @@ def mark_self_question_resolved(
         if str(entry.get("question") or "").strip().lower() != lower:
             continue
         entry["resolved_at"] = now_iso
+        entry["resolution_evidence_hash"] = evidence_hash(evidence, evidence_references) if evidence is not None or evidence_references else entry.get("evidence_hash")
         if reason:
             entry["resolved_reason"] = reason
         entry["last_updated"] = now_iso
@@ -389,6 +432,63 @@ def mark_self_question_resolved(
         updated = True
     if updated:
         _save_self_question_entries(entries, target_child)
+
+
+def create_self_question_help_request(question: str, *, child: Optional[str] = None) -> Optional[str]:
+    """Record a deliberate operator ask separately from repeated triggers."""
+    target_child = child or _current_child()
+    entries = _load_self_question_entries(target_child)
+    lower = question_key(question)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for entry in entries:
+        if (entry.get("question_key") or question_key(entry.get("question", ""), entry.get("question_type"))) != lower:
+            continue
+        request = formulate_help_request(entry)
+        entry["help_request"] = request
+        entry["ask_count"] = int(entry.get("ask_count", 0) or 0) + 1
+        entry["last_asked_at"] = now_iso
+        _save_self_question_entries(entries, target_child)
+        return request
+    return None
+
+
+def record_self_question_evidence(
+    question: str, evidence: Any, *, references: Optional[List[Any]] = None,
+    uncertainty_changed: bool = False, resolved: bool = False,
+    evaluation: Optional[Dict[str, Any]] = None, child: Optional[str] = None,
+) -> bool:
+    """Attach evaluated evidence; resolution requires changed uncertainty.
+
+    Learners remain responsible for interpreting evidence in their own domain.
+    This record captures their comparison rather than treating an answer's mere
+    arrival as proof that the underlying question was answered.
+    """
+    target_child = child or _current_child()
+    entries = _load_self_question_entries(target_child)
+    target_key = question_key(question)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for entry in entries:
+        key = entry.get("question_key") or question_key(entry.get("question", ""), entry.get("question_type"))
+        if key != target_key:
+            continue
+        digest = evidence_hash(evidence, references)
+        history = entry.setdefault("evidence_history", [])
+        history.append({
+            "timestamp": now_iso, "evidence_hash": digest,
+            "references": list(dict.fromkeys(str(v) for v in (references or [])))[:32],
+            "uncertainty_changed": bool(uncertainty_changed),
+            "evaluation": evaluation or {},
+        })
+        del history[:-32]
+        entry["evidence_hash"] = digest
+        entry["last_updated"] = now_iso
+        if resolved and uncertainty_changed:
+            entry["resolved_at"] = now_iso
+            entry["resolved_reason"] = "evaluated evidence changed underlying uncertainty"
+            entry["resolution_evidence_hash"] = digest
+        _save_self_question_entries(entries, target_child)
+        return True
+    return False
 
 
 def append_typed_outbox_entry(
