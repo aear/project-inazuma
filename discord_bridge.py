@@ -61,7 +61,7 @@ from vector_math import cosine_similarity as visual_cosine_similarity
 from visual_token_learning import observe_image as observe_visual_tokens
 from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
-from model_manager import get_inastate, update_inastate
+from runtime_state import get_inastate, update_inastate
 from text_memory import (
     build_text_symbol_links,
     review_text_evidence,

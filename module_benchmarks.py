@@ -644,6 +644,34 @@ def _communication_continuity_v2() -> dict[str, Any]:
     ])
 
 
+def _discord_bridge_memory_v1() -> dict[str, Any]:
+    source = _v1_text("discord_bridge.py")
+    core_source = _v1_text("comms_core.py")
+    guard_source = _v1_text("fragment_limits.py")
+    text_source = _v1_text("text_memory.py")
+    adapter_source = _v1_text("lm_studio_adapter.py")
+    return _capability([
+        {"case": "bridge avoids monolithic manager import", "component": "isolation", "correct": "from model_manager import get_inastate" not in source and "from model_manager import increment_inastate_metric" not in core_source},
+        {"case": "text memory uses canonical state seam", "component": "state_reuse", "correct": "from model_manager import increment_inastate_metric" not in text_source},
+        {"case": "fallback adapter avoids manager import", "component": "fallback", "correct": "from model_manager import load_config" not in adapter_source},
+        {"case": "memory guard avoids manager import", "component": "guard", "correct": "from model_manager import load_config" not in guard_source},
+    ])
+
+
+def _discord_bridge_memory_v2() -> dict[str, Any]:
+    source = Path("discord_bridge.py").read_text(encoding="utf-8")
+    core_source = Path("comms_core.py").read_text(encoding="utf-8")
+    guard_source = Path("fragment_limits.py").read_text(encoding="utf-8")
+    text_source = Path("text_memory.py").read_text(encoding="utf-8")
+    adapter_source = Path("lm_studio_adapter.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "bridge avoids monolithic manager import", "component": "isolation", "correct": "from runtime_state import get_inastate, update_inastate" in source and "from runtime_state import increment_inastate_metric" in core_source and "from model_manager" not in source and "from model_manager" not in core_source},
+        {"case": "text memory uses canonical state seam", "component": "state_reuse", "correct": "from runtime_state import increment_inastate_metric" in text_source and "from model_manager import increment_inastate_metric" not in text_source},
+        {"case": "fallback adapter avoids manager import", "component": "fallback", "correct": "from runtime_state import seed_self_question" in adapter_source and "from model_manager import load_config" not in adapter_source},
+        {"case": "memory guard avoids manager import", "component": "guard", "correct": "from runtime_state import get_inastate, update_inastate" in guard_source and "from model_manager" not in guard_source},
+    ])
+
+
 def _self_read_language_v1() -> dict[str, Any]:
     source = _v1_text("raw_file_manager.py")
     audio_source = _v1_text("audio_digest.py")
@@ -1236,6 +1264,7 @@ _REGISTRY = {
     "language_components": (ModuleVersion("language_components", "V1", "Historical language context", _language_v1), ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2)),
     "discord_retention": (ModuleVersion("discord_retention", "V1", "Unbounded delivery history", _discord_retention_v1), ModuleVersion("discord_retention", "V2", "Bounded history and buffers", _discord_retention_v2)),
     "communication_continuity": (ModuleVersion("communication_continuity", "V1", "Stale speech mixed into ordinary episodic recall", _communication_continuity_v1), ModuleVersion("communication_continuity", "V2", "Explicit unfinished speech with bounded contextual recall", _communication_continuity_v2)),
+    "discord_bridge_memory": (ModuleVersion("discord_bridge_memory", "V1", "Discord imports the monolithic cognitive manager", _discord_bridge_memory_v1), ModuleVersion("discord_bridge_memory", "V2", "Discord reuses lightweight canonical state seams", _discord_bridge_memory_v2)),
     "native_test_support": (ModuleVersion("native_test_support", "V1", "External pytest required", _native_tests_v1), ModuleVersion("native_test_support", "V2", "Dependency-free pytest subset", _native_tests_v2)),
     "self_read_language": (ModuleVersion("self_read_language", "V1", "Music assets without explicit language roles", _self_read_language_v1), ModuleVersion("self_read_language", "V2", "Vocal, spoken, and written self-read alignment", _self_read_language_v2)),
     "experience_cycle": (ModuleVersion("experience_cycle", "V1", "Historical event and episode logging", _experience_cycle_v1), ModuleVersion("experience_cycle", "V2", "Optional bounded intent-attempt-observation-evaluation cycles", _experience_cycle_v2)),

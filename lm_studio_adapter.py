@@ -19,7 +19,8 @@ from language_processing import (
 )
 from live_experience_bridge import LiveExperienceBridge
 from memory_graph import build_experience_graph
-from model_manager import load_config, seed_self_question
+from config_layers import load_config
+from runtime_state import seed_self_question
 from self_question_loop import semantic_text_candidate
 from discourse_context import DISCOURSE_TERMS, build_discourse_context, retrieval_routes, role_alignment
 from continuity_manager import ContinuityManager

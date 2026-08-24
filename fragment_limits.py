@@ -8,17 +8,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
 
-try:
-    from model_manager import load_config, get_inastate, update_inastate  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    def load_config() -> Dict[str, Any]:  # type: ignore[redefinition]
-        return {}
-
-    def get_inastate(key: str, default=None):  # type: ignore[redefinition]
-        return default
-
-    def update_inastate(key: str, value) -> None:  # type: ignore[redefinition]
-        return None
+from config_layers import load_config
+from runtime_state import get_inastate, update_inastate
 
 
 _FRAGMENT_LIMITS_DEFAULTS = {

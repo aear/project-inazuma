@@ -13,7 +13,7 @@ import re
 
 from conversation_scene import ConversationSceneBuffer
 from experience_logger import ExperienceLogger
-from model_manager import increment_inastate_metric
+from runtime_state import increment_inastate_metric
 
 try:
     from text_memory import record_text_observation

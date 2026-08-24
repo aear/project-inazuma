@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
-from model_manager import increment_inastate_metric, set_inastate_metric
+from runtime_state import increment_inastate_metric, set_inastate_metric
 
 try:
     import fcntl
