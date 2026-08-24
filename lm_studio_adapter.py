@@ -23,6 +23,8 @@ from model_manager import load_config, seed_self_question
 from self_question_loop import semantic_text_candidate
 from discourse_context import DISCOURSE_TERMS, build_discourse_context, retrieval_routes, role_alignment
 from continuity_manager import ContinuityManager
+from discord_retention import tail_jsonl_entries
+from discord_runtime import typed_outbox_archive_path
 
 
 _STOPWORDS = {
@@ -63,6 +65,11 @@ _STOPWORDS = {
     "with",
     "you",
     "your",
+}
+
+_COMMUNICATION_CONTINUITY_TERMS = {
+    "continue", "earlier", "forgot", "message", "meant", "old", "pending",
+    "resume", "said", "saying", "thought", "unfinished", "unsent",
 }
 
 
@@ -175,21 +182,27 @@ class LMStudioAdapter:
         max_graph_bytes: int = 8 * 1024 * 1024,
     ) -> List[Dict[str, Any]]:
         """Offer a few cue-matched experience references, or decline cheaply."""
+        item_limit = max(0, int(max_items))
+        char_limit = max(0, int(max_chars))
+        references = self._recall_unfinished_communication(
+            prompt, max_items=item_limit, max_chars=char_limit,
+        )
+        remaining = max(0, char_limit - sum(len(str(item.get("summary") or "")) for item in references))
         path = self._experience_graph_path()
         try:
             stat = path.stat()
         except OSError:
-            return []
+            return references
         if stat.st_size <= 0 or stat.st_size > max(1, int(max_graph_bytes)):
-            return []
+            return references
         signature = (stat.st_mtime_ns, stat.st_size)
         if self._relevance_cache_signature != signature:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
-                return []
+                return references
             if not isinstance(payload, dict):
-                return []
+                return references
             events = {
                 str(event.get("id")): event
                 for event in payload.get("events", [])
@@ -206,8 +219,6 @@ class LMStudioAdapter:
         words_index = (
             cache.get("words_index") if isinstance(cache.get("words_index"), dict) else {}
         )
-        remaining = max(0, int(max_chars))
-        references: List[Dict[str, Any]] = []
         seen_events = set()
         scene = scene if isinstance(scene, dict) else {}
         present_discourse = scene.get("discourse") if isinstance(scene.get("discourse"), dict) else {}
@@ -269,7 +280,7 @@ class LMStudioAdapter:
                 seen_events.add(str(event_id))
                 remaining -= len(summary)
                 break
-            if len(references) >= max(0, int(max_items)) or remaining <= 0:
+            if len(references) >= item_limit or remaining <= 0:
                 break
         if not references:
             return references
@@ -282,6 +293,59 @@ class LMStudioAdapter:
         except Exception:
             # Recall remains available if coordination metadata cannot be persisted.
             return references
+
+    def _recall_unfinished_communication(
+        self, prompt: str, *, max_items: int, max_chars: int
+    ) -> List[Dict[str, Any]]:
+        """Recall old unsent speech only when the present scene asks for it."""
+        if max_items <= 0 or max_chars <= 0:
+            return []
+        prompt_terms = set(self._tokenize(prompt)) - _STOPWORDS
+        continuity_terms = prompt_terms & _COMMUNICATION_CONTINUITY_TERMS
+        if not continuity_terms:
+            return []
+        if self._base_path == Path("AI_Children"):
+            path = typed_outbox_archive_path(self.child)
+        else:
+            path = self._base_path / self.child / "memory" / "typed_outbox_archive.jsonl"
+        entries = tail_jsonl_entries(path, max_lines=128, max_tail_bytes=256 * 1024)
+        recalled: List[Dict[str, Any]] = []
+        remaining = max_chars
+        for entry in reversed(entries):
+            if not isinstance(entry, dict):
+                continue
+            text = " ".join(str(entry.get("text") or "").split())
+            text_terms = set(self._tokenize(text)) - _STOPWORDS
+            topical_overlap = sorted((prompt_terms - _COMMUNICATION_CONTINUITY_TERMS) & text_terms)
+            if not topical_overlap:
+                continue
+            summary = text[: min(320, remaining)].rstrip()
+            if not summary:
+                break
+            recalled.append({
+                "event_id": str(entry.get("id") or entry.get("created_at") or "unfinished"),
+                "cue": topical_overlap[0],
+                "surface_cue": next(iter(sorted(continuity_terms))),
+                "summary": summary,
+                "tags": ["communication_continuity", "unfinished"],
+                "source": "typed_outbox_archive",
+                "memory_type": "prospective_communication",
+                "confidence": 0.72,
+                "path": str(path),
+                "communication_state": "unfinished",
+                "delivery_state": str(entry.get("delivery_state") or "not_delivered"),
+                "retrieval_route": {
+                    "kind": "unfinished_communication",
+                    "lookup_term": topical_overlap[0],
+                    "surface": next(iter(sorted(continuity_terms))),
+                    "witness": "typed_outbox_archive",
+                    "status": "resolved",
+                },
+            })
+            remaining -= len(summary)
+            if len(recalled) >= max_items or remaining <= 0:
+                break
+        return recalled
 
     def consider_recalled_memories(
         self,
@@ -484,7 +548,17 @@ class LMStudioAdapter:
         if not entries:
             return None
 
-        entry = entries[0]
+        # Unsent/stale outbox text is prospective communication, not evidence
+        # for the ordinary lexical meaning of a word. It has a separate,
+        # explicitly cued recall route in _recall_unfinished_communication().
+        entry = next((
+            candidate for candidate in entries
+            if not {"typed_outbox", "archive", "stale_buffer"}.intersection(
+                {str(tag) for tag in candidate.get("situation_tags") or []}
+            )
+        ), None)
+        if entry is None:
+            return None
         narrative = _speaker_aware_narrative(entry) or "I remember the word but not the story."
         narrative = narrative.strip()
         if len(narrative) > 220:

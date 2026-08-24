@@ -626,6 +626,24 @@ def _discord_retention_v2() -> dict[str, Any]:
     ])
 
 
+def _communication_continuity_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "stale speech remains generic episodic recall", "component": "separation", "correct": False},
+        {"case": "unfinished speech has explicit state", "component": "persistence", "correct": False},
+        {"case": "recall requires continuity and topic cues", "component": "routing", "correct": False},
+    ])
+
+
+def _communication_continuity_v2() -> dict[str, Any]:
+    source = Path("discord_bridge.py").read_text(encoding="utf-8")
+    adapter = Path("lm_studio_adapter.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "stale speech is excluded from lexical grounding", "component": "separation", "correct": "prospective communication, not evidence" in adapter},
+        {"case": "unfinished speech has explicit state", "component": "persistence", "correct": '"communication_state": "unfinished"' in source},
+        {"case": "recall requires continuity and topic cues", "component": "routing", "correct": "if not continuity_terms" in adapter and "if not topical_overlap" in adapter},
+    ])
+
+
 def _self_read_language_v1() -> dict[str, Any]:
     source = _v1_text("raw_file_manager.py")
     audio_source = _v1_text("audio_digest.py")
@@ -1217,6 +1235,7 @@ _REGISTRY = {
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
     "language_components": (ModuleVersion("language_components", "V1", "Historical language context", _language_v1), ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2)),
     "discord_retention": (ModuleVersion("discord_retention", "V1", "Unbounded delivery history", _discord_retention_v1), ModuleVersion("discord_retention", "V2", "Bounded history and buffers", _discord_retention_v2)),
+    "communication_continuity": (ModuleVersion("communication_continuity", "V1", "Stale speech mixed into ordinary episodic recall", _communication_continuity_v1), ModuleVersion("communication_continuity", "V2", "Explicit unfinished speech with bounded contextual recall", _communication_continuity_v2)),
     "native_test_support": (ModuleVersion("native_test_support", "V1", "External pytest required", _native_tests_v1), ModuleVersion("native_test_support", "V2", "Dependency-free pytest subset", _native_tests_v2)),
     "self_read_language": (ModuleVersion("self_read_language", "V1", "Music assets without explicit language roles", _self_read_language_v1), ModuleVersion("self_read_language", "V2", "Vocal, spoken, and written self-read alignment", _self_read_language_v2)),
     "experience_cycle": (ModuleVersion("experience_cycle", "V1", "Historical event and episode logging", _experience_cycle_v1), ModuleVersion("experience_cycle", "V2", "Optional bounded intent-attempt-observation-evaluation cycles", _experience_cycle_v2)),

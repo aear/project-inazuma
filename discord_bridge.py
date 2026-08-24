@@ -3201,6 +3201,11 @@ class InaDiscordClient(discord.Bot):
         archived = {
             **entry,
             "archive_reason": reason,
+            # Expiry ends an attempted delivery, not the thought behind it.
+            # Keep that distinction explicit so recall can treat this as
+            # prospective communication instead of an ordinary past episode.
+            "communication_state": "unfinished",
+            "delivery_state": "not_delivered",
             "archived_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -3231,6 +3236,8 @@ class InaDiscordClient(discord.Bot):
                             "target": entry.get("target"),
                             "status": "archived",
                             "reason": reason,
+                            "communication_state": "unfinished",
+                            "delivery_state": "not_delivered",
                         }
                     ],
                     timestamp=entry.get("created_at") or archived["archived_at"],
