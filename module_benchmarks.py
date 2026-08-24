@@ -1224,6 +1224,40 @@ def _thread_governor_v3() -> dict[str, Any]:
          "correct": higher_probe.direction == "higher" and higher_probe.candidate_threads != lower_probe.candidate_threads},
     ])
 
+
+def _code_experiment_lab_v1() -> dict[str, Any]:
+    """Baseline before a governed code-experiment capability existed."""
+    return _capability([
+        {"case": name, "component": component, "correct": False}
+        for name, component in (
+            ("question and hypothesis retained", "learning_loop"),
+            ("isolated finite execution room", "sandbox"),
+            ("source and dataset are content-addressed", "reproducibility"),
+            ("attempt and judgement use Experience Cycles", "experience"),
+            ("promotion cannot modify production", "promotion"),
+        )
+    ])
+
+
+def _code_experiment_lab_v2() -> dict[str, Any]:
+    from code_experiment_lab import CodeExperimentLab, PythonScratchRoom
+    source = Path("code_experiment_lab.py").read_text(encoding="utf-8")
+    command = PythonScratchRoom(python="/usr/bin/python3", bwrap="/usr/bin/bwrap")._command(
+        Path("/tmp/ina-benchmark-experiment"), "main.py",
+    )
+    return _capability([
+        {"case": "question and hypothesis retained", "component": "learning_loop",
+         "correct": all(token in source for token in ('"question"', '"hypothesis"'))},
+        {"case": "isolated finite execution room", "component": "sandbox",
+         "correct": "--unshare-all" in command and "--clearenv" in command and "--die-with-parent" in command},
+        {"case": "source and dataset are content-addressed", "component": "reproducibility",
+         "correct": "source_sha256" in source and "dataset_sha256" in source},
+        {"case": "attempt and judgement use Experience Cycles", "component": "experience",
+         "correct": "complete_attempt" in source and "record_choice" in source},
+        {"case": "promotion cannot modify production", "component": "promotion",
+         "correct": '"production_tree_modified": False' in source and not hasattr(CodeExperimentLab, "promote")},
+    ])
+
 _HISTORY_BACKED_MODULES = {
     "q_decoder", "bridge_origin", "mirror_audience", "hindsight_claims",
     "mycelial_links", "seedling_clusters", "shadow_candidates", "soul_drift",
@@ -1287,6 +1321,10 @@ _REGISTRY = {
         ModuleVersion("thread_governor", "V1", "Historical unmanaged module thread pools", _thread_governor_v1),
         ModuleVersion("thread_governor", "V2", "Bounded per-module observation-driven thread selection", _thread_governor_v2),
         ModuleVersion("thread_governor", "V3", "Opposing differential control with deadband and hard operating envelopes", _thread_governor_v3),
+    ),
+    "code_experiment_lab": (
+        ModuleVersion("code_experiment_lab", "V1", "No governed executable experiment room", _code_experiment_lab_v1),
+        ModuleVersion("code_experiment_lab", "V2", "Bounded reproducible Python experiments with review-only promotion", _code_experiment_lab_v2),
     ),
 }
 
