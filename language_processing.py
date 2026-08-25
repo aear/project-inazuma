@@ -1245,6 +1245,7 @@ def build_dual_symbolic_message(
     human_label: str = "Human guess",
     symbol_to_token_vocab: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    from expression_core import NativeSymbolRealiser, TextRealiser, create_expression_intent
     if isinstance(symbols, str):
         normalized = [symbols.strip()] if symbols.strip() else []
     else:
@@ -1329,6 +1330,39 @@ def build_dual_symbolic_message(
 
     combined = f"{native_label}: {native_text}\n{human_label}: {gloss_text}"
 
+    expression_context = context if isinstance(context, dict) else {}
+    supplied_intent = expression_context.get("expression_intent")
+    if isinstance(supplied_intent, dict) and supplied_intent.get("intent_id"):
+        expression_intent = dict(supplied_intent)
+    else:
+        try:
+            drive = max(0.0, min(1.0, float(expression_context.get("expression_drive", 0.5))))
+        except (TypeError, ValueError):
+            drive = 0.5
+        expression_intent = create_expression_intent(
+            "communicate symbolic meaning",
+            semantic_references=[expression_context.get("semantic_event_id")],
+            concept_references=normalized,
+            affect_references=[expression_context.get("emotion_snapshot_id")],
+            audience_references=[expression_context.get("space_identity"), expression_context.get("channel")],
+            dimensions={"intensity": drive},
+            allowed_media=("text", "native_symbol"),
+            provenance=[expression_context.get("source"), expression_context.get("source_message_id")],
+        )
+    native_realisation = NativeSymbolRealiser().realise(
+        expression_intent,
+        content={"native_text": native_text, "native_tokens": list(native_tokens)},
+        conventions=[native_style, expression_context.get("source")],
+        provenance=native_sources.values(),
+    )
+    text_realisation = TextRealiser().realise(
+        expression_intent,
+        content={"text": gloss_text, "combined_compatibility_text": combined,
+                 "tokens": list(guessed_words)},
+        conventions=[human_label, expression_context.get("source")],
+        provenance=gloss_sources.values(),
+    )
+
     return {
         "text": combined,
         "native_text": native_text,
@@ -1338,6 +1372,9 @@ def build_dual_symbolic_message(
         "unresolved_symbols": unresolved_symbols,
         "native_sources": native_sources,
         "gloss_sources": gloss_sources,
+        "expression_intent": expression_intent,
+        "expression_realisation": native_realisation,
+        "expression_realisations": [native_realisation, text_realisation],
     }
 
 
@@ -2292,6 +2329,9 @@ def generate_symbolic_reply_from_text(
         "learned_media_guidance": learned_media_guidance,
         "semantic_event": semantic_event,
         "native_intent": native_intent,
+        "expression_intent": (dual_message or {}).get("expression_intent"),
+        "expression_realisation": (dual_message or {}).get("expression_realisation"),
+        "expression_realisations": (dual_message or {}).get("expression_realisations") or [],
     }
 
 

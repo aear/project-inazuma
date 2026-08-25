@@ -1358,6 +1358,64 @@ def _desktop_lifecycle_v2() -> dict[str, Any]:
          "correct": 'status="restarting"' in source and "rebooted_at" in source and "reboot_reason" in source},
     ])
 
+
+def _expression_core_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "intent owns no output medium", "component": "separation", "correct": False},
+        {"case": "multiple realisers share one intent", "component": "modularity", "correct": False},
+        {"case": "realisation retains intent provenance", "component": "provenance", "correct": False},
+        {"case": "reaction remains observation not reward", "component": "learning_safety", "correct": False},
+        {"case": "reaction interpretations retain alternatives", "component": "uncertainty", "correct": False},
+        {"case": "trace is append-only and bounded", "component": "storage", "correct": False},
+    ])
+
+
+def _expression_core_v2() -> dict[str, Any]:
+    import tempfile
+    from expression_core import (
+        ExpressionTraceStore, create_expression_intent, create_realisation,
+        create_reaction_interpretation, create_reaction_observation,
+    )
+    intent = create_expression_intent(
+        "offer reassurance", dimensions={"intensity": 0.4},
+        allowed_media=["text", "voice"], provenance=["semantic:event-1"],
+    )
+    text = create_realisation(intent, medium="text", content={"text": "I am here."},
+                              realiser="benchmark.text")
+    voice = create_realisation(intent, medium="voice", content={"plan": "voice-plan-1"},
+                               realiser="benchmark.voice")
+    reaction = create_reaction_observation(text["realisation_id"], {"kind": "reply"},
+                                           source="conversation:event-2", causal_confidence=0.4)
+    interpretation = create_reaction_interpretation(reaction["reaction_id"], [
+        {"meaning": "reassured", "confidence": 0.6},
+        {"meaning": "unrelated", "confidence": 0.4},
+    ])
+    with tempfile.TemporaryDirectory(prefix="ina_expression_benchmark_") as directory:
+        path = Path(directory) / "trace.jsonl"
+        store = ExpressionTraceStore(path)
+        for record in (intent, text, reaction, interpretation):
+            store.append(record)
+        rows = path.read_text(encoding="utf-8").splitlines()
+    reward_rejected = False
+    try:
+        create_reaction_observation(text["realisation_id"], {"reward": 1}, source="invalid")
+    except ValueError:
+        reward_rejected = True
+    return _capability([
+        {"case": "intent owns no output medium", "component": "separation",
+         "correct": "medium" not in intent and "text" not in intent},
+        {"case": "multiple realisers share one intent", "component": "modularity",
+         "correct": text["intent_id"] == voice["intent_id"] == intent["intent_id"]},
+        {"case": "realisation retains intent provenance", "component": "provenance",
+         "correct": text["intent_id"] == intent["intent_id"] and bool(intent["provenance"])},
+        {"case": "reaction remains observation not reward", "component": "learning_safety",
+         "correct": reward_rejected and "reward" not in reaction},
+        {"case": "reaction interpretations retain alternatives", "component": "uncertainty",
+         "correct": len(interpretation["candidates"]) == 2},
+        {"case": "trace is append-only and bounded", "component": "storage",
+         "correct": len(rows) == 4 and all(len(row.encode("utf-8")) < 65536 for row in rows)},
+    ])
+
 _HISTORY_BACKED_MODULES = {
     "q_decoder", "bridge_origin", "mirror_audience", "hindsight_claims",
     "mycelial_links", "seedling_clusters", "shadow_candidates", "soul_drift",
@@ -1437,6 +1495,10 @@ _REGISTRY = {
     "desktop_lifecycle": (
         ModuleVersion("desktop_lifecycle", "V1", "No governed self-service virtual desktop restart", _desktop_lifecycle_v1),
         ModuleVersion("desktop_lifecycle", "V2", "Prepared reasoned observable virtual desktop restart", _desktop_lifecycle_v2),
+    ),
+    "expression_core": (
+        ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),
+        ModuleVersion("expression_core", "V2", "Output-neutral intent with medium realisers and reaction provenance", _expression_core_v2),
     ),
 }
 

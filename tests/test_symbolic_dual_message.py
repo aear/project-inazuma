@@ -92,6 +92,11 @@ def test_build_dual_symbolic_message_combines_native_and_guess(monkeypatch):
     assert payload is not None
     assert payload["native_text"] == "sym_hello sym_calm"
     assert payload["gloss_text"] == "hello calm"
+    assert payload["expression_intent"]["purpose"] == "communicate symbolic meaning"
+    assert payload["expression_realisation"]["intent_id"] == payload["expression_intent"]["intent_id"]
+    assert payload["expression_realisation"]["medium"] == "native_symbol"
+    assert [item["medium"] for item in payload["expression_realisations"]] == ["native_symbol", "text"]
+    assert {item["intent_id"] for item in payload["expression_realisations"]} == {payload["expression_intent"]["intent_id"]}
     assert payload["text"] == "Native: sym_hello sym_calm\nHuman guess: hello calm"
 
 
