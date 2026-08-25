@@ -597,6 +597,37 @@ def _language_v2() -> dict[str, Any]:
     return _capability(cases)
 
 
+def _language_v3() -> dict[str, Any]:
+    from language_context import build_language_context_snapshot
+    message = "Before you reboot the desktop, save the painting because I want both changes."
+    snapshot = build_language_context_snapshot(
+        {"source_text": message, "language_state_signals": {
+            "current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {},
+        }}, child="TestChild", logic_reader=False,
+    )
+    ordinary = build_language_context_snapshot(
+        {"source_text": "<3", "language_state_signals": {
+            "current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {},
+        }}, child="TestChild", logic_reader=False,
+    )
+    prior = list(_language_v2().get("cases") or ())
+    return _capability([*prior,
+        {"case": "complete message survives as one semantic event", "component": "whole_message",
+         "correct": snapshot["message"]["text"] == message
+                    and snapshot["semantic_event"]["source_text"] == message
+                    and snapshot["linguistic_analysis"]["text"] == message},
+        {"case": "ordered words coexist with whole message", "component": "word_sequence",
+         "correct": snapshot["message"]["words"].count("the") == 2
+                    and snapshot["message"]["unique_words"].count("the") == 1},
+        {"case": "context layers retain bidirectional hierarchy", "component": "context_hierarchy",
+         "correct": snapshot["context_hierarchy"]["information_flow"] == "bidirectional"
+                    and len(snapshot["context_hierarchy"]["layers"]) == 5},
+        {"case": "deep retrieval is trigger-driven", "component": "attention",
+         "correct": ordinary["attentional_escalation"]["deep_retrieval_requested"] is False
+                    and ordinary["attentional_escalation"]["deep_retrieval_performed"] is False},
+    ])
+
+
 def _discord_retention_v1() -> dict[str, Any]:
     source = _v1_text("discord_bridge.py")
     return _capability([
@@ -1235,6 +1266,7 @@ def _code_experiment_lab_v1() -> dict[str, Any]:
             ("source and dataset are content-addressed", "reproducibility"),
             ("attempt and judgement use Experience Cycles", "experience"),
             ("promotion cannot modify production", "promotion"),
+            ("declared support tools are content-addressed", "extensibility"),
         )
     ])
 
@@ -1256,6 +1288,74 @@ def _code_experiment_lab_v2() -> dict[str, Any]:
          "correct": "complete_attempt" in source and "record_choice" in source},
         {"case": "promotion cannot modify production", "component": "promotion",
          "correct": '"production_tree_modified": False' in source and not hasattr(CodeExperimentLab, "promote")},
+        {"case": "declared support tools are content-addressed", "component": "extensibility",
+         "correct": "support_files" in source and "MAX_SUPPORT_BYTES" in source},
+    ])
+
+
+def _fault_pattern_research_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": name, "component": component, "correct": False}
+        for name, component in (
+            ("bounded deterministic fault model", "simulation"),
+            ("reversible reference comparison", "recoverability"),
+            ("inspectable distribution features", "measurement"),
+            ("position capacity upper bound", "capacity"),
+            ("security and cover roles separated", "threat_model"),
+            ("held-out adversarial protocol", "evaluation"),
+        )
+    ])
+
+
+def _fault_pattern_research_v2() -> dict[str, Any]:
+    from fault_pattern_research import (
+        apply_fault_map, extract_fault_map, fault_features, generate_fault_map,
+        position_capacity_bits,
+    )
+    faults = generate_fault_map(4096, 12, seed=34)
+    carrier = bytes(512)
+    observed = apply_fault_map(carrier, faults)
+    features = fault_features(faults, 4096)
+    brief = Path("docs/fault_pattern_steganography_challenge.md").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "bounded deterministic fault model", "component": "simulation",
+         "correct": faults == generate_fault_map(4096, 12, seed=34)},
+        {"case": "reversible reference comparison", "component": "recoverability",
+         "correct": extract_fault_map(carrier, observed) == faults},
+        {"case": "inspectable distribution features", "component": "measurement",
+         "correct": features["fault_count"] == len(faults) and len(features["bit_lane_counts"]) == 8},
+        {"case": "position capacity upper bound", "component": "capacity",
+         "correct": position_capacity_bits(8, 1) > 2.99},
+        {"case": "security and cover roles separated", "component": "threat_model",
+         "correct": "not the security" in brief and "authenticated encryption" in brief},
+        {"case": "held-out adversarial protocol", "component": "evaluation",
+         "correct": "held-out" in brief and "more than one detector family" in brief},
+    ])
+
+
+def _desktop_lifecycle_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "desktop can restart without rebooting host", "component": "scope", "correct": False},
+        {"case": "restart requires preparation and reason", "component": "guard", "correct": False},
+        {"case": "restart has a human-scale cooldown", "component": "cadence", "correct": False},
+        {"case": "restart lifecycle remains observable", "component": "telemetry", "correct": False},
+    ])
+
+
+def _desktop_lifecycle_v2() -> dict[str, Any]:
+    from ina_desktop.service import workspace_control_api_payload
+    source = Path("ina_desktop/service.py").read_text(encoding="utf-8")
+    command = next(item for item in workspace_control_api_payload()["commands"]
+                   if item["action"] == "reboot_workspace")
+    return _capability([
+        {"case": "desktop can restart without rebooting host", "component": "scope",
+         "correct": command["scope"].endswith("never the host") and "_stop_workspace_devices" in source},
+        {"case": "restart requires preparation and reason", "component": "guard",
+         "correct": "prepared=true" in source and "reboot reason must be" in source},
+        {"case": "restart has a human-scale cooldown", "component": "cadence",
+         "correct": command["cooldown_seconds"] == 300},
+        {"case": "restart lifecycle remains observable", "component": "telemetry",
+         "correct": 'status="restarting"' in source and "rebooted_at" in source and "reboot_reason" in source},
     ])
 
 _HISTORY_BACKED_MODULES = {
@@ -1295,7 +1395,11 @@ _REGISTRY = {
     "self_question_display": (ModuleVersion("self_question_display", "V1", "Latest timestamp and resolved state only", _question_display_v1), ModuleVersion("self_question_display", "V2", "Bounded trigger history and reversible display hiding", _question_display_v2)),
     "self_question_resolution": (ModuleVersion("self_question_resolution", "V1", "Questions accumulate without evidence routing", _question_resolution_v1), ModuleVersion("self_question_resolution", "V2", "Typed evidence routing and evaluated lifecycle", _question_resolution_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
-    "language_components": (ModuleVersion("language_components", "V1", "Historical language context", _language_v1), ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2)),
+    "language_components": (
+        ModuleVersion("language_components", "V1", "Historical language context", _language_v1),
+        ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2),
+        ModuleVersion("language_components", "V3", "Whole-message event with ordered word sequence", _language_v3),
+    ),
     "discord_retention": (ModuleVersion("discord_retention", "V1", "Unbounded delivery history", _discord_retention_v1), ModuleVersion("discord_retention", "V2", "Bounded history and buffers", _discord_retention_v2)),
     "communication_continuity": (ModuleVersion("communication_continuity", "V1", "Stale speech mixed into ordinary episodic recall", _communication_continuity_v1), ModuleVersion("communication_continuity", "V2", "Explicit unfinished speech with bounded contextual recall", _communication_continuity_v2)),
     "discord_bridge_memory": (ModuleVersion("discord_bridge_memory", "V1", "Discord imports the monolithic cognitive manager", _discord_bridge_memory_v1), ModuleVersion("discord_bridge_memory", "V2", "Discord reuses lightweight canonical state seams", _discord_bridge_memory_v2)),
@@ -1325,6 +1429,14 @@ _REGISTRY = {
     "code_experiment_lab": (
         ModuleVersion("code_experiment_lab", "V1", "No governed executable experiment room", _code_experiment_lab_v1),
         ModuleVersion("code_experiment_lab", "V2", "Bounded reproducible Python experiments with review-only promotion", _code_experiment_lab_v2),
+    ),
+    "fault_pattern_research": (
+        ModuleVersion("fault_pattern_research", "V1", "No dedicated fault-pattern research instruments", _fault_pattern_research_v1),
+        ModuleVersion("fault_pattern_research", "V2", "Bounded synthetic fault modelling and adversarial measurement", _fault_pattern_research_v2),
+    ),
+    "desktop_lifecycle": (
+        ModuleVersion("desktop_lifecycle", "V1", "No governed self-service virtual desktop restart", _desktop_lifecycle_v1),
+        ModuleVersion("desktop_lifecycle", "V2", "Prepared reasoned observable virtual desktop restart", _desktop_lifecycle_v2),
     ),
 }
 

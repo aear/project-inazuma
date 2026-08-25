@@ -62,3 +62,32 @@ def test_python_room_fails_closed_and_command_has_no_project_mount(tmp_path):
     assert "/workspace/main.py" in command
     with pytest.raises(SandboxUnavailable):
         room.run(tmp_path, "main.py")
+
+
+def test_support_modules_are_hashed_bounded_and_mounted_read_only(tmp_path):
+    lab = CodeExperimentLab(tmp_path / "lab", rooms={"fake-python": FakeRoom()})
+    experiment = lab.create(
+        question="Q?", hypothesis="H.", code="import helper", room="fake-python",
+        support_files={"helper.py": "VALUE = 3\n"},
+    )
+    support = experiment["support_files"][0]
+    directory = tmp_path / "lab" / "artifacts" / experiment["experiment_id"]
+    assert support["name"] == "helper.py" and support["sha256"]
+    assert (directory / "helper.py").read_text(encoding="utf-8") == "VALUE = 3\n"
+
+    command = PythonScratchRoom(python="/usr/bin/python3", bwrap="/usr/bin/bwrap")._command(
+        directory, "main.py", marker="READY\n",
+    )
+    assert str((directory / "helper.py").resolve()) in command
+    assert "/workspace/helper.py" in command
+    assert "sys.path.insert(0,'/workspace')" in command[-1]
+    with pytest.raises(ValueError):
+        lab.create(question="Q?", hypothesis="H.", code="pass", room="fake-python",
+                   support_files={"../escape.py": "pass"})
+
+
+def test_process_limit_is_relative_to_existing_host_tasks():
+    room = PythonScratchRoom(limits=RoomLimits(processes=8))
+    baseline = room._user_task_count()
+    assert baseline >= 1
+    assert baseline + room.limits.processes > baseline

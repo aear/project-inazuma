@@ -142,6 +142,57 @@ def _text_structure(text: str) -> dict:
     }
 
 
+def _local_windows(words: list[str], radius: int = 2, limit: int = 32) -> list[dict]:
+    """Retain ordered local context without pretending windows are whole meanings."""
+    result = []
+    for index, word in enumerate(words[:limit]):
+        start = max(0, index - radius)
+        end = min(len(words), index + radius + 1)
+        result.append({
+            "focus_index": index, "focus": word, "start": start, "end": end,
+            "words": words[start:end], "parent": "message:current",
+        })
+    return result
+
+
+def _minimum_uncertainty_confidence(analysis: Mapping[str, Any]) -> float:
+    confidences = []
+    for value in dict(analysis.get("uncertainty") or {}).values():
+        if isinstance(value, Mapping) and "confidence" in value:
+            confidences.append(_number(value.get("confidence"), 1.0))
+    return min(confidences, default=1.0)
+
+
+def _attentional_escalation(context: Mapping[str, Any], scene: Mapping[str, Any],
+                            signals: Mapping[str, Any], analysis: Mapping[str, Any],
+                            turns: list[dict], memories: list[dict]) -> dict:
+    """Describe a finite escalation request; never perform memory retrieval here."""
+    reasons = []
+    uncertainty = _minimum_uncertainty_confidence(analysis)
+    novelty = _number(signals.get("novelty"))
+    contradiction = bool(signals.get("contradiction") or context.get("contradiction"))
+    explicit_recall = bool(context.get("explicit_recall_requested"))
+    lexical_size = len(_words(str(context.get("source_text") or "")))
+    if uncertainty < 0.55 and lexical_size >= 3:
+        reasons.append("high_uncertainty")
+    if novelty >= 0.7:
+        reasons.append("high_novelty")
+    if contradiction:
+        reasons.append("contradiction")
+    if explicit_recall:
+        reasons.append("explicit_recall")
+    requested = "deep_retrieval" if reasons else ("conversation" if turns else "message")
+    return {
+        "path": ["local", "message", "conversation", "episodic", "deep_retrieval"],
+        "requested_level": requested,
+        "reasons": reasons,
+        "deep_retrieval_requested": bool(reasons),
+        "deep_retrieval_performed": False,
+        "already_retrieved_witness_count": len(memories),
+        "policy": "event_triggered_bounded",
+    }
+
+
 def _prediction_signal(raw: Any, policy: Mapping[str, Any], now: datetime) -> dict:
     prediction = raw if isinstance(raw, Mapping) else {}
     vector = prediction.get("predicted_vector")
@@ -195,7 +246,8 @@ def build_language_context_snapshot(
     turns = _compact_turns(context, policy)
     memories = _compact_memories(scene, int(policy["max_memory_references"]))
     current_text = str(context.get("source_text") or "")
-    current_words = _bounded_unique(_words(current_text), 64)
+    current_words = _words(current_text)[:128]
+    current_unique_words = _bounded_unique(current_words, 64)
     topic_terms = _bounded_unique(scene.get("topic_terms") or [], 12)
     continuity = _bounded_unique(signals.get("continuity_terms") or [], 12)
     referents = _bounded_unique(
@@ -278,6 +330,30 @@ def build_language_context_snapshot(
         turn=len(turns),
     )
     semantic_event = build_semantic_event(current_text, supplied_discourse)
+    local_windows = _local_windows(current_words)
+    message_interpretations = list(linguistic_analysis.get("whole_utterance_interpretations") or ())[:8]
+    hierarchy = {
+        "version": 1,
+        "layers": [
+            {"id": "tokens:current", "kind": "token_subtoken", "items": [
+                {"index": index, "surface": word, "parent": "message:current"}
+                for index, word in enumerate(current_words)
+            ]},
+            {"id": "windows:current", "kind": "phrase_local_window", "items": local_windows,
+             "parent": "message:current", "children": ["tokens:current"]},
+            {"id": "message:current", "kind": "utterance_message", "text": current_text,
+             "children": ["windows:current", "tokens:current"], "parent": "conversation:current"},
+            {"id": "conversation:current", "kind": "conversation_episode", "turns": turns,
+             "children": ["message:current"], "parent": "retrieved_context:current"},
+            {"id": "retrieved_context:current", "kind": "retrieved_long_term_context",
+             "witnesses": memories, "children": ["conversation:current"]},
+        ],
+        "information_flow": "bidirectional",
+        "competing_interpretations": [
+            {"layer": "message", "candidate": candidate, "status": "retained"}
+            for candidate in message_interpretations
+        ],
+    }
     return {
         "version": 2,
         "enabled": True,
@@ -288,6 +364,7 @@ def build_language_context_snapshot(
             # later and must never masquerade as separate thoughts here.
             "text": current_text,
             "words": current_words,
+            "unique_words": current_unique_words,
             "channel": context.get("channel"),
             "written_structure": _text_structure(current_text),
         },
@@ -295,6 +372,10 @@ def build_language_context_snapshot(
         "reply_ancestry": reply_ids,
         "linguistic_analysis": linguistic_analysis,
         "semantic_event": semantic_event,
+        "context_hierarchy": hierarchy,
+        "attentional_escalation": _attentional_escalation(
+            context, scene, signals, linguistic_analysis, turns, memories,
+        ),
         "referent_table": dict(supplied_discourse.get("referent_table") or {}),
         "learned_media_guidance": learned_media_guidance,
         "candidate_referents": referents,

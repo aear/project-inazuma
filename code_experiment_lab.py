@@ -26,6 +26,8 @@ from io_utils import atomic_write_json
 SCHEMA = "ina.code_experiment/V1"
 MAX_SOURCE_BYTES = 64 * 1024
 MAX_DATASET_BYTES = 2 * 1024 * 1024
+MAX_SUPPORT_BYTES = 256 * 1024
+MAX_SUPPORT_FILES = 8
 MAX_TEXT_LENGTH = 2_000
 
 
@@ -110,10 +112,17 @@ class PythonScratchRoom:
         dataset_path = (experiment_dir / "input.json").resolve()
         if dataset_path.is_file():
             command.extend(("--ro-bind", str(dataset_path), "/workspace/input.json"))
+        manifest_path = experiment_dir / "manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for support in manifest.get("support_files", ()):
+                name = str(support["name"])
+                path = (experiment_dir / name).resolve()
+                command.extend(("--ro-bind", str(path), f"/workspace/{name}"))
         command.extend(("--remount-ro", "/", "--chdir", "/workspace"))
         if marker:
             bootstrap = (
-                "import os,runpy;"
+                "import os,runpy,sys;sys.path.insert(0,'/workspace');"
                 f"os.write(2,{marker.encode('utf-8')!r});"
                 f"runpy.run_path('/workspace/{source_name}',run_name='__main__')"
             )
@@ -122,12 +131,31 @@ class PythonScratchRoom:
             command.extend((self.python, "-I", "-B", f"/workspace/{source_name}"))
         return command
 
-    def _limit_child(self) -> None:
+    @staticmethod
+    def _user_task_count() -> int:
+        """Count current UID tasks so RLIMIT_NPROC bounds additions, not host history."""
+        uid = os.getuid()
+        total = 0
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (entry / "status").read_text(encoding="utf-8").splitlines()
+                real_uid = next(line for line in fields if line.startswith("Uid:"))
+                if int(real_uid.split()[1]) != uid:
+                    continue
+                threads = next((line for line in fields if line.startswith("Threads:")), "Threads: 1")
+                total += int(threads.split()[1])
+            except (FileNotFoundError, PermissionError, StopIteration, ValueError):
+                continue
+        return max(1, total)
+
+    def _limit_child(self, task_ceiling: int) -> None:
         limits = self.limits
         resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_seconds, limits.cpu_seconds))
         resource.setrlimit(resource.RLIMIT_AS, (limits.memory_bytes, limits.memory_bytes))
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.file_bytes, limits.file_bytes))
-        resource.setrlimit(resource.RLIMIT_NPROC, (limits.processes, limits.processes))
+        resource.setrlimit(resource.RLIMIT_NPROC, (task_ceiling, task_ceiling))
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
@@ -139,11 +167,13 @@ class PythonScratchRoom:
         stderr_path = experiment_dir / ".stderr.tmp"
         started = datetime.now(timezone.utc)
         timed_out = False
+        task_baseline = self._user_task_count()
+        task_ceiling = task_baseline + self.limits.processes
         try:
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 process = subprocess.Popen(
                     command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                    close_fds=True, preexec_fn=self._limit_child,
+                    close_fds=True, preexec_fn=lambda: self._limit_child(task_ceiling),
                 )
                 try:
                     return_code = process.wait(timeout=self.limits.wall_seconds)
@@ -172,7 +202,8 @@ class PythonScratchRoom:
             "stderr": stderr_data.decode("utf-8", errors="replace"),
             "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
             "network": "isolated", "workspace_scope": "experiment-only",
-            "limits": asdict(self.limits),
+            "limits": {**asdict(self.limits), "host_task_baseline": task_baseline,
+                       "host_task_ceiling": task_ceiling},
         }
 
 
@@ -189,6 +220,7 @@ class CodeExperimentLab:
 
     def create(self, *, question: str, hypothesis: str, code: str,
                dataset: Any = None, room: str = "python-scratch",
+               support_files: Mapping[str, str] | None = None,
                autonomous_continuation_budget: int = 0) -> dict[str, Any]:
         if room not in self.rooms:
             raise ValueError(f"unknown execution room: {room}")
@@ -200,6 +232,20 @@ class CodeExperimentLab:
         dataset_bytes = json.dumps(dataset, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(dataset_bytes) > MAX_DATASET_BYTES:
             raise ValueError(f"dataset exceeds {MAX_DATASET_BYTES} bytes")
+        support_files = dict(support_files or {})
+        if len(support_files) > MAX_SUPPORT_FILES:
+            raise ValueError(f"support_files exceeds {MAX_SUPPORT_FILES} files")
+        support_payloads: list[tuple[str, bytes]] = []
+        support_total = 0
+        for raw_name, content in sorted(support_files.items()):
+            name = str(raw_name)
+            if Path(name).name != name or not name.endswith(".py") or not name[:-3].replace("_", "a").isalnum():
+                raise ValueError("support file names must be simple Python module names")
+            payload = str(content).encode("utf-8")
+            support_total += len(payload)
+            support_payloads.append((name, payload))
+        if support_total > MAX_SUPPORT_BYTES:
+            raise ValueError(f"support_files exceed {MAX_SUPPORT_BYTES} bytes")
 
         experiment_id = f"experiment_{uuid.uuid4().hex}"
         directory = self.root / "artifacts" / experiment_id
@@ -207,11 +253,16 @@ class CodeExperimentLab:
         source_path = directory / "main.py"
         source_path.write_bytes(source)
         (directory / "input.json").write_bytes(dataset_bytes)
+        support_manifest = []
+        for name, payload in support_payloads:
+            (directory / name).write_bytes(payload)
+            support_manifest.append({"name": name, "sha256": _digest(payload), "bytes": len(payload)})
         manifest = {
             "schema": SCHEMA, "experiment_id": experiment_id,
             "question": question, "hypothesis": hypothesis,
             "room": room, "source": "main.py", "dataset": "input.json",
             "source_sha256": _digest(source), "dataset_sha256": _digest(dataset_bytes),
+            "support_files": support_manifest,
             "status": "created", "created_at": _now(),
         }
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
@@ -232,6 +283,7 @@ class CodeExperimentLab:
         run_id = f"run_{uuid.uuid4().hex}"
         record = {"schema": SCHEMA, "run_id": run_id, "experiment_id": experiment_id,
                   "source_sha256": manifest["source_sha256"], "dataset_sha256": manifest["dataset_sha256"],
+                  "support_files": list(manifest.get("support_files", ())),
                   "run_at": _now(), **result}
         atomic_write_json(directory / f"{run_id}.json", record, indent=2, ensure_ascii=False)
         self.cycles.complete_attempt(
@@ -281,5 +333,5 @@ class CodeExperimentLab:
 
 __all__ = [
     "SCHEMA", "CodeExperimentLab", "ExecutionRoom", "PythonScratchRoom",
-    "RoomLimits", "SandboxUnavailable",
+    "RoomLimits", "SandboxUnavailable", "MAX_SUPPORT_BYTES", "MAX_SUPPORT_FILES",
 ]

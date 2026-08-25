@@ -110,6 +110,30 @@ def test_workspace_control_api_advertises_semantic_focus_and_cycle():
     assert {"focus_tool", "select_tool", "cycle_window", "next_window", "previous_window"} <= advertised
 
 
+def test_workspace_reboot_is_scoped_prepared_reasoned_and_cooled_down(monkeypatch):
+    service = VirtualWorkspaceService("Ina")
+    service.desktop = object()
+    calls = []
+    monkeypatch.setattr(service, "_reboot_workspace", lambda reason: calls.append(reason) or {
+        "ok": True, "rebooted": True, "scope": "virtual_workspace",
+    })
+
+    assert not service._dispatch({"action": "reboot_workspace", "reason": "display stuck"})["ok"]
+    result = service._dispatch({
+        "action": "reboot_workspace", "reason": "display stopped responding", "prepared": True,
+    })
+    assert result == {"ok": True, "rebooted": True, "scope": "virtual_workspace"}
+    assert calls == ["display stopped responding"]
+    service.last_workspace_reboot = __import__("time").monotonic()
+    cooldown = service._dispatch({
+        "action": "reboot_workspace", "reason": "display stopped responding", "prepared": True,
+    })
+    assert cooldown["ok"] is False and cooldown["retry_after_seconds"] > 0
+
+    command = next(item for item in workspace_control_api_payload()["commands"] if item["action"] == "reboot_workspace")
+    assert command["scope"] == "Ina's virtual desktop only; never the host"
+
+
 def test_x11_desktop_cycles_and_focuses_tools_without_a_window_manager():
     desktop = object.__new__(X11Desktop)
     windows = [

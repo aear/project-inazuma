@@ -45,6 +45,15 @@ def workspace_control_api_payload() -> dict[str, Any]:
             },
             {"action": "tile", "arguments": {}},
             {"action": "capture", "arguments": {}},
+            {
+                "action": "reboot_workspace",
+                "arguments": {
+                    "reason": "specific observed need, 8..240 characters",
+                    "prepared": "true after saving or deliberately discarding open work",
+                },
+                "scope": "Ina's virtual desktop only; never the host",
+                "cooldown_seconds": 300,
+            },
             {"action": "open_file_explorer", "arguments": {}, "execution_policy": "launches only the fixed data-only explorer"},
         ],
         "examples": [
@@ -105,6 +114,7 @@ class VirtualWorkspaceService:
         self.desktop: X11Desktop | None = None
         self.audio: dict[str, Any] = {}
         self.display = ""
+        self.last_workspace_reboot = float("-inf")
         self.state: dict[str, Any] = {
             "service_pid": os.getpid(), "status": "starting", "ready": False,
             "started_at": _now(), "child": self.child,
@@ -217,6 +227,17 @@ class VirtualWorkspaceService:
         elif action == "capture":
             path = desktop.save_ppm(self.root / "latest.ppm")
             return {"ok": True, "path": str(path)}
+        elif action == "reboot_workspace":
+            reason = str(request.get("reason") or "").strip()
+            if not 8 <= len(reason) <= 240:
+                return {"ok": False, "error": "reboot reason must be 8..240 characters"}
+            if request.get("prepared") is not True:
+                return {"ok": False, "error": "save or deliberately discard open work, then set prepared=true"}
+            remaining = 300.0 - (time.monotonic() - self.last_workspace_reboot)
+            if remaining > 0:
+                return {"ok": False, "error": "workspace reboot cooldown active",
+                        "retry_after_seconds": round(remaining, 3)}
+            return self._reboot_workspace(reason)
         elif action == "open_file_explorer":
             project_root = Path(__file__).resolve().parents[1]
             env = os.environ.copy()
@@ -229,6 +250,43 @@ class VirtualWorkspaceService:
         else:
             return {"ok": False, "error": f"unknown action: {action}"}
         return {"ok": True}
+
+    def _stop_workspace_devices(self) -> None:
+        if self.desktop is not None:
+            self.desktop.close()
+            self.desktop = None
+        if self.xvfb is not None and self.xvfb.poll() is None:
+            self.xvfb.terminate()
+            try:
+                self.xvfb.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                self.xvfb.kill()
+        self.xvfb = None
+        unload_audio_buses(list(self.audio.get("module_ids") or []))
+        self.audio = {}
+        self.display = ""
+
+    def _reboot_workspace(self, reason: str) -> dict[str, Any]:
+        """Restart only Ina's virtual display/audio devices, never the host."""
+        requested_at = _now()
+        self.last_workspace_reboot = time.monotonic()
+        self._publish(status="restarting", ready=False, reboot_reason=reason,
+                      reboot_requested_at=requested_at, reboot_scope="virtual_workspace")
+        try:
+            self._stop_workspace_devices()
+            self._start_display()
+            self.audio = ensure_audio_buses()
+        except Exception as exc:
+            self._publish(status="failed", ready=False, error=str(exc),
+                          reboot_reason=reason, reboot_scope="virtual_workspace")
+            return {"ok": False, "error": str(exc), "scope": "virtual_workspace"}
+        self._publish(
+            status="running", ready=True, display=self.display, audio=self.audio,
+            display_process_pid=self.xvfb.pid if self.xvfb is not None else None,
+            reboot_reason=reason, rebooted_at=_now(), reboot_scope="virtual_workspace",
+        )
+        return {"ok": True, "rebooted": True, "scope": "virtual_workspace",
+                "reason": reason, "display": self.display}
 
     def _serve(self) -> None:
         path = socket_path(self.child)
@@ -296,15 +354,7 @@ class VirtualWorkspaceService:
                 socket_path(self.child).unlink()
             except FileNotFoundError:
                 pass
-            if self.desktop is not None:
-                self.desktop.close()
-            if self.xvfb is not None and self.xvfb.poll() is None:
-                self.xvfb.terminate()
-                try:
-                    self.xvfb.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    self.xvfb.kill()
-            unload_audio_buses(list(self.audio.get("module_ids") or []))
+            self._stop_workspace_devices()
             previous_status = self.state.get("status")
             self._publish(status="stopped", ready=False, previous_status=previous_status)
 

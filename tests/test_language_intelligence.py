@@ -43,7 +43,9 @@ def test_discourse_entities_and_reading_hierarchy_persist():
 
 
 def test_language_benchmark_scores_components_separately():
-    v1, v2 = benchmark_module("language_components")
+    v1, v2, v3 = benchmark_module("language_components")
     assert v2.accuracy > v1.accuracy
     assert set(v2.component_scores) == {"composition", "morphology", "constructions", "pragmatics", "discourse", "uncertainty", "counterfactuals", "reading_spans"}
     assert all(score["correct"] == score["total"] for score in v2.component_scores.values())
+    assert v3.accuracy == 1.0
+    assert {"whole_message", "word_sequence", "context_hierarchy", "attention"} <= set(v3.component_scores)

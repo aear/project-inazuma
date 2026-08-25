@@ -53,6 +53,51 @@ def test_snapshot_is_descriptive_bounded_and_ignores_stale_prediction():
     assert snapshot["freshness"]["machine_semantics_age_seconds"] == 0.0
 
 
+def test_complete_message_and_words_coexist_in_one_language_event():
+    message = "Before you reboot the desktop, save the painting because I want both changes."
+    snapshot = lc.build_language_context_snapshot(
+        {
+            "source_text": message,
+            "language_state_signals": {
+                "current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {}
+            },
+        },
+        child="TestChild", logic_reader=False,
+    )
+    assert snapshot["message"]["text"] == message
+    assert snapshot["message"]["words"] == lc._words(message)
+    assert snapshot["message"]["words"].count("the") == 2
+    assert snapshot["message"]["unique_words"].count("the") == 1
+    assert snapshot["semantic_event"]["source_text"] == message
+    assert snapshot["linguistic_analysis"]["text"] == message
+    assert snapshot["message"]["written_structure"]["word_count"] == len(lc._words(message))
+    layers = snapshot["context_hierarchy"]["layers"]
+    assert [layer["kind"] for layer in layers] == [
+        "token_subtoken", "phrase_local_window", "utterance_message",
+        "conversation_episode", "retrieved_long_term_context",
+    ]
+    assert snapshot["context_hierarchy"]["information_flow"] == "bidirectional"
+
+
+def test_attentional_escalation_is_triggered_not_automatic():
+    state = {"current_prediction": {}, "machine_semantics": {}, "emotion_snapshot": {}}
+    ordinary = lc.build_language_context_snapshot(
+        {"source_text": "<3", "language_state_signals": state},
+        child="TestChild", logic_reader=False,
+    )
+    assert ordinary["attentional_escalation"]["deep_retrieval_requested"] is False
+    assert ordinary["attentional_escalation"]["deep_retrieval_performed"] is False
+
+    recalled = lc.build_language_context_snapshot(
+        {"source_text": "Do you remember that?", "explicit_recall_requested": True,
+         "language_state_signals": state},
+        child="TestChild", logic_reader=False,
+    )
+    assert recalled["attentional_escalation"]["requested_level"] == "deep_retrieval"
+    assert recalled["attentional_escalation"]["reasons"] == ["explicit_recall"]
+    assert recalled["attentional_escalation"]["deep_retrieval_performed"] is False
+
+
 def test_prediction_requires_freshness_confidence_and_clarity():
     now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
     base = {"timestamp": now.isoformat(), "predicted_symbol_word": {"symbol": "sym_river"}}
