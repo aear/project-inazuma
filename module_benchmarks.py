@@ -896,6 +896,49 @@ def _experience_cycle_v2() -> dict[str, Any]:
     ])
 
 
+def _adaptive_storage_decision_v1() -> dict[str, Any]:
+    source = _v1_text("adaptive_storage.py")
+    return _capability([
+        {"case": "operation-local evidence attribution", "component": "attribution", "correct": "record_operation_evidence" in source},
+        {"case": "strong repeated evidence may choose placement", "component": "agency", "correct": "min_operation_samples" in source},
+        {"case": "decision captures a restorable snapshot", "component": "reversibility", "correct": "restore_decision_snapshot" in source},
+        {"case": "applied decision writes an audit report", "component": "reporting", "correct": "decision_report_path" in source},
+        {"case": "durable source is excluded from automatic movement", "component": "durability", "correct": False},
+    ])
+
+
+def _adaptive_storage_decision_v2() -> dict[str, Any]:
+    import tempfile
+    from adaptive_storage import load_state, record_operation_evidence, restore_decision_snapshot, save_state
+    with tempfile.TemporaryDirectory(prefix="ina_adaptive_storage_benchmark_") as directory:
+        root = Path(directory)
+        config = {"adaptive_storage_policy": {
+            "state_path": str(root / "{child}.json"),
+            "decision_report_path": str(root / "decisions.jsonl"),
+            "decision_cooldown_seconds": 0,
+        }}
+        state = load_state("Ina", config)
+        state["devices"]["fast"] = {"samples": 3, "success_ewma": 1.0, "free_ratio": 0.5}
+        state["decisions"]["index"] = {"tier": "durable", "reason": "benchmark_baseline"}
+        save_state("Ina", state, config)
+        result = None
+        for _ in range(5):
+            result = record_operation_evidence(
+                "Ina", "indexed_recall", "index", config,
+                latency_seconds=0.75, latency_budget_seconds=0.20,
+                storage_attribution=0.95, bottlenecked=True,
+            )
+        restored = restore_decision_snapshot("Ina", result["snapshot_id"], config)
+        reports = (root / "decisions.jsonl").read_text(encoding="utf-8").splitlines()
+    return _capability([
+        {"case": "operation-local evidence attribution", "component": "attribution", "correct": result["summary"]["mean_storage_attribution"] == 0.95},
+        {"case": "strong repeated evidence may choose placement", "component": "agency", "correct": result["changed"] and result["decision"]["tier"] == "fast"},
+        {"case": "decision captures a restorable snapshot", "component": "reversibility", "correct": restored["restored"] and restored["decision"]["tier"] == "durable"},
+        {"case": "applied decision writes an audit report", "component": "reporting", "correct": len(reports) == 2},
+        {"case": "durable source is excluded from automatic movement", "component": "durability", "correct": result["report"]["durable_source_moved"] is False},
+    ])
+
+
 def _file_explorer_v1() -> dict[str, Any]:
     source = _v1_text("ina_desktop/service.py")
     return _capability([
@@ -1293,6 +1336,21 @@ def _code_experiment_lab_v2() -> dict[str, Any]:
     ])
 
 
+def _code_experiment_lab_v3() -> dict[str, Any]:
+    baseline = _code_experiment_lab_v2()
+    source = Path("code_experiment_lab.py").read_text(encoding="utf-8")
+    cases = list(baseline["cases"])
+    cases.extend([
+        {"case": "strong storage evidence may open an IDE experiment goal", "component": "storage_learning",
+         "correct": "create_storage_optimization_goal" in source and "strong attributed storage evidence is required" in source},
+        {"case": "judged proposal code can enter the review issue outbox", "component": "review",
+         "correct": "queue_review_issue" in source and "production_tree_modified" in source},
+        {"case": "storage optimisation cannot autonomously continue", "component": "bounds",
+         "correct": "autonomous_continuation_budget=0" in source},
+    ])
+    return _capability(cases)
+
+
 def _fault_pattern_research_v1() -> dict[str, Any]:
     return _capability([
         {"case": name, "component": component, "correct": False}
@@ -1464,6 +1522,7 @@ _REGISTRY = {
     "native_test_support": (ModuleVersion("native_test_support", "V1", "External pytest required", _native_tests_v1), ModuleVersion("native_test_support", "V2", "Dependency-free pytest subset", _native_tests_v2)),
     "self_read_language": (ModuleVersion("self_read_language", "V1", "Music assets without explicit language roles", _self_read_language_v1), ModuleVersion("self_read_language", "V2", "Vocal, spoken, and written self-read alignment", _self_read_language_v2)),
     "experience_cycle": (ModuleVersion("experience_cycle", "V1", "Historical event and episode logging", _experience_cycle_v1), ModuleVersion("experience_cycle", "V2", "Optional bounded intent-attempt-observation-evaluation cycles", _experience_cycle_v2)),
+    "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),
     "continuity_recall": (
         ModuleVersion("continuity_recall", "V1", "Historical isolated continuity snapshots", _continuity_recall_v1),
@@ -1487,6 +1546,7 @@ _REGISTRY = {
     "code_experiment_lab": (
         ModuleVersion("code_experiment_lab", "V1", "No governed executable experiment room", _code_experiment_lab_v1),
         ModuleVersion("code_experiment_lab", "V2", "Bounded reproducible Python experiments with review-only promotion", _code_experiment_lab_v2),
+        ModuleVersion("code_experiment_lab", "V3", "Evidence-triggered storage optimisation goals with code review issues", _code_experiment_lab_v3),
     ),
     "fault_pattern_research": (
         ModuleVersion("fault_pattern_research", "V1", "No dedicated fault-pattern research instruments", _fault_pattern_research_v1),

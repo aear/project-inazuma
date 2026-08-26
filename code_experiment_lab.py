@@ -16,7 +16,7 @@ from pathlib import Path
 import resource
 import shutil
 import subprocess
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 import uuid
 
 from experience_engine import ExperienceCycleEngine
@@ -211,17 +211,20 @@ class CodeExperimentLab:
     """Orchestrate code artifacts while Experience Engine owns learning state."""
 
     def __init__(self, root: Path | str, *, cycle_engine: ExperienceCycleEngine | None = None,
-                 rooms: Mapping[str, ExecutionRoom] | None = None) -> None:
+                 rooms: Mapping[str, ExecutionRoom] | None = None,
+                 finding_reporter: Callable[..., dict[str, Any]] | None = None) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.cycles = cycle_engine or ExperienceCycleEngine(root_path=self.root / "cycles", enable_hot=False)
         default_room = PythonScratchRoom()
         self.rooms = dict(rooms or {default_room.name: default_room})
+        self.finding_reporter = finding_reporter
 
     def create(self, *, question: str, hypothesis: str, code: str,
                dataset: Any = None, room: str = "python-scratch",
                support_files: Mapping[str, str] | None = None,
-               autonomous_continuation_budget: int = 0) -> dict[str, Any]:
+               autonomous_continuation_budget: int = 0,
+               goal_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if room not in self.rooms:
             raise ValueError(f"unknown execution room: {room}")
         question = _bounded_text(question, "question")
@@ -232,6 +235,9 @@ class CodeExperimentLab:
         dataset_bytes = json.dumps(dataset, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(dataset_bytes) > MAX_DATASET_BYTES:
             raise ValueError(f"dataset exceeds {MAX_DATASET_BYTES} bytes")
+        goal_context_payload = dict(goal_context or {})
+        if len(json.dumps(goal_context_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")) > MAX_DATASET_BYTES:
+            raise ValueError(f"goal_context exceeds {MAX_DATASET_BYTES} bytes")
         support_files = dict(support_files or {})
         if len(support_files) > MAX_SUPPORT_FILES:
             raise ValueError(f"support_files exceeds {MAX_SUPPORT_FILES} files")
@@ -263,6 +269,7 @@ class CodeExperimentLab:
             "room": room, "source": "main.py", "dataset": "input.json",
             "source_sha256": _digest(source), "dataset_sha256": _digest(dataset_bytes),
             "support_files": support_manifest,
+            "goal_context": goal_context_payload,
             "status": "created", "created_at": _now(),
         }
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
@@ -274,6 +281,29 @@ class CodeExperimentLab:
         manifest["cycle_id"] = cycle["cycle_id"]
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
         return manifest
+
+    def create_storage_optimization_goal(
+        self, *, evidence_report: Mapping[str, Any], hypothesis: str, code: str,
+        dataset: Any = None, room: str = "python-scratch",
+        support_files: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Open an IDE experiment only from strong attributed storage evidence."""
+        report = dict(evidence_report or {})
+        summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+        if not bool(summary.get("strong")):
+            raise ValueError("strong attributed storage evidence is required")
+        operation = str(report.get("operation") or "unknown operation")
+        artifact = str(report.get("artifact_class") or "unknown artifact")
+        return self.create(
+            question=f"Can a bounded code change reduce storage latency for {operation} ({artifact})?",
+            hypothesis=hypothesis, code=code, dataset=dataset, room=room,
+            support_files=support_files, autonomous_continuation_budget=0,
+            goal_context={
+                "goal_kind": "storage_optimization", "operation": operation,
+                "artifact_class": artifact, "evidence_summary": dict(summary),
+                "storage_decision_snapshot_id": report.get("snapshot_id"),
+            },
+        )
 
     def run(self, experiment_id: str) -> dict[str, Any]:
         directory, manifest = self._load(experiment_id)
@@ -317,8 +347,48 @@ class CodeExperimentLab:
             "hypothesis": manifest["hypothesis"], "source_sha256": manifest["source_sha256"],
             "dataset_sha256": manifest["dataset_sha256"], "decision": cycle.get("last_choice"),
             "run_record": str(directory / f"{manifest['run_id']}.json"),
+            "goal_context": dict(manifest.get("goal_context") or {}),
             "promotion_state": "review-required", "production_tree_modified": False,
         }
+
+    def queue_review_issue(
+        self, experiment_id: str, *, child: str, config: Mapping[str, Any],
+        touched_files: list[str] | None = None, delivery_choice: str = "submit",
+    ) -> dict[str, Any]:
+        """Put judged experiment code and evidence in the review outbox."""
+        proposal = self.proposal_summary(experiment_id)
+        directory, manifest = self._load(experiment_id)
+        source = (directory / str(manifest["source"])).read_text(encoding="utf-8")
+        run_record = json.loads((directory / f"{manifest['run_id']}.json").read_text(encoding="utf-8"))
+        context = dict(manifest.get("goal_context") or {})
+        summary = "\n".join([
+            "Ina completed a bounded private code experiment and is requesting review.",
+            "", "## Question", str(manifest["question"]),
+            "", "## Hypothesis", str(manifest["hypothesis"]),
+            "", "## Evidence and judgement",
+            f"- Decision: `{proposal.get('decision')}`",
+            f"- Goal context: `{json.dumps(context, sort_keys=True)}`",
+            f"- Run return code: `{run_record.get('return_code')}`",
+            f"- Run elapsed seconds: `{run_record.get('elapsed_seconds')}`",
+            f"- Source SHA-256: `{proposal['source_sha256']}`",
+            "", "## Proposed experiment code", "````python", source, "````",
+            "", "This is review material only; the production tree was not modified.",
+        ])
+        reporter = self.finding_reporter
+        if reporter is None:
+            from github_submission import report_github_finding
+            reporter = report_github_finding
+        return reporter(
+            child, f"Review storage optimisation experiment: {manifest['question']}", summary,
+            kind="feature", component="adaptive_storage", severity="low", confidence=1.0,
+            evidence=[f"experiment_id={experiment_id}", f"run_record={proposal['run_record']}"],
+            suggestion="Review the measured proposal and apply it through the normal development workflow if accepted.",
+            touched_files=list(touched_files or []),
+            dedupe_key=f"code-experiment-review:{experiment_id}",
+            metadata={"source": "ina_code_experiment", "experiment_id": experiment_id,
+                      "production_tree_modified": False, "goal_context": context},
+            cfg=dict(config), delivery_choice=delivery_choice,
+        )
 
     def _load(self, experiment_id: str) -> tuple[Path, dict[str, Any]]:
         identifier = str(experiment_id)

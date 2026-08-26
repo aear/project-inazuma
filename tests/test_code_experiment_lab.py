@@ -91,3 +91,46 @@ def test_process_limit_is_relative_to_existing_host_tasks():
     baseline = room._user_task_count()
     assert baseline >= 1
     assert baseline + room.limits.processes > baseline
+
+
+def test_strong_storage_evidence_can_become_review_issue_with_code(tmp_path):
+    captured = {}
+
+    def reporter(child, title, summary, **kwargs):
+        captured.update(child=child, title=title, summary=summary, kwargs=kwargs)
+        return {"queued": True, "entry_id": "review-1", "delivery_choice": kwargs["delivery_choice"]}
+
+    lab = CodeExperimentLab(
+        tmp_path / "lab", rooms={"fake-python": FakeRoom()}, finding_reporter=reporter,
+    )
+    experiment = lab.create_storage_optimization_goal(
+        evidence_report={
+            "operation": "memory_lookup", "artifact_class": "index", "snapshot_id": "snapshot-1",
+            "summary": {"strong": True, "samples": 5, "mean_storage_attribution": 0.95},
+        },
+        hypothesis="Batching the reads reduces latency.", code="print('candidate')",
+        dataset=[2, 3], room="fake-python",
+    )
+    lab.run(experiment["experiment_id"])
+    lab.judge(
+        experiment["experiment_id"], choice="keep", metrics={"latency_ratio": 0.5},
+        explanation="The candidate reduced measured latency.",
+    )
+    queued = lab.queue_review_issue(
+        experiment["experiment_id"], child="Ina", config={},
+        touched_files=["memory_lookup.py"], delivery_choice="hold",
+    )
+    assert queued["queued"] is True
+    assert "print('candidate')" in captured["summary"]
+    assert "production tree was not modified" in captured["summary"]
+    assert captured["kwargs"]["metadata"]["production_tree_modified"] is False
+    assert captured["kwargs"]["delivery_choice"] == "hold"
+
+
+def test_storage_experiment_goal_rejects_weak_evidence(tmp_path):
+    lab = CodeExperimentLab(tmp_path / "lab", rooms={"fake-python": FakeRoom()})
+    with pytest.raises(ValueError, match="strong attributed"):
+        lab.create_storage_optimization_goal(
+            evidence_report={"operation": "lookup", "artifact_class": "index", "summary": {"strong": False}},
+            hypothesis="Maybe faster.", code="pass", room="fake-python",
+        )
