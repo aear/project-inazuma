@@ -1,5 +1,6 @@
 from cognition_runtime import CognitiveContext
 from thought_processor import ThoughtProcessor
+from expression_core import create_reaction_interpretation, create_reaction_observation, create_realisation
 
 
 def test_non_linguistic_thought_keeps_structure_without_language_conversion():
@@ -97,3 +98,50 @@ def test_model_manager_exposes_guided_decision_through_stable_facade():
     )
     assert result["decision"]["selected"] == "rest"
     assert result["thoughts"][0]["provenance"] == ["runtime:test", "guidance:emotion"]
+
+
+def test_thoughts_prepare_communication_without_exposing_internal_content():
+    processor = ThoughtProcessor()
+    feeling = processor.process_non_linguistic(
+        {"care": 0.9}, confidence=0.8,
+        metadata={"guidance_source": "emotion"}, provenance=["emotion:snapshot-2"],
+    )
+    meaning = processor.process_linguistic("I want to understand what changed.", confidence=0.7)
+    plan = processor.prepare_communication(
+        "ask for clarification", [feeling, meaning],
+        audience_references=["person:sakura"], allowed_media=["text", "voice"],
+        dimensions={"care": 0.9, "directness": 0.6},
+    )
+    intent = plan["expression_intent"]
+    assert set(plan["selected_thought_ids"]) == {feeling.thought_id, meaning.thought_id}
+    assert intent["affect_references"] == [f"affect:{feeling.thought_id}"]
+    assert intent["semantic_references"] == [f"semantic:{meaning.thought_id}"]
+    assert feeling.content not in intent.values()
+    assert "text" not in intent
+
+
+def test_communication_feedback_becomes_evidence_for_revision_not_reward():
+    processor = ThoughtProcessor()
+    original = processor.process_linguistic("The plan is clear.", confidence=0.6)
+    plan = processor.prepare_communication("check shared understanding", [original], allowed_media=["text"])
+    realised = create_realisation(
+        plan["expression_intent"], medium="text", content={"text": "Does that make sense?"},
+        realiser="test.text",
+    )
+    reaction = create_reaction_observation(
+        realised["realisation_id"], {"kind": "clarifying_question"},
+        source="conversation:event-3", causal_confidence=0.8,
+    )
+    interpretation = create_reaction_interpretation(reaction["reaction_id"], [
+        {"meaning": "explanation was ambiguous", "confidence": 0.75},
+        {"meaning": "listener wants detail", "confidence": 0.25},
+    ])
+    feedback = processor.process_communication_feedback(plan, reaction, interpretation)
+    revised = processor.revise_thought(
+        original, "The plan may need a clearer explanation.", evidence=[feedback], confidence=0.75,
+    )
+    assert feedback.metadata["revision_candidate"] is True
+    assert feedback.confidence == 0.6
+    assert "reward" not in feedback.content
+    assert revised.metadata["revision_of"] == original.thought_id
+    assert revised.metadata["evidence_thought_ids"] == (feedback.thought_id,)

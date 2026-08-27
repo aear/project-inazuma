@@ -239,6 +239,45 @@ def _thought_processor_v3() -> dict[str, Any]:
     ])
 
 
+def _thought_processor_v4() -> dict[str, Any]:
+    baseline = _thought_processor_v3()
+    from expression_core import create_reaction_interpretation, create_reaction_observation, create_realisation
+    from thought_processor import ThoughtProcessor
+    processor = ThoughtProcessor()
+    original = processor.process_linguistic("The explanation is sufficient.", confidence=0.6)
+    plan = processor.prepare_communication(
+        "check understanding", [original], audience_references=["person:sakura"],
+        allowed_media=["text"],
+    )
+    realised = create_realisation(
+        plan["expression_intent"], medium="text", content={"text": "Does that make sense?"},
+        realiser="benchmark.text",
+    )
+    reaction = create_reaction_observation(
+        realised["realisation_id"], {"kind": "clarifying_question"},
+        source="benchmark:reaction", causal_confidence=0.8,
+    )
+    interpretation = create_reaction_interpretation(reaction["reaction_id"], [
+        {"meaning": "explanation may be ambiguous", "confidence": 0.75},
+        {"meaning": "more detail requested", "confidence": 0.25},
+    ])
+    feedback = processor.process_communication_feedback(plan, reaction, interpretation)
+    revised = processor.revise_thought(
+        original, "The explanation may need clarification.", evidence=[feedback], confidence=0.75,
+    )
+    return _capability([*baseline["cases"],
+        {"case": "thoughts prepare medium-neutral communication", "component": "communication",
+         "correct": plan["expression_intent"]["purpose"] == "check understanding"
+         and "text" not in plan["expression_intent"]},
+        {"case": "reaction alternatives become evidence rather than reward", "component": "feedback",
+         "correct": feedback.metadata.get("revision_candidate") is True
+         and "reward" not in feedback.content and len(feedback.content.get("interpretations") or ()) == 2},
+        {"case": "feedback supports a provenance-linked revision", "component": "improvement",
+         "correct": revised.metadata.get("revision_of") == original.thought_id
+         and feedback.thought_id in revised.metadata.get("evidence_thought_ids", ())},
+    ])
+
+
 def _q_decoder_v1() -> dict[str, Any]:
     module = _v1_module("transformers/QTransformer.py", package="transformers")
     transformer = module.QTransformer()
@@ -1620,6 +1659,7 @@ _REGISTRY = {
         ModuleVersion("thought_processor", "V1", "Cognition without a shared typed thought boundary", _thought_processor_v1),
         ModuleVersion("thought_processor", "V2", "Separate non-linguistic and linguistic thought with mixed decisions", _thought_processor_v2),
         ModuleVersion("thought_processor", "V3", "Emotion, instinct, cognition, and memory guide one inspectable decision", _thought_processor_v3),
+        ModuleVersion("thought_processor", "V4", "Communication supplies evidence for bounded thought revision", _thought_processor_v4),
     ),
 }
 

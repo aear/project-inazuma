@@ -6,12 +6,15 @@ boundary before it can contribute to a decision.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 import math
 import uuid
 
 from cognition_runtime.cognitive_context import CognitiveContext, _bounded
+from expression_core import (
+    INTERPRETATION_SCHEMA, REACTION_SCHEMA, create_expression_intent,
+)
 from semantic_event import build_native_intent, build_semantic_event
 
 
@@ -72,6 +75,37 @@ class ThoughtProcessor:
     """Form two kinds of thought and combine either kind for one decision."""
 
     GUIDANCE_SOURCES = ("emotion", "instinct", "cognition", "memory")
+
+    def revise_thought(
+        self, parent: Thought, revision: Any, *, evidence: Iterable[Thought] = (),
+        linguistic: bool | None = None, context: CognitiveContext | None = None,
+        confidence: float | None = None, relevance: float | None = None,
+        provenance: Iterable[str] = (),
+    ) -> Thought:
+        """Create an inspectable revision without overwriting the prior thought."""
+        witnesses = tuple(evidence)[:32]
+        use_language = parent.mode == "linguistic" if linguistic is None else bool(linguistic)
+        metadata = {
+            **dict(parent.metadata), "revision_of": parent.thought_id,
+            "evidence_thought_ids": [item.thought_id for item in witnesses],
+        }
+        sources = tuple(dict.fromkeys((
+            *parent.provenance,
+            *(source for item in witnesses for source in item.provenance),
+            *tuple(provenance),
+        )))
+        common = {
+            "context": context, "confidence": parent.confidence if confidence is None else confidence,
+            "relevance": parent.relevance if relevance is None else relevance,
+            "provenance": sources, "metadata": metadata,
+        }
+        if use_language:
+            revised = self.process_linguistic(str(revision or ""), **common)
+        else:
+            revised = self.process_non_linguistic(revision, **common)
+        if context is None and parent.context_id:
+            revised = replace(revised, context_id=parent.context_id)
+        return revised
 
     def process_non_linguistic(
         self, content: Any, *, context: CognitiveContext | None = None,
@@ -238,6 +272,90 @@ class ThoughtProcessor:
                 source: len(by_source[source]) for source in self.GUIDANCE_SOURCES
             },
         }
+
+    def prepare_communication(
+        self, purpose: str, thoughts: Iterable[Thought], *,
+        audience_references: Iterable[str] = (), allowed_media: Iterable[str] | None = None,
+        dimensions: Mapping[str, Any] | None = None, max_thoughts: int = 8,
+        thought_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Select thought references and prepare an output-neutral expression intent."""
+        bounded = tuple(thoughts)[:64]
+        requested = set(str(item) for item in thought_ids or ())
+        eligible = [item for item in bounded if not requested or item.thought_id in requested]
+        selected = sorted(
+            eligible, key=lambda item: (-(item.confidence * item.relevance), item.thought_id),
+        )[:max(1, min(16, int(max_thoughts)))]
+        if not selected:
+            raise ValueError("communication requires at least one selected thought")
+        thought_references = [f"thought:{item.thought_id}" for item in selected]
+        linguistic = [f"semantic:{item.thought_id}" for item in selected if item.mode == "linguistic"]
+        concepts = [f"concept:{item.thought_id}" for item in selected if item.mode != "linguistic"]
+        affects = [
+            f"affect:{item.thought_id}" for item in selected
+            if item.metadata.get("guidance_source") == "emotion"
+        ]
+        uncertain = [
+            {"thought_id": item.thought_id, "confidence": item.confidence}
+            for item in selected if item.confidence < 1.0
+        ]
+        intent = create_expression_intent(
+            purpose, semantic_references=linguistic,
+            concept_references=concepts, affect_references=affects,
+            audience_references=audience_references, dimensions=dimensions,
+            uncertainty={"thoughts": uncertain[:8]}, allowed_media=allowed_media,
+            provenance=tuple(dict.fromkeys(
+                (*thought_references, *(source for item in selected for source in item.provenance))
+            )),
+        )
+        return {
+            "schema": "ina.thought_communication_plan/V1",
+            "plan_id": uuid.uuid4().hex, "purpose": str(purpose)[:500],
+            "selected_thought_ids": [item.thought_id for item in selected],
+            "expression_intent": intent,
+            "context_ids": list(dict.fromkeys(item.context_id for item in selected if item.context_id)),
+        }
+
+    def process_communication_feedback(
+        self, plan: Mapping[str, Any], reaction: Mapping[str, Any],
+        interpretation: Mapping[str, Any], *, context: CognitiveContext | None = None,
+        relevance: float = 1.0,
+    ) -> Thought:
+        """Turn uncertain communication feedback into evidence for later revision."""
+        if plan.get("schema") != "ina.thought_communication_plan/V1":
+            raise ValueError("a valid thought communication plan is required")
+        if reaction.get("schema") != REACTION_SCHEMA:
+            raise ValueError("a valid expression reaction is required")
+        if interpretation.get("schema") != INTERPRETATION_SCHEMA:
+            raise ValueError("a valid reaction interpretation is required")
+        if interpretation.get("reaction_id") != reaction.get("reaction_id"):
+            raise ValueError("reaction interpretation does not match the reaction")
+        observation = dict(reaction.get("observation") or {})
+        if "reward" in observation:
+            raise ValueError("communication feedback is evidence, not reward")
+        candidates = [dict(item) for item in list(interpretation.get("candidates") or ())[:8]]
+        causal = reaction.get("causal_confidence")
+        causal_factor = 1.0 if causal is None else _unit(causal)
+        confidence = round(_unit(
+            _unit(max((item.get("confidence", 0.0) for item in candidates), default=0.0))
+            * causal_factor
+        ), 6)
+        return self.process_non_linguistic(
+            {
+                "communication_plan_id": str(plan.get("plan_id") or ""),
+                "expression_intent_id": str((plan.get("expression_intent") or {}).get("intent_id") or ""),
+                "reaction_id": str(reaction.get("reaction_id") or ""),
+                "observation": observation, "interpretations": candidates,
+                "about_thought_ids": list(plan.get("selected_thought_ids") or ())[:16],
+            },
+            context=context, confidence=confidence, relevance=relevance,
+            provenance=tuple(dict.fromkeys((
+                *tuple(reaction.get("provenance") or ()),
+                *tuple(interpretation.get("provenance") or ()),
+                f"communication_plan:{plan.get('plan_id')}",
+            ))),
+            metadata={"role": "communication_feedback", "revision_candidate": True},
+        )
 
     @staticmethod
     def _thought(

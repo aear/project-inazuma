@@ -4733,6 +4733,18 @@ def guide_thought_decision(
     )
 
 
+def prepare_thought_communication(purpose, thoughts, **kwargs):
+    """Prepare a medium-neutral communication plan from selected thoughts."""
+    return _THOUGHT_PROCESSOR.prepare_communication(purpose, thoughts, **kwargs)
+
+
+def process_thought_communication_feedback(plan, reaction, interpretation, **kwargs):
+    """Convert witnessed communication feedback into revisable thought evidence."""
+    return _THOUGHT_PROCESSOR.process_communication_feedback(
+        plan, reaction, interpretation, **kwargs,
+    )
+
+
 def route_cognitive_work(
     capability: str, *, context: Optional[CognitiveContext] = None, payload: Any = None,
     observations=(), goals=(), active_state=None, discourse=None, provenance=(), references=(), metadata=None,
