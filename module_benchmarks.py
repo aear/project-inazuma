@@ -183,6 +183,62 @@ def _capability(cases: list[dict[str, Any]]) -> dict[str, Any]:
     return {"correct": sum(bool(case.get("correct")) for case in cases), "total": len(cases), "cases": cases}
 
 
+def _thought_processor_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "non-linguistic thought has a dedicated path", "component": "separation", "correct": False},
+        {"case": "linguistic thought crosses semantic-event boundary", "component": "language", "correct": False},
+        {"case": "decisions combine both thought modalities", "component": "decision", "correct": False},
+        {"case": "close evidence may remain unresolved", "component": "uncertainty", "correct": False},
+    ])
+
+
+def _thought_processor_v2() -> dict[str, Any]:
+    from thought_processor import ThoughtProcessor
+    processor = ThoughtProcessor()
+    spatial = processor.process_non_linguistic({"route": "right", "clear": True}, confidence=0.9)
+    language = processor.process_linguistic("The left route is shorter.", confidence=0.7)
+    decision = processor.decide(["left", "right"], [spatial, language], evidence=[
+        {"option": "left", "thought_id": language.thought_id, "weight": 0.5},
+        {"option": "right", "thought_id": spatial.thought_id, "weight": 1.0},
+    ])
+    tied = processor.decide(["left", "right"], [spatial], evidence=[
+        {"option": "left", "thought_id": spatial.thought_id, "weight": 0.5},
+        {"option": "right", "thought_id": spatial.thought_id, "weight": 0.5},
+    ])
+    return _capability([
+        {"case": "non-linguistic thought has a dedicated path", "component": "separation",
+         "correct": spatial.mode == "non_linguistic" and "source_text" not in spatial.content},
+        {"case": "linguistic thought crosses semantic-event boundary", "component": "language",
+         "correct": bool(language.content.get("semantic_event", {}).get("events"))},
+        {"case": "decisions combine both thought modalities", "component": "decision",
+         "correct": decision.selected == "right" and len(decision.modalities) == 2},
+        {"case": "close evidence may remain unresolved", "component": "uncertainty",
+         "correct": tied.status == "undecided"},
+    ])
+
+
+def _thought_processor_v3() -> dict[str, Any]:
+    baseline = _thought_processor_v2()
+    from thought_processor import ThoughtProcessor
+    processor = ThoughtProcessor()
+    guided = processor.guided_decision(["left", "right"], {
+        "emotion": [{"content": {"risk": 0.7}}],
+        "instinct": [{"content": {"urge": "right"}}],
+        "cognition": [{"content": "The left route is shorter.", "linguistic": True}],
+        "memory": [{"content": {"reference": "memory://fragment/7", "left": "blocked"}}],
+    }, evidence=[
+        {"option": "right", "source": "emotion", "weight": 0.4},
+        {"option": "right", "source": "instinct", "weight": 0.5},
+        {"option": "left", "source": "cognition", "weight": 0.4},
+        {"option": "right", "source": "memory", "weight": 0.7},
+    ])
+    return _capability([*baseline["cases"],
+        {"case": "four guidance roles retain provenance and jointly guide decisions", "component": "integration",
+         "correct": guided["decision"]["selected"] == "right" and all(
+             count == 1 for count in guided["guidance_coverage"].values())},
+    ])
+
+
 def _q_decoder_v1() -> dict[str, Any]:
     module = _v1_module("transformers/QTransformer.py", package="transformers")
     transformer = module.QTransformer()
@@ -1559,6 +1615,11 @@ _REGISTRY = {
     "expression_core": (
         ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),
         ModuleVersion("expression_core", "V2", "Output-neutral intent with medium realisers and reaction provenance", _expression_core_v2),
+    ),
+    "thought_processor": (
+        ModuleVersion("thought_processor", "V1", "Cognition without a shared typed thought boundary", _thought_processor_v1),
+        ModuleVersion("thought_processor", "V2", "Separate non-linguistic and linguistic thought with mixed decisions", _thought_processor_v2),
+        ModuleVersion("thought_processor", "V3", "Emotion, instinct, cognition, and memory guide one inspectable decision", _thought_processor_v3),
     ),
 }
 

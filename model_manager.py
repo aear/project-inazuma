@@ -65,6 +65,7 @@ from cognition_runtime import (
     ResourceBudget, ResultBus, capability_specs_from_task_profiles,
 )
 from cognition_runtime.default_capabilities import build_task_profiles
+from thought_processor import ThoughtProcessor
 
 try:
     from ina_process import psutil
@@ -86,6 +87,7 @@ _RESOURCE_BUDGET = ResourceBudget(
 )
 _COGNITION_RUNTIME: Optional[CognitionRuntime] = None
 _COGNITION_RUNTIME_LOCK = threading.RLock()
+_THOUGHT_PROCESSOR = ThoughtProcessor()
 _DECISION_PANIC_LOG_PATH = MEMORY_PATH / "decision_panic_log.jsonl"
 _FRAGMENT_HEALTH_PATH = MEMORY_PATH / "fragment_integrity.json"
 
@@ -4710,6 +4712,24 @@ def build_cognitive_context(
     return CognitiveContext.build(
         observations=observations, goals=goals, active_state=active_state, discourse=discourse,
         provenance=provenance, references=references, metadata=metadata,
+    )
+
+
+def guide_thought_decision(
+    options, guidance, *, evidence, context: Optional[CognitiveContext] = None,
+    observations=(), goals=(), active_state=None, discourse=None, provenance=(),
+    references=(), metadata=None, minimum_score: float = 0.0,
+    tie_margin: float = 0.05,
+):
+    """Stable façade for an emotion/instinct/cognition/memory-guided decision."""
+    cycle = context or build_cognitive_context(
+        observations=observations, goals=goals, active_state=active_state,
+        discourse=discourse, provenance=provenance, references=references,
+        metadata=metadata,
+    )
+    return _THOUGHT_PROCESSOR.guided_decision(
+        options, guidance, evidence=evidence, context=cycle,
+        minimum_score=minimum_score, tie_margin=tie_margin,
     )
 
 
