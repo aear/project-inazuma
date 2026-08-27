@@ -27,6 +27,7 @@ from geometry_utils import (
     get_unit_sphere_meshdata,
 )
 from world_collision import HouseCollisionMap, distance_to_segment
+from world_environment import CachedWeatherProvider, LocalSurfaceEnvironment
 
 from house_model import (
     create_prototype_house,
@@ -1032,6 +1033,21 @@ class HouseViewer(QtWidgets.QMainWindow):
             "fetched_at": 0.0,
             "source": None,
         }
+        # Weather is fetched on a single background worker.  The 16 ms render
+        # timer only consumes completed evidence and never performs network IO.
+        self._weather_provider = CachedWeatherProvider(
+            latitude=self.sun_location[0],
+            longitude=self.sun_location[1],
+        )
+        self._surface_environment = LocalSurfaceEnvironment()
+        self._environment_observation = None
+        self._environment_future: Optional[Future] = None
+        self._environment_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="house_environment",
+        )
+        self._environment_last_check = 0.0
+        self._environment_check_interval = 60.0
         self._lit_items = []
         self._lighting_last_update = 0.0
 
@@ -5740,6 +5756,7 @@ class HouseViewer(QtWidgets.QMainWindow):
         dt = now - self._last_tick
         self._last_tick = now
         self._update_sky_positions()
+        self._update_environment_observation()
         self._update_door_animations(min(dt, 0.05))
         self._update_tv_stream()
         self._update_ina_network_motion(min(dt, 0.05))
@@ -5749,6 +5766,62 @@ class HouseViewer(QtWidgets.QMainWindow):
         self._apply_player_input(min(dt, 0.05))
         self._maybe_respawn_player()
         self._update_interaction_target()
+
+    def _update_environment_observation(self) -> None:
+        """Adopt completed weather evidence and request refreshes at a slow seam."""
+        now = time.monotonic()
+        future = self._environment_future
+        if future is not None and future.done():
+            try:
+                self._environment_observation = future.result()
+            except Exception:
+                # CachedWeatherProvider normally fails into inspectable fallback
+                # evidence; this guard keeps a worker failure out of rendering.
+                pass
+            self._environment_future = None
+        if self._environment_future is not None:
+            return
+        if self._environment_observation is not None:
+            age = now - self._environment_observation.fetched_at_monotonic
+            if age < self._weather_provider.cache_seconds:
+                return
+        if now - self._environment_last_check < self._environment_check_interval:
+            return
+        self._environment_last_check = now
+        self._environment_future = self._environment_executor.submit(
+            self._weather_provider.current
+        )
+
+    def observe_surface_channels(self, surface_id: str) -> Optional[dict]:
+        """Resolve one local surface lazily, exposing physical channels only."""
+        observation = self._environment_observation
+        if observation is None or surface_id not in self._surface_environment.surfaces:
+            return None
+        return self._surface_environment.observe(
+            surface_id,
+            observation,
+            now_monotonic=time.monotonic(),
+        )
+
+    def environment_debug_snapshot(self) -> dict:
+        """Conceptual introspection path; not an Ina sensory payload."""
+        observation = self._environment_observation
+        return {
+            "location": self.sun_location_name,
+            "forcing": observation.public_channels() if observation is not None else None,
+            "surfaces": {
+                surface_id: {
+                    "material": surface.material.name,
+                    "moisture_mm": round(surface.moisture_mm, 6),
+                    "surface_temperature_c": (
+                        round(surface.surface_temperature_c, 4)
+                        if surface.surface_temperature_c is not None
+                        else None
+                    ),
+                }
+                for surface_id, surface in self._surface_environment.surfaces.items()
+            },
+        }
 
     def set_ina_network_pose(self, position, velocity=None) -> None:
         target = np.array(position, dtype=float)
