@@ -45,6 +45,34 @@ def test_gui_restart_request_signals_the_supervisor(monkeypatch, tmp_path):
         assert calls[0][1] == signal.SIGUSR1
 
 
+def test_gui_shutdown_waits_for_supervisor_then_cleans_stragglers(monkeypatch):
+    calls = []
+
+    class Process:
+        def terminate(self):
+            calls.append("terminate")
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            return 0
+
+    monkeypatch.setattr(services, "_safe_json", lambda path: {"supervisor_pid": 777})
+    monkeypatch.setattr(services, "_is_supervisor_process", lambda pid: pid == 777)
+    monkeypatch.setattr(services.psutil, "Process", lambda pid: Process())
+    monkeypatch.setattr(
+        services,
+        "stop_runtime_services",
+        lambda root, grace_seconds: calls.append(("cleanup", grace_seconds))
+        or {"matched": [], "errors": []},
+    )
+
+    result = services.shutdown_runtime_service_supervisor("Ina", grace_seconds=6.0)
+
+    assert result["ok"] is True
+    assert result["graceful"] is True
+    assert calls == ["terminate", ("wait", 6.0), ("cleanup", 3.0)]
+
+
 def test_crash_exit_requests_bounded_restart(monkeypatch, tmp_path):
     monkeypatch.setattr(services, "load_config", lambda: {"runtime_services": {}})
     supervisor = services.RuntimeServiceSupervisor("Ina")

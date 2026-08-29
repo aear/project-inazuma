@@ -91,3 +91,20 @@ def test_early_comm_import_does_not_load_model_manager():
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "False"
+
+
+def test_discord_voice_dispatch_benchmark_v1_typing_gate_vs_v2_independent_voice():
+    """V2 allows ready voice output even when no typed contact is ready."""
+    ready = ec.discord_voice_dispatch_decision(
+        voice_preferred=True, speech_allowed=True, clip_available=True,
+    )
+    quiet = ec.discord_voice_dispatch_decision(
+        voice_preferred=True, speech_allowed=False, clip_available=True,
+    )
+    broken = ec.discord_voice_dispatch_decision(
+        voice_preferred=True, speech_allowed=True, clip_available=False,
+    )
+
+    assert ready == {"queue": True, "reason": "volitional_voice_ready"}
+    assert quiet == {"queue": False, "reason": "voice_urge_below_threshold"}
+    assert broken == {"queue": False, "reason": "no_rendered_voice_clip"}

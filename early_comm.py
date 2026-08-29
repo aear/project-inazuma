@@ -32,6 +32,7 @@ from language_processing import (
     text_length_profile,
 )
 from runtime_state import load_config, seed_self_question, update_inastate, get_inastate, append_typed_outbox_entry
+from voice_cognition_trace import record_voice_cognition
 from social_map import get_high_trust_contacts, get_owner_user_id
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
@@ -87,6 +88,19 @@ def _resolve_adjusted_urge_level(state: Any) -> float:
     except Exception:
         adjusted = base
     return max(0.0, min(1.0, adjusted))
+
+
+def discord_voice_dispatch_decision(
+    *, voice_preferred: bool, speech_allowed: bool, clip_available: bool,
+) -> Dict[str, Any]:
+    """Keep Discord speech eligibility independent from typed-contact readiness."""
+    if not voice_preferred:
+        return {"queue": False, "reason": "discord_voice_not_preferred"}
+    if not speech_allowed:
+        return {"queue": False, "reason": "voice_urge_below_threshold"}
+    if not clip_available:
+        return {"queue": False, "reason": "no_rendered_voice_clip"}
+    return {"queue": True, "reason": "volitional_voice_ready"}
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -1753,7 +1767,7 @@ def early_communicate():
         effective_language_mode = "none"
     queued_id = None
     audio_clip_path = None
-    if allow_symbol_autotype and speech_symbols:
+    if speech_symbols and (allow_symbol_autotype or (voice_pref and allow_speech)):
         try:
             audio_dm_dir = Path("AI_Children") / child / "memory" / "comm_output" / "typed_audio"
             audio_dm_dir.mkdir(parents=True, exist_ok=True)
@@ -1770,6 +1784,12 @@ def early_communicate():
         except Exception as exc:
             audio_clip_path = None
             log_to_statusbox(f"[Comms] Failed to render DM audio clip: {exc}")
+
+    voice_dispatch = discord_voice_dispatch_decision(
+        voice_preferred=bool(voice_pref),
+        speech_allowed=allow_speech,
+        clip_available=bool(audio_clip_path),
+    )
 
     if ready_to_type and cooled_down:
         chosen_text = None
@@ -1872,8 +1892,8 @@ def early_communicate():
                     "expression_length_profile": text_length_profile(chosen_text),
                     "expression_stored_in_full": True,
                     "delivery_chunking": "discord_transport_only",
-                    "delivery": voice_delivery,
-                    "voice_target": voice_pref,
+                    "delivery": "discord_voice" if voice_dispatch["queue"] else "text_contact",
+                    "voice_target": voice_pref if voice_dispatch["queue"] else None,
                     "audio_attachment_kind": "symbolic_voice" if audio_clip_path else None,
                     "available_symbol_count": len(speech_symbols),
                     "chosen_symbol_count": len(typed_symbols),
@@ -1912,11 +1932,58 @@ def early_communicate():
                 },
             )
 
+    voice_dispatch_id = queued_id if queued_id and voice_dispatch["queue"] else None
+    if voice_dispatch["queue"] and not voice_dispatch_id:
+        voice_dispatch_id = append_typed_outbox_entry(
+            "",
+            target="voice_channel",
+            metadata={
+                "source": "early_comm",
+                "strategy": expression_strategy,
+                "urge_to_voice": voice_urge_level,
+                "delivery": "discord_voice",
+                "voice_target": voice_pref,
+                "audio_attachment_kind": "symbolic_voice",
+                "typed_contact_required": False,
+            },
+            allow_empty=True,
+            attachment_path=str(audio_clip_path),
+        )
+    update_inastate(
+        "discord_voice_expression_intent",
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "queued" if voice_dispatch_id else "quiet",
+            "reason": voice_dispatch["reason"],
+            "urge_level": voice_urge_level,
+            "threshold": min_urge_to_speak,
+            "queue_id": voice_dispatch_id,
+            "clip_available": bool(audio_clip_path),
+            "typing_gate_applied": False,
+        },
+    )
+    record_voice_cognition(child, "expression_intent", {
+        "status": "queued" if voice_dispatch_id else "quiet",
+        "reason": voice_dispatch["reason"],
+        "urge_level": voice_urge_level,
+        "threshold": min_urge_to_speak,
+        "queue_id": voice_dispatch_id,
+        "clip_available": bool(audio_clip_path),
+        "typing_gate_applied": False,
+    })
+    if voice_dispatch_id and not queued_id:
+        log_to_statusbox(f"[Comms] Queued Discord voice expression independently of typing: {voice_dispatch_id}")
+
     # === Audio expression attempt (log + speak)
     if not allow_speech:
         log_to_statusbox(
             f"[Comms] Staying quiet (urge {voice_urge_level:.2f} < {min_urge_to_speak}). Expression logged only."
         )
+    elif voice_pref:
+        if voice_dispatch_id:
+            log_to_statusbox(f"[Comms] Discord voice expression queued: {voice_dispatch_id}")
+        else:
+            log_to_statusbox(f"[Comms] Discord voice stayed quiet: {voice_dispatch['reason']}.")
     else:
         channel_hint = " via Discord voice" if voice_pref else ""
         log_to_statusbox(f"[Comms] Preparing to speak{channel_hint}: \"{expression}\"")

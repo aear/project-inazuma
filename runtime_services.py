@@ -132,6 +132,38 @@ def request_service_restart(child: str, service: str) -> Dict[str, Any]:
     return {"ok": True, "service": service, "supervisor_pid": pid}
 
 
+def shutdown_runtime_service_supervisor(
+    child: str,
+    *,
+    grace_seconds: float = 6.0,
+) -> Dict[str, Any]:
+    """Stop supervised bridges before GUI exit, then clean up legacy stragglers."""
+    status = _safe_json(supervisor_status_path(child))
+    pid = int(status.get("supervisor_pid", 0) or 0)
+    graceful = False
+    errors = []
+    if _is_supervisor_process(pid):
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+            process.wait(timeout=max(0.0, float(grace_seconds)))
+            graceful = True
+        except (psutil.Error, OSError) as exc:
+            errors.append(str(exc))
+    cleanup = stop_runtime_services(
+        Path(__file__).resolve().parent,
+        grace_seconds=max(1.0, min(3.0, float(grace_seconds))),
+    )
+    errors.extend(cleanup.get("errors") or [])
+    return {
+        "ok": graceful or not cleanup.get("matched"),
+        "supervisor_pid": pid or None,
+        "graceful": graceful,
+        "cleanup": cleanup,
+        "errors": errors,
+    }
+
+
 class RuntimeServiceSupervisor:
     def __init__(self, child: str) -> None:
         self.child = str(child)

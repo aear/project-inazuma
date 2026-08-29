@@ -53,6 +53,8 @@ from storage_layout import fast_runtime_path
 from storage_vitals import sample_storage_vitals
 from io_pressure import active_pressure
 from movement_drive import calculate_movement_urge
+from voice_identity import conversation_urge_influence
+from voice_cognition_trace import record_voice_cognition
 from operator_permissions import (
     FAST_RUNTIME_PERMISSION_TYPE,
     OPERATOR_PERMISSION_KEY,
@@ -2464,6 +2466,7 @@ _EXPLORATION_NUDGE_WINDOW_SEC = 6 * 3600.0
 _EXPLORATION_NUDGE_HISTORY_LIMIT = 32
 _last_voice_urge_log = 0.0
 _last_typing_urge_log = 0.0
+_last_voice_cognition_trace = 0.0
 _COMM_URGE_LOG_COOLDOWN = 180  # seconds
 _last_stable_urge_log = 0.0
 _STABLE_URGE_LOG_COOLDOWN = 180  # seconds
@@ -6889,7 +6892,7 @@ def _update_contact_urges():
     """
     Surface urges to use voice and to type without forcing an expression.
     """
-    global _last_voice_urge_log, _last_typing_urge_log
+    global _last_voice_urge_log, _last_typing_urge_log, _last_voice_cognition_trace
     snapshot = get_inastate("emotion_snapshot") or {}
     values = snapshot.get("values") if isinstance(snapshot, dict) else {}
     if isinstance(values, dict) and values:
@@ -6920,7 +6923,14 @@ def _update_contact_urges():
     reward_drive = 0.15 * positivity - 0.1 * negativity
     temporal_drive = 0.1 * time_factor
 
-    voice_base = social_drive + curiosity_drive + salience_drive + reward_drive + temporal_drive
+    conversation_influence = conversation_urge_influence(
+        get_inastate("discord_voice_conversation"),
+        now=now,
+        curiosity=curiosity,
+        isolation=isolation,
+    )
+    conversation_adjustment = float(conversation_influence.get("adjustment", 0.0) or 0.0)
+    voice_base = social_drive + curiosity_drive + salience_drive + reward_drive + temporal_drive + conversation_adjustment
     voice_inhibition = min(0.7, (0.5 * stress) + (0.5 * threat) + (0.4 * sleep_pressure))
     voice_inhibition = max(0.0, voice_inhibition)
     voice_urge = min(1.0, max(0.0, voice_base * (1.0 - voice_inhibition)))
@@ -6959,9 +6969,20 @@ def _update_contact_urges():
             "seconds_since_last_expression": since_expression,
             "inhibition": round(voice_inhibition, 3),
             "base_urge": round(voice_base, 3),
+            "conversation_adjustment": round(conversation_adjustment, 3),
+            "conversation_evidence": conversation_influence,
         },
     }
     update_inastate("urge_to_voice", voice_payload)
+    if now - _last_voice_cognition_trace >= _COMM_URGE_LOG_COOLDOWN:
+        record_voice_cognition(CHILD, "urge_evaluated", {
+            "level": voice_payload["level"],
+            "base_urge": voice_payload["drivers"]["base_urge"],
+            "inhibition": voice_payload["drivers"]["inhibition"],
+            "conversation_adjustment": voice_payload["drivers"]["conversation_adjustment"],
+            "conversation_evidence": conversation_influence,
+        })
+        _last_voice_cognition_trace = now
 
     update_inastate(
         "urge_to_type",

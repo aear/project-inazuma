@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import ast
+import io
 import math
 import os
 import re
 import time
+import wave
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -61,6 +63,7 @@ from vector_math import cosine_similarity as visual_cosine_similarity
 from visual_token_learning import observe_image as observe_visual_tokens
 from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
+from gui_hook import log_to_statusbox
 from runtime_state import get_inastate, update_inastate
 from text_memory import (
     build_text_symbol_links,
@@ -69,12 +72,16 @@ from text_memory import (
 from io_pressure import pressure_signal
 from music_delivery import ensure_opus_sidecar
 from discord_runtime import (
+    discord_runtime_path,
     load_root_config as load_layered_root_config,
     resolve_discord_token,
     typed_outbox_path,
     typed_outbox_history_path,
     typed_outbox_archive_path,
 )
+from voice_identity import observe_discord_voice, pcm_s16le_signature, recognition_candidates
+from discord_voice_receive import InaDiscordVoiceReceiver
+from voice_cognition_trace import record_voice_cognition
 from discord_retention import BoundedIdSet, compact_jsonl_tail, prune_buffer_files, tail_jsonl_entries
 from outbox_event_store import record_configured_event
 try:
@@ -297,6 +304,58 @@ def _install_voice_debug_hooks():
     vc_cls.on_voice_server_update = wrapped_vserv  # type: ignore
 
 
+def _install_pycord_opus_resilience(packet_decoder_cls=None, opus_error_cls=None):
+    """Keep one corrupt decrypted Opus packet from killing the receive router."""
+    if packet_decoder_cls is None or opus_error_cls is None:
+        try:
+            from discord.opus import OpusError, PacketDecoder
+        except (ImportError, AttributeError):
+            return False
+        packet_decoder_cls = PacketDecoder
+        opus_error_cls = OpusError
+    if getattr(packet_decoder_cls, "_ina_corrupt_packet_guard", False):
+        return True
+    original = packet_decoder_cls.pop_data
+
+    def guarded_pop_data(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        except opus_error_cls as exc:
+            message = str(exc).casefold()
+            code = getattr(exc, "code", None)
+            # libopus OPUS_BAD_ARG (-1) and OPUS_INVALID_PACKET (-4) are
+            # packet-local here: both originate inside Decoder.decode for one
+            # decrypted RTP payload. Decoder state/allocation errors remain fatal.
+            if code not in {-1, -4} and not any(
+                marker in message for marker in ("corrupted stream", "invalid argument")
+            ):
+                raise
+            now = time.monotonic()
+            count = int(getattr(packet_decoder_cls, "_ina_corrupt_packet_count", 0)) + 1
+            packet_decoder_cls._ina_corrupt_packet_count = count
+            reasons = dict(getattr(packet_decoder_cls, "_ina_dropped_packet_reasons", {}))
+            reason = "invalid_argument" if code == -1 or "invalid argument" in message else "corrupted_stream"
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+            packet_decoder_cls._ina_dropped_packet_reasons = reasons
+            last_report = float(getattr(packet_decoder_cls, "_ina_corrupt_packet_report", 0.0) or 0.0)
+            if now - last_report >= 30.0:
+                packet_decoder_cls._ina_corrupt_packet_report = now
+                logger.warning(
+                    "Skipped malformed Discord Opus packet without restarting capture "
+                    "(bounded_count=%d, reasons=%s).",
+                    count, reasons,
+                )
+            return None
+
+    packet_decoder_cls.pop_data = guarded_pop_data
+    packet_decoder_cls._ina_corrupt_packet_guard = True
+    # Pycord logs two INFO lines for every rejected packet before raising.
+    # Our bounded aggregate above retains the useful evidence without flooding
+    # Ina's GUI or journal.
+    logging.getLogger("discord.opus").setLevel(logging.WARNING)
+    return True
+
+
 def load_root_config() -> dict:
     """Return the cached compatibility base plus owned config layers."""
     return load_layered_root_config(CONFIG_PATH)
@@ -435,6 +494,13 @@ def get_voice_io_config() -> dict:
         "voice_buffer_dir": voice_cfg.get("voice_buffer_dir")
         or str(Path("AI_Children") / child / "memory" / "discord_voice"),
         "voice_chunk_seconds": max(5, int(voice_cfg.get("voice_chunk_seconds", 15) or 15)),
+        "voice_receive_backend": str(voice_cfg.get("voice_receive_backend", "ina") or "ina").strip().lower(),
+        "voice_receive_reorder_packets": max(2, min(32, int(voice_cfg.get("voice_receive_reorder_packets", 8) or 8))),
+        "voice_receive_max_speakers": max(1, min(32, int(voice_cfg.get("voice_receive_max_speakers", 16) or 16))),
+        "voice_receive_max_pcm_bytes_per_speaker": max(
+            192_000,
+            int(voice_cfg.get("voice_receive_max_pcm_bytes_per_speaker", 8 * 1024 * 1024) or 8 * 1024 * 1024),
+        ),
     }
 
 
@@ -1589,6 +1655,77 @@ def _attachment_path_is_audio(path: Optional[str]) -> bool:
     return Path(path).suffix.lower() in AUDIO_ATTACHMENT_EXTENSIONS
 
 
+def _create_voice_capture_sink(sinks_module, voice_client):
+    """Adapt Pycord's legacy storage sink to its 2.8 receive router contract."""
+    sink_type = getattr(sinks_module, "Sink", None)
+    if sink_type is None:
+        sink_type = getattr(sinks_module, "RawDataSink", None)
+    if sink_type is None:
+        sink_type = getattr(sinks_module, "RawSink", None)
+    if sink_type is None:
+        sink_type = getattr(sinks_module, "WaveSink", None)
+    if sink_type is None:
+        raise RuntimeError("No compatible Discord voice sink is installed.")
+
+    sink = sink_type()
+    # Pycord 2.8.1's receive router expects the forthcoming composable-sink
+    # surface, while its released discord.sinks classes still expose the older
+    # storage API. Supply the no-child/no-listener contract Ina needs without
+    # patching the installed package.
+    if not hasattr(sink, "__sink_listeners__"):
+        sink.__sink_listeners__ = ()
+    if not hasattr(sink, "walk_children"):
+        sink.walk_children = lambda: ()
+    # The 2.8 receive router speaks the new VoiceData protocol, but the public
+    # discord.sinks.Sink still accepts raw bytes. Ina stores decoded PCM, so
+    # explicitly request decoding and unwrap each packet into legacy AudioData.
+    sink.is_opus = lambda: False
+
+    def _write_voice_data(data, user):
+        pcm = getattr(data, "pcm", data)
+        if not isinstance(pcm, (bytes, bytearray, memoryview)) or not pcm:
+            return
+        source_key = getattr(user, "id", user)
+        if source_key not in sink.audio_data:
+            audio_type = getattr(sinks_module, "AudioData", None)
+            if audio_type is None:
+                raise RuntimeError("Discord audio storage type is unavailable.")
+            sink.audio_data[source_key] = audio_type(io.BytesIO())
+        sink.audio_data[source_key].write(bytes(pcm))
+
+    sink.write = _write_voice_data
+    init = getattr(sink, "init", None)
+    if callable(init):
+        init(voice_client)
+    elif getattr(sink, "vc", None) is None:
+        sink.vc = voice_client
+    return sink
+
+
+def _discord_voice_speaker(source, voice_channel) -> dict:
+    """Resolve Pycord's packet source into authoritative Discord provenance."""
+    source_id = getattr(source, "id", source)
+    member = source if getattr(source, "id", None) is not None else None
+    guild = getattr(voice_channel, "guild", None)
+    if member is None and guild is not None and source_id is not None:
+        try:
+            member = guild.get_member(int(source_id))
+        except (TypeError, ValueError):
+            member = None
+    user_id = str(getattr(member, "id", source_id) or "unknown")
+    name = (
+        getattr(member, "display_name", None)
+        or getattr(member, "name", None)
+        or f"discord-user-{user_id}"
+    )
+    return {
+        "discord_user_id": user_id,
+        "display_name": str(name)[:128],
+        "is_bot": bool(getattr(member, "bot", False)),
+        "attribution_basis": "discord_voice_packet_source",
+    }
+
+
 def _find_channel_by_name(client: discord.Client, name: str, channel_type) -> discord.abc.GuildChannel | None:
     """
     Search across all guilds the bot can see to find a channel by exact name and type.
@@ -1628,6 +1765,7 @@ def autonomous_voice_join_decision(
     urge_level: float,
     channel_id: object,
     trusted_member_present: bool,
+    human_member_present: bool = True,
     now: float,
     last_join_at: float = 0.0,
 ) -> dict:
@@ -1645,11 +1783,16 @@ def autonomous_voice_join_decision(
     if not allowed_ids or str(channel_id) not in allowed_ids:
         return {"allowed": False, "reason": "channel_not_allowlisted"}
     if policy.get("require_trusted_presence", True) and not trusted_member_present:
-        return {"allowed": False, "reason": "no_trusted_person_present"}
+        if not human_member_present and policy.get("allow_empty_channel", False):
+            reason = "high_urge_empty_room_invitation"
+        else:
+            return {"allowed": False, "reason": "no_trusted_person_present"}
+    else:
+        reason = "high_urge_social_opportunity"
     cooldown = _coerce_nonnegative_float(policy.get("cooldown_seconds"), 900.0)
     if last_join_at and now - last_join_at < cooldown:
         return {"allowed": False, "reason": "cooldown", "retry_after": cooldown - (now - last_join_at)}
-    return {"allowed": True, "reason": "high_urge_social_opportunity", "threshold": threshold}
+    return {"allowed": True, "reason": reason, "threshold": threshold}
 
 
 def resolve_configured_channels(client: discord.Client):
@@ -2378,9 +2521,25 @@ class InaDiscordClient(discord.Bot):
         self.voice_pipe_path = Path(voice_cfg["voice_pipe_path"]) if voice_cfg.get("voice_pipe_path") else None
         self.voice_buffer_dir = Path(voice_cfg["voice_buffer_dir"])
         self.voice_buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.voice_identity_path = discord_runtime_path(
+            "voice_identity_path", child=self.child,
+            fallback_name="discord_voice_identities.json",
+        )
+        self.voice_learning_manifest_path = discord_runtime_path(
+            "voice_learning_manifest_path", child=self.child,
+            fallback_name="discord_voice_learning.jsonl",
+        )
         self.voice_chunk_seconds = voice_cfg["voice_chunk_seconds"]
+        self.voice_receive_backend = voice_cfg["voice_receive_backend"]
+        self.voice_receive_reorder_packets = voice_cfg["voice_receive_reorder_packets"]
+        self.voice_receive_max_speakers = voice_cfg["voice_receive_max_speakers"]
+        self.voice_receive_max_pcm_bytes_per_speaker = voice_cfg["voice_receive_max_pcm_bytes_per_speaker"]
         self._recording_active = False
         self._active_sink = None
+        self._capture_generation = 0
+        self._capture_restart_handle = None
+        self._ina_voice_receiver = None
+        self._ina_capture_timer = None
         self.history_bridge = LiveExperienceBridge(child=self.child)
         self._typed_outbox_path = typed_outbox_path(self.child)
         self._typed_outbox_history_path = typed_outbox_history_path(self.child)
@@ -2540,6 +2699,22 @@ class InaDiscordClient(discord.Bot):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user and self.user.id)
         logger.info("Discord bridge is active. DMs from owner (%s) + configured text channel will be routed.", SAKURA_USER_ID)
+        log_to_statusbox(
+            "[Discord] Bridge ready; local /ina status, join, leave, and learn command handlers registered."
+        )
+        update_inastate("discord_bridge_update", {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "ready",
+            "voice_io_revision": 2,
+            "capabilities": [
+                "discord_voice_pcm_capture",
+                "speaker_attribution",
+                "voice_learning_manifest",
+                "typing_independent_voice_dispatch",
+                "restart_voice_disconnect",
+            ],
+            "note": "Runtime evidence available for Ina to notice; no response is required.",
+        })
         self.text_channel, self.voice_channel = resolve_configured_channels(self)
         if self._typed_outbox_task is None:
             self._typed_outbox_task = asyncio.create_task(self._watch_typed_outbox())
@@ -2727,9 +2902,16 @@ class InaDiscordClient(discord.Bot):
 
         async def _attempt_join(reason: str | None = None) -> tuple[bool, bool]:
             try:
+                log_to_statusbox(
+                    f"[DiscordVoice] Manual join requested for {target_channel.name}"
+                    f" (attempt={reason or 'initial'})."
+                )
                 await self.ensure_voice_connected(target_channel)
                 suffix = f" ({reason})" if reason else ""
                 await message.channel.send(f"Joined voice channel: {target_channel.name}{suffix}")
+                log_to_statusbox(
+                    f"[DiscordVoice] Joined {target_channel.name}; capture={self._recording_active}."
+                )
                 return True, True
             except discord.errors.ConnectionClosed as exc:
                 logger.warning(
@@ -2739,6 +2921,10 @@ class InaDiscordClient(discord.Bot):
                     reason or "initial",
                 )
                 if exc.code == 4006:
+                    log_to_statusbox(
+                        f"[DiscordVoice] Invalid voice session (4006) for {target_channel.name}; "
+                        "discarding it before one fresh retry."
+                    )
                     await message.channel.send(
                         "Discord reported an invalid voice session (4006). Resetting the voice client and retrying..."
                     )
@@ -2762,6 +2948,7 @@ class InaDiscordClient(discord.Bot):
                 return True, True
             except Exception:
                 logger.exception("Failed to join voice channel %s", target_channel)
+                log_to_statusbox(f"[DiscordVoice] Failed to join {target_channel.name}; see runtime log.")
                 await message.channel.send(f"Failed to join voice channel: {target_channel.name}")
                 return True, True
 
@@ -3407,19 +3594,28 @@ class InaDiscordClient(discord.Bot):
         if not self._entry_wants_voice_playback(entry, attachment_path):
             return False
         path = Path(str(attachment_path))
+        output_base = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "entry_id": entry.get("id"),
+            "attachment_path": str(path),
+        }
+        update_inastate("discord_voice_output", {**output_base, "status": "requested"})
         if not path.exists() or not path.is_file():
             logger.warning("Voice attachment missing for entry %s: %s", entry.get("id"), attachment_path)
+            update_inastate("discord_voice_output", {**output_base, "status": "failed", "reason": "attachment_missing"})
             return False
 
         ffmpeg_audio = getattr(discord, "FFmpegPCMAudio", None)
         if ffmpeg_audio is None:
             logger.warning("Discord FFmpegPCMAudio unavailable; cannot play %s into voice.", path)
+            update_inastate("discord_voice_output", {**output_base, "status": "failed", "reason": "ffmpeg_audio_unavailable"})
             return False
 
         if self.voice_channel is None:
             _text_channel, self.voice_channel = resolve_configured_channels(self)
         if self.voice_channel is None:
             logger.warning("No configured voice channel available for voice attachment %s.", path)
+            update_inastate("discord_voice_output", {**output_base, "status": "failed", "reason": "voice_channel_unavailable"})
             return False
 
         cfg = get_discord_config()
@@ -3439,17 +3635,30 @@ class InaDiscordClient(discord.Bot):
                         )
                         for member in getattr(self.voice_channel, "members", [])
                     )
+                    human_present = any(
+                        not getattr(member, "bot", False)
+                        for member in getattr(self.voice_channel, "members", [])
+                    )
                     decision = autonomous_voice_join_decision(
                         cfg,
                         urge_level=urge_level,
                         channel_id=getattr(self.voice_channel, "id", None),
                         trusted_member_present=trusted_present,
+                        human_member_present=human_present,
                         now=time.time(),
                         last_join_at=self._last_autonomous_voice_join_at,
                     )
                     if not decision["allowed"]:
                         logger.info("Autonomous Discord voice entry declined: %s", decision)
+                        update_inastate("discord_voice_output", {
+                            **output_base, "status": "quiet", "reason": decision["reason"],
+                            "decision": decision,
+                        })
                         return False
+                    log_to_statusbox(
+                        f"[DiscordVoice] Urge-led join allowed for {self.voice_channel.name}: "
+                        f"{decision['reason']} (urge={urge_level:.2f})."
+                    )
                     self._last_autonomous_voice_join_at = time.time()
                     self._autonomous_voice_session = True
                     update_inastate("last_discord_voice_entry", {
@@ -3458,9 +3667,13 @@ class InaDiscordClient(discord.Bot):
                         "urge_level": urge_level,
                         "reason": decision["reason"],
                     })
+                policy = cfg.get("autonomous_voice_join") or {}
+                remain_connected = not policy.get("leave_after_playback", True)
                 voice_client = await self.ensure_voice_connected(
                     self.voice_channel,
-                    capture=already_connected and not self._autonomous_voice_session,
+                    capture=(
+                        already_connected and not self._autonomous_voice_session
+                    ) or (self._autonomous_voice_session and remain_connected),
                 )
                 while voice_client.is_playing() or voice_client.is_paused():
                     await asyncio.sleep(0.25)
@@ -3476,15 +3689,30 @@ class InaDiscordClient(discord.Bot):
                     loop.call_soon_threadsafe(_finish)
 
                 source = ffmpeg_audio(str(path), before_options="-nostdin", options="-vn")
+                speaking_signalled = await self._set_discord_speaking(True, reason="voice_attachment")
+                update_inastate("discord_voice_output", {
+                    **output_base, "status": "playing",
+                    "channel_id": str(getattr(self.voice_channel, "id", "")) or None,
+                    "speaking_indicator": "signalled" if speaking_signalled else "unavailable",
+                })
                 voice_client.play(source, after=_after_playback)
                 error = await asyncio.wait_for(done, timeout=timeout)
                 if error:
                     logger.warning("Voice playback failed for %s: %s", path, error)
+                    update_inastate("discord_voice_output", {
+                        **output_base, "status": "failed", "reason": "playback_callback_error",
+                        "error": type(error).__name__,
+                    })
                     return False
                 logger.info("Played Discord voice attachment %s for entry %s.", path, entry.get("id"))
+                update_inastate("discord_voice_output", {
+                    **output_base, "status": "played",
+                    "channel_id": str(getattr(self.voice_channel, "id", "")) or None,
+                })
                 return True
             except asyncio.TimeoutError:
                 logger.warning("Timed out playing Discord voice attachment %s.", path)
+                update_inastate("discord_voice_output", {**output_base, "status": "failed", "reason": "playback_timeout"})
                 try:
                     if self.voice_client and self.voice_client.is_playing():
                         self.voice_client.stop()
@@ -3492,11 +3720,41 @@ class InaDiscordClient(discord.Bot):
                     pass
             except Exception:
                 logger.exception("Failed to play Discord voice attachment %s.", path)
+                update_inastate("discord_voice_output", {**output_base, "status": "failed", "reason": "playback_exception"})
             finally:
+                await self._set_discord_speaking(False, reason="voice_attachment_finished")
                 policy = cfg.get("autonomous_voice_join") or {}
                 if self._autonomous_voice_session and policy.get("leave_after_playback", True):
                     await self._reset_voice_client()
         return False
+
+    async def _set_discord_speaking(self, active: bool, *, reason: str) -> bool:
+        """Explicitly publish Ina's speaking state and retain its outcome."""
+        voice_client = self.voice_client
+        websocket = getattr(voice_client, "ws", None) if voice_client else None
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "active": bool(active),
+            "reason": reason,
+            "channel_id": str(getattr(self.voice_channel, "id", "")) or None,
+        }
+        if websocket is None or not hasattr(websocket, "speak"):
+            update_inastate("discord_voice_speaking", {**payload, "status": "unavailable"})
+            return False
+        try:
+            state = discord.SpeakingState.voice if active else discord.SpeakingState.none
+            await websocket.speak(state)
+        except Exception as exc:
+            logger.warning("Could not signal Discord speaking=%s: %s", active, exc)
+            update_inastate("discord_voice_speaking", {
+                **payload, "status": "failed", "error": type(exc).__name__,
+            })
+            return False
+        update_inastate("discord_voice_speaking", {**payload, "status": "signalled"})
+        record_voice_cognition(self.child, "speaking_signal", {
+            **payload, "status": "signalled",
+        })
+        return True
 
     async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:
         text = entry.get("text")
@@ -4048,12 +4306,16 @@ class InaDiscordClient(discord.Bot):
             await self.voice_client.move_to(channel)
         else:
             try:
-                self.voice_client = await channel.connect(reconnect=True)
+                # Pycord 2.6.1 can consume five invalid-session (4006) failures
+                # and return without a usable websocket when reconnect=True.
+                # Let our caller discard the poisoned client and make one fresh,
+                # observable attempt instead.
+                self.voice_client = await channel.connect(reconnect=False)
             except discord.errors.ClientException as exc:
                 if "Already connected" in str(exc):
                     logger.info("Discord claims an existing voice session; forcing disconnect before retry.")
                     await self._reset_voice_client()
-                    self.voice_client = await channel.connect(reconnect=True)
+                    self.voice_client = await channel.connect(reconnect=False)
                 else:
                     raise
         self.voice_channel = channel
@@ -4065,6 +4327,9 @@ class InaDiscordClient(discord.Bot):
         """
         Start continuous chunked recording into a pipe/buffer directory if sinks are available.
         """
+        if self.voice_receive_backend == "ina":
+            self._start_ina_voice_capture()
+            return
         if sinks is None:
             logger.warning("discord.sinks not available; voice capture disabled.")
             return
@@ -4079,29 +4344,108 @@ class InaDiscordClient(discord.Bot):
             return
         self._start_recording_segment()
 
+    def _start_ina_voice_capture(self) -> None:
+        if not self.voice_client or not self.voice_client.is_connected() or self._recording_active:
+            return
+        try:
+            receiver = InaDiscordVoiceReceiver(
+                self.voice_client,
+                max_speakers=self.voice_receive_max_speakers,
+                max_pcm_bytes_per_speaker=self.voice_receive_max_pcm_bytes_per_speaker,
+                reorder_packets=self.voice_receive_reorder_packets,
+            )
+            receiver.start()
+        except Exception as exc:
+            logger.exception("Failed to start Ina-owned Discord voice receiver.")
+            log_to_statusbox(f"[DiscordVoice] Ina receive backend failed to start: {exc}")
+            update_inastate("discord_voice_receive_health", {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "backend": "ina_v1", "running": False, "last_error": type(exc).__name__,
+            })
+            return
+        self._ina_voice_receiver = receiver
+        self._recording_active = True
+        self._capture_generation += 1
+        generation = self._capture_generation
+        log_to_statusbox("[DiscordVoice] Ina receive backend started.")
+        self._ina_capture_timer = self.loop.call_later(
+            self.voice_chunk_seconds, self._snapshot_ina_voice_capture, generation,
+        )
+
+    def _snapshot_ina_voice_capture(self, generation: int) -> None:
+        self._ina_capture_timer = None
+        receiver = self._ina_voice_receiver
+        if generation != self._capture_generation or receiver is None:
+            return
+        snapshot = receiver.snapshot()
+        self.loop.create_task(self._after_ina_voice_snapshot(snapshot, generation))
+
+    async def _after_ina_voice_snapshot(self, snapshot, generation: int) -> None:
+        if generation != self._capture_generation or self._ina_voice_receiver is None:
+            return
+        update_inastate("discord_voice_receive_health", {
+            "timestamp": datetime.now(timezone.utc).isoformat(), **snapshot.metrics,
+        })
+        record_voice_cognition(self.child, "receive_snapshot", {
+            **snapshot.metrics,
+            "attributed_audio_sources": len(snapshot.audio_data),
+        })
+        if snapshot.audio_data:
+            await self._persist_audio_segment(snapshot)
+        if (
+            generation == self._capture_generation
+            and self.voice_client and self.voice_client.is_connected()
+            and self._ina_voice_receiver is not None
+        ):
+            self._ina_capture_timer = self.loop.call_later(
+                self.voice_chunk_seconds, self._snapshot_ina_voice_capture, generation,
+            )
+
     def _start_recording_segment(self):
         if sinks is None or not self.voice_client:
             return
+        if self._recording_active:
+            return
+        is_recording = getattr(self.voice_client, "is_recording", None)
+        if callable(is_recording) and is_recording():
+            self._schedule_capture_restart(0.5)
+            return
         try:
-            sink = getattr(sinks, "RawDataSink", None)
-            if sink is None:
-                sink = getattr(sinks, "RawSink", None)
-            sink = sink() if sink else sinks.WaveSink()
+            sink = _create_voice_capture_sink(sinks, self.voice_client)
         except Exception:
             logger.exception("Failed to create voice sink; voice capture disabled.")
             return
+        self._capture_generation += 1
+        generation = self._capture_generation
         self._active_sink = sink
         self._recording_active = True
+
+        def _record_complete(error=None):
+            # Pycord 2.8 changed AfterCallback from (sink, *args) to
+            # (error). Keep Ina's capture lifecycle independent of that API:
+            # the sink belongs to this segment and is closed over explicitly.
+            self.loop.call_soon_threadsafe(
+                self._on_record_complete, sink, generation, error,
+            )
+
         try:
-            self.voice_client.start_recording(sink, self._on_record_complete)
+            self.voice_client.start_recording(sink, _record_complete)
         except Exception:
             self._recording_active = False
             logger.exception("Failed to start voice recording sink.")
+            log_to_statusbox("[DiscordVoice] Joined voice, but capture failed to start.")
             return
+        log_to_statusbox("[DiscordVoice] Voice capture started.")
         loop = self.loop
-        loop.call_later(self.voice_chunk_seconds, self._stop_recording_segment)
+        loop.call_later(
+            self.voice_chunk_seconds,
+            self._stop_recording_segment,
+            generation,
+        )
 
-    def _stop_recording_segment(self):
+    def _stop_recording_segment(self, generation=None):
+        if generation is not None and generation != self._capture_generation:
+            return
         if not self.voice_client or not self._recording_active:
             return
         try:
@@ -4110,10 +4454,35 @@ class InaDiscordClient(discord.Bot):
             logger.exception("Failed to stop recording sink.")
             self._recording_active = False
 
+    def _schedule_capture_restart(self, delay=0.35):
+        if self._capture_restart_handle is not None:
+            try:
+                self._capture_restart_handle.cancel()
+            except Exception:
+                pass
+        self._capture_restart_handle = self.loop.call_later(
+            max(0.1, float(delay)), self._restart_capture_if_connected,
+        )
+
+    def _restart_capture_if_connected(self):
+        self._capture_restart_handle = None
+        if self.voice_client and self.voice_client.is_connected() and not self._recording_active:
+            self._start_recording_segment()
+
     async def _reset_voice_client(self):
         """
         Forcefully disconnect the current voice client and reset recording state.
         """
+        await self._set_discord_speaking(False, reason="voice_disconnect")
+        if self._ina_capture_timer is not None:
+            self._ina_capture_timer.cancel()
+            self._ina_capture_timer = None
+        if self._ina_voice_receiver is not None:
+            try:
+                self._ina_voice_receiver.stop()
+            except Exception:
+                logger.exception("Failed to stop Ina-owned Discord voice receiver.")
+            self._ina_voice_receiver = None
         targets = set()
         if self.voice_client:
             targets.add(self.voice_client)
@@ -4132,15 +4501,48 @@ class InaDiscordClient(discord.Bot):
         self._autonomous_voice_session = False
         self._recording_active = False
         self._active_sink = None
+        self._capture_generation += 1
+        if self._capture_restart_handle is not None:
+            try:
+                self._capture_restart_handle.cancel()
+            except Exception:
+                pass
+            self._capture_restart_handle = None
+        log_to_statusbox("[DiscordVoice] Voice client disconnected and session state cleared.")
 
-    def _on_record_complete(self, sink, *args):
+    async def close(self) -> None:
+        """Leave voice explicitly before a bridge restart or orderly shutdown."""
+        update_inastate("discord_bridge_update", {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "stopping",
+            "reason": "bridge_close",
+            "voice_disconnect_requested": True,
+        })
+        await self._reset_voice_client()
+        await super().close()
+        update_inastate("discord_bridge_update", {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "stopped",
+            "reason": "bridge_close",
+            "voice_disconnected": True,
+        })
+
+    def _on_record_complete(self, sink, generation=None, error=None):
         """
         Called by discord.py when a recording segment completes.
         Writes PCM to pipe if configured and WAV chunks to buffer dir.
         """
-        self.loop.create_task(self._after_record_complete(sink))
+        if generation is not None and (
+            generation != self._capture_generation or sink is not self._active_sink
+        ):
+            logger.debug("Ignoring stale Discord capture callback for generation %s.", generation)
+            return
+        if error is not None:
+            logger.warning("Discord voice recording segment ended with an error: %s", error)
+            log_to_statusbox(f"[DiscordVoice] Capture segment error: {error}")
+        self.loop.create_task(self._after_record_complete(sink, error=error))
 
-    async def _after_record_complete(self, sink):
+    async def _after_record_complete(self, sink, *, error=None):
         self._recording_active = False
         self._active_sink = None
         if not sink.audio_data:
@@ -4150,52 +4552,150 @@ class InaDiscordClient(discord.Bot):
 
         # Schedule next segment if still connected
         if self.voice_client and self.voice_client.is_connected():
-            self._start_recording_segment()
+            self._schedule_capture_restart(0.5 if error is not None else 0.2)
 
     async def _persist_audio_segment(self, sink):
         """
-        Persist the first user's audio to FIFO/buffer dir.
+        Persist each speaker separately with Discord and acoustic provenance.
         """
-        # pick first user entry
-        audio_entry = next(iter(sink.audio_data.values()))
-        try:
-            audio_entry.file.seek(0)
-        except Exception:
-            pass
-        pcm_bytes = audio_entry.file.read()
-
-        # Write to FIFO/pipe if configured
-        if self.voice_pipe_path and self.voice_pipe_path.exists():
+        observed_at = datetime.now(timezone.utc).isoformat()
+        ts = observed_at.replace(":", "_")
+        channel = self.voice_channel
+        guild = getattr(channel, "guild", None)
+        saved = 0
+        conversation_speakers = []
+        total_pcm_bytes = 0
+        longest_speaker_bytes = 0
+        for source, audio_entry in list(sink.audio_data.items())[:16]:
             try:
-                mode = self.voice_pipe_path.stat().st_mode
-                is_fifo = (mode & 0o170000) == 0o010000  # stat.S_IFIFO
-                if not is_fifo:
-                    logger.warning("Configured voice_pipe_path is not a FIFO: %s", self.voice_pipe_path)
-                fd = os.open(self.voice_pipe_path, os.O_WRONLY | os.O_NONBLOCK)
-                try:
-                    os.write(fd, pcm_bytes)
-                finally:
-                    os.close(fd)
+                audio_entry.file.seek(0)
             except Exception:
-                logger.exception("Failed to write Discord voice segment to pipe %s", self.voice_pipe_path)
+                pass
+            pcm_bytes = audio_entry.file.read()
+            if not pcm_bytes:
+                continue
+            speaker = _discord_voice_speaker(source, channel)
+            user_id = speaker["discord_user_id"]
+            safe_user_id = re.sub(r"[^0-9A-Za-z_-]", "_", user_id)[:64]
+            out_path = self.voice_buffer_dir / f"{self.voice_label}_{safe_user_id}_{ts}.wav"
+            try:
+                with wave.open(str(out_path), "wb") as handle:
+                    handle.setnchannels(2)
+                    handle.setsampwidth(2)
+                    handle.setframerate(48_000)
+                    handle.writeframes(pcm_bytes)
+                signature = pcm_s16le_signature(pcm_bytes)
+                candidates = recognition_candidates(self.voice_identity_path, signature, limit=3)
+                candidate_margin = None
+                if len(candidates) >= 2:
+                    candidate_margin = round(candidates[0]["similarity"] - candidates[1]["similarity"], 6)
+                profile = observe_discord_voice(
+                    self.voice_identity_path,
+                    discord_user_id=user_id,
+                    display_name=speaker["display_name"],
+                    signature=signature,
+                    observed_at=observed_at,
+                    guild_id=str(getattr(guild, "id", "")) or None,
+                    channel_id=str(getattr(channel, "id", "")) or None,
+                )
+                manifest = {
+                    "version": 1,
+                    "observed_at": observed_at,
+                    "path": str(out_path),
+                    "bytes": len(pcm_bytes),
+                    "speaker": speaker,
+                    "guild_id": str(getattr(guild, "id", "")) or None,
+                    "guild_name": str(getattr(guild, "name", "")) or None,
+                    "channel_id": str(getattr(channel, "id", "")) or None,
+                    "channel_name": str(getattr(channel, "name", "")) or None,
+                    "recognition_candidates_before_update": candidates,
+                    "recognition_uncertainty": {
+                        "candidate_count": len(candidates),
+                        "top_margin": candidate_margin,
+                        "ambiguous": candidate_margin is not None and candidate_margin < 0.08,
+                        "identity_decision": "discord_user_id",
+                    },
+                    "profile_observations": int(profile.get("observations", 0) or 0),
+                    "learning": {
+                        "eligible": not speaker["is_bot"],
+                        "label": "discord_voice",
+                        "identity_is_provenance": True,
+                        "acoustic_match_is_identity": False,
+                    },
+                }
+                self.voice_learning_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.voice_learning_manifest_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")) + "\n")
+                compact_jsonl_tail(
+                    self.voice_learning_manifest_path,
+                    max_bytes=8 * 1024 * 1024,
+                    keep_lines=4096,
+                    tail_bytes=4 * 1024 * 1024,
+                )
+                logger.info(
+                    "Discord voice segment saved for %s (%s) to %s (%d bytes)",
+                    speaker["display_name"], user_id, out_path, len(pcm_bytes),
+                )
+                saved += 1
+                total_pcm_bytes += len(pcm_bytes)
+                longest_speaker_bytes = max(longest_speaker_bytes, len(pcm_bytes))
+                conversation_speakers.append({
+                    **speaker,
+                    "profile_observations": int(profile.get("observations", 0) or 0),
+                    "novelty": round(1.0 / max(1, int(profile.get("observations", 0) or 1)), 6),
+                })
+            except Exception:
+                logger.exception("Failed to persist Discord voice segment for %s", user_id)
 
-        # Always write to buffer directory as WAV-like raw bytes (named .pcm)
-        ts = datetime.now(timezone.utc).isoformat().replace(":", "_")
-        ext = ".wav" if sinks and isinstance(sink, getattr(sinks, "WaveSink", ())) else ".pcm"
-        out_path = self.voice_buffer_dir / f"{self.voice_label}_{ts}{ext}"
-        try:
-            out_path.write_bytes(pcm_bytes)
-            logger.info("Discord voice segment saved to %s (%d bytes)", out_path, len(pcm_bytes))
-            retention = prune_buffer_files(
-                self.voice_buffer_dir,
-                max_files=self._outbox_policy["voice_buffer_max_files"],
-                max_bytes=self._outbox_policy["voice_buffer_max_bytes"],
-                max_age_hours=self._outbox_policy["voice_buffer_max_age_hours"],
-            )
-            if retention["removed_files"]:
-                logger.info("Pruned %d old Discord voice buffers (%d bytes)", retention["removed_files"], retention["removed_bytes"])
-        except Exception:
-            logger.exception("Failed to persist Discord voice segment to %s", out_path)
+            # Preserve the existing real-time audio route as a best-effort mix
+            # input while per-speaker learning remains separately attributed.
+            if self.voice_pipe_path and self.voice_pipe_path.exists():
+                try:
+                    mode = self.voice_pipe_path.stat().st_mode
+                    if (mode & 0o170000) != 0o010000:
+                        logger.warning("Configured voice_pipe_path is not a FIFO: %s", self.voice_pipe_path)
+                    fd = os.open(self.voice_pipe_path, os.O_WRONLY | os.O_NONBLOCK)
+                    try:
+                        os.write(fd, pcm_bytes)
+                    finally:
+                        os.close(fd)
+                except Exception:
+                    logger.exception("Failed to write Discord voice segment to pipe %s", self.voice_pipe_path)
+
+        retention = prune_buffer_files(
+            self.voice_buffer_dir,
+            max_files=self._outbox_policy["voice_buffer_max_files"],
+            max_bytes=self._outbox_policy["voice_buffer_max_bytes"],
+            max_age_hours=self._outbox_policy["voice_buffer_max_age_hours"],
+        )
+        if retention["removed_files"]:
+            logger.info("Pruned %d old Discord voice buffers (%d bytes)", retention["removed_files"], retention["removed_bytes"])
+        if conversation_speakers:
+            distinct_speakers = {
+                row["discord_user_id"]: row for row in conversation_speakers
+            }
+            concurrency_load = 0.0
+            if longest_speaker_bytes:
+                concurrency_load = min(
+                    1.0,
+                    max(0.0, (total_pcm_bytes - longest_speaker_bytes) / longest_speaker_bytes),
+                )
+            conversation_evidence = {
+                "version": 1,
+                "timestamp": observed_at,
+                "channel_id": str(getattr(channel, "id", "")) or None,
+                "speakers": list(distinct_speakers.values()),
+                "speaker_count": len(distinct_speakers),
+                "voiced_seconds": round(longest_speaker_bytes / 192_000.0, 3),
+                "summed_speaker_seconds": round(total_pcm_bytes / 192_000.0, 3),
+                "concurrency_load": round(concurrency_load, 6),
+                "concurrency_interpretation": "multi_speaker_activity_not_proof_of_overlap",
+                "identity_basis": "discord_user_id",
+                "acoustic_matches_are_candidates_only": True,
+            }
+            update_inastate("discord_voice_conversation", conversation_evidence)
+            record_voice_cognition(self.child, "conversation_observed", conversation_evidence)
+        log_to_statusbox(f"[DiscordVoice] Retained {saved} attributed speaker segment(s) for recognition and learning.")
 
 
 # ---------------------------------------------------------------------------
@@ -4233,6 +4733,7 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     _install_voice_debug_hooks()
+    _install_pycord_opus_resilience()
     # Create CommsCore with our custom process_inbound hook
     runtime_log_dir = (
         Path(discord_cfg["runtime_log_dir"])

@@ -24,7 +24,10 @@ import time
 from memory_graph import build_fractal_memory
 import platform
 from runtime_lifecycle import stop_core_runtime
-from runtime_services import ensure_runtime_service_supervisor, request_service_restart, supervisor_status_path
+from runtime_services import (
+    ensure_runtime_service_supervisor, request_service_restart,
+    shutdown_runtime_service_supervisor, supervisor_status_path,
+)
 from ina_desktop.client import launch_environment
 from birth_system import boot
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
@@ -35,6 +38,7 @@ from module_benchmark_window import ModuleBenchmarkWindow
 from self_questions_window import SelfQuestionsWindow
 from io_utils import load_json_dict
 from collections import deque
+from tk_context_actions import install_text_context_actions
 
 STATUS_RETENTION_SEC = float(os.environ.get("INA_STATUS_RETENTION_SEC", "600"))
 _status_buffer = deque()
@@ -1891,6 +1895,23 @@ def quit_program():
         status_box.insert(tk.END, "Quit Program confirmed. Exiting...\n")
         status_box.see(tk.END)
         save_config()
+        child_name = str(config.get("current_child") or "Inazuma_Yagami")
+        shutdown_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "gui_quit",
+            "mode": "orderly",
+            "clean": True,
+            "runtime_mode": "stopped",
+        }
+        update_inastate("shutdown_intent", shutdown_payload)
+        update_inastate("last_shutdown", shutdown_payload)
+        service_result = shutdown_runtime_service_supervisor(child_name)
+        status_box.insert(
+            tk.END,
+            "[Services] Discord voice and supervised services disconnected "
+            f"before GUI exit (graceful={service_result.get('graceful', False)}).\n",
+        )
+        status_box.see(tk.END)
         current_pid = os.getpid()
         parent = psutil.Process(current_pid)
         children = parent.children(recursive=True)
@@ -1952,6 +1973,7 @@ ui_style.map('Danger.TButton', background=[('active', PALETTE['danger_active'])]
 ui_style.configure('TButton', padding=(10, 7))
 ui_style.configure('TNotebook', background=PALETTE['background'], borderwidth=0)
 ui_style.configure('TNotebook.Tab', padding=(16, 8), font=('Helvetica', 10, 'bold'))
+install_text_context_actions(root)
 
 book_path_var = tk.StringVar(value=config.get("book_folder_path", ""))
 music_path_var = tk.StringVar(value=config.get("music_folder_path", ""))

@@ -160,6 +160,43 @@ def test_image_attachment_preview_benchmark_v1_remove_only_vs_v2_persistent_zoom
     assert sum(v2.values()) == 5
 
 
+def test_image_attachment_preview_benchmark_v3_identity_metadata():
+    """V3 makes near-identical queued screenshots distinguishable before sending."""
+    source = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    v2 = {
+        "persistent_zoom": "dialog.showModal()" in source,
+        "explicit_remove": "images.splice(index,1)" in source,
+    }
+    v3 = {
+        **v2,
+        "visible_filename": "label.textContent=item.name" in source,
+        "dimensions": "probe.naturalWidth" in source and "probe.naturalHeight" in source,
+        "bounded_size": "Math.round(item.size/1024)" in source,
+        "modal_identity": "previewCaption" in source and "imageIdentity(item)" in source,
+    }
+    assert sum(v2.values()) == 2
+    assert sum(v3.values()) == 6
+
+
+def test_context_actions_benchmark_v1_browser_only_vs_v2_targeted_copy_menu():
+    """V2 exposes bounded copy actions without replacing editable-field menus."""
+    source = Path("codex_harness_ui.html").read_text(encoding="utf-8")
+    v1 = {"browser_selection": True}
+    v2 = {
+        **v1,
+        "selection": "Copy selection" in source,
+        "message": "Copy message" in source,
+        "raw": "Copy raw details" in source,
+        "diff": "Copy diff" in source,
+        "image_details": "Copy image details" in source,
+        "image_pixels": "new ClipboardItem" in source,
+        "editable_native_menu": "closest('textarea,input,select')" in source,
+        "keyboard_dismiss": "event.key==='Escape'" in source,
+    }
+    assert sum(v1.values()) == 1
+    assert sum(v2.values()) == 9
+
+
 def test_diff_rendering_benchmark_v4_raw_text_vs_v5_bounded_collapsible_payload():
     diff = "\n".join([
         "diff --git a/old.py b/new.py", "--- a/old.py", "+++ b/new.py",
