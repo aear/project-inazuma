@@ -26,6 +26,7 @@ def test_discord_speaking_indicator_benchmark_v1_implicit_vs_v2_explicit(monkeyp
     )
     observed = []
     monkeypatch.setattr(bridge, "update_inastate", lambda key, value: observed.append((key, value)))
+    monkeypatch.setattr(bridge, "record_voice_cognition", lambda child, event, payload: True)
 
     assert asyncio.run(bridge.InaDiscordClient._set_discord_speaking(
         client, True, reason="benchmark_playback",

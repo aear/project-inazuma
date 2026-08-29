@@ -27,6 +27,7 @@ from storage_layout import fast_runtime_path
 
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_LINE_COUNT_BYTES = 32 * 1024 * 1024
+DEFAULT_URGE_STALE_SECONDS = 300.0
 
 
 def _child_memory() -> Path:
@@ -105,6 +106,19 @@ def _age(timestamp: Any) -> str:
         return f'{int(seconds // 86400)}d ago'
     except (ValueError, TypeError, OverflowError, OSError):
         return str(timestamp)[:24]
+
+
+def _timestamp_age_seconds(timestamp: Any, *, now: float | None = None) -> float | None:
+    if timestamp in (None, '', 0):
+        return None
+    try:
+        if isinstance(timestamp, (int, float)):
+            then = float(timestamp)
+        else:
+            then = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00')).timestamp()
+        return max(0.0, (time.time() if now is None else float(now)) - then)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
 
 
 def _state_text(value: Any) -> str:
@@ -487,7 +501,16 @@ def _communication() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, s
     social = _safe_json(base / 'social_map.json', [])
     contact = get_inastate('last_heard_contact') or {}
     flush = get_inastate('discord_outbox_flush') or {}
-    speaking = get_inastate('currently_speaking')
+    local_speaking = bool(get_inastate('currently_speaking'))
+    discord_speaking = get_inastate('discord_voice_speaking') or {}
+    discord_speaking = discord_speaking if isinstance(discord_speaking, dict) else {}
+    discord_speaking_age = _timestamp_age_seconds(discord_speaking.get('timestamp'))
+    discord_active = bool(discord_speaking.get('active'))
+    discord_active_is_current = discord_active and (
+        discord_speaking_age is None or discord_speaking_age <= 30.0
+    )
+    speaking = local_speaking or discord_active_is_current
+    speaking_label = 'yes' if speaking else ('stale (last yes)' if discord_active else 'no')
     bridge = base / 'discord_bridge.lock'
     runtime_status_path = base / 'runtime_services.json'
     runtime_status = _safe_json(runtime_status_path, {})
@@ -503,10 +526,17 @@ def _communication() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, s
         ('Discord process lock', 'lock present' if bridge.exists() else 'not present', 'process evidence', _modified(bridge), str(bridge)),
         ('Last heard contact', _state_text(contact.get('name') or contact.get('display_name') if isinstance(contact, dict) else contact), 'conversation', _age(contact.get('timestamp') if isinstance(contact, dict) else None), json.dumps(contact, indent=2) if isinstance(contact, dict) else str(contact)),
         ('Outbox flush', _state_text(flush.get('status') if isinstance(flush, dict) else flush), 'delivery', _age(flush.get('timestamp') if isinstance(flush, dict) else None), json.dumps(flush, indent=2) if isinstance(flush, dict) else str(flush)),
-        ('Speaking now', _state_text(speaking), 'voice', 'live state', str(speaking)),
+        ('Speaking now', speaking_label, 'voice', 'live state', json.dumps({
+            'local_speaking': local_speaking,
+            'discord_active': discord_active,
+            'discord_signal_age_seconds': discord_speaking_age,
+            'discord_signal_current': discord_active_is_current,
+        }, indent=2)),
+        ('Discord speaking indicator', _state_text(discord_speaking.get('status')), 'Discord voice gateway',
+         _age(discord_speaking.get('timestamp')), json.dumps(discord_speaking, indent=2, default=str)),
         _file_row('Typed outbox', base / 'typed_outbox.jsonl', 'recent messages'),
     ]
-    cards = [('Contacts', str(len(social) if isinstance(social, list) else len(social) if isinstance(social, dict) else 0)), ('Discord', _state_text(discord_state.get('status'))), ('World', _state_text(world_state.get('status'))), ('Speaking', 'yes' if speaking else 'no'), ('Last contact', _age(contact.get('timestamp') if isinstance(contact, dict) else None))]
+    cards = [('Contacts', str(len(social) if isinstance(social, list) else len(social) if isinstance(social, dict) else 0)), ('Discord', _state_text(discord_state.get('status'))), ('World', _state_text(world_state.get('status'))), ('Speaking', speaking_label), ('Last contact', _age(contact.get('timestamp') if isinstance(contact, dict) else None))]
     return cards, rows
 
 def _unit_level(value: Any) -> float | None:
@@ -651,6 +681,11 @@ def _urges() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]
     ]
     rows = []
     payloads: dict[str, dict[str, Any]] = {}
+    freshness: dict[str, bool] = {}
+    try:
+        stale_seconds = max(30.0, float(config.get('urge_signal_stale_seconds', DEFAULT_URGE_STALE_SECONDS)))
+    except (TypeError, ValueError):
+        stale_seconds = DEFAULT_URGE_STALE_SECONDS
     for label, key, raw_threshold in specs:
         raw = state.get(key)
         if key == 'urge_to_voice' and not raw:
@@ -664,8 +699,13 @@ def _urges() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]
         arbitration_state = payload.get('arbitration')
         arbitration_state = arbitration_state if isinstance(arbitration_state, dict) else {}
         allowed = arbitration_state.get('allowed')
+        signal_age = _timestamp_age_seconds(payload.get('timestamp'))
+        is_stale = signal_age is not None and signal_age > stale_seconds
+        freshness[key] = not is_stale
         if effective is None:
             status = 'not reported'
+        elif is_stale:
+            status = 'stale · not a current action signal'
         elif allowed is False:
             status = 'present · held by arbitration'
         elif threshold is not None and effective >= threshold:
@@ -677,12 +717,17 @@ def _urges() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]
         value = _percent_level(effective)
         if adjusted is not None and base is not None and adjusted != base:
             value = f'{_percent_level(base)} base → {_percent_level(adjusted)} adjusted'
+        if is_stale:
+            value = f'{value} · stale'
         detail = {
             'meaning': (
                 'An urge is pressure or inclination toward an action. Its level does not by itself '
                 'explain why the action did or did not happen.'
             ),
             'threshold': threshold,
+            'stale_after_seconds': stale_seconds,
+            'signal_age_seconds': round(signal_age, 3) if signal_age is not None else None,
+            'current_action_signal': not is_stale,
             'payload': payload,
         }
         rows.append((label, value, status, _age(payload.get('timestamp')), json.dumps(detail, indent=2, default=str)))
@@ -705,8 +750,8 @@ def _urges() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]
     if move_level is None:
         move_level = _urge_level(payloads.get('urge_to_move', {}))
     cards = [
-        ('Type', _percent_level(type_level)),
-        ('Voice', _percent_level(voice_level)),
+        ('Type', _percent_level(type_level) if freshness.get('urge_to_type', True) else f'stale ({_percent_level(type_level)})'),
+        ('Voice', _percent_level(voice_level) if freshness.get('urge_to_voice', True) else f'stale ({_percent_level(voice_level)})'),
         ('Move', _percent_level(move_level)),
         ('Arbitration', str(arbitration.get('status') or 'not reported')),
     ]
