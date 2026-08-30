@@ -107,6 +107,24 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def continuity_improvement_evidence(report: object, core: object) -> Optional[Dict[str, object]]:
+    """Return a bounded self-improvement cue only when the core has actionable gaps."""
+    report = report if isinstance(report, dict) else {}
+    core = core if isinstance(core, dict) else {}
+    recommendations = core.get("recommendations")
+    recommendations = recommendations if isinstance(recommendations, list) else []
+    actionable = [item for item in recommendations if isinstance(item, dict)][:10]
+    if not actionable:
+        return None
+    return {
+        "overall_continuity": report.get("overall_continuity"),
+        "evidence_coverage": report.get("evidence_coverage"),
+        "minimum_boot_status": core.get("status"),
+        "recommendations": actionable,
+        "constraint": "preserve federated source witnesses and use bounded indexed evidence",
+    }
+
+
 def _stable_slice(items: Iterable, limit: int) -> List:
     out = []
     for item in items:

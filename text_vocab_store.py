@@ -1,0 +1,99 @@
+"""SQLite-backed storage for the learned English/native meaning map.
+
+JSON remains an import/export compatibility format. Runtime callers use this
+store once it exists so the complete mapping is no longer parsed from a large
+document on every lookup pass.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict
+
+
+SCHEMA_VERSION = 1
+
+
+def sqlite_path_for(json_path: Path) -> Path:
+    return json_path.with_suffix(".sqlite")
+
+
+def write_text_vocab_store(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically replace the logical mapping inside one SQLite transaction."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30.0)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evaluated (
+                word TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS links (
+                word TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY (word, symbol)
+            );
+            CREATE INDEX IF NOT EXISTS links_symbol_idx ON links(symbol, rank);
+            """
+        )
+        with connection:
+            connection.execute("DELETE FROM metadata")
+            connection.execute("DELETE FROM evaluated")
+            connection.execute("DELETE FROM links")
+            metadata = {key: value for key, value in payload.items() if key not in {"evaluated", "links"}}
+            metadata["sqlite_schema_version"] = SCHEMA_VERSION
+            connection.executemany(
+                "INSERT INTO metadata(key, value_json) VALUES (?, ?)",
+                ((key, json.dumps(value, ensure_ascii=False)) for key, value in metadata.items()),
+            )
+            evaluated = payload.get("evaluated") if isinstance(payload.get("evaluated"), dict) else {}
+            connection.executemany(
+                "INSERT INTO evaluated(word, value_json) VALUES (?, ?)",
+                ((str(word), json.dumps(value, ensure_ascii=False)) for word, value in evaluated.items()),
+            )
+            rows = []
+            for rank, link in enumerate(payload.get("links") or []):
+                if not isinstance(link, dict) or not link.get("word") or not link.get("symbol"):
+                    continue
+                rows.append((str(link["word"]), str(link["symbol"]), rank, json.dumps(link, ensure_ascii=False)))
+            connection.executemany(
+                "INSERT INTO links(word, symbol, rank, value_json) VALUES (?, ?, ?, ?)", rows
+            )
+    finally:
+        connection.close()
+
+
+def load_text_vocab_store(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    try:
+        payload = {
+            str(key): json.loads(value)
+            for key, value in connection.execute("SELECT key, value_json FROM metadata")
+            if key != "sqlite_schema_version"
+        }
+        payload["evaluated"] = {
+            str(word): json.loads(value)
+            for word, value in connection.execute("SELECT word, value_json FROM evaluated")
+        }
+        payload["links"] = [
+            json.loads(value)
+            for (value,) in connection.execute("SELECT value_json FROM links ORDER BY rank")
+        ]
+        return payload
+    except (sqlite3.Error, ValueError, json.JSONDecodeError):
+        return {}
+    finally:
+        connection.close()

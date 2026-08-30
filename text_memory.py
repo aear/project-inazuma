@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from embedding_stack import MultimodalEmbedder, guess_language_code
 from runtime_state import increment_inastate_metric, set_inastate_metric
+from text_vocab_store import load_text_vocab_store, sqlite_path_for, write_text_vocab_store
 
 try:
     import fcntl
@@ -580,10 +581,12 @@ def build_text_symbol_links(
     ).hexdigest()
 
     out_path = _memory_root(child_name) / "text_vocab_links.json"
-    try:
-        prior = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
-    except Exception:
-        prior = {}
+    prior = load_text_vocab_store(sqlite_path_for(out_path))
+    if not prior:
+        try:
+            prior = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
+        except Exception:
+            prior = {}
     prior = prior if isinstance(prior, dict) else {}
     evaluated = prior.get("evaluated") if isinstance(prior.get("evaluated"), dict) else {}
     if str(prior.get("symbol_source_revision") or "") != symbol_revision:
@@ -762,7 +765,27 @@ def build_text_symbol_links(
         "links": links,
     }
     with _json_lock(out_path):
+        write_text_vocab_store(sqlite_path_for(out_path), payload)
         _atomic_write_json(out_path, payload, indent=2, ensure_ascii=False)
+        _atomic_write_json(
+            out_path.with_name("text_vocab_links_status.json"),
+            {
+                "schema_version": 1,
+                "generated": payload["generated"],
+                "meaning_model": payload["meaning_model"],
+                "linked_word_count": len(links_by_word),
+                "link_count": len(links),
+                "evaluated_count": payload["evaluated_count"],
+                "remaining": payload["remaining"],
+                "queue_by_source": payload["queue_by_source"],
+                "last_batch": payload["last_batch"],
+                "complete": payload["complete"],
+                "source_size": out_path.stat().st_size,
+                "source_mtime_ns": out_path.stat().st_mtime_ns,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
     try:
         increment_inastate_metric("link_pass_runs")
     except Exception:

@@ -64,7 +64,7 @@ from visual_token_learning import observe_image as observe_visual_tokens
 from visual_token_learning import observe_words as observe_visual_words
 from live_experience_bridge import LiveExperienceBridge
 from gui_hook import log_to_statusbox
-from runtime_state import get_inastate, update_inastate
+from runtime_state import get_inastate, seed_self_question, update_inastate
 from text_memory import (
     build_text_symbol_links,
     review_text_evidence,
@@ -1795,6 +1795,86 @@ def autonomous_voice_join_decision(
     return {"allowed": True, "reason": reason, "threshold": threshold}
 
 
+def select_voice_invitation_candidate(
+    discord_cfg: dict,
+    *,
+    contacts: list[dict],
+    owner_user_id: object,
+    guild_member_ids: set[str],
+    last_heard_user_id: object = None,
+    last_invitation: Optional[dict] = None,
+    now: float,
+) -> dict:
+    """Choose at most one trusted cached guild member for an empty-room invitation."""
+    policy = discord_cfg.get("autonomous_voice_join") or {}
+    if not isinstance(policy, dict) or policy.get("invite_when_empty", True) is not True:
+        return {"selected": False, "reason": "empty_room_invitations_disabled"}
+    allowed_ids = {str(value) for value in policy.get("invite_user_ids", []) if str(value)}
+    owner_id = str(owner_user_id or "")
+    last_heard_id = str(last_heard_user_id or "")
+    candidates = {}
+    for contact in contacts if isinstance(contacts, list) else []:
+        if not isinstance(contact, dict):
+            continue
+        user_id = str(contact.get("user_id") or "")
+        if user_id:
+            candidates[user_id] = contact
+    if owner_id:
+        candidates.setdefault(owner_id, {
+            "user_id": owner_id, "display_name": "owner", "trust_hint": "very_high",
+        })
+    eligible = []
+    for user_id, contact in candidates.items():
+        if user_id not in guild_member_ids or (allowed_ids and user_id not in allowed_ids):
+            continue
+        trust_hint = str(contact.get("trust_hint") or "").strip().lower().replace(" ", "_")
+        trust_rank = {"very_high": 3, "high": 2}.get(trust_hint, 0)
+        tags = {str(tag).strip().lower() for tag in contact.get("tags", []) if str(tag).strip()}
+        if user_id != owner_id and trust_rank < 2 and "trusted" not in tags:
+            continue
+        recency = 0.0
+        try:
+            recency = datetime.fromisoformat(str(contact.get("last_interaction") or "").replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            pass
+        eligible.append({
+            "user_id": user_id,
+            "display_name": str(contact.get("display_name") or user_id)[:128],
+            "trust_rank": 4 if user_id == owner_id else max(2, trust_rank),
+            "recent_conversation": user_id == last_heard_id,
+            "last_interaction_timestamp": recency,
+        })
+    if not eligible:
+        return {"selected": False, "reason": "no_eligible_trusted_guild_member"}
+    cooldown = max(300.0, _coerce_nonnegative_float(policy.get("invitation_cooldown_seconds"), 21600.0))
+    previous = last_invitation if isinstance(last_invitation, dict) else {}
+    previous_id = str(previous.get("user_id") or "")
+    previous_at = previous.get("timestamp")
+    try:
+        previous_timestamp = datetime.fromisoformat(str(previous_at).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        previous_timestamp = 0.0
+    if previous_id and now - previous_timestamp < cooldown:
+        eligible = [candidate for candidate in eligible if candidate["user_id"] != previous_id]
+        if not eligible:
+            return {
+                "selected": False, "reason": "invitation_cooldown",
+                "retry_after": round(cooldown - (now - previous_timestamp), 3),
+            }
+    eligible.sort(key=lambda row: (
+        -int(row["recent_conversation"]), -row["trust_rank"],
+        -row["last_interaction_timestamp"], row["user_id"],
+    ))
+    chosen = eligible[0]
+    return {
+        "selected": True,
+        "reason": "recent_trusted_conversation" if chosen["recent_conversation"] else "trusted_available_contact",
+        "candidate": chosen,
+        "eligible_count": len(eligible),
+        "cooldown_seconds": cooldown,
+    }
+
+
 def resolve_configured_channels(client: discord.Client):
     """
     Resolve text/voice channel targets using IDs when present, otherwise by name.
@@ -2712,6 +2792,7 @@ class InaDiscordClient(discord.Bot):
                 "voice_learning_manifest",
                 "typing_independent_voice_dispatch",
                 "restart_voice_disconnect",
+                "discord_stream_presence_awareness",
             ],
             "note": "Runtime evidence available for Ina to notice; no response is required.",
         })
@@ -2721,6 +2802,74 @@ class InaDiscordClient(discord.Bot):
         if getattr(self, "_io_pressure_task", None) is None:
             self._io_pressure_task = asyncio.create_task(self._watch_io_pressure())
         await self._start_language_review_if_ready()
+
+    async def on_voice_state_update(self, member, before, after) -> None:
+        """Notice Go Live/video opportunities without claiming unreceived frames."""
+        was_streaming = bool(getattr(before, "self_stream", False))
+        is_streaming = bool(getattr(after, "self_stream", False))
+        was_video = bool(getattr(before, "self_video", False))
+        is_video = bool(getattr(after, "self_video", False))
+        if was_streaming == is_streaming and was_video == is_video:
+            return
+        channel = getattr(after, "channel", None) or getattr(before, "channel", None)
+        configured_channel_id = str(get_discord_config().get("voice_channel_id") or "")
+        in_configured_channel = bool(
+            channel and str(getattr(channel, "id", "")) == configured_channel_id
+        )
+        event = {
+            "version": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "discord_user_id": str(getattr(member, "id", "")) or None,
+            "display_name": str(
+                getattr(member, "display_name", None) or getattr(member, "name", "unknown")
+            )[:128],
+            "channel_id": str(getattr(channel, "id", "")) or None,
+            "channel_name": str(getattr(channel, "name", "")) or None,
+            "go_live_active": is_streaming,
+            "camera_active": is_video,
+            "in_configured_voice_channel": in_configured_channel,
+            "watch_status": (
+                "opportunity_detected_video_subscription_unverified"
+                if in_configured_channel and (is_streaming or is_video)
+                else "ended_or_outside_configured_channel"
+            ),
+            "frames_received": False,
+        }
+        update_inastate("discord_stream_presence", event)
+        record_voice_cognition(self.child, "stream_presence_changed", event)
+        if in_configured_channel and (is_streaming or is_video):
+            seed_self_question(
+                "How can I subscribe to and meaningfully watch a Discord Go Live stream?",
+                child=self.child,
+                trigger="discord_stream_detected",
+                question_type="capability_research",
+                origin={
+                    "module": "discord_bridge",
+                    "trigger": "discord_stream_detected",
+                    "event_id": f"discord-stream:{event['channel_id']}:{event['discord_user_id']}",
+                },
+                evidence={
+                    **event,
+                    "known_protocol": "Discord voice gateway v8 with DAVE video media",
+                    "missing_capabilities": [
+                        "verified video sink subscription payload",
+                        "RTP video frame depacketization",
+                        "DAVE video frame decryption after reassembly",
+                        "bounded VP8 or VP9 decoding and visual observation",
+                    ],
+                    "retention_rule": "retain metadata and sparse chosen observations, never continuous raw frame archives",
+                },
+                evidence_references=[
+                    "discord_voice_cognition.jsonl",
+                    "discord_voice_receive.py",
+                    "https://docs.discord.com/developers/topics/voice-connections",
+                    "https://github.com/discord/dave-protocol/blob/main/protocol.md",
+                ],
+            )
+            logger.info(
+                "Discord stream opportunity detected from %s in %s; video subscription is not yet verified.",
+                event["discord_user_id"], event["channel_id"],
+            )
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         """Record and process meaningful Discord message edits."""
@@ -3621,6 +3770,8 @@ class InaDiscordClient(discord.Bot):
         cfg = get_discord_config()
         timeout = _coerce_nonnegative_float(cfg.get("voice_playback_timeout_seconds"), 120.0) or 120.0
         async with self._voice_playback_lock:
+            invitation_sent = False
+            empty_room_join = False
             try:
                 already_connected = bool(self.voice_client and self.voice_client.is_connected())
                 if not already_connected:
@@ -3661,6 +3812,7 @@ class InaDiscordClient(discord.Bot):
                     )
                     self._last_autonomous_voice_join_at = time.time()
                     self._autonomous_voice_session = True
+                    empty_room_join = decision["reason"] == "high_urge_empty_room_invitation"
                     update_inastate("last_discord_voice_entry", {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "channel_id": str(getattr(self.voice_channel, "id", "")),
@@ -3668,13 +3820,16 @@ class InaDiscordClient(discord.Bot):
                         "reason": decision["reason"],
                     })
                 policy = cfg.get("autonomous_voice_join") or {}
-                remain_connected = not policy.get("leave_after_playback", True)
+                invite_expected = empty_room_join and policy.get("invite_when_empty", True)
+                remain_connected = not policy.get("leave_after_playback", True) or invite_expected
                 voice_client = await self.ensure_voice_connected(
                     self.voice_channel,
                     capture=(
                         already_connected and not self._autonomous_voice_session
                     ) or (self._autonomous_voice_session and remain_connected),
                 )
+                if empty_room_join:
+                    invitation_sent = await self._invite_someone_to_empty_voice(cfg)
                 while voice_client.is_playing() or voice_client.is_paused():
                     await asyncio.sleep(0.25)
 
@@ -3724,7 +3879,11 @@ class InaDiscordClient(discord.Bot):
             finally:
                 await self._set_discord_speaking(False, reason="voice_attachment_finished")
                 policy = cfg.get("autonomous_voice_join") or {}
-                if self._autonomous_voice_session and policy.get("leave_after_playback", True):
+                if (
+                    self._autonomous_voice_session
+                    and policy.get("leave_after_playback", True)
+                    and not invitation_sent
+                ):
                     await self._reset_voice_client()
         return False
 
@@ -3754,6 +3913,65 @@ class InaDiscordClient(discord.Bot):
         record_voice_cognition(self.child, "speaking_signal", {
             **payload, "status": "signalled",
         })
+        return True
+
+    async def _invite_someone_to_empty_voice(self, discord_cfg: dict) -> bool:
+        """Send one private, optional invitation selected from trusted evidence."""
+        channel = self.voice_channel
+        guild = getattr(channel, "guild", None)
+        if channel is None or guild is None:
+            return False
+        guild_members = {
+            str(getattr(member, "id", "")) for member in getattr(guild, "members", [])
+            if getattr(member, "id", None) and not getattr(member, "bot", False)
+        }
+        last_heard = get_inastate("last_heard_contact") or {}
+        decision = select_voice_invitation_candidate(
+            discord_cfg,
+            contacts=get_high_trust_contacts(config=load_root_config(), min_level="high", limit=16),
+            owner_user_id=SAKURA_USER_ID,
+            guild_member_ids=guild_members,
+            last_heard_user_id=last_heard.get("user_id") if isinstance(last_heard, dict) else None,
+            last_invitation=get_inastate("last_discord_voice_invitation"),
+            now=time.time(),
+        )
+        if not decision.get("selected"):
+            record_voice_cognition(self.child, "invitation_decision", decision)
+            return False
+        candidate = decision["candidate"]
+        user_id = int(candidate["user_id"])
+        member = getattr(guild, "get_member", lambda _user_id: None)(user_id)
+        recipient = member or self.get_user(user_id)
+        if recipient is None or not hasattr(recipient, "send"):
+            failure = {**decision, "selected": False, "reason": "recipient_not_cached"}
+            record_voice_cognition(self.child, "invitation_decision", failure)
+            return False
+        channel_label = str(
+            getattr(channel, "mention", None) or f"#{getattr(channel, 'name', 'voice')}"
+        )
+        try:
+            await recipient.send(
+                f"Ina joined {channel_label} and would like some company, if you feel like joining her."
+            )
+        except Exception as exc:
+            logger.warning("Discord voice invitation to %s failed: %s", user_id, exc)
+            log_to_statusbox(f"[DiscordVoice] Invitation failed: {type(exc).__name__}.")
+            record_voice_cognition(self.child, "invitation_delivery", {
+                **decision, "status": "failed", "error": type(exc).__name__,
+            })
+            return False
+        invitation = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": str(user_id),
+            "display_name": candidate["display_name"],
+            "channel_id": str(getattr(channel, "id", "")),
+            "channel_name": str(getattr(channel, "name", "")),
+            "selection_reason": decision["reason"],
+            "status": "sent",
+        }
+        update_inastate("last_discord_voice_invitation", invitation)
+        record_voice_cognition(self.child, "invitation_delivery", invitation)
+        logger.info("Ina invited %s to join Discord voice (%s).", user_id, decision["reason"])
         return True
 
     async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:

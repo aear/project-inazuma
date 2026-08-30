@@ -387,9 +387,26 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
 
     vocab_data = _safe_json(base / 'text_vocab.json', {})
     vocab = vocab_data.get('vocab', {}) if isinstance(vocab_data, dict) else {}
-    links_data = _safe_json(base / 'text_vocab_links.json', {})
-    links = links_data.get('links', []) if isinstance(links_data, dict) else []
-    link_count = len(links) if isinstance(links, (list, dict)) else 0
+    links_path = base / 'text_vocab_links.json'
+    links_data = _safe_json(links_path, {})
+    links_status_path = base / 'text_vocab_links_status.json'
+    links_status = _safe_json(links_status_path, {})
+    links_status = links_status if isinstance(links_status, dict) else {}
+    try:
+        links_stat = links_path.stat()
+        status_matches_source = (
+            int(links_status.get('source_size', -1)) == int(links_stat.st_size)
+            and int(links_status.get('source_mtime_ns', -1)) == int(links_stat.st_mtime_ns)
+        )
+    except OSError:
+        status_matches_source = False
+    if not links_data and status_matches_source:
+        links_data = links_status
+    links = links_data.get('links') if isinstance(links_data, dict) else None
+    link_count = (
+        len(links) if isinstance(links, (list, dict))
+        else int(links_data.get('link_count', 0) or 0)
+    )
     linked_words = set()
     if isinstance(links, list):
         for link in links:
@@ -399,12 +416,13 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
                         linked_words.add(str(link[key]).lower())
     elif isinstance(links, dict):
         linked_words.update(str(key).lower() for key in links)
+    linked_word_count = len(linked_words) or int(links_data.get('linked_word_count', 0) or 0)
     word_count = len(vocab) if isinstance(vocab, dict) else 0
-    mapped_ratio = (100.0 * len(linked_words) / word_count) if word_count else 0.0
+    mapped_ratio = (100.0 * linked_word_count / word_count) if word_count else 0.0
     average_links = (link_count / word_count) if word_count else 0.0
     text_policy = config.get('text_memory_policy') if isinstance(config.get('text_memory_policy'), dict) else {}
     vocab_limit = int(text_policy.get('vocab_limit', 25000) or 25000)
-    evaluated_count = int(links_data.get('evaluated_count', len(linked_words)) or 0) if isinstance(links_data, dict) else len(linked_words)
+    evaluated_count = int(links_data.get('evaluated_count', linked_word_count) or 0) if isinstance(links_data, dict) else linked_word_count
     remaining = int(links_data.get('remaining', max(0, word_count - evaluated_count)) or 0) if isinstance(links_data, dict) else 0
     queue_by_source = links_data.get('queue_by_source', {}) if isinstance(links_data, dict) else {}
     queue_by_source = queue_by_source if isinstance(queue_by_source, dict) else {}
@@ -424,8 +442,9 @@ def _mind() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     vocab_status = 'cap reached' if word_count >= vocab_limit else f'cap {vocab_limit:,}'
     rows.extend([
         ('Observed vocabulary', f'{word_count:,} words · {vocab_status}', 'language', _age(vocab_data.get('updated') if isinstance(vocab_data, dict) else None), str(base / 'text_vocab.json')),
-        ('English mappings', f'{len(linked_words):,} linked · {evaluated_count:,} evaluated · {remaining:,} queued', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
-        ('Mapping queue by source', queue_detail, 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
+        ('English mappings', f'{linked_word_count:,} mapped · {link_count:,} ranked links', 'language', _modified(links_path), str(links_path)),
+        ('Current-revision review', f'{evaluated_count:,} reviewed · {remaining:,} awaiting review', 'language review queue', _modified(links_path), str(links_path)),
+        ('Review queue by source', queue_detail, 'language review queue', _modified(links_path), str(links_path)),
         ('Last mapping pass', f"{batch_mode} · {int(last_batch.get('new_mappings', 0) or 0):,} new · {int(last_batch.get('revisited_mappings', 0) or 0):,} revisited", 'language queue', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Average links per word', f'{average_links:.2f}', 'language', _modified(base / 'text_vocab_links.json'), str(base / 'text_vocab_links.json')),
         ('Emotion map', emotion_map_label, emotion_map_state, _modified(emotion_map_path), str(emotion_map_path)),

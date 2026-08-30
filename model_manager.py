@@ -26,7 +26,7 @@ from deep_recall import DeepRecallConfig, DeepRecallManager
 from memory_graph import MEMORY_TIERS, MemoryManager
 from self_reflection_core import SelfReflectionCore
 from self_adjustment_scheduler import SelfAdjustmentScheduler
-from continuity_manager import ContinuityManager
+from continuity_manager import ContinuityManager, continuity_improvement_evidence
 from intuition_engine import QuantumIntuitionEngine
 from fragment_health import scan_fragment_integrity
 from fragment_repair import process_corrupt_queue
@@ -5133,6 +5133,21 @@ def _ensure_continuity_thread(force: bool = False):
         status = continuity_manager.run()
         update_inastate("continuity_status", status)
         update_inastate("continuity_core_map_status", status.get("minimum_boot", {}))
+        core = continuity_manager.load_minimum_boot_core()
+        improvement_evidence = continuity_improvement_evidence(status, core)
+        if improvement_evidence:
+            _runtime_seed_self_question(
+                "How can I improve the continuity engine's missing or weak dimensions without rewriting source memories?",
+                child=CHILD,
+                trigger="continuity_core_recommendations",
+                question_type="system_improvement",
+                origin={"module": "continuity_manager", "trigger": "bounded_continuity_sweep"},
+                evidence=improvement_evidence,
+                evidence_references=[
+                    "continuity/continuity_map.json",
+                    "continuity/continuity_core_map.json",
+                ],
+            )
         _last_continuity_run = now
         try:
             continuity = status.get("overall_continuity")

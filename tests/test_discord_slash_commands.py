@@ -143,6 +143,79 @@ def test_autonomous_voice_entry_benchmark_v3_empty_room_invitation():
     assert occupied_by_untrusted_person["reason"] == "no_trusted_person_present"
 
 
+def test_voice_invitation_benchmark_v3_empty_join_vs_v4_one_trusted_person_selected():
+    cfg = {"autonomous_voice_join": {"invite_when_empty": True, "invitation_cooldown_seconds": 600}}
+    contacts = [
+        {"user_id": "20", "display_name": "Recent friend", "trust_hint": "high",
+         "last_interaction": "2026-08-29T12:00:00+00:00"},
+        {"user_id": "30", "display_name": "Trusted friend", "trust_hint": "very_high",
+         "last_interaction": "2026-08-29T13:00:00+00:00"},
+    ]
+    decision = bridge.select_voice_invitation_candidate(
+        cfg, contacts=contacts, owner_user_id="10", guild_member_ids={"10", "20", "30"},
+        last_heard_user_id="20", now=1788009000,
+    )
+    assert decision["selected"] is True
+    assert decision["candidate"]["user_id"] == "20"
+    assert decision["reason"] == "recent_trusted_conversation"
+    assert decision["eligible_count"] == 3
+
+    rotated = bridge.select_voice_invitation_candidate(
+        cfg, contacts=contacts, owner_user_id="10", guild_member_ids={"10", "20", "30"},
+        last_heard_user_id="20", now=1788009000,
+        last_invitation={"user_id": "20", "timestamp": "2026-08-29T13:05:00+00:00"},
+    )
+    assert rotated["selected"] is True
+    assert rotated["candidate"]["user_id"] == "10"
+
+
+def test_voice_invitation_selection_respects_allowlist_and_cooldown():
+    cfg = {"autonomous_voice_join": {
+        "invite_when_empty": True, "invite_user_ids": ["20"],
+        "invitation_cooldown_seconds": 600,
+    }}
+    contact = {"user_id": "20", "display_name": "Friend", "trust_hint": "high"}
+    decision = bridge.select_voice_invitation_candidate(
+        cfg, contacts=[contact], owner_user_id="10", guild_member_ids={"10", "20"},
+        now=1788009000,
+        last_invitation={"user_id": "20", "timestamp": "2026-08-29T13:05:00+00:00"},
+    )
+    assert decision["selected"] is False
+    assert decision["reason"] == "invitation_cooldown"
+
+
+def test_stream_awareness_benchmark_v1_invisible_go_live_vs_v2_inspectable_opportunity(monkeypatch):
+    observed = []
+    traced = []
+    questions = []
+    monkeypatch.setattr(bridge, "get_discord_config", lambda: {"voice_channel_id": "44"})
+    monkeypatch.setattr(bridge, "update_inastate", lambda key, payload: observed.append((key, payload)))
+    monkeypatch.setattr(
+        bridge, "record_voice_cognition",
+        lambda child, event, payload: traced.append((child, event, payload)) or True,
+    )
+    monkeypatch.setattr(
+        bridge, "seed_self_question",
+        lambda question, **kwargs: questions.append((question, kwargs)),
+    )
+    client = SimpleNamespace(child="Inazuma_Yagami")
+    member = SimpleNamespace(id=20, display_name="Streamer")
+    channel = SimpleNamespace(id=44, name="ina-voice")
+    before = SimpleNamespace(self_stream=False, self_video=False, channel=channel)
+    after = SimpleNamespace(self_stream=True, self_video=False, channel=channel)
+
+    asyncio.run(bridge.InaDiscordClient.on_voice_state_update(client, member, before, after))
+
+    key, payload = observed[-1]
+    assert key == "discord_stream_presence"
+    assert payload["go_live_active"] is True
+    assert payload["watch_status"] == "opportunity_detected_video_subscription_unverified"
+    assert payload["frames_received"] is False
+    assert traced[-1][1] == "stream_presence_changed"
+    assert questions[-1][1]["trigger"] == "discord_stream_detected"
+    assert "RTP video frame depacketization" in questions[-1][1]["evidence"]["missing_capabilities"]
+
+
 def test_voice_connection_disables_pycord_internal_invalid_session_retry():
     calls = []
 

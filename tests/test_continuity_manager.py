@@ -5,7 +5,23 @@ import sqlite3
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from continuity_manager import ContinuityManager
+from continuity_manager import ContinuityManager, continuity_improvement_evidence
+
+
+def test_continuity_improvement_benchmark_v1_passive_recommendation_vs_v2_actionable_cue():
+    evidence = continuity_improvement_evidence(
+        {"overall_continuity": 1.0, "evidence_coverage": 0.79},
+        {"status": "partial", "recommendations": [
+            {"dimension": "active_goals", "action": "capture_anchor"},
+            {"dimension": "reasoning_tendencies", "action": "capture_anchor"},
+        ]},
+    )
+    assert evidence["overall_continuity"] == 1.0
+    assert evidence["evidence_coverage"] == 0.79
+    assert [row["dimension"] for row in evidence["recommendations"]] == [
+        "active_goals", "reasoning_tendencies",
+    ]
+    assert continuity_improvement_evidence({}, {"recommendations": []}) is None
 
 
 def _write_fragment(memory_root, fragment_id, summary, tags):

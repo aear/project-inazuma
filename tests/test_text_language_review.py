@@ -110,6 +110,11 @@ def test_existing_mapping_can_be_revisited_without_new_vocabulary(tmp_path, monk
     first = json.loads((memory / "text_vocab_links.json").read_text(encoding="utf-8"))
     assert first["links"][0]["symbol"] == "sym_a"
     assert isinstance(first["evaluated"]["hello"], dict)
+    status = json.loads((memory / "text_vocab_links_status.json").read_text(encoding="utf-8"))
+    assert status["linked_word_count"] == 1
+    assert status["link_count"] == len(first["links"])
+    assert status["evaluated_count"] == 1
+    assert status["source_size"] == (memory / "text_vocab_links.json").stat().st_size
 
     embedder.prefer_b = True
     assert tm.build_text_symbol_links(

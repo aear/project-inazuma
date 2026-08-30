@@ -703,6 +703,13 @@ def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
 
 def load_text_vocab_links(child, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "text_vocab_links.json"
+    try:
+        from text_vocab_store import load_text_vocab_store, sqlite_path_for
+        sqlite_payload = load_text_vocab_store(sqlite_path_for(path))
+        if sqlite_payload:
+            return sqlite_payload
+    except Exception:
+        pass
     if not path.exists():
         return {}
     try:
