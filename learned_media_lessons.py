@@ -49,6 +49,8 @@ def _lesson(fragment: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
         "supports_pronunciation": bool(evidence.get("supports_pronunciation")),
         "supports_cadence": bool(evidence.get("supports_cadence")),
         "supports_written_alignment": bool(evidence.get("supports_written_alignment")),
+        "supports_voice_identity": bool(evidence.get("supports_voice_identity")),
+        "voice_identity_authority": str(evidence.get("voice_identity_authority") or "none")[:80],
         "symbols": _bounded(fragment.get("symbols"), 48),
         "proto_words": _bounded(fragment.get("proto_words"), 24),
         "study_dimensions": _bounded(evidence.get("study_dimensions"), 8),

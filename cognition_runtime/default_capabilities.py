@@ -232,4 +232,14 @@ def build_task_profiles(child: str) -> dict[str, dict[str, Any]]:
             "gpu_class": "none",
             "exclusive_group": "creative_ui",
         },
+        "lyric_search_run": {
+            "kind": "subprocess",
+            "command": ["python", "lyric_search_engine.py", "--runtime-request", "--child", str(child)],
+            "module": "lyric_search_engine",
+            "priority": 50,
+            "memory_class": "low",
+            "cpu_class": "low",
+            "gpu_class": "none",
+            "exclusive_group": "network_lookup",
+        },
     }

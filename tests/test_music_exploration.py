@@ -7,17 +7,17 @@ NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
 
 
 def test_music_exploration_benchmark_v1_tied_to_local_files_vs_v2_provider_plan():
-    policy = {"enabled": True, "default_provider": "local_mpris"}
+    policy = {"enabled": True, "default_provider": "local_library"}
     plan = build_listening_plan({"query": "an unfamiliar shoegaze artist"}, policy, now=NOW)
 
     assert plan == {
         "status": "ready",
-        "provider": "local_mpris",
+        "provider": "local_library",
         "query": "an unfamiliar shoegaze artist",
         "requested_at": "2026-08-30T00:00:00+00:00",
         "purpose": "explore_other_people_music",
         "one_bounded_attempt": True,
-        "action": "open_spotify_for_selection",
+        "action": "browse_verified_local_library",
     }
 
 

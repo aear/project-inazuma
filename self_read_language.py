@@ -100,12 +100,16 @@ def annotate_music_language_evidence(fragment: dict[str, Any], relative_label: s
     """Attach descriptive evidence policy without asserting a transcription."""
     tags = fragment.setdefault("tags", [])
     context = fragment.setdefault("source_context", {})
+    voice_policy = context.get("voice_learning_policy") if isinstance(context.get("voice_learning_policy"), dict) else {}
+    owns_voice = str(context.get("ownership_hint") or "").casefold() == "self_voice"
     modality = str(fragment.get("modality") or "").casefold()
     label = str(context.get("stem_label") or context.get("archive_member_path") or relative_label)
     evidence: dict[str, Any] = {
         "schema": "ina.self_read_language/V2",
         "alignment_keys": _alignment_keys(relative_label, context),
         "token_alignment_claimed": False,
+        "supports_voice_identity": bool(owns_voice and voice_policy.get("self_voice_identity", True)),
+        "voice_identity_authority": "self" if owns_voice else "external_reference_only",
     }
 
     def add(*values: str) -> None:

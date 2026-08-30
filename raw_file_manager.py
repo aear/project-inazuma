@@ -172,6 +172,7 @@ DEFAULT_SELF_READ_PREFS = {
     "source_choices": {
         "code": True,
         "music": True,
+        "public_music": True,
         "books": True,
         "venv": False,
         "github_history": True,
@@ -218,6 +219,12 @@ SOURCE_ANNOTATIONS = {
         "flags": ["self_voice", "music"],
         "provenance": "ina_voice_library",
         "ownership": "self_voice",
+    },
+    "public_music": {
+        "tags": ["public_music", "external_music", "audio_reference"],
+        "flags": ["music", "external", "license_verified"],
+        "provenance": "verified_public_music_library",
+        "ownership": "external_artist",
     },
     "books": {
         "tags": ["book_library", "external_source"],
@@ -677,7 +684,7 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
         env_file = Path(relative_label).name if relative_label else ""
         if env_file:
             context.setdefault("environment_file", env_file)
-    elif source_key == "music":
+    elif source_key in {"music", "public_music"}:
         archive_category = str(context.get("archive_member_category") or "").casefold()
         archive_member = str(context.get("archive_member_path") or "")
         if external_artist:
@@ -697,11 +704,25 @@ def annotate_fragment_source(fragment, source_key, relative_label, base_root):
                     tags.append(tag)
             context.setdefault("music_asset_kind", asset_kind)
             context.setdefault("music_language_reference", Path(context_label).stem)
-        elif not external_artist:
+        elif source_key == "music" and not external_artist:
             context.setdefault("self_voice_hint", "ina_voice_reference")
             voice_name = Path(relative_label).stem if relative_label else ""
             if voice_name:
                 context.setdefault("self_voice_reference", voice_name)
+        elif source_key == "public_music":
+            from public_music_library import admitted_track
+            admission = admitted_track(Path(base_root), relative_label)
+            context["public_music_admission"] = admission
+            context["voice_learning_policy"] = {
+                "learn_words": True,
+                "learn_sung_phrasing": True,
+                "learn_musical_tone": True,
+                "self_voice_identity": False,
+                "voice_imitation_target": False,
+            }
+            if not admission.get("admitted"):
+                fragment["learning_blocked"] = True
+                fragment["learning_block_reason"] = admission.get("reason", "license_unverified")
 
         if archive_category == "audio" or (studio_stem_root and modality == "audio"):
             if "music_stem" not in tags:
@@ -3370,6 +3391,7 @@ def self_read_and_train():
                 return
             if path is None:
                 return
+            path = Path(path)
             try:
                 resolved = path.resolve()
             except FileNotFoundError:
@@ -3401,10 +3423,15 @@ def self_read_and_train():
                 add_root(studio_stems_path, audio_only=True, source_key="music")
             if music_folder_path and music_folder_path.exists():
                 add_root(music_folder_path, audio_only=True, source_key="music")
-            elif music_folder_path:
-                log_to_statusbox(f"[SelfRead] Music folder not found: {music_folder_path}")
-        elif music_folder_path:
-            log_to_statusbox("[SelfRead] Preference: music folder skipped by choice.")
+
+        if source_choices.get("public_music", True):
+            public_music_path = config.get("public_music_folder_path")
+            if public_music_path:
+                public_music_path = Path(public_music_path).expanduser()
+                if public_music_path.exists():
+                    add_root(public_music_path, audio_only=True, source_key="public_music")
+                else:
+                    log_to_statusbox(f"[SelfRead] Public music folder not found: {public_music_path}")
 
         if source_choices.get("code", True):
             if ina_work_path and ina_work_path.exists():
@@ -3492,6 +3519,16 @@ def self_read_and_train():
             prior = current_prior
             candidate["prior"] = prior
         stamp = candidate["stamp"]
+
+        if source_key == "public_music":
+            from public_music_library import admitted_track
+            admission = admitted_track(Path(base_root), rel_str)
+            if not admission.get("admitted"):
+                log_to_statusbox(
+                    f"[SelfRead] BLOCKED {path.name} — public music provenance: "
+                    f"{admission.get('reason', 'unverified')}."
+                )
+                return False
 
         log_to_statusbox(
             f"[SelfRead] PROCESSING {path.name} [{category}; {read_reason}]"
@@ -3617,7 +3654,7 @@ def self_read_and_train():
                         "observed_spans": list(media_experience.get("observed_spans") or ())[:4],
                     })
 
-                if source_key == "music":
+                if source_key in {"music", "public_music"} and not frag.get("learning_blocked"):
                     try:
                         record_media_lesson(child, frag)
                     except Exception as exc:

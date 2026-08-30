@@ -6,14 +6,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 
-SUPPORTED_PROVIDERS = {"local_mpris", "discord_music_bot"}
+SUPPORTED_PROVIDERS = {"local_library", "discord_music_bot"}
 
 
 def build_listening_plan(
     request: Dict[str, Any], policy: Dict[str, Any], *, now: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """Validate one chosen listening attempt without selecting music for Ina."""
-    provider = str(request.get("provider") or policy.get("default_provider") or "local_mpris").strip().lower()
+    provider = str(request.get("provider") or policy.get("default_provider") or "local_library").strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         return {"status": "blocked", "reason": "unsupported_provider", "provider": provider}
     if not bool(policy.get("enabled", False)):
@@ -37,7 +37,7 @@ def build_listening_plan(
             return {**plan, "status": "blocked", "reason": "discord_music_channel_not_configured"}
         plan.update({"channel_id": channel_id, "request_text": template.replace("{query}", query)[:400]})
     else:
-        plan["action"] = "open_spotify_for_selection"
+        plan["action"] = "browse_verified_local_library"
     return plan
 
 

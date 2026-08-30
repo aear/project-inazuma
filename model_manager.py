@@ -6282,6 +6282,23 @@ def music_studio_check() -> Optional[str]:
     return task_id
 
 
+def lyric_search_check() -> Optional[str]:
+    """Schedule one explicit, bounded lyric lookup chosen by Ina."""
+    request = get_inastate("lyric_search_request")
+    if not isinstance(request, dict) or not _coerce_bool(request.get("requested"), False):
+        return None
+    query = " ".join(str(request.get("query") or "").split())[:240]
+    if not query or get_inastate("dreaming") or get_inastate("meditating"):
+        return None
+    task_id = request_scheduler_task(
+        "lyric_search_run", reason="chosen_lyric_lookup",
+        metadata={"query": query, "request_id": request.get("id")},
+    )
+    if task_id:
+        update_inastate("lyric_search_request", {**request, "status": "queued", "requested": False, "task_id": task_id})
+    return task_id
+
+
 def _queue_autonomous_paint_seed(emotions: Dict[str, Any]) -> None:
     """Translate a creative urge into an observable first drawing gesture."""
     queue = get_inastate("paint_command_queue")
@@ -9585,6 +9602,7 @@ def run_internal_loop():
         paint_check()
         _maybe_self_read()
         music_studio_check()
+        lyric_search_check()
         if not ground_fault_active:
             _maybe_run_deferred_memory_graph_build(memory_guard=memory_guard)
             rebuild_maps_if_needed()
