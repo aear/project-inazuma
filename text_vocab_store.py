@@ -10,14 +10,36 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
+
+from storage_layout import fast_runtime_path
 
 
 SCHEMA_VERSION = 1
 
 
 def sqlite_path_for(json_path: Path) -> Path:
-    return json_path.with_suffix(".sqlite")
+    fallback = json_path.with_suffix(".sqlite")
+    parts = json_path.parts
+    try:
+        child = parts[parts.index("AI_Children") + 1]
+    except (ValueError, IndexError):
+        return fallback
+    return fast_runtime_path(
+        child, fallback.name, fallback, subdir="index",
+        root_keys=("fast_index_root", "fast_runtime_root", "fast_root"),
+    )
+
+
+def _values(values: Iterable[Any] | None, limit: int = 256) -> list[str]:
+    result = []
+    for value in values or ():
+        item = str(value or "").strip().casefold()
+        if item and item not in result:
+            result.append(item[:500])
+        if len(result) >= limit:
+            break
+    return result
 
 
 def write_text_vocab_store(path: Path, payload: Dict[str, Any]) -> None:
@@ -92,6 +114,51 @@ def load_text_vocab_store(path: Path) -> Dict[str, Any]:
             json.loads(value)
             for (value,) in connection.execute("SELECT value_json FROM links ORDER BY rank")
         ]
+        return payload
+    except (sqlite3.Error, ValueError, json.JSONDecodeError):
+        return {}
+    finally:
+        connection.close()
+
+
+def load_text_vocab_store_subset(
+    path: Path, *, words: Iterable[Any] | None = None,
+    symbols: Iterable[Any] | None = None,
+) -> Dict[str, Any]:
+    """Load only requested indexed mappings for latency-sensitive realisation."""
+    selected_words = _values(words)
+    selected_symbols = _values(symbols)
+    if not selected_words and not selected_symbols or not path.exists():
+        return {}
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    try:
+        payload = {
+            str(key): json.loads(value)
+            for key, value in connection.execute("SELECT key, value_json FROM metadata")
+            if key != "sqlite_schema_version"
+        }
+        clauses = []
+        parameters: list[str] = []
+        if selected_words:
+            clauses.append("word IN (" + ",".join("?" for _ in selected_words) + ")")
+            parameters.extend(selected_words)
+        if selected_symbols:
+            clauses.append("symbol IN (" + ",".join("?" for _ in selected_symbols) + ")")
+            parameters.extend(selected_symbols)
+        query = "SELECT value_json FROM links WHERE " + " OR ".join(clauses) + " ORDER BY rank"
+        payload["links"] = [json.loads(value) for (value,) in connection.execute(query, parameters)]
+        if selected_words:
+            placeholders = ",".join("?" for _ in selected_words)
+            payload["evaluated"] = {
+                str(word): json.loads(value)
+                for word, value in connection.execute(
+                    f"SELECT word, value_json FROM evaluated WHERE word IN ({placeholders})",
+                    selected_words,
+                )
+            }
+        else:
+            payload["evaluated"] = {}
+        payload["subset"] = {"words": selected_words, "symbols": selected_symbols}
         return payload
     except (sqlite3.Error, ValueError, json.JSONDecodeError):
         return {}

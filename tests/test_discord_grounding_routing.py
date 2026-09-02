@@ -324,6 +324,33 @@ def test_emotion_signal_is_bounded_but_can_expose_all_24():
     assert len(complete["sliders"]) == 24
 
 
+def test_discord_meaning_shadow_keeps_conversation_surface_out_and_output_unchanged(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        '{"emotion_snapshot":{"timestamp":"snapshot:1","values":{"trust":0.9}},'
+        '"urge_to_type":{"adjusted_level":0.8}}', encoding="utf-8",
+    )
+    adapter = _Adapter(response="A grounded response.")
+    adapter.has_constructive_reply = lambda _text: True
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *a, **k: None)
+
+    message = _message("Any thoughts?", context=[{
+        "content": "private prior surface", "author_id": "person:1", "message_id": "message:1",
+    }])
+    result = db.process_inbound_message(message)
+
+    assert result.text == "A grounded response."
+    assert result.metadata["communicative_meaning_shadow_output_unchanged"] is True
+    assert result.metadata["communicative_meaning_shadow"]["abstention"]["reason"] == "no_supported_meaning"
+    examples = result.metadata["conversation_meaning_examples"]
+    assert examples["surface_included"] is False
+    assert "surface_text" not in examples["examples"][0]
+
+
 def test_code_pointer_signal_validates_modules_and_functions(tmp_path):
     (tmp_path / "signal_target.py").write_text(
         "def indicate_problem():\n    return True\n",

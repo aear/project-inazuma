@@ -222,6 +222,38 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - A code change is not complete until each changed behaviour has an explicitly versioned benchmark entry (for example, retained `V1` and candidate `V2`) in the benchmark suite. Unit tests verify correctness but do not replace this comparison. If a meaningful comparison cannot yet run, record the blocker in the benchmark registry or change notes rather than silently omitting it.
 - Benchmark UI and export/reporting changes as user-facing capabilities too; measurement is not limited to numerical kernels.
 
+### Quality and optimisation are open-ended
+
+Passing the current tests, matching the historical implementation, or clearing
+an existing threshold is a floor, not the target. For material changes:
+
+- Define the capability, correctness, safety, resource, and human-visible
+  quality dimensions before promotion; do not compress them into one score.
+- Compare against the retained historical version and the strongest practical
+  candidate, not merely a deliberately weak baseline.
+- Improve the limiting dimension without silently spending another dimension.
+  Faster output does not excuse weaker grounding, worse latency does not excuse
+  prettier output, and aggregate resource headroom does not excuse interference.
+- Include held-out and adversarial cases capable of disproving the claimed
+  improvement. A benchmark that only confirms its implementation is incomplete.
+- Record ceilings, regressions, unavailable measurements, and unresolved
+  tradeoffs plainly. “Passed” never means “finished improving.”
+- Prefer substantial, generalisable gains over metric-specific tricks, while
+  retaining bounded execution, human-scale cadence, inspectability, and rollback.
+
+### Never rely on a single signal
+
+- Decisions, interpretations, promotions, and confident claims require multiple
+  relevant signals when independent corroboration is practical.
+- Separate signals by origin or failure mode; several transformations of one
+  measurement are still one witness.
+- A lone signal may trigger bounded observation, a provisional hypothesis, or
+  a safety pause, but not an irreversible conclusion.
+- Retain disagreement and missing corroboration explicitly. Prefer uncertainty,
+  deferral, or abstention over manufacturing consensus.
+- Benchmarks must report the individual signals used and test cases where they
+  disagree, so fusion cannot hide a failed input behind an aggregate score.
+
 ### Background interference benchmarks
 
 - Changes to heavy or persistent background work must run a bounded idle-versus-loaded interference benchmark. Measure audio xrun/error rate, input latency, desktop frame latency, context switches/second, involuntary context switches, writeback pressure, and per-core saturation; aggregate CPU/GPU/RAM totals are not sufficient evidence of responsiveness.

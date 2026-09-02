@@ -67,6 +67,7 @@ def _bounded(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def create_expression_intent(
     purpose: str, *, semantic_references: Iterable[Any] | None = None,
+    meaning_references: Iterable[Any] | None = None,
     concept_references: Iterable[Any] | None = None,
     affect_references: Iterable[Any] | None = None,
     body_references: Iterable[Any] | None = None,
@@ -91,6 +92,7 @@ def create_expression_intent(
     return _bounded({
         "schema": INTENT_SCHEMA, "intent_id": _identifier("expression_intent"),
         "purpose": purpose,
+        "meaning_references": _references(meaning_references),
         "semantic_references": _references(semantic_references),
         "concept_references": _references(concept_references),
         "affect_references": _references(affect_references),

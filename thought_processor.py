@@ -278,6 +278,7 @@ class ThoughtProcessor:
         audience_references: Iterable[str] = (), allowed_media: Iterable[str] | None = None,
         dimensions: Mapping[str, Any] | None = None, max_thoughts: int = 8,
         thought_ids: Iterable[str] | None = None,
+        meaning_set: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Select thought references and prepare an output-neutral expression intent."""
         bounded = tuple(thoughts)[:64]
@@ -299,8 +300,18 @@ class ThoughtProcessor:
             {"thought_id": item.thought_id, "confidence": item.confidence}
             for item in selected if item.confidence < 1.0
         ]
+        meaning_references = []
+        if isinstance(meaning_set, Mapping):
+            if meaning_set.get("schema") != "ina.communicative_meaning_set/V1":
+                raise ValueError("a valid communicative meaning set is required")
+            meaning_references = [
+                f"meaning:{item.get('candidate_id')}"
+                for item in list(meaning_set.get("candidates") or ())[:8]
+                if isinstance(item, Mapping) and item.get("candidate_id")
+            ]
         intent = create_expression_intent(
             purpose, semantic_references=linguistic,
+            meaning_references=meaning_references,
             concept_references=concepts, affect_references=affects,
             audience_references=audience_references, dimensions=dimensions,
             uncertainty={"thoughts": uncertain[:8]}, allowed_media=allowed_media,
@@ -313,6 +324,7 @@ class ThoughtProcessor:
             "plan_id": uuid.uuid4().hex, "purpose": str(purpose)[:500],
             "selected_thought_ids": [item.thought_id for item in selected],
             "expression_intent": intent,
+            "communicative_meaning_set": dict(meaning_set) if isinstance(meaning_set, Mapping) else None,
             "context_ids": list(dict.fromkeys(item.context_id for item in selected if item.context_id)),
         }
 

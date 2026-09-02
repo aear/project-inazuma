@@ -37,6 +37,7 @@ except ModuleNotFoundError as exc:
     raise
 
 from comms_core import CommsCore, CommsResponse, load_secret
+from communicative_meaning import build_conversation_examples, interpret_communicative_meaning
 from conversation_scene import scene_with_memory_consideration
 from backend_discord import (
     make_sender_info_from_discord,
@@ -2256,6 +2257,38 @@ def process_inbound_message(msg) -> CommsResponse:
     )
     symbolic_native_text = symbolic.get("native_text") if symbolic else None
     symbolic_gloss_text = symbolic.get("gloss_text") if symbolic else None
+    meaning_context_id = str(conversation_scene.get("scene_id") or "")
+    conversation_examples = build_conversation_examples(
+        conversation_context,
+        context_id=meaning_context_id,
+        include_surface=False,
+        max_turns=12,
+    )
+    supplied_meaning_witnesses = conversation_scene.get("response_meaning_witnesses")
+    if not isinstance(supplied_meaning_witnesses, list):
+        supplied_meaning_witnesses = []
+    try:
+        shadow_playfulness = max(0.0, min(1.0, float(state.get("emotion_playfulness_level", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        shadow_playfulness = 0.0
+    affect_witness = {
+        "witness_id": f"emotion:{(state.get('emotion_snapshot') or {}).get('timestamp', 'current')}",
+        "role": "affect",
+        "confidence": 1.0,
+        "relevance": 1.0,
+        "stance": {
+            "urgency": max(0.0, min(1.0, urge_level)),
+            "playfulness": shadow_playfulness,
+        },
+        "provenance": ["runtime_state:emotion_snapshot", "runtime_state:urge_to_type"],
+    }
+    communicative_meaning_shadow = interpret_communicative_meaning(
+        [*supplied_meaning_witnesses[:31], affect_witness],
+        context_id=meaning_context_id,
+    )
+    metadata["communicative_meaning_shadow"] = communicative_meaning_shadow
+    metadata["conversation_meaning_examples"] = conversation_examples
+    metadata["communicative_meaning_shadow_output_unchanged"] = True
     emotion_signal = format_emotion_signal(state)
     code_pointer_signal = format_code_pointer_signal(state)
     song_candidate = resolve_song_expression_candidate(state, child=child)

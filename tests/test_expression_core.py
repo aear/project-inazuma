@@ -28,6 +28,15 @@ def test_intent_is_output_neutral_and_realisers_are_medium_specific():
         create_expression_intent("care", dimensions={"emoji": 0.5})
 
 
+def test_intent_can_reference_meaning_without_embedding_a_realisation():
+    intent = create_expression_intent(
+        "respond", meaning_references=["meaning:candidate-1"],
+        allowed_media=["text", "native_symbol"],
+    )
+    assert intent["meaning_references"] == ["meaning:candidate-1"]
+    assert "text" not in intent and "native_text" not in intent
+
+
 def test_reaction_is_observation_then_uncertain_interpretation_not_reward(tmp_path):
     intent = create_expression_intent("greet", allowed_media=["text"])
     realised = create_realisation(

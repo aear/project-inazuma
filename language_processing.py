@@ -701,11 +701,15 @@ def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
         _atomic_write_json(path, data, indent=4, ensure_ascii=True)
 
 
-def load_text_vocab_links(child, base_path: Optional[Path] = None):
+def load_text_vocab_links(child, base_path: Optional[Path] = None, *, words=None, symbols=None):
     path = _memory_root(child, base_path) / "text_vocab_links.json"
     try:
-        from text_vocab_store import load_text_vocab_store, sqlite_path_for
-        sqlite_payload = load_text_vocab_store(sqlite_path_for(path))
+        from text_vocab_store import load_text_vocab_store, load_text_vocab_store_subset, sqlite_path_for
+        sqlite_path = sqlite_path_for(path)
+        sqlite_payload = (
+            load_text_vocab_store_subset(sqlite_path, words=words, symbols=symbols)
+            if words or symbols else load_text_vocab_store(sqlite_path)
+        )
         if sqlite_payload:
             return sqlite_payload
     except Exception:
@@ -718,6 +722,18 @@ def load_text_vocab_links(child, base_path: Optional[Path] = None):
             return loaded if isinstance(loaded, (dict, list)) else {}
     except Exception:
         return {}
+
+
+def _load_text_vocab_links_scoped(child, base_path=None, *, words=None, symbols=None):
+    """Use indexed subsets while preserving older/test loader call contracts."""
+    try:
+        return load_text_vocab_links(
+            child, base_path=base_path, words=words, symbols=symbols,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return load_text_vocab_links(child, base_path=base_path)
 
 
 def _candidate_word(candidate: Any) -> str:
@@ -1269,7 +1285,9 @@ def build_dual_symbolic_message(
     use_glyphs = _use_native_glyphs(native_style)
     native_unresolved_indexes: List[tuple] = []
 
-    links_payload = load_text_vocab_links(child, base_path=base_path) if (use_glyphs or not explicit_human_text) else {}
+    links_payload = _load_text_vocab_links_scoped(
+        child, base_path=base_path, symbols=normalized,
+    ) if (use_glyphs or not explicit_human_text) else {}
     for idx, sym in enumerate(normalized):
         link = _lookup_text_vocab_word(sym, links_payload, context=context) if links_payload else None
         if link and use_glyphs:
@@ -2197,7 +2215,7 @@ def generate_symbolic_reply_from_text(
     learned_media_guidance = load_output_guidance(child, guidance_consumer, base_path=base_path)
     reply_context.setdefault("learned_media_guidance", learned_media_guidance)
 
-    links_payload = load_text_vocab_links(child, base_path=base_path)
+    links_payload = _load_text_vocab_links_scoped(child, base_path=base_path, words=tokens)
     linked_word_to_symbol = _build_text_vocab_word_symbol_index(links_payload) if links_payload else {}
     resolved_meanings = resolve_text_vocab_meanings(
         text, links_payload, child=child, context=reply_context

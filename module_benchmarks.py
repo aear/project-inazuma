@@ -278,6 +278,33 @@ def _thought_processor_v4() -> dict[str, Any]:
     ])
 
 
+def _thought_processor_v5() -> dict[str, Any]:
+    baseline = _thought_processor_v4()
+    from communicative_meaning import interpret_communicative_meaning
+    from thought_processor import ThoughtProcessor
+    processor = ThoughtProcessor()
+    thought = processor.process_non_linguistic(
+        {"concept_reference": "concept:need"}, provenance=["benchmark:thought"],
+    )
+    meaning_set = interpret_communicative_meaning([{
+        "witness_id": thought.thought_id,
+        "communicative_act": "ask",
+        "proposition_references": ["concept:need"],
+        "confidence": thought.confidence,
+        "relevance": thought.relevance,
+        "provenance": thought.provenance,
+    }])
+    plan = processor.prepare_communication(
+        "respond", [thought], meaning_set=meaning_set,
+        allowed_media=["text", "native_symbol"],
+    )
+    return _capability([*baseline["cases"],
+        {"case": "thought communication references a meaning hypothesis", "component": "meaning",
+         "correct": bool(plan["expression_intent"]["meaning_references"])
+         and plan["communicative_meaning_set"]["meaning_set_id"] == meaning_set["meaning_set_id"]},
+    ])
+
+
 def _q_decoder_v1() -> dict[str, Any]:
     module = _v1_module("transformers/QTransformer.py", package="transformers")
     transformer = module.QTransformer()
@@ -1569,6 +1596,96 @@ def _expression_core_v2() -> dict[str, Any]:
          "correct": len(rows) == 4 and all(len(row.encode("utf-8")) < 65536 for row in rows)},
     ])
 
+
+def _expression_core_v3() -> dict[str, Any]:
+    baseline = _expression_core_v2()
+    from expression_core import create_expression_intent
+    intent = create_expression_intent(
+        "respond", meaning_references=["meaning:candidate-1"],
+        allowed_media=["text", "native_symbol"],
+    )
+    return _capability([*baseline["cases"],
+        {"case": "intent references medium-neutral communicative meaning", "component": "meaning",
+         "correct": intent["meaning_references"] == ["meaning:candidate-1"]
+         and "text" not in intent and "native_text" not in intent},
+    ])
+
+
+def _communicative_meaning_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "affect cannot invent a proposition", "component": "grounding", "correct": False},
+        {"case": "competing meanings remain alternatives", "component": "uncertainty", "correct": False},
+        {"case": "private meaning may remain unexpressed", "component": "privacy", "correct": False},
+        {"case": "conversation examples need no retained surface", "component": "language", "correct": False},
+    ])
+
+
+def _communicative_meaning_v2() -> dict[str, Any]:
+    from communicative_meaning import build_conversation_examples, interpret_communicative_meaning
+    affect_only = interpret_communicative_meaning([{
+        "witness_id": "affect:1", "stance": {"urgency": 0.9}, "confidence": 1.0,
+    }])
+    alternatives = interpret_communicative_meaning([
+        {"witness_id": "thought:1", "communicative_act": "ask",
+         "proposition_references": ["concept:need"], "confidence": 0.9},
+        {"witness_id": "memory:1", "communicative_act": "disclose",
+         "proposition_references": ["concept:concern"], "confidence": 0.9},
+    ])
+    private = interpret_communicative_meaning([{
+        "witness_id": "thought:2", "communicative_act": "disclose",
+        "proposition_references": ["concept:private"], "confidence": 0.9,
+        "disclosure": "private",
+    }])
+    examples = build_conversation_examples([{
+        "content": "What do you need?", "message_id": "message:1",
+    }])
+    return _capability([
+        {"case": "affect cannot invent a proposition", "component": "grounding",
+         "correct": not affect_only["candidates"] and affect_only["abstention"]["active"]},
+        {"case": "competing meanings remain alternatives", "component": "uncertainty",
+         "correct": len(alternatives["candidates"]) == 2
+         and alternatives["abstention"]["reason"] == "meaning_ambiguous"},
+        {"case": "private meaning may remain unexpressed", "component": "privacy",
+         "correct": private["abstention"]["reason"] == "meaning_not_shareable"},
+        {"case": "conversation examples need no retained surface", "component": "language",
+         "correct": "surface_text" not in examples["examples"][0]
+         and bool(examples["examples"][0]["native_intent"]["events"])},
+    ])
+
+
+def _text_vocab_lookup_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "reply lookup avoids full mapping materialisation", "component": "latency", "correct": False},
+        {"case": "rebuildable mapping projection follows fast-tier policy", "component": "storage", "correct": False},
+    ])
+
+
+def _text_vocab_lookup_v2() -> dict[str, Any]:
+    import tempfile
+    from text_vocab_store import load_text_vocab_store_subset, write_text_vocab_store
+    with tempfile.TemporaryDirectory(prefix="ina_text_vocab_lookup_") as directory:
+        path = Path(directory) / "links.sqlite"
+        payload = {
+            "schema_version": 2, "evaluated": {},
+            "links": [
+                {"word": f"word-{index}", "symbol": f"symbol-{index}", "strength": 0.8}
+                for index in range(2048)
+            ],
+        }
+        write_text_vocab_store(path, payload)
+        subset = load_text_vocab_store_subset(path, words=["word-7", "word-19"])
+    from text_vocab_store import sqlite_path_for
+    source = Path("AI_Children") / "Inazuma_Yagami" / "memory" / "text_vocab_links.json"
+    selected_path = sqlite_path_for(source)
+    return _capability([
+        {"case": "reply lookup avoids full mapping materialisation", "component": "latency",
+         "correct": len(subset.get("links") or ()) == 2
+         and len(subset.get("links") or ()) < len(payload["links"])},
+        {"case": "rebuildable mapping projection follows fast-tier policy", "component": "storage",
+         "correct": selected_path.name == "text_vocab_links.sqlite"
+         and ("fast_runtime" in selected_path.parts or selected_path == source.with_suffix(".sqlite"))},
+    ])
+
 _HISTORY_BACKED_MODULES = {
     "q_decoder", "bridge_origin", "mirror_audience", "hindsight_claims",
     "mycelial_links", "seedling_clusters", "shadow_candidates", "soul_drift",
@@ -1654,12 +1771,22 @@ _REGISTRY = {
     "expression_core": (
         ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),
         ModuleVersion("expression_core", "V2", "Output-neutral intent with medium realisers and reaction provenance", _expression_core_v2),
+        ModuleVersion("expression_core", "V3", "Intents reference uncertain medium-neutral communicative meanings", _expression_core_v3),
+    ),
+    "communicative_meaning": (
+        ModuleVersion("communicative_meaning", "V1", "State and lexical output without a communicative meaning boundary", _communicative_meaning_v1),
+        ModuleVersion("communicative_meaning", "V2", "Bounded evidence-backed meaning alternatives and abstention", _communicative_meaning_v2),
+    ),
+    "text_vocab_lookup": (
+        ModuleVersion("text_vocab_lookup", "V1", "Full durable-tier meaning-map materialisation per reply", _text_vocab_lookup_v1),
+        ModuleVersion("text_vocab_lookup", "V2", "Indexed subsets through the rebuildable fast-tier projection", _text_vocab_lookup_v2),
     ),
     "thought_processor": (
         ModuleVersion("thought_processor", "V1", "Cognition without a shared typed thought boundary", _thought_processor_v1),
         ModuleVersion("thought_processor", "V2", "Separate non-linguistic and linguistic thought with mixed decisions", _thought_processor_v2),
         ModuleVersion("thought_processor", "V3", "Emotion, instinct, cognition, and memory guide one inspectable decision", _thought_processor_v3),
         ModuleVersion("thought_processor", "V4", "Communication supplies evidence for bounded thought revision", _thought_processor_v4),
+        ModuleVersion("thought_processor", "V5", "Communication planning references bounded meaning hypotheses", _thought_processor_v5),
     ),
 }
 
