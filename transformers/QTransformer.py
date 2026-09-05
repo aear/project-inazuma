@@ -6,7 +6,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 from origin_record import make_origin
 
@@ -182,3 +182,55 @@ class QTransformer:
         self.reset()
         self.inject_symbol_emotion(symbol, emotion_vector)
         return self.collapse_to_meaning(self.run_dreamstep())
+
+    def collapse_candidates(
+        self, candidates: Iterable[Mapping[str, Any]], *, context: str = "",
+        seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Collapse a bounded representational superposition of viable choices.
+
+        Callers remain responsible for grounding, capability, consent, and
+        safety.  This operation is only an ambiguity resolver among candidates
+        that have already passed those gates.  The returned trace deliberately
+        exposes the choice distribution, not simulator/circuit internals.
+        """
+        states = []
+        for raw in list(candidates)[:16]:
+            identifier = str(raw.get("id") or "").strip()
+            if not identifier or any(item["id"] == identifier for item in states):
+                continue
+            try:
+                activation = max(0.0, float(raw.get("activation", 0.0)))
+            except (TypeError, ValueError):
+                activation = 0.0
+            states.append({"id": identifier[:160], "activation": activation})
+        total = sum(item["activation"] for item in states)
+        if not states or total <= 0.0:
+            raise ValueError("candidate collapse requires positive activation")
+        distribution = [{
+            "id": item["id"],
+            "probability": round(item["activation"] / total, 9),
+        } for item in states]
+        if seed is None:
+            entropy = f"{context}:{random.SystemRandom().getrandbits(128)}"
+            resolved_seed = int(hashlib.sha256(entropy.encode("utf-8")).hexdigest()[:16], 16)
+        else:
+            resolved_seed = int(seed)
+        point = random.Random(resolved_seed).random()
+        cumulative = 0.0
+        selected = distribution[-1]["id"]
+        for item in distribution:
+            cumulative += item["probability"]
+            if point <= cumulative:
+                selected = item["id"]
+                break
+        origin = make_origin(
+            self.__class__.__name__, "V3",
+            inputs={"candidate_ids": [item["id"] for item in distribution]},
+            trigger="expression_ambiguity_collapse",
+            metadata={"candidate_count": len(distribution), "representation": "weighted_superposition"},
+        )
+        return {
+            "selected_id": selected, "distribution": distribution,
+            "representation": "weighted_superposition", "origins": [origin],
+        }

@@ -7,6 +7,7 @@ from model_manager import load_config, get_inastate
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from gui_hook import log_to_statusbox
 from logic_engine import resolve_self_questions
+from identity_manager import IdentityManager, create_identity_witness
 
 def load_self_reflection(child):
     path = Path("AI_Children") / child / "identity" / "self_reflection.json"
@@ -96,6 +97,37 @@ def run_reflection():
 
     new_prompts = generate_self_question_prompts()
     now = datetime.now(timezone.utc).isoformat()
+
+    # Compatibility entry point: who_am_i still owns its legacy question file,
+    # while the plural identity manager is the canonical identity coordinator.
+    manager = IdentityManager(child)
+    identity_witnesses = [create_identity_witness(
+        "identity", "I am presently examining my continuity and self-understanding",
+        evidence_references=[f"identity:{child}/self_reflection.json"],
+        context_references=["module:who_am_i"], confidence=0.5,
+    ), create_identity_witness(
+        "ego", "I am mediating whether and how to examine current self-questions",
+        evidence_references=["module:who_am_i", f"identity:{child}/self_reflection.json"],
+        confidence=0.5,
+    )]
+    if get_inastate("emotion_snapshot") or get_inastate("current_emotions"):
+        identity_witnesses.append(create_identity_witness(
+            "id", "Affective and impulse state is present in this reflection",
+            evidence_references=["inastate:emotion_snapshot"], confidence=0.5,
+        ))
+    shadow_index_path = Path("AI_Children") / child / "shadow" / "shadow_index.json"
+    try:
+        shadow_index = json.loads(shadow_index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        shadow_index = {}
+    envelope_ids = list(shadow_index)[:8] if isinstance(shadow_index, dict) else []
+    if envelope_ids:
+        identity_witnesses.append(create_identity_witness(
+            "shadow", "Unintegrated shadow material is available for voluntary dialogue",
+            evidence_references=[f"shadow_envelope:{item}" for item in envelope_ids],
+            confidence=0.5,
+        ))
+    manager.add_witnesses(identity_witnesses)
 
     for prompt in new_prompts:
         if not any(prompt == q.get("question") for q in reflection["self_notes"]):

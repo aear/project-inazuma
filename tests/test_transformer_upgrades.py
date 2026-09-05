@@ -91,6 +91,18 @@ def test_q_decoder_learns_from_experience_statistics():
     assert result["origins"][0]["module"] == "QTransformer"
 
 
+def test_q_candidate_superposition_is_bounded_reproducible_and_coarse():
+    transformer = QTransformer()
+    candidates = [{"id": f"act-{index}", "activation": index + 1} for index in range(20)]
+    first = transformer.collapse_candidates(candidates, context="expression:1", seed=27)
+    second = transformer.collapse_candidates(candidates, context="expression:1", seed=27)
+    assert first["selected_id"] == second["selected_id"]
+    assert len(first["distribution"]) == 16
+    assert abs(sum(item["probability"] for item in first["distribution"]) - 1.0) < 1e-8
+    assert "raw_bits" not in first and "seed" not in first
+    assert first["origins"][0]["trigger"] == "expression_ambiguity_collapse"
+
+
 def test_mirror_learns_separate_audience_models(tmp_path):
     transformer = HeuristicMirrorTransformer(child="tester", root_path=tmp_path)
     for _ in range(8):

@@ -1611,6 +1611,187 @@ def _expression_core_v3() -> dict[str, Any]:
     ])
 
 
+def _expression_core_v4() -> dict[str, Any]:
+    baseline = _expression_core_v3()
+    from expression_core import (
+        create_expression_affordance, create_expression_intent,
+        create_requested_effect, select_expression_affordance,
+    )
+    intent = create_expression_intent("participate", allowed_media=["text", "voice"])
+    request = create_requested_effect(intent, effects=[
+        {"kind": "evoke", "target": "auditory event"},
+        {"kind": "social_play", "target": "shared amusement"},
+    ], constraints={"uses_words": False})
+    witnesses = {
+        "effect_fit": ["interpretation:1"], "constraint_fit": ["constraint:1"],
+        "capability": ["capability:voice"], "willingness": ["choice:1"],
+    }
+    direct = create_expression_affordance(
+        request, medium="audio.vocal_gesture", action={"plan": "bounded-burst"},
+        assessments={"effect_fit": .9, "constraint_fit": 1, "capability": .8,
+                     "willingness": .9}, witnesses=witnesses,
+    )
+    words = create_expression_affordance(
+        request, medium="text", action={"text": "sound word"},
+        fulfilment="representation_only",
+        assessments={"effect_fit": .8, "constraint_fit": 0, "capability": 1,
+                     "willingness": .9}, witnesses=witnesses,
+    )
+    selected = select_expression_affordance(request, [words, direct])
+    lone = create_expression_affordance(
+        request, medium="visual.diagram", action={"plan": "show"},
+        assessments={"effect_fit": .9, "constraint_fit": .9, "capability": .9,
+                     "willingness": .9},
+        witnesses={key: ["one:model"] for key in witnesses},
+    )
+    abstained = select_expression_affordance(request, [lone])
+    return _capability([*baseline["cases"],
+        {"case": "requested outcome is separate from its medium", "component": "grounding",
+         "correct": "medium" not in request and len(request["effects"]) == 2},
+        {"case": "direct experience outranks its written representation", "component": "selection",
+         "correct": selected["selected_affordance_id"] == direct["affordance_id"]
+         and selected["fulfils_request"]},
+        {"case": "capability media are extensible", "component": "modularity",
+         "correct": lone["medium"] == "visual.diagram"},
+        {"case": "one witness cannot compel expression", "component": "evidence",
+         "correct": abstained["status"] == "abstained"},
+    ])
+
+
+def _expression_core_v5() -> dict[str, Any]:
+    baseline = _expression_core_v4()
+    from expression_core import (
+        create_expression_affordance, create_expression_intent,
+        create_requested_effect, select_expression_affordance,
+    )
+    from transformers.QTransformer import QTransformer
+    intent = create_expression_intent("choose expression", allowed_media=["voice", "gesture"])
+    request = create_requested_effect(
+        intent, effects=[{"kind": "social_play", "target": "shared amusement"}],
+    )
+    witnesses = {
+        "effect_fit": ["interpretation:1"], "capability": ["registry:1"],
+        "willingness": ["choice:1"],
+    }
+    candidates = [create_expression_affordance(
+        request, medium=medium, action={"plan": medium},
+        assessments={"effect_fit": fit, "capability": capability, "willingness": .9},
+        witnesses=witnesses,
+    ) for medium, fit, capability in (
+        ("audio.vocal_gesture", .9, .8), ("embodied.gesture", .88, .82),
+    )]
+    transformer = QTransformer()
+    selected = select_expression_affordance(
+        request, candidates,
+        ambiguity_resolver=lambda states, context: transformer.collapse_candidates(
+            states, context=context, seed=34,
+        ),
+    )
+    trace = selected["ambiguity_resolution"] or {}
+    return _capability([*baseline["cases"],
+        {"case": "superposition is limited to already viable affordances", "component": "safety",
+         "correct": set(trace.get("candidate_ids") or ())
+         == {candidate["affordance_id"] for candidate in candidates}},
+        {"case": "collapse cannot invent an unavailable expression", "component": "grounding",
+         "correct": selected["selected_affordance_id"]
+         in {candidate["affordance_id"] for candidate in candidates}},
+        {"case": "selection telemetry says what won without exporting why", "component": "privacy",
+         "correct": "distribution" not in trace and "raw_bits" not in trace
+         and "considered" not in selected and "assessments" not in selected
+         and "witnesses" not in selected},
+    ])
+
+
+def _self_inquiry_journey_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "deep introspection requires an explicit request", "component": "agency", "correct": False},
+        {"case": "inquiry progresses through bounded witnesses", "component": "cadence", "correct": False},
+        {"case": "code is evidence rather than an answer key", "component": "epistemics", "correct": False},
+        {"case": "uncertainty may remain unresolved", "component": "uncertainty", "correct": False},
+    ])
+
+
+def _self_inquiry_journey_v2() -> dict[str, Any]:
+    from self_inquiry_journey import begin_self_inquiry, continue_self_inquiry, current_inquiry_request
+    journey = begin_self_inquiry(
+        "Why did I choose that?", trigger_references=["selection:1"],
+        depth_budget=5, include_code=True,
+    )
+    routes = []
+    while current_inquiry_request(journey) is not None:
+        request = current_inquiry_request(journey)
+        routes.append(request["evidence_route"])
+        if journey["remaining_continuations"] <= 0:
+            journey = continue_self_inquiry(journey, choice="remain_uncertain", hypotheses=[
+                {"hypothesis": "Several causes may have contributed", "confidence": .4},
+            ])
+        else:
+            journey = continue_self_inquiry(
+                journey, choice="deeper", observation_references=[f"witness:{request['stage']}"],
+            )
+    return _capability([
+        {"case": "deep introspection requires an explicit request", "component": "agency",
+         "correct": journey["journey_id"].startswith("self_inquiry_") and journey["may_stop"]},
+        {"case": "inquiry progresses through bounded witnesses", "component": "cadence",
+         "correct": routes == ["activity_witness", "reflection_witness", "memory_index_query",
+                                "self_read_code", "hypothesis_review"]},
+        {"case": "code is evidence rather than an answer key", "component": "epistemics",
+         "correct": journey["stages"][3]["evidence_route"] == "self_read_code"
+         and all(not item["authoritative"] for item in journey["hypotheses"])},
+        {"case": "uncertainty may remain unresolved", "component": "uncertainty",
+         "correct": journey["status"] == "remain_uncertain"},
+    ])
+
+
+def _identity_system_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "identity aspects remain distinct witnesses", "component": "plurality", "correct": False},
+        {"case": "internal conflict may remain open", "component": "integration", "correct": False},
+        {"case": "shadow dialogue does not claim hidden truth", "component": "shadow", "correct": False},
+        {"case": "identity contributes read-only continuity witnesses", "component": "continuity", "correct": False},
+    ])
+
+
+def _identity_system_v2() -> dict[str, Any]:
+    import tempfile
+    from identity_manager import (
+        IdentityManager, create_identity_tension, create_identity_witness,
+        identity_continuity_candidates,
+    )
+    from transformers.shadow_transformer import ShadowTransformer
+    with tempfile.TemporaryDirectory(prefix="ina_identity_benchmark_") as directory:
+        root = Path(directory)
+        manager = IdentityManager("Ina", root_path=root)
+        witnesses = [
+            create_identity_witness("identity", "I value continuity", evidence_references=["memory:1"]),
+            create_identity_witness("ego", "I will keep this commitment", evidence_references=["decision:1"]),
+            create_identity_witness("id", "I want novelty", evidence_references=["urge:1"]),
+            create_identity_witness("shadow", "I resent this limit", evidence_references=["shadow:env-1"]),
+        ]
+        manager.add_witnesses(witnesses)
+        state = manager.add_tension(create_identity_tension(
+            [witnesses[1]["witness_id"], witnesses[2]["witness_id"], witnesses[3]["witness_id"]],
+            description="Commitment, novelty, and resentment remain in tension",
+        ))
+        candidates = identity_continuity_candidates(state, cue="tension resentment")
+        shadow = ShadowTransformer(child="Ina", root_path=root)
+        shadow.index = {"env-1": {"sealed": True}}
+        dialogue = shadow.prepare_identity_dialogue(["env-1"], ego_witness_ids=[witnesses[1]["witness_id"]])
+    return _capability([
+        {"case": "identity aspects remain distinct witnesses", "component": "plurality",
+         "correct": {item["aspect"] for item in state["witnesses"]}
+         == {"identity", "ego", "id", "shadow"}},
+        {"case": "internal conflict may remain open", "component": "integration",
+         "correct": state["tensions"][0]["state"] == "open"
+         and not state["tensions"][0]["resolution_required"]},
+        {"case": "shadow dialogue does not claim hidden truth", "component": "shadow",
+         "correct": dialogue["hidden_truth_claimed"] is False
+         and dialogue["resolution_required"] is False},
+        {"case": "identity contributes read-only continuity witnesses", "component": "continuity",
+         "correct": bool(candidates) and all(item["source"] == "identity_system" for item in candidates)},
+    ])
+
+
 def _communicative_meaning_v1() -> dict[str, Any]:
     return _capability([
         {"case": "affect cannot invent a proposition", "component": "grounding", "correct": False},
@@ -1772,6 +1953,12 @@ _REGISTRY = {
         ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),
         ModuleVersion("expression_core", "V2", "Output-neutral intent with medium realisers and reaction provenance", _expression_core_v2),
         ModuleVersion("expression_core", "V3", "Intents reference uncertain medium-neutral communicative meanings", _expression_core_v3),
+        ModuleVersion("expression_core", "V4", "Requested effects select corroborated cross-modal affordances", _expression_core_v4),
+        ModuleVersion("expression_core", "V5", "Near-equivalent affordances may use bounded superposition", _expression_core_v5),
+        ModuleVersion("self_inquiry_journey", "V1", "No voluntary staged route for deeper self-understanding", _self_inquiry_journey_v1),
+        ModuleVersion("self_inquiry_journey", "V2", "Meditation offers a finite witness-led self-inquiry journey", _self_inquiry_journey_v2),
+        ModuleVersion("identity_system", "V1", "Single-profile self-reflection without aspect coordination", _identity_system_v1),
+        ModuleVersion("identity_system", "V2", "Plural identity witnesses preserve conflict and feed continuity", _identity_system_v2),
     ),
     "communicative_meaning": (
         ModuleVersion("communicative_meaning", "V1", "State and lexical output without a communicative meaning boundary", _communicative_meaning_v1),

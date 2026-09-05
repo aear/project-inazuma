@@ -17,8 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from io_utils import atomic_write_json
+from io_utils import atomic_write_json, load_json_dict
 from continuity_recall import ContinuityRecallCoordinator
+from identity_manager import identity_continuity_candidates
 from memory_index import indexed_fragment_rows, resolve_indexed_fragment
 
 
@@ -387,13 +388,16 @@ class ContinuityManager:
 
     def coordinate_recall(
         self, cue: str, candidates: Iterable[Dict[str, object]], *,
-        include_core: bool = True, max_results: int = 6,
+        include_core: bool = True, include_identity: bool = True, max_results: int = 6,
         autonomous_continuation_budget: int = 0,
     ) -> Dict[str, object]:
         """Rank read-only witnesses and represent recall as one bounded experience."""
         witness_candidates = [dict(item) for item in candidates if isinstance(item, dict)]
         if include_core:
             witness_candidates.extend(self._core_recall_candidates(cue))
+        if include_identity:
+            identity_state = load_json_dict(self.memory_root.parent / "identity" / "identity_system.json")
+            witness_candidates.extend(identity_continuity_candidates(identity_state, cue=cue, limit=16))
         return self._recall().recall(
             cue, witness_candidates, max_results=max_results,
             autonomous_continuation_budget=autonomous_continuation_budget,

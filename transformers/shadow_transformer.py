@@ -6,6 +6,7 @@ from pathlib import Path
 from model_manager import load_config
 from gui_hook import log_to_statusbox
 from origin_record import make_origin
+from io_utils import file_lock, flush_for_durability
 
 # Optional integrations
 try:
@@ -65,6 +66,7 @@ class ShadowTransformer:
         self.index_path = self.shadow_path / "shadow_index.json"
         self.log_path = self.shadow_path / "shadow_log.jsonl"
         self.candidate_queue_path = self.shadow_path / "candidate_queue.jsonl"
+        self.dialogue_path = self.shadow_path / "identity_dialogues.jsonl"
 
         self.envelopes_path.mkdir(parents=True, exist_ok=True)
         self.shadow_path.mkdir(parents=True, exist_ok=True)
@@ -287,6 +289,56 @@ class ShadowTransformer:
 
     def intent_telemetry(self):
         return dict(self.last_telemetry)
+
+    def prepare_identity_dialogue(
+        self, envelope_ids, *, ego_witness_ids=None, identity_witness_ids=None,
+    ):
+        """Surface shadow references as perspectives, never hidden truth."""
+        envelopes = list(dict.fromkeys(str(item) for item in envelope_ids if item))[:8]
+        known = set(self.index)
+        envelopes = [item for item in envelopes if item in known]
+        if not envelopes:
+            raise ValueError("shadow dialogue requires a known envelope")
+        return {
+            "schema": "ina.shadow_identity_dialogue/V1",
+            "dialogue_id": f"shadow_dialogue_{uuid.uuid4().hex}",
+            "shadow_envelope_ids": envelopes,
+            "ego_witness_ids": list(dict.fromkeys(str(item) for item in ego_witness_ids or () if item))[:8],
+            "identity_witness_ids": list(dict.fromkeys(str(item) for item in identity_witness_ids or () if item))[:8],
+            "questions": [
+                "What might this perspective be protecting?",
+                "Where does it conflict with my current commitments?",
+                "Can I acknowledge it without obeying or rejecting it?",
+            ],
+            "ownership_hypotheses": [], "hidden_truth_claimed": False,
+            "resolution_required": False, "status": "open",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def record_identity_dialogue(self, dialogue, *, status="held", ownership_hypotheses=None):
+        """Retain a dialogue outcome without unsealing or rewriting its source."""
+        if dialogue.get("schema") != "ina.shadow_identity_dialogue/V1":
+            raise ValueError("a valid shadow identity dialogue is required")
+        selected = str(status or "").strip().lower()
+        if selected not in {"open", "held", "exploring", "integrating", "reframed"}:
+            raise ValueError("unknown shadow dialogue status")
+        result = dict(dialogue)
+        result["status"] = selected
+        result["ownership_hypotheses"] = [{
+            "hypothesis": str(item.get("hypothesis") or "")[:500],
+            "confidence": max(0.0, min(1.0, float(item.get("confidence", 0.0)))),
+            "authoritative": False,
+        } for item in list(ownership_hypotheses or ())[:8] if item.get("hypothesis")]
+        result["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with file_lock(self.dialogue_path.with_suffix(".jsonl.lock")):
+            with self.dialogue_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                flush_for_durability(handle, self.dialogue_path)
+        self.log("identity_dialogue", {
+            "dialogue_id": result["dialogue_id"], "status": selected,
+            "shadow_envelope_count": len(result["shadow_envelope_ids"]),
+        })
+        return result
 
 
 if __name__ == "__main__":

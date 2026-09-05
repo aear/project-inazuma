@@ -3,7 +3,8 @@ import json
 import pytest
 
 from expression_core import (
-    ExpressionTraceStore, NativeSymbolRealiser, TextRealiser, create_expression_intent, create_realisation,
+    ExpressionTraceStore, NativeSymbolRealiser, TextRealiser, create_expression_affordance,
+    create_expression_intent, create_realisation, create_requested_effect, select_expression_affordance,
     create_reaction_interpretation, create_reaction_observation,
 )
 
@@ -76,3 +77,85 @@ def test_concrete_realisers_translate_one_intent_independently():
     assert text["medium"] == "text" and native["medium"] == "native_symbol"
     assert text["intent_id"] == native["intent_id"] == intent["intent_id"]
     assert text["content"] != native["content"]
+
+
+def test_requested_effect_selects_direct_cross_modal_affordance_over_words():
+    intent = create_expression_intent("join harmless play", allowed_media=["text", "voice"])
+    request = create_requested_effect(intent, effects=[
+        {"kind": "evoke", "target": "brief horn-like auditory experience"},
+        {"kind": "social_play", "target": "participate in shared absurdity", "importance": 0.7},
+    ], constraints={"uses_words": False}, provenance=["conversation:event-honk"])
+    common_witnesses = {
+        "effect_fit": ["request_interpretation:1"],
+        "constraint_fit": ["constraint_check:1"],
+        "capability": ["capability_registry:voice"],
+        "willingness": ["expression_choice:1"],
+    }
+    vocal = create_expression_affordance(
+        request, medium="audio.vocal_gesture", action={"gesture_plan": "horn-like-burst"},
+        assessments={"effect_fit": 0.9, "constraint_fit": 1.0, "capability": 0.8,
+                     "willingness": 0.9}, witnesses=common_witnesses,
+    )
+    caption = create_expression_affordance(
+        request, medium="text", action={"text": "Honk!"}, fulfilment="representation_only",
+        assessments={"effect_fit": 0.95, "constraint_fit": 0.0, "capability": 1.0,
+                     "willingness": 0.9}, witnesses=common_witnesses,
+    )
+    selection = select_expression_affordance(request, [caption, vocal])
+    assert selection["selected_affordance_id"] == vocal["affordance_id"]
+    assert selection["selected_medium"] == "audio.vocal_gesture"
+    assert selection["fulfils_request"] is True
+
+
+def test_affordance_selection_is_generic_and_abstains_without_corroboration():
+    intent = create_expression_intent("demonstrate", allowed_media=["gesture"])
+    request = create_requested_effect(
+        intent, effects=[{"kind": "demonstrate", "target": "spatial route"}],
+    )
+    visual = create_expression_affordance(
+        request, medium="visual.diagram", action={"scene_reference": "route:1"},
+        assessments={"effect_fit": 0.9, "capability": 0.9, "willingness": 0.8},
+        witnesses={"effect_fit": ["single:model"], "capability": ["single:model"],
+                   "willingness": ["single:model"]},
+    )
+    selection = select_expression_affordance(request, [visual])
+    assert selection["status"] == "abstained"
+    assert selection["selected_affordance_id"] is None
+
+
+def test_near_equivalent_viable_affordances_can_use_bounded_superposition():
+    from transformers.QTransformer import QTransformer
+
+    intent = create_expression_intent("play", allowed_media=["voice", "gesture"])
+    request = create_requested_effect(
+        intent, effects=[{"kind": "social_play", "target": "shared amusement"}],
+    )
+    witnesses = {
+        "effect_fit": ["interpretation:1"], "capability": ["registry:1"],
+        "willingness": ["choice:1"],
+    }
+    vocal = create_expression_affordance(
+        request, medium="audio.vocal_gesture", action={"plan": "burst"},
+        assessments={"effect_fit": .9, "capability": .8, "willingness": .9},
+        witnesses=witnesses,
+    )
+    gesture = create_expression_affordance(
+        request, medium="embodied.gesture", action={"plan": "comic-pose"},
+        assessments={"effect_fit": .88, "capability": .82, "willingness": .9},
+        witnesses=witnesses,
+    )
+    transformer = QTransformer()
+    selection = select_expression_affordance(
+        request, [vocal, gesture],
+        ambiguity_resolver=lambda candidates, context: transformer.collapse_candidates(
+            candidates, context=context, seed=9,
+        ),
+    )
+    assert selection["selected_affordance_id"] in {vocal["affordance_id"], gesture["affordance_id"]}
+    assert set(selection["ambiguity_resolution"]["candidate_ids"]) == {
+        vocal["affordance_id"], gesture["affordance_id"],
+    }
+    assert selection["ambiguity_resolution"]["origins"][0]["module"] == "QTransformer"
+    assert set(selection["viable_affordance_ids"]) == {vocal["affordance_id"], gesture["affordance_id"]}
+    assert "considered" not in selection
+    assert "assessments" not in selection and "witnesses" not in selection

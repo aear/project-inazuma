@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 import uuid
 
 from io_utils import file_lock, flush_for_durability
@@ -20,8 +20,12 @@ INTENT_SCHEMA = "ina.expression_intent/V1"
 REALISATION_SCHEMA = "ina.expression_realisation/V1"
 REACTION_SCHEMA = "ina.expression_reaction/V1"
 INTERPRETATION_SCHEMA = "ina.expression_reaction_interpretation/V1"
+REQUEST_SCHEMA = "ina.requested_effect/V1"
+AFFORDANCE_SCHEMA = "ina.expression_affordance/V1"
+SELECTION_SCHEMA = "ina.expression_affordance_selection/V1"
 MAX_RECORD_BYTES = 64 * 1024
 MEDIA = frozenset({"text", "native_symbol", "voice", "gesture", "music"})
+FULFILMENT = frozenset({"direct", "approximation", "representation_only"})
 _FORBIDDEN_INTENT_KEYS = frozenset({
     "text", "punctuation", "emoji", "phoneme", "pitch", "voice",
     "animation", "pose", "avatar", "discord_formatting", "rendered",
@@ -126,6 +130,156 @@ def create_realisation(intent: Mapping[str, Any], *, medium: str,
     })
 
 
+def create_requested_effect(
+    intent: Mapping[str, Any], *, effects: Iterable[Mapping[str, Any]],
+    constraints: Mapping[str, Any] | None = None,
+    provenance: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Describe what an expression should cause, without prescribing a medium.
+
+    Interpretation belongs upstream.  This record can represent informing,
+    demonstrating, evoking a sensation, coordinating an action, social play,
+    or combinations of those effects.  Medium-specific properties stay in a
+    candidate affordance rather than leaking into the expression intent.
+    """
+    if intent.get("schema") != INTENT_SCHEMA or not intent.get("intent_id"):
+        raise ValueError("a valid expression intent is required")
+    normalized = []
+    for raw in list(effects)[:16]:
+        effect = dict(raw)
+        kind = str(effect.get("kind") or "").strip()
+        target = str(effect.get("target") or "").strip()
+        if not kind or not target:
+            raise ValueError("each requested effect requires kind and target")
+        normalized.append({
+            "kind": kind[:80], "target": target[:500],
+            "importance": _unit(effect.get("importance", 1.0), "importance"),
+        })
+    if not normalized:
+        raise ValueError("at least one requested effect is required")
+    return _bounded({
+        "schema": REQUEST_SCHEMA, "request_id": _identifier("requested_effect"),
+        "intent_id": str(intent["intent_id"]), "effects": normalized,
+        "constraints": dict(constraints or {}),
+        "provenance": _references(provenance, 64), "created_at": _now(),
+    })
+
+
+def create_expression_affordance(
+    request: Mapping[str, Any], *, medium: str, action: Mapping[str, Any],
+    assessments: Mapping[str, Any], witnesses: Mapping[str, Iterable[Any]],
+    fulfilment: str = "direct", available: bool = True,
+    provenance: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Offer one capability-owned way to pursue a requested effect."""
+    if request.get("schema") != REQUEST_SCHEMA or not request.get("request_id"):
+        raise ValueError("a valid requested effect is required")
+    medium = str(medium or "").strip()
+    if not medium or len(medium) > 80 or any(character.isspace() for character in medium):
+        raise ValueError("affordance medium must be a compact capability name")
+    fulfilment = str(fulfilment or "").strip()
+    if fulfilment not in FULFILMENT:
+        raise ValueError("unknown fulfilment class")
+    scores = {str(key)[:80]: _unit(value, str(key)) for key, value in assessments.items()}
+    required = {"effect_fit", "capability", "willingness"}
+    if not required.issubset(scores):
+        raise ValueError("assessments require effect_fit, capability, and willingness")
+    evidence = {str(key)[:80]: _references(values, 16) for key, values in witnesses.items()}
+    missing = [key for key in required if not evidence.get(key)]
+    if missing:
+        raise ValueError("each required assessment needs a witness: " + ", ".join(sorted(missing)))
+    return _bounded({
+        "schema": AFFORDANCE_SCHEMA, "affordance_id": _identifier("expression_affordance"),
+        "request_id": str(request["request_id"]), "medium": medium,
+        "action": dict(action), "assessments": scores, "witnesses": evidence,
+        "fulfilment": fulfilment, "available": bool(available),
+        "provenance": _references(provenance, 64), "created_at": _now(),
+    })
+
+
+def select_expression_affordance(
+    request: Mapping[str, Any], candidates: Iterable[Mapping[str, Any]], *,
+    minimum_signal: float = 0.5, ambiguity_margin: float = 0.05,
+    ambiguity_resolver: Callable[..., Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Select an inspectable, corroborated affordance or explicitly abstain."""
+    if request.get("schema") != REQUEST_SCHEMA or not request.get("request_id"):
+        raise ValueError("a valid requested effect is required")
+    threshold = _unit(minimum_signal, "minimum_signal")
+    considered = []
+    fulfilment_rank = {"direct": 2, "approximation": 1, "representation_only": 0}
+    for raw in list(candidates)[:32]:
+        candidate = dict(raw)
+        if candidate.get("schema") != AFFORDANCE_SCHEMA:
+            raise ValueError("all candidates must be expression affordances")
+        if candidate.get("request_id") != request.get("request_id"):
+            raise ValueError("candidate belongs to a different requested effect")
+        scores = dict(candidate.get("assessments") or {})
+        evidence = dict(candidate.get("witnesses") or {})
+        required_signals = ["effect_fit", "capability", "willingness"]
+        if request.get("constraints"):
+            required_signals.append("constraint_fit")
+        origins = {item for key in required_signals for item in evidence.get(key, ())}
+        eligible = (
+            bool(candidate.get("available")) and len(origins) >= 2
+            and all(float(scores.get(key, 0.0)) >= threshold for key in required_signals)
+        )
+        bottleneck = min((float(scores.get(key, 0.0)) for key in required_signals), default=0.0)
+        mean = sum(float(scores.get(key, 0.0)) for key in required_signals) / len(required_signals)
+        considered.append({
+            "candidate": candidate, "eligible": eligible,
+            "required_signals": required_signals, "independent_witnesses": sorted(origins),
+            "bottleneck": round(bottleneck, 6), "mean": round(mean, 6),
+        })
+    eligible = [item for item in considered if item["eligible"]]
+    eligible.sort(key=lambda item: (
+        item["candidate"].get("fulfilment") == "representation_only",
+        -item["bottleneck"], -item["mean"],
+        -fulfilment_rank.get(str(item["candidate"].get("fulfilment")), -1),
+        str(item["candidate"].get("affordance_id")),
+    ))
+    resolution = None
+    if eligible and ambiguity_resolver is not None:
+        margin = _unit(ambiguity_margin, "ambiguity_margin")
+        leading = eligible[0]
+        leading_class = leading["candidate"].get("fulfilment") == "representation_only"
+        ambiguous = [item for item in eligible if (
+            (item["candidate"].get("fulfilment") == "representation_only") == leading_class
+            and leading["bottleneck"] - item["bottleneck"] <= margin
+        )]
+        if len(ambiguous) > 1:
+            resolved = dict(ambiguity_resolver([{
+                "id": item["candidate"].get("affordance_id"),
+                "activation": max(0.0, item["bottleneck"] * 0.7 + item["mean"] * 0.3),
+            } for item in ambiguous], context=str(request.get("request_id"))))
+            selected_id = resolved.get("selected_id")
+            match = next((item for item in ambiguous
+                          if item["candidate"].get("affordance_id") == selected_id), None)
+            if match is not None:
+                eligible.remove(match)
+                eligible.insert(0, match)
+                resolution = {
+                    "resolver": "candidate_superposition",
+                    "candidate_ids": [item["candidate"].get("affordance_id") for item in ambiguous],
+                    "selected_id": selected_id,
+                    "origins": list(resolved.get("origins") or ())[:8],
+                }
+    chosen = eligible[0]["candidate"] if eligible else None
+    return _bounded({
+        "schema": SELECTION_SCHEMA, "selection_id": _identifier("affordance_selection"),
+        "request_id": str(request["request_id"]),
+        "selected_affordance_id": chosen.get("affordance_id") if chosen else None,
+        "selected_medium": chosen.get("medium") if chosen else None,
+        "fulfils_request": bool(chosen and chosen.get("fulfilment") != "representation_only"),
+        "status": "selected" if chosen else "abstained",
+        "ambiguity_resolution": resolution,
+        "viable_affordance_ids": [
+            item["candidate"].get("affordance_id") for item in considered if item["eligible"]
+        ],
+        "created_at": _now(),
+    })
+
+
 def create_reaction_observation(realisation_id: str, observation: Mapping[str, Any], *,
                                 source: str, provenance: Iterable[Any] | None = None,
                                 causal_confidence: float | None = None) -> dict[str, Any]:
@@ -200,6 +354,7 @@ class ExpressionTraceStore:
         payload = _bounded(record)
         if payload.get("schema") not in {
             INTENT_SCHEMA, REALISATION_SCHEMA, REACTION_SCHEMA, INTERPRETATION_SCHEMA,
+            REQUEST_SCHEMA, AFFORDANCE_SCHEMA, SELECTION_SCHEMA,
         }:
             raise ValueError("unknown expression record schema")
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -211,7 +366,9 @@ class ExpressionTraceStore:
 
 __all__ = [
     "INTENT_SCHEMA", "REALISATION_SCHEMA", "REACTION_SCHEMA", "INTERPRETATION_SCHEMA",
+    "REQUEST_SCHEMA", "AFFORDANCE_SCHEMA", "SELECTION_SCHEMA",
     "ExpressionRealiser", "ExpressionTraceStore", "TextRealiser", "NativeSymbolRealiser",
     "create_expression_intent",
+    "create_requested_effect", "create_expression_affordance", "select_expression_affordance",
     "create_realisation", "create_reaction_observation", "create_reaction_interpretation",
 ]

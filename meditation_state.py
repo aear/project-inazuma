@@ -13,6 +13,7 @@ from model_manager import (
     get_sweet_spots, seed_self_question, load_config, request_scheduler_task
 )
 from gui_hook import log_to_statusbox
+from self_inquiry_journey import begin_self_inquiry, continue_self_inquiry, current_inquiry_request
 
 
 def _meditation_lock(child):
@@ -77,11 +78,65 @@ def meditate_loop():
         return
     try:
         enter_meditation()
+        _begin_requested_self_inquiry()
         _run_meditation_cycles()
     finally:
         if get_inastate("meditating", False):
             exit_meditation("interrupted")
         lock_handle.close()
+
+
+def _begin_requested_self_inquiry():
+    """Admit a voluntary inquiry during meditation without auto-continuing it."""
+    request = get_inastate("self_inquiry_request")
+    if not isinstance(request, dict) or not request.get("requested"):
+        return None
+    try:
+        journey = begin_self_inquiry(
+            request.get("question"),
+            trigger_references=request.get("trigger_references") or (),
+            depth_budget=request.get("depth_budget", 3),
+            include_code=bool(request.get("include_code", False)),
+        )
+    except (TypeError, ValueError) as exc:
+        update_inastate("self_inquiry_request", {
+            **request, "requested": False, "status": "rejected", "error": str(exc)[:240],
+        })
+        return None
+    update_inastate("self_inquiry_journey", journey)
+    update_inastate("self_inquiry_evidence_request", current_inquiry_request(journey))
+    update_inastate("self_inquiry_request", {
+        **request, "requested": False, "status": "started", "journey_id": journey["journey_id"],
+    })
+    log_to_statusbox("[Meditation] Ina began a bounded self-inquiry journey.")
+    return journey
+
+
+def _continue_requested_self_inquiry():
+    """Advance exactly once when Ina explicitly asks to continue her journey."""
+    request = get_inastate("self_inquiry_continue_request")
+    journey = get_inastate("self_inquiry_journey")
+    if not isinstance(request, dict) or not request.get("requested") or not isinstance(journey, dict):
+        return None
+    try:
+        updated = continue_self_inquiry(
+            journey, choice=request.get("choice"),
+            observation_references=request.get("observation_references") or (),
+            hypotheses=request.get("hypotheses") or (),
+        )
+    except (PermissionError, TypeError, ValueError) as exc:
+        update_inastate("self_inquiry_continue_request", {
+            **request, "requested": False, "status": "rejected", "error": str(exc)[:240],
+        })
+        return None
+    update_inastate("self_inquiry_journey", updated)
+    update_inastate("self_inquiry_evidence_request", current_inquiry_request(updated))
+    update_inastate("self_inquiry_continue_request", {
+        **request, "requested": False, "status": "applied",
+        "journey_id": updated["journey_id"], "stage_index": updated["stage_index"],
+    })
+    log_to_statusbox("[Meditation] Ina chose the next state of her self-inquiry journey.")
+    return updated
 
 
 def _run_meditation_cycles():
@@ -91,6 +146,7 @@ def _run_meditation_cycles():
     while loop_count < max_loops:
         loop_count += 1
         log_to_statusbox(f"[Meditation] Reflective cycle {loop_count}/{max_loops}")
+        _continue_requested_self_inquiry()
         try:
             request_scheduler_task("emotion_engine_run", reason="meditation_cycle", priority=74)
             request_scheduler_task("who_am_i_run", reason="meditation_cycle", priority=70)
