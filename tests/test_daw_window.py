@@ -885,6 +885,7 @@ def test_control_api_advertises_exact_dispatcher_without_autonomous_microphone()
         "inspect",
         "state",
         "snapshot",
+        "experience_choice",
         "set_step",
         "set_track",
         "set_stem",

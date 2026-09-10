@@ -246,6 +246,11 @@ class BoundedEvents:
                 self._condition.wait(timeout=max(0.0, min(25.0, timeout)))
             return [dict(item) for item in self._items if item["sequence"] > sequence]
 
+    def latest_sequence(self) -> int:
+        """Return a cursor callers can use when replacing the visible thread."""
+        with self._condition:
+            return self._sequence
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -364,6 +369,19 @@ class AppServerClient:
                 self.events.append("diagnostic", normalized)
 
     def _handle_notification(self, method: str, params: Any) -> None:
+        data = params if isinstance(params, dict) else {}
+        notification_thread = str(data.get("threadId") or "")
+        notification_turn = str(data.get("turnId") or "")
+        turn = data.get("turn") if isinstance(data.get("turn"), dict) else {}
+        notification_turn = notification_turn or str(turn.get("id") or "")
+        # App-server can emit late notifications after a resume. Never let a
+        # previous thread or completed turn mutate the currently visible one.
+        if notification_thread and self.thread_id and notification_thread != self.thread_id:
+            return
+        if (
+            notification_turn and self.turn_id and notification_turn != self.turn_id
+        ):
+            return
         if method == "turn/started" and isinstance(params, dict):
             turn = params.get("turn") or {}
             self.turn_id = str(turn.get("id") or self.turn_id or "") or None
@@ -491,9 +509,14 @@ class AppServerClient:
         thread = result.get("thread") if isinstance(result, dict) else {}
         self.thread_id = str(thread.get("id") or "") or None
         self.turn_id = None
+        self.latest_diff = None
+        self.diff_seen = False
         self.active_model = str(result.get("model") or model or "") or None
         self.events.append("status", {"new_thread": self.thread_id})
-        return {"thread_id": self.thread_id, "model": self.active_model}
+        return {
+            "thread_id": self.thread_id, "model": self.active_model,
+            "event_sequence": self.events.latest_sequence(),
+        }
 
     @staticmethod
     def _thread_summary(thread: Any) -> dict[str, Any] | None:
@@ -573,8 +596,13 @@ class AppServerClient:
         self.turn_status = "idle"
         self.running_turn = False
         self.work_status = "Ready"
+        self.latest_diff = None
+        self.diff_seen = False
         self.events.append("status", {"resumed_thread": thread_id})
-        return {"thread": summary, "transcript": self._thread_transcript(thread), "model": self.active_model}
+        return {
+            "thread": summary, "transcript": self._thread_transcript(thread),
+            "model": self.active_model, "event_sequence": self.events.latest_sequence(),
+        }
 
     def send_prompt(
         self, prompt: str, *, model: str | None = None,
@@ -617,6 +645,10 @@ class AppServerClient:
             "summary": summary,
             "raw": {"steering": bool(steering), "image_count": len(attached_images)},
         })
+        # A legitimate turn/started notification can race the request response.
+        # Clearing the completed turn here accepts only that new identity while
+        # preserving strict rejection once the active turn is known.
+        self.turn_id = None
         result = self.request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else {}
         self.turn_id = str(turn.get("id") or "") or None

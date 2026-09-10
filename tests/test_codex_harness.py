@@ -408,6 +408,30 @@ def test_thread_and_turn_notifications_are_authoritative_for_completion(tmp_path
     assert events[0]["payload"]["summary"] == "Task complete"
 
 
+def test_notifications_from_other_threads_or_stale_turns_are_ignored(tmp_path):
+    client = _notification_client(tmp_path)
+    client._handle_notification("item/completed", {
+        "threadId": "thread-previous", "turnId": "turn-old",
+        "item": {"id": "message-old", "type": "agentMessage", "text": "wrong thread"},
+    })
+    client._handle_notification("turn/completed", {
+        "threadId": "thread-1", "turn": {"id": "turn-old", "status": "completed"},
+    })
+    assert client.events.wait_after(0, 0) == []
+    assert client.turn_id == "turn-1"
+    assert client.turn_status == "idle"
+
+
+def test_stale_turn_started_cannot_replace_known_active_turn(tmp_path):
+    client = _notification_client(tmp_path)
+    client.running_turn = True
+    client._handle_notification("turn/started", {
+        "threadId": "thread-1", "turn": {"id": "turn-old", "status": "inProgress"},
+    })
+    assert client.turn_id == "turn-1"
+    assert client.events.wait_after(0, 0) == []
+
+
 def test_usage_notification_updates_bounded_authoritative_meter(tmp_path):
     client = _notification_client(tmp_path)
     client.token_usage = token_usage_payload({})

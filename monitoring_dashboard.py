@@ -271,6 +271,11 @@ def _bias() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
     source_skew = metric(latest, "source_selection_skew", "strength")
 
     rows = []
+    if not latest:
+        rows.append((
+            "Recall bias evidence", "not reported", "waiting for a recall action",
+            _modified(path), "No recall arbitration has been observed yet. Missing evidence is not treated as zero bias or perfect diversity.",
+        ))
     specs = (
         ("Recall modality diversity", type_diversity, type_dominance, "selected_type_diversity",
          "How varied the surfaced memory modalities were. Low diversity describes concentration; it does not establish unfairness."),
@@ -319,12 +324,6 @@ def _bias() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]
                 "federation_rule": "Continuity coordinates rankings and links; it never rewrites modality traces.",
             }, indent=2, default=str),
         ))
-    if not latest:
-        rows.append((
-            "Recall bias evidence", "not reported", "waiting for a recall action",
-            _modified(path), "No recall arbitration has been observed yet. Missing evidence is not treated as zero bias or perfect diversity.",
-        ))
-
     cards = [
         ("Type diversity", _percent_level(type_diversity)),
         ("Source diversity", _percent_level(source_diversity)),

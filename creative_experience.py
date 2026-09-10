@@ -8,6 +8,7 @@ import uuid
 
 from io_utils import atomic_write_json, load_json_dict
 from experience_engine import CHOICES, SCHEMA, new_attempt, new_cycle
+from emergence_capture import CAPTURE_SCHEMA
 
 
 STAGES = ("intent", "attempt", "observation", "evaluation", "keep", "revise", "revisit", "stop")
@@ -36,6 +37,21 @@ def begin_experience(tool: str, intention: str, *, hypothesis: str = "", source:
         "hypothesis": str(hypothesis)[:500], "source": str(source)[:80],
         "started_at": cycle["created_at"], "experiment_count": 0, "experiments": [],
     })
+    return cycle
+
+
+def begin_cultivation(
+    capture: Mapping[str, Any], tool: str, intention: str, *, hypothesis: str = "",
+) -> dict[str, Any]:
+    """Start deliberate exploration while retaining the pre-intent source link."""
+    capture_id = str(capture.get("capture_id") or "")
+    if capture.get("schema") != CAPTURE_SCHEMA or not capture_id:
+        raise ValueError("a valid emergence capture is required")
+    cycle = begin_experience(tool, intention, hypothesis=hypothesis, source="emergence_capture")
+    references = list(cycle.get("payload_references") or [])
+    references.append({"id": capture_id, "kind": CAPTURE_SCHEMA, "role": "surfaced_material"})
+    cycle["payload_references"] = references
+    cycle["emergence_capture_id"] = capture_id
     return cycle
 
 def record_experiment(session: Mapping[str, Any], variation: Mapping[str, Any] | str, *, observation: str = "") -> dict[str, Any]:
@@ -90,4 +106,4 @@ def experience_command_fields(session: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["SCHEMA", "STAGES", "NEXT_CHOICES", "begin_experience", "record_experiment", "choose_next", "save_experience", "experience_path", "experience_command_fields"]
+__all__ = ["SCHEMA", "STAGES", "NEXT_CHOICES", "begin_experience", "begin_cultivation", "record_experiment", "choose_next", "save_experience", "experience_path", "experience_command_fields"]

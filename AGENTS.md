@@ -283,6 +283,9 @@ an existing threshold is a floor, not the target. For material changes:
 - Render turn diffs as a compact file/addition/deletion summary with the bounded unified diff collapsed by default. Keep raw protocol details separate and lazy; do not duplicate the full diff in both payloads.
 - Cached authentication is private local state: never copy it into this repository, logs, benchmark fixtures, or exported reports. VS Code does not need to be running for cached CLI/app-server authentication to work.
 - Benchmark the historical VS Code-hosted workflow against the standalone harness for capability coverage, startup/runtime resources, latency, isolation, and authentication safety.
+- Keep harness and broad-suite diagnostics in standalone processes outside Ina's runtime tree. Use unbuffered output and an explicit time limit for broad runs, then reproduce a suspected stall with the smallest focused test before attributing it to Ina.
+- Interpret diagnostic termination from the invoked signals: a deliberate `SIGABRT` used for faulthandler stack capture may report `Aborted` or `core dumped`, while exit 137 means `SIGKILL` (often a timeout escalation). Neither alone proves an OOM kill or spontaneous kernel action; corroborate with the command, captured stacks, and host evidence.
+- On hosts where `asyncio.run()` stalls while shutting down its default executor after completed `asyncio.to_thread()` work, record full-suite completion as unavailable, retain focused results, and confirm with a minimal standalone reproducer. Do not weaken production isolation or remove legitimate thread offloading merely to make that interpreter-specific test shutdown disappear.
 
 ## Experiential action design
 
