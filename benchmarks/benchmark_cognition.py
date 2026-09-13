@@ -13,7 +13,9 @@ import shlex
 from pathlib import Path
 
 from cognitive_benchmarks.audit import audit_surface_cues, surface_cues_pass
-from cognitive_benchmarks.backends import CommandScorer, HuggingFaceCausalScorer
+from cognitive_benchmarks.backends import (
+    CommandScorer, HuggingFaceCausalScorer, conventional_transformer_scorer,
+)
 from cognitive_benchmarks.core import load_cases, run_benchmark
 from cognitive_benchmarks.schedule import MonthlyCadence
 from cognitive_benchmarks.procedural import PROCEDURAL_VERSION, generate_cases
@@ -32,9 +34,21 @@ def _append_jsonl(path: Path, payload: dict) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("huggingface", "command"), default="huggingface")
+    parser.add_argument(
+        "--backend", choices=("huggingface", "command", "conventional"),
+        default="huggingface",
+    )
     parser.add_argument("--model", default="gpt2", help="model id or label recorded in results")
     parser.add_argument("--command", help="JSON scorer command (required for command backend)")
+    parser.add_argument("--weights", type=Path, help="conventional Transformer V1 state JSON")
+    parser.add_argument(
+        "--model-family", choices=("external", "federated_ina", "conventional_transformer"),
+        default="external", help="architecture family used for task-level comparisons",
+    )
+    parser.add_argument(
+        "--model-seed", type=int, default=0x1A,
+        help="fixed initialization seed for an untrained conventional baseline",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--procedural", action="store_true", help="generate fresh in-memory cases")
@@ -97,6 +111,10 @@ def main() -> int:
         if not args.command:
             raise SystemExit("--command is required for the command backend")
         scorer = CommandScorer(args.model, shlex.split(args.command))
+    elif args.backend == "conventional":
+        scorer = conventional_transformer_scorer(
+            weights=args.weights, seed=args.model_seed, name=args.model,
+        )
     else:
         scorer = HuggingFaceCausalScorer(args.model, device=args.device)
 
@@ -110,12 +128,18 @@ def main() -> int:
         benchmark_version=PROCEDURAL_VERSION if procedural else "1",
     )
     payload = result.to_dict()
+    payload["model_family"] = (
+        "conventional_transformer" if args.backend == "conventional" else args.model_family
+    )
+    payload["trained_weights"] = bool(getattr(scorer, "trained", args.backend != "conventional"))
     payload["evaluation_protocol"] = (
         "procedural-generative" if procedural else
         "public-smoke" if public_suite else "blind-held-out"
     )
     if procedural:
         payload["seed_fingerprint"] = hashlib.sha256(str(seed).encode()).hexdigest()[:16]
+    else:
+        payload["suite_fingerprint"] = hashlib.sha256(args.cases.read_bytes()).hexdigest()[:16]
     if not public_suite:
         payload["cases"] = []
         payload["case_details_withheld"] = True

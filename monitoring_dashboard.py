@@ -903,6 +903,41 @@ def _system() -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str
     return cards, rows
 
 
+def _transformer_benchmarks(
+    history_path: Path = Path('benchmark_results/history.jsonl'),
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    """Show task-specific comparison evidence without making promotion decisions."""
+    from transformer_comparison import compare_transformer_families, load_benchmark_history
+    report = compare_transformer_families(load_benchmark_history(history_path))
+    comparisons = report['comparisons']
+    recommendations = report['recommendations']
+    rows = []
+    if not comparisons:
+        rows.append((
+            'Conventional Transformer comparison', 'not enough matched evidence',
+            'benchmark-only · no recommendation', _modified(history_path),
+            json.dumps(report, indent=2),
+        ))
+    for comparison in comparisons:
+        signals = comparison['signals']
+        accuracy = 100.0 * float(signals['mean_accuracy_gain'])
+        state = comparison['status'].replace('_', ' ')
+        if comparison['review_recommended']:
+            state += ' · highlight'
+        rows.append((
+            f"{comparison['task']} · conventional vs federated",
+            f"{accuracy:+.1f} pp · {comparison['matched_independent_witnesses']} matched runs",
+            state, _modified(history_path), json.dumps(comparison, indent=2),
+        ))
+    cards = [
+        ('Task comparisons', str(len(comparisons))),
+        ('Review candidates', str(len(recommendations))),
+        ('Required witnesses', str(report['policy']['minimum_matched_independent_witnesses'])),
+        ('Promotion', 'human review only'),
+    ]
+    return cards, rows
+
+
 COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]]] = {
     'Mind': _mind,
     'Continuity': _continuity,
@@ -911,6 +946,7 @@ COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, 
     'World': _world,
     'Memory': _memory,
     'Reports': _reports,
+    'Model comparisons': _transformer_benchmarks,
     'Communication': _communication,
     'Actions': _actions,
     'System': _system,

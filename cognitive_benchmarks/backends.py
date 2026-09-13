@@ -84,3 +84,14 @@ class CommandScorer:
             return [float(value) for value in response["scores"]]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("scorer command must return JSON: {\"scores\": [...]}") from exc
+
+
+def conventional_transformer_scorer(
+    *, weights: Path | None = None, seed: int = 0x1A,
+    name: str = "ina-conventional-transformer-untrained",
+):
+    """Construct Ina's benchmark-only conventional baseline lazily."""
+    from transformers.conventional_transformer import ConventionalTransformer
+    if weights is not None:
+        return ConventionalTransformer.from_json(weights, name=name)
+    return ConventionalTransformer(seed=seed, name=name)

@@ -13,6 +13,8 @@ _EXPORTS = {
     "HindsightTransformer": ("transformers.hindsight_transformer", "HindsightTransformer"),
     "ShadowTransformer": ("transformers.shadow_transformer", "ShadowTransformer"),
     "BridgeTransformer": ("transformers.bridge_transformer", "BridgeTransformer"),
+    "ConventionalTransformer": ("transformers.conventional_transformer", "ConventionalTransformer"),
+    "ConventionalTransformerConfig": ("transformers.conventional_transformer", "ConventionalTransformerConfig"),
 }
 
 __all__ = list(_EXPORTS)

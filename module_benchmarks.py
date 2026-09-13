@@ -1,6 +1,7 @@
 """Deterministic, explicit comparisons between retained module versions."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -181,6 +182,41 @@ def _referent_event_discourse() -> dict[str, Any]:
 
 def _capability(cases: list[dict[str, Any]]) -> dict[str, Any]:
     return {"correct": sum(bool(case.get("correct")) for case in cases), "total": len(cases), "cases": cases}
+
+
+def _conventional_transformer_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "causal multi-head self-attention exists", "component": "architecture", "correct": False},
+        {"case": "benchmark choice-scoring contract exists", "component": "evaluation", "correct": False},
+        {"case": "weights are injectable and shape checked", "component": "weights", "correct": False},
+        {"case": "benchmark status cannot imply council membership", "component": "governance", "correct": False},
+    ])
+
+
+def _conventional_transformer_v2() -> dict[str, Any]:
+    from transformers.conventional_transformer import (
+        ConventionalTransformer, ConventionalTransformerConfig,
+    )
+    config = ConventionalTransformerConfig(
+        model_width=8, heads=2, layers=1, feed_forward_width=12, max_sequence=16,
+    )
+    model = ConventionalTransformer(config, seed=7)
+    forward = model.forward([0, 66, 67], return_attention=True)
+    scores = model.score_choices("A", ("B", "C"))
+    evidence = model.promotion_evidence()
+    restored = ConventionalTransformer(config, state=model.state_dict())
+    return _capability([
+        {"case": "causal multi-head self-attention exists", "component": "architecture",
+         "correct": len(forward["attention"]) == 1 and len(forward["attention"][0]) == 2
+         and len(forward["attention"][0][0][2]) == 3},
+        {"case": "benchmark choice-scoring contract exists", "component": "evaluation",
+         "correct": len(scores) == 2 and all(math.isfinite(value) for value in scores)},
+        {"case": "weights are injectable and shape checked", "component": "weights",
+         "correct": restored.forward([0, 66])["logits"] == model.forward([0, 66])["logits"]},
+        {"case": "benchmark status cannot imply council membership", "component": "governance",
+         "correct": evidence["deployment_status"] == "benchmark_only"
+         and evidence["council_member"] is False and evidence["promotion_state"] == "not_evaluated"},
+    ])
 
 
 def _thought_processor_v1() -> dict[str, Any]:
@@ -1834,6 +1870,75 @@ def _communicative_meaning_v2() -> dict[str, Any]:
     ])
 
 
+def _communicative_meaning_v3() -> dict[str, Any]:
+    baseline = _communicative_meaning_v2()
+    from social_expression import assess_communicative_repair, build_listener_hypotheses
+    listener = build_listener_hypotheses("person:sakura", [
+        {"witness_id": "conversation:1", "proposition_reference": "concept:need",
+         "state": "may_misunderstand", "confidence": .7,
+         "provenance": ["conversation:1"]},
+        {"witness_id": "repair:1", "proposition_reference": "concept:need",
+         "state": "may_misunderstand", "confidence": .8,
+         "provenance": ["repair:1"]},
+    ])
+    repair = assess_communicative_repair(
+        ["meaning:intended"], [{
+            "meaning_references": ["meaning:received"], "confidence": .8,
+            "witness_references": ["reaction:1"], "provenance": ["conversation:2"],
+        }], realisation_id="realisation:1",
+    )
+    return _capability([*baseline["cases"],
+        {"case": "listener knowledge remains a federated non-authoritative hypothesis",
+         "component": "common_ground", "correct": listener["hypotheses"][0]["authoritative"] is False
+         and listener["hypotheses"][0]["independent_origins"] == 2},
+        {"case": "corroborated intended-versus-received mismatch proposes optional repair",
+         "component": "repair", "correct": repair["status"] == "repair_candidate"
+         and repair["automatic_expression"] is False},
+    ])
+
+
+def _transformer_comparison_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "comparison is task-specific", "component": "diagnosis", "correct": False},
+        {"case": "repeated matched evidence is required", "component": "evidence", "correct": False},
+        {"case": "public smoke cannot recommend promotion", "component": "safety", "correct": False},
+        {"case": "advantage points back to federated improvement", "component": "improvement", "correct": False},
+    ])
+
+
+def _transformer_comparison_v2() -> dict[str, Any]:
+    from transformer_comparison import compare_transformer_families
+    records = []
+    for index in range(3):
+        for family, accuracy, margin, elapsed in (
+            ("federated_ina", .5, .1, 1.0),
+            ("conventional_transformer", .8, .3, 1.2),
+        ):
+            records.append({
+                "benchmark": "held-out", "benchmark_version": "1",
+                "evaluation_protocol": "procedural-generative",
+                "seed_fingerprint": f"seed-{index}", "model_family": family,
+                "trained_weights": True, "elapsed_seconds": elapsed, "total": 10,
+                "categories": {"composition": {"accuracy": accuracy, "mean_margin": margin}},
+            })
+    records.append({
+        "benchmark": "public", "benchmark_version": "1", "evaluation_protocol": "public-smoke",
+        "model_family": "conventional_transformer", "trained_weights": True,
+        "categories": {"memory": {"accuracy": 1, "mean_margin": 1}},
+    })
+    report = compare_transformer_families(records)
+    candidate = report["recommendations"][0]
+    return _capability([
+        {"case": "comparison is task-specific", "component": "diagnosis",
+         "correct": candidate["task"] == "composition"},
+        {"case": "repeated matched evidence is required", "component": "evidence",
+         "correct": candidate["matched_independent_witnesses"] == 3},
+        {"case": "public smoke cannot recommend promotion", "component": "safety",
+         "correct": len(report["recommendations"]) == 1 and not report["policy"]["public_smoke_is_evidence"]},
+        {"case": "advantage points back to federated improvement", "component": "improvement",
+         "correct": "missing federated capability" in candidate["improvement_route"]
+         and candidate["automatic_promotion"] is False},
+    ])
 def _text_vocab_lookup_v1() -> dict[str, Any]:
     return _capability([
         {"case": "reply lookup avoids full mapping materialisation", "component": "latency", "correct": False},
@@ -1880,6 +1985,10 @@ _HISTORY_BACKED_MODULES = {
 
 
 _REGISTRY = {
+    "conventional_transformer": (
+        ModuleVersion("conventional_transformer", "V1", "No conventional attention baseline", _conventional_transformer_v1),
+        ModuleVersion("conventional_transformer", "V2", "Benchmark-only conventional decoder Transformer", _conventional_transformer_v2),
+    ),
     "semantic_topology": (
         ModuleVersion("semantic_topology", "V1", "One word to one scalar winning link", _semantic_topology_v1),
         ModuleVersion("semantic_topology", "V2", "One word to bounded ranked meanings with contextual activation", _semantic_topology_v2),
@@ -1963,6 +2072,11 @@ _REGISTRY = {
     "communicative_meaning": (
         ModuleVersion("communicative_meaning", "V1", "State and lexical output without a communicative meaning boundary", _communicative_meaning_v1),
         ModuleVersion("communicative_meaning", "V2", "Bounded evidence-backed meaning alternatives and abstention", _communicative_meaning_v2),
+        ModuleVersion("communicative_meaning", "V3", "Listener hypotheses and evidence-gated communicative repair", _communicative_meaning_v3),
+    ),
+    "transformer_comparison": (
+        ModuleVersion("transformer_comparison", "V1", "No task-specific architecture comparison guidance", _transformer_comparison_v1),
+        ModuleVersion("transformer_comparison", "V2", "Repeated multi-signal comparison with improvement routing", _transformer_comparison_v2),
     ),
     "text_vocab_lookup": (
         ModuleVersion("text_vocab_lookup", "V1", "Full durable-tier meaning-map materialisation per reply", _text_vocab_lookup_v1),
