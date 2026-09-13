@@ -48,6 +48,7 @@ _STOPWORDS = {
     "in",
     "is",
     "it",
+    "just",
     "of",
     "on",
     "or",
@@ -68,10 +69,32 @@ _STOPWORDS = {
     "your",
 }
 
+_EXPLICIT_GROUNDING_TERMS = {
+    "define", "definition", "ground", "grounding", "mean", "meaning",
+    "recall", "remember", "word",
+}
+
 _COMMUNICATION_CONTINUITY_TERMS = {
     "continue", "earlier", "forgot", "message", "meant", "old", "pending",
     "resume", "said", "saying", "thought", "unfinished", "unsent",
 }
+
+
+def is_explicit_grounding_request(text: str) -> bool:
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z']+", str(text))}
+    return bool(tokens & _EXPLICIT_GROUNDING_TERMS)
+
+
+def grounding_subjects(text: str, vocabulary: Dict[str, str], *, child: str) -> List[str]:
+    """Return lexical subjects, never grammatical/deictic retrieval routes."""
+    subjects = []
+    child_name = str(child or "").casefold()
+    for word in (token.lower() for token in re.findall(r"[A-Za-z']+", str(text))):
+        if word in _STOPWORDS or word in DISCOURSE_TERMS or word == child_name:
+            continue
+        if word in vocabulary and word not in subjects:
+            subjects.append(word)
+    return subjects
 
 
 def _speaker_aware_narrative(record: Dict[str, Any]) -> str:
@@ -166,6 +189,8 @@ class LMStudioAdapter:
     def has_constructive_reply(self, prompt: str) -> bool:
         """Read-only check for grounded recall without canned clarification."""
         if not self._experience_graph_path().exists():
+            return False
+        if not is_explicit_grounding_request(prompt):
             return False
         return bool(self._compose_reply(
             prompt,
@@ -482,15 +507,20 @@ class LMStudioAdapter:
         seen_grounded: set[str] = set()
         seen_unknown: set[str] = set()
 
+        grounded_subjects = set(grounding_subjects(prompt, vocab, child=self.child))
         for word in words:
+            if word in _STOPWORDS or word in DISCOURSE_TERMS or word == self.child.casefold():
+                continue
             if word in vocab:
+                if word not in grounded_subjects:
+                    continue
                 if word in seen_grounded:
                     continue
                 grounding = self._summarise_grounding(word)
                 if grounding:
                     grounded_details.append((word, grounding))
                     seen_grounded.add(word)
-            elif word not in _STOPWORDS and len(word) > 2 and word not in seen_unknown:
+            elif len(word) > 2 and word not in seen_unknown:
                 unknown_words.append(word)
                 seen_unknown.add(word)
 

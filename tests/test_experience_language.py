@@ -162,6 +162,10 @@ def test_experience_logging_and_grounding(temp_child, monkeypatch):
     assert len(saved["events"]) >= 4
     assert saved["words_index"].get("cup")
     assert saved["words_index"].get("grip")
+    # Ordinary dialogue remains in its source event but is not automatically
+    # promoted into the sentence-level quick-reach projection.
+    utterances = [item for event in saved["events"] for item in event.get("utterance_memory", [])]
+    assert utterances == []
 
     groundings = describe_word_grounding(child, "cup", base_path=base)
     assert groundings

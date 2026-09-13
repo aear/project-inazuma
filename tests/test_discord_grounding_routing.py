@@ -148,6 +148,35 @@ def test_discord_sender_replies_on_first_chunk_without_ping():
     assert all("reference" not in kwargs for _text, kwargs in sent[1:])
 
 
+def test_discord_edit_capability_only_edits_ina_authored_message():
+    edited = []
+
+    class Message:
+        def __init__(self, author_id):
+            self.author = SimpleNamespace(id=author_id)
+
+        async def edit(self, *, content):
+            edited.append(content)
+
+    class Destination:
+        def __init__(self, author_id):
+            self.author_id = author_id
+
+        async def fetch_message(self, message_id):
+            assert message_id == 42
+            return Message(self.author_id)
+
+    client = SimpleNamespace(user=SimpleNamespace(id=999))
+    allowed = asyncio.run(db.InaDiscordClient._edit_own_discord_message(
+        client, Destination(999), "42", "rephrased expression",
+    ))
+    refused = asyncio.run(db.InaDiscordClient._edit_own_discord_message(
+        client, Destination(123), "42", "must not replace this",
+    ))
+    assert allowed is True and refused is False
+    assert edited == ["rephrased expression"]
+
+
 class _Adapter:
     def __init__(self, response="adapter reply"):
         self.calls = []
@@ -202,6 +231,52 @@ def test_grounded_adapter_probe_is_nonclarifying_and_side_effect_free(monkeypatc
         include_clarification=False,
         seed_questions=False,
     ) == ""
+
+
+def test_grounded_adapter_does_not_turn_conversation_or_deictics_into_recall(monkeypatch):
+    adapter = object.__new__(lmsa.LMStudioAdapter)
+    adapter.child = "Inazuma"
+    adapter._base_path = Path("AI_Children")
+    monkeypatch.setattr(adapter, "_experience_graph_path", lambda: SimpleNamespace(exists=lambda: True))
+    monkeypatch.setattr(adapter, "_load_known_words", lambda: {
+        "your": "sym_your", "just": "sym_just", "ina": "sym_ina", "sentences": "sym_sentences",
+    })
+    monkeypatch.setattr(adapter, "_summarise_grounding", lambda word: {
+        "event_id": "event:1", "situation_tags": ["discord"], "narrative": "old event",
+    })
+
+    prompt = "Maybe help ya store sentences, not just words."
+    assert adapter.has_constructive_reply(prompt) is False
+    explicit = adapter._compose_reply("What does sentences mean?", include_clarification=False)
+    assert "'sentences'" in explicit
+    assert "'your'" not in adapter._compose_reply("What does your mean?", include_clarification=False)
+
+
+def test_memory_consideration_is_private_by_default(monkeypatch, tmp_path):
+    _enable_replying(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    memory = tmp_path / "AI_Children" / "TestChild" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "inastate.json").write_text(
+        '{"urge_to_type":{"adjusted_level":0.8}}', encoding="utf-8",
+    )
+    monkeypatch.setattr(db, "load_root_config", lambda: {"ignore_urge_for_typing": True})
+    adapter = _Adapter("A response.")
+    adapter.recall_relevant = lambda *args, **kwargs: [{
+        "event_id": "event:1", "cue": "response", "summary": "private diagnostic",
+    }]
+    adapter.consider_recalled_memories = lambda *args, **kwargs: {"accepted": [{
+        "event_id": "event:1", "cue": "response", "summary": "private diagnostic",
+        "consideration": {"description": "diagnostic must stay private"},
+    }], "rejected": []}
+    adapter.has_constructive_reply = lambda prompt: True
+    monkeypatch.setattr(db, "get_chat_adapter", lambda: adapter)
+    monkeypatch.setattr(db, "generate_symbolic_reply_from_text", lambda *args, **kwargs: None)
+    _force_expression_strategy(monkeypatch, "respond")
+
+    result = db.process_inbound_message(_message("Please respond."))
+    assert "Memory consideration:" not in result.text
+    assert result.metadata["conversation_scene"]["memory_references"]
 
 
 def _message(text, *, attachments=None, context=None):

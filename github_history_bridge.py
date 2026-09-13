@@ -103,6 +103,7 @@ def commit_as_text(commit: Dict[str, Any]) -> str:
     merge_note = "merge commit" if len(commit.get("parents") or []) > 1 else "commit"
     lines = [
         f"Project evolution {merge_note} {commit.get('short_hash')}: {commit.get('subject')}",
+        "Memory role: read-only witness to my project evolution; part of developmental memory, not direct autobiographical experience or proof of authorship.",
         f"Authored {commit.get('authored_at')} by {commit.get('author')}.",
         f"Changed {commit.get('file_count', 0)} files with {commit.get('insertions', 0)} insertions and {commit.get('deletions', 0)} deletions.",
     ]
@@ -112,3 +113,17 @@ def commit_as_text(commit: Dict[str, Any]) -> str:
     if body:
         lines.append("Commit notes: " + " ".join(body.split()))
     return "\n".join(lines)
+
+
+def commit_memory_witness(commit: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify local history as genuine but bounded developmental memory."""
+    return {
+        "schema": "ina.project_history_memory_witness/V1",
+        "commit_reference": str(commit.get("hash") or commit.get("short_hash") or "")[:80],
+        "memory_relationship": "part_of_developmental_memory",
+        "source_scope": "project_evolution",
+        "read_only": True,
+        "direct_experience": False,
+        "authorship_claimed": False,
+        "provenance": "local_git_history",
+    }

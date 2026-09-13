@@ -2536,7 +2536,7 @@ def process_inbound_message(msg) -> CommsResponse:
         metadata.update(encoding_metadata)
 
     show_memory_consideration = bool(
-        root_cfg.get("conversation_scene_show_memory_consideration", True)
+        root_cfg.get("conversation_scene_show_memory_consideration", False)
     )
     if reply_text and show_memory_consideration:
         consideration_descriptions = []
@@ -4007,6 +4007,26 @@ class InaDiscordClient(discord.Bot):
         logger.info("Ina invited %s to join Discord voice (%s).", user_id, decision["reason"])
         return True
 
+    async def _edit_own_discord_message(self, destination, message_id: object, text: str) -> bool:
+        """Edit one verified Ina-authored message; never expose arbitrary edits."""
+        fetch_message = getattr(destination, "fetch_message", None)
+        if not callable(fetch_message) or not message_id or self.user is None:
+            return False
+        try:
+            message = await fetch_message(int(message_id))
+            author = getattr(message, "author", None)
+            if author is None or str(getattr(author, "id", "")) != str(self.user.id):
+                logger.warning("Refusing to edit Discord message %s not authored by Ina.", message_id)
+                return False
+            await message.edit(content=str(text))
+            return True
+        except (TypeError, ValueError):
+            logger.warning("Invalid Discord edit target: %r", message_id)
+            return False
+        except Exception:
+            logger.exception("Failed to edit Ina's Discord message %s", message_id)
+            return False
+
     async def _deliver_typed_outbox_entry(self, entry: dict) -> bool:
         text = entry.get("text")
         allow_empty = bool(entry.get("allow_empty"))
@@ -4039,6 +4059,19 @@ class InaDiscordClient(discord.Bot):
         target_user_id = entry.get("user_id")
         sent = False
         voice_played = await self._maybe_play_voice_attachment(entry, attachment_path)
+        action = str(entry.get("action") or "send").strip().lower()
+        if action == "edit":
+            if attachment_path or not channel_id or not entry.get("message_id"):
+                logger.warning("Refusing incomplete or attachment-bearing Discord edit entry %s", entry.get("id"))
+                return False
+            try:
+                channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+                sent = bool(channel) and await self._edit_own_discord_message(
+                    channel, entry.get("message_id"), text_str,
+                )
+            except Exception:
+                logger.exception("Failed to resolve Discord edit destination for entry %s", entry.get("id"))
+                return False
 
         async def _send_dm(user_id: int) -> bool:
             try:
@@ -4119,7 +4152,7 @@ class InaDiscordClient(discord.Bot):
             )
             entry_id = entry.get("id")
             if entry_id:
-                self._log_outbox_history(str(entry_id), "sent")
+                self._log_outbox_history(str(entry_id), "edited" if action == "edit" else "sent")
         else:
             logger.warning("Unable to deliver typed outbox entry %s; no usable target.", entry.get("id"))
         return sent or voice_played

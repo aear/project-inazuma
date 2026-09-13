@@ -26,6 +26,7 @@ from body_schema import get_region_anchors
 from experience_storage import iter_event_paths
 from io_utils import atomic_write_json, file_lock, flush_for_durability, load_json_dict
 from storage_layout import fast_runtime_path
+from utterance_memory import evaluate_utterance_memory_hook
 
 try:
     import native_vector as _native_vector
@@ -2451,6 +2452,13 @@ def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict
             for entity in raw.get("perceived_entities", [])
             if entity.get("name") or entity.get("label")
         }
+        utterance_memory = [
+            decision
+            for usage in list(raw.get("word_usage") or [])[:4]
+            if isinstance(usage, dict)
+            for decision in [evaluate_utterance_memory_hook(usage, raw)]
+            if decision["retained"]
+        ]
         node = {
             "id": raw.get("id"),
             "timestamp": raw.get("timestamp"),
@@ -2459,6 +2467,7 @@ def build_experience_graph(child: str, base_path: Optional[Path] = None) -> Dict
             "episode_id": raw.get("episode_id"),
             "narrative": raw.get("narrative", ""),
             "word_usage": raw.get("word_usage", []),
+            "utterance_memory": utterance_memory,
         }
         nodes.append(node)
         for usage in node["word_usage"]:

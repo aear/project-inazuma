@@ -1939,6 +1939,70 @@ def _transformer_comparison_v2() -> dict[str, Any]:
          "correct": "missing federated capability" in candidate["improvement_route"]
          and candidate["automatic_promotion"] is False},
     ])
+
+
+def _conversational_expression_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "deictics cannot become lexical recall subjects", "component": "grounding", "correct": False},
+        {"case": "ordinary proposals do not trigger generic recall replies", "component": "pragmatics", "correct": False},
+        {"case": "whole utterances survive the rebuildable graph projection", "component": "memory", "correct": False},
+        {"case": "project history is bounded developmental memory", "component": "continuity", "correct": False},
+        {"case": "rephrasing preserves source and meaning", "component": "revision", "correct": False},
+        {"case": "repair may edit only Ina-authored Discord messages", "component": "delivery", "correct": False},
+    ])
+
+
+def _conversational_expression_v2() -> dict[str, Any]:
+    from github_history_bridge import commit_memory_witness
+    from lm_studio_adapter import grounding_subjects, is_explicit_grounding_request
+    from utterance_memory import evaluate_utterance_memory_hook
+    subjects = grounding_subjects(
+        "Maybe help ya store sentences, not just your words, Ina.",
+        {"sentences": "sym_sentence", "just": "sym_just", "your": "sym_your", "ina": "sym_ina"},
+        child="Ina",
+    )
+    history = commit_memory_witness({"hash": "a" * 40})
+    retained = evaluate_utterance_memory_hook(
+        {"utterance": "I know my memory loves quotes."},
+        {"id": "event:1", "situation_tags": ["relationship"],
+         "internal_state": {"communicative_resonance": .9}},
+    )
+    ordinary = evaluate_utterance_memory_hook(
+        {"utterance": "ordinary sentence"},
+        {"id": "event:2", "situation_tags": ["conversation"], "internal_state": {}},
+    )
+    rephrased = evaluate_utterance_memory_hook(
+        {"utterance": "History is memory in a way.",
+         "meaning_references": ["meaning:history"]},
+        {"id": "event:3", "situation_tags": ["relationship"],
+         "internal_state": {"communicative_resonance": .9}},
+        rephrasing_candidates=[{
+            "text": "Project history is developmental memory.",
+            "meaning_references": ["meaning:history"], "confidence": .9,
+            "purpose": "clarity", "provenance": ["semantic:1", "social:1"],
+        }],
+    )
+    bridge_source = Path("discord_bridge.py").read_text(encoding="utf-8")
+    return _capability([
+        {"case": "deictics cannot become lexical recall subjects", "component": "grounding",
+         "correct": subjects == ["sentences"]},
+        {"case": "ordinary proposals do not trigger generic recall replies", "component": "pragmatics",
+         "correct": not is_explicit_grounding_request("Maybe help ya store sentences")
+         and is_explicit_grounding_request("What does sentences mean?")},
+        {"case": "whole utterances survive the rebuildable graph projection", "component": "memory",
+         "correct": retained["retained"] and not ordinary["retained"]
+         and retained["independent_origins"] == 2},
+        {"case": "project history is bounded developmental memory", "component": "continuity",
+         "correct": history["memory_relationship"] == "part_of_developmental_memory"
+         and history["read_only"] and not history["direct_experience"]
+         and 'conversation_scene_show_memory_consideration", False' in bridge_source},
+        {"case": "rephrasing preserves source and meaning", "component": "revision",
+         "correct": rephrased["surface_kind"] == "rephrased"
+         and rephrased["source_unchanged"] and rephrased["rephrasing"]["status"] == "selected"},
+        {"case": "repair may edit only Ina-authored Discord messages", "component": "delivery",
+         "correct": "_edit_own_discord_message" in bridge_source
+         and "not authored by Ina" in bridge_source and 'action == "edit"' in bridge_source},
+    ])
 def _text_vocab_lookup_v1() -> dict[str, Any]:
     return _capability([
         {"case": "reply lookup avoids full mapping materialisation", "component": "latency", "correct": False},
@@ -2077,6 +2141,10 @@ _REGISTRY = {
     "transformer_comparison": (
         ModuleVersion("transformer_comparison", "V1", "No task-specific architecture comparison guidance", _transformer_comparison_v1),
         ModuleVersion("transformer_comparison", "V2", "Repeated multi-signal comparison with improvement routing", _transformer_comparison_v2),
+    ),
+    "conversational_expression": (
+        ModuleVersion("conversational_expression", "V1", "Word-triggered recall and ambiguous project history", _conversational_expression_v1),
+        ModuleVersion("conversational_expression", "V2", "Pragmatic recall gating, sentence projection, and developmental history", _conversational_expression_v2),
     ),
     "text_vocab_lookup": (
         ModuleVersion("text_vocab_lookup", "V1", "Full durable-tier meaning-map materialisation per reply", _text_vocab_lookup_v1),

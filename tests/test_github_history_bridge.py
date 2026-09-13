@@ -44,3 +44,13 @@ def test_commit_as_text_describes_evolution_without_diff():
     assert "Refine curiosity" in text
     assert "eq_engine.py" in text
     assert "8 insertions and 3 deletions" in text
+    assert "part of developmental memory" in text
+    assert "not direct autobiographical experience" in text
+
+
+def test_commit_history_is_classified_as_bounded_developmental_memory():
+    witness = ghb.commit_memory_witness({"hash": "a" * 40})
+    assert witness["memory_relationship"] == "part_of_developmental_memory"
+    assert witness["read_only"] is True
+    assert witness["direct_experience"] is False
+    assert witness["authorship_claimed"] is False
