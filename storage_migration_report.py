@@ -156,6 +156,40 @@ def _render_detailed(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _report_signal(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only material, review-relevant state; omit date and score drift."""
+    decisions = report.get("decisions") if isinstance(report.get("decisions"), dict) else {}
+    migrations = report.get("recent_migrations") or []
+    migration_attention = any(
+        item.get("status") != "ok" or item.get("failed") or item.get("conflicts")
+        for item in migrations if isinstance(item, dict)
+    )
+    fragment_root = report.get("directories", {}).get("fragment_root", {})
+    devices = report.get("devices") if isinstance(report.get("devices"), dict) else {}
+    device_health = {
+        str(name): {
+            "failures": int(item.get("failures") or 0),
+            "low_free_space": float(item.get("free_ratio") or 0.0) < 0.08,
+        }
+        for name, item in sorted(devices.items()) if isinstance(item, dict)
+    }
+    return {
+        "tiers": {str(name): str(item.get("tier") or "unknown")
+                  for name, item in sorted(decisions.items()) if isinstance(item, dict)},
+        "legacy_root_files": int(fragment_root.get("files") or 0),
+        "fragment_scan_truncated": bool(fragment_root.get("sample_truncated")),
+        "migration_attention": bool(migration_attention),
+        "device_health": device_health,
+    }
+
+
+def _signal_is_actionable(signal: Dict[str, Any]) -> bool:
+    if signal.get("legacy_root_files") or signal.get("fragment_scan_truncated") or signal.get("migration_attention"):
+        return True
+    return any(item.get("failures") or item.get("low_free_space")
+               for item in signal.get("device_health", {}).values())
+
+
 def maybe_queue_daily_migration_report(child: str, config: Dict[str, Any], *, now: Optional[datetime] = None, force: bool = False) -> Dict[str, Any]:
     policy = report_policy(config)
     if not bool(policy.get("enabled", False)):
@@ -170,17 +204,34 @@ def maybe_queue_daily_migration_report(child: str, config: Dict[str, Any], *, no
     report = build_daily_migration_report(child, config, now=stamp)
     preference = load_report_preferences(child, policy)
     detail, delivery = preference["detail_level"], preference["delivery"]
+    signal = _report_signal(report)
+    prior_signal = prior.get("report_signal") if isinstance(prior.get("report_signal"), dict) else None
+    changed = prior_signal is not None and prior_signal != signal
+    actionable = _signal_is_actionable(signal)
     result = {"queued": False, "reason": "delivery_disabled", "delivery": delivery, "detail_level": detail}
-    if delivery == "github" and bool(policy.get("queue_github_issue", True)):
+    if prior_signal == signal:
+        result["reason"] = "unchanged"
+    elif prior_signal is None and not actionable:
+        result["reason"] = "baseline_recorded"
+    elif delivery == "github" and bool(policy.get("queue_github_issue", True)):
         body = _render_detailed(report) if detail == "detailed" else _render_abstract(report)
-        public_metadata = {"source": "daily_storage_migration_report", "disclosure": detail}
+        public_metadata = {
+            "source": "storage_migration_state_change" if changed else "storage_migration_actionable_baseline",
+            "disclosure": detail,
+            "state_changed": changed,
+        }
         result = report_github_finding(child, f"Daily storage migration report — {report['date']}", body, kind="issue", component="adaptive_storage", severity="low", confidence=1.0, evidence=[] if detail == "abstract" else [f"adaptive state updated at {report.get('adaptive_state_updated_at')}"], suggestion="Ina may disclose more publicly or route detail privately through Discord.", touched_files=[] if detail == "abstract" else ["adaptive_storage.py", "storage_layout.py", "memory_graph.py"], dedupe_key=f"daily-storage-migration:{report['date']}", metadata=public_metadata, cfg=config)
         result.update(delivery="github", detail_level=detail)
     elif delivery == "discord":
         entry_id = append_typed_outbox_notice(child, _render_detailed(report), target="owner_dm", metadata={"source": "daily_storage_migration_report", "privacy": "private", "chosen_by": "ina_preference"})
         result = {"queued": bool(entry_id), "entry_id": entry_id, "reason": "queued_private" if entry_id else "discord_queue_failed", "delivery": "discord", "detail_level": "private"}
-    if result.get("queued"):
-        _save_report_state(child, policy, {"last_report_at": stamp.isoformat(), "last_report_date": report["date"], "entry_id": result.get("entry_id"), "delivery": result.get("delivery"), "detail_level": result.get("detail_level")})
+    state = {
+        "last_report_at": stamp.isoformat(), "last_report_date": report["date"],
+        "entry_id": result.get("entry_id") or prior.get("entry_id"),
+        "delivery": result.get("delivery"), "detail_level": result.get("detail_level"),
+        "report_signal": signal, "last_result": result.get("reason"),
+    }
+    _save_report_state(child, policy, state)
     result["report"] = report
     return result
 

@@ -33,6 +33,7 @@ from github_submission import (
 logger = logging.getLogger("github_bridge")
 _LOCK_HANDLE = None
 _LAST_FEEDBACK_CHECK = 0.0
+MAX_STALE_ARCHIVES_PER_PASS = 128
 
 
 def _acquire_single_instance_lock(child: str) -> bool:
@@ -84,6 +85,40 @@ def maybe_check_issue_feedback(*, force: bool = False) -> Optional[dict]:
     return result
 
 
+def archive_stale_entries_without_delivery(
+    child: str, cfg: dict, *, max_entries: int = MAX_STALE_ARCHIVES_PER_PASS,
+) -> int:
+    """Archive expired local records even when remote authentication is absent."""
+    ceiling = max(1, min(MAX_STALE_ARCHIVES_PER_PASS, int(max_entries)))
+    completed = load_completed_history_ids(child)
+    archived = 0
+    while archived < ceiling:
+        entries = read_pending_entries(child, cfg=cfg, seen_ids=completed)
+        stale = [entry for entry in entries if entry.get("_stale")]
+        if not stale:
+            break
+        for entry in stale:
+            entry_id = str(entry.get("id") or "").strip()
+            if not entry_id:
+                continue
+            # JSONL archive/history are the append-only sources consumed by the
+            # bridge. Projection backfill is separate, so a busy SQLite ledger
+            # cannot block local queue hygiene.
+            archive_entry(
+                child, entry, "stale", record_event_ledger=False,
+                update_hot_projection=False,
+            )
+            log_history(
+                child, entry_id, "archived", reason="stale", record_event_ledger=False,
+                update_hot_projection=False,
+            )
+            completed.add(entry_id)
+            archived += 1
+            if archived >= ceiling:
+                break
+    return archived
+
+
 def process_once() -> int:
     cfg = load_config()
     child = get_current_child(cfg)
@@ -106,6 +141,12 @@ def process_once() -> int:
     if policy.get("delivery_mode") != "issues":
         logger.info("GitHub delivery mode is %s; queue will not be delivered.", policy.get("delivery_mode"))
         return 0
+
+
+    stale_archived = archive_stale_entries_without_delivery(child, cfg)
+    if stale_archived:
+        logger.info("Archived %s stale local GitHub outbox entr%s.", stale_archived,
+                    "y" if stale_archived == 1 else "ies")
 
     try:
         resolve_github_token(cfg, policy)
@@ -130,6 +171,8 @@ def process_once() -> int:
         entry_id = str(entry.get("id") or "").strip()
         if not entry_id:
             continue
+        # Expiry is handled before authentication. Retain this guard for a
+        # clock-boundary transition between local maintenance and delivery.
         if entry.get("_stale"):
             archive_entry(child, entry, "stale")
             log_history(child, entry_id, "archived", reason="stale")

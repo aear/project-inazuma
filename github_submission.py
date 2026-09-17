@@ -12,7 +12,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from discord_runtime import typed_outbox_path as resolve_typed_outbox_path
-from outbox_event_store import record_configured_event
+from outbox_event_store import durable_database_path, record_configured_event, record_event
 
 DEFAULT_GITHUB_SUBMISSION: Dict[str, Any] = {
     "enabled": False,
@@ -620,7 +620,27 @@ def read_pending_entries(child: str, cfg: Optional[Dict[str, Any]] = None, seen_
     return pending
 
 
-def log_history(child: str, entry_id: str, status: str, **extra: Any) -> bool:
+def _record_github_event(
+    child: str, event_type: str, payload: Dict[str, Any], *, update_hot_projection: bool,
+) -> None:
+    if update_hot_projection:
+        cfg = load_config()
+        record_configured_event(
+            child=child, channel="github", event_type=event_type, payload=payload,
+            typed_path=resolve_typed_outbox_path(child, cfg),
+        )
+        return
+    record_event(
+        channel="github", event_type=event_type, payload=payload,
+        durable_path=durable_database_path(child), hot_path=None,
+    )
+
+
+def log_history(
+    child: str, entry_id: str, status: str, *, record_event_ledger: bool = True,
+    update_hot_projection: bool = True,
+    **extra: Any,
+) -> bool:
     payload = {
         "id": str(entry_id or "").strip(),
         "status": str(status or "").strip().lower(),
@@ -631,29 +651,31 @@ def log_history(child: str, entry_id: str, status: str, **extra: Any) -> bool:
         return False
     written = _append_jsonl(github_outbox_history_path(child), payload)
     cfg = load_config()
-    if written and child == get_current_child(cfg):
+    if written and record_event_ledger and child == get_current_child(cfg):
         try:
-            record_configured_event(
-                child=child, channel="github", event_type="history", payload=payload,
-                typed_path=resolve_typed_outbox_path(child, cfg),
+            _record_github_event(
+                child, "history", payload, update_hot_projection=update_hot_projection,
             )
         except Exception:
             pass
     return written
 
 
-def archive_entry(child: str, entry: Dict[str, Any], reason: str, **extra: Any) -> bool:
+def archive_entry(
+    child: str, entry: Dict[str, Any], reason: str, *, record_event_ledger: bool = True,
+    update_hot_projection: bool = True,
+    **extra: Any,
+) -> bool:
     payload = dict(entry)
     payload["archive_reason"] = str(reason or "").strip().lower()
     payload["archived_at"] = datetime.now(timezone.utc).isoformat()
     payload.update({key: value for key, value in extra.items() if value is not None})
     written = _append_jsonl(github_outbox_archive_path(child), payload)
     cfg = load_config()
-    if written and child == get_current_child(cfg):
+    if written and record_event_ledger and child == get_current_child(cfg):
         try:
-            record_configured_event(
-                child=child, channel="github", event_type="archived", payload=payload,
-                typed_path=resolve_typed_outbox_path(child, cfg),
+            _record_github_event(
+                child, "archived", payload, update_hot_projection=update_hot_projection,
             )
         except Exception:
             pass

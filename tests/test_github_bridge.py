@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -61,5 +62,33 @@ def test_process_once_reports_rejected_auth_without_consuming_entry(monkeypatch)
         assert not gs.github_outbox_history_path(child).exists()
         state = json.loads(gs.github_auth_health_path(child).read_text())
         assert state["status"] == "unavailable"
+    finally:
+        _cleanup_child(child)
+
+
+def test_process_once_archives_stale_entries_without_token(monkeypatch):
+    child = "TestGitHubBridgeStaleNoToken"
+    _cleanup_child(child)
+    try:
+        cfg = {
+            "current_child": child,
+            "github_submission": {
+                "enabled": True, "delivery_mode": "issues", "repo_full_name": "owner/repo",
+                "max_batch": 2, "max_age_minutes": 60,
+            },
+        }
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        ids = [gs.append_github_issue_entry(child, f"Old {index}", "Expired") for index in range(5)]
+        outbox = gs.github_outbox_path(child)
+        entries = [json.loads(line) for line in outbox.read_text(encoding="utf-8").splitlines()]
+        for entry in entries:
+            entry["created_at"] = old
+        outbox.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+        monkeypatch.setattr(gb, "load_config", lambda: cfg)
+
+        assert gb.process_once() == 0
+        completed = gs.load_completed_history_ids(child)
+        assert all(entry_id in completed for entry_id in ids)
+        assert gs.read_pending_entries(child, cfg=cfg) == []
     finally:
         _cleanup_child(child)
