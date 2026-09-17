@@ -20,6 +20,16 @@ class FakeRoom:
         }
 
 
+def honest(**extra):
+    return {
+        **extra,
+        "honesty": {
+            "complete": True, "failures": [], "uncertainties": [],
+            "unavailable_measurements": [], "conflicting_evidence": [],
+        },
+    }
+
+
 def test_question_to_judgement_is_reproducible_and_separate_from_promotion(tmp_path):
     lab = CodeExperimentLab(tmp_path, rooms={"fake-python": FakeRoom()})
     experiment = lab.create(
@@ -28,7 +38,7 @@ def test_question_to_judgement_is_reproducible_and_separate_from_promotion(tmp_p
     )
     result = lab.run(experiment["experiment_id"])
     decision = lab.judge(
-        experiment["experiment_id"], choice="keep", metrics={"score": 5},
+        experiment["experiment_id"], choice="keep", metrics=honest(score=5),
         explanation="The bounded comparison matched the prediction.",
     )
     proposal = lab.proposal_summary(experiment["experiment_id"])
@@ -113,7 +123,7 @@ def test_strong_storage_evidence_can_become_review_issue_with_code(tmp_path):
     )
     lab.run(experiment["experiment_id"])
     lab.judge(
-        experiment["experiment_id"], choice="keep", metrics={"latency_ratio": 0.5},
+        experiment["experiment_id"], choice="keep", metrics=honest(latency_ratio=0.5),
         explanation="The candidate reduced measured latency.",
     )
     queued = lab.queue_review_issue(
@@ -134,3 +144,39 @@ def test_storage_experiment_goal_rejects_weak_evidence(tmp_path):
             evidence_report={"operation": "lookup", "artifact_class": "index", "summary": {"strong": False}},
             hypothesis="Maybe faster.", code="pass", room="fake-python",
         )
+
+
+def test_honesty_disclosure_precedes_correctness_or_efficiency(tmp_path):
+    lab = CodeExperimentLab(tmp_path / "lab", rooms={"fake-python": FakeRoom()})
+    experiment = lab.create(question="Q?", hypothesis="Fast and correct.", code="pass", room="fake-python")
+    lab.run(experiment["experiment_id"])
+    with pytest.raises(ValueError, match="honesty disclosure"):
+        lab.judge(experiment["experiment_id"], choice="keep",
+                  metrics={"correctness": 1.0, "speedup": 100.0}, explanation="Looks perfect.")
+
+
+def test_connectome_design_requires_full_evidence_and_human_review_flag(tmp_path):
+    lab = CodeExperimentLab(tmp_path / "lab", rooms={"fake-python": FakeRoom()})
+    experiment = lab.create_connectome_design_goal(
+        question="Can a sparse candidate preserve capability?", hypothesis="A modular graph can.",
+        code="print('candidate')", room="fake-python", dataset=[1],
+        reference_snapshots=[{"snapshot_id": "snapshot-1", "source_sha256": "a" * 64}],
+        objectives=["preserve capability"], constraints=["never write live maps"],
+        baseline={"version": "V1", "score": 0.5},
+    )
+    lab.run(experiment["experiment_id"])
+    with pytest.raises(ValueError, match="full testing"):
+        lab.judge(experiment["experiment_id"], choice="keep", metrics=honest(), explanation="Incomplete.")
+
+    dimensions = experiment["goal_context"]["required_test_dimensions"]
+    metrics = honest(
+        testing={name: {"status": "pass", "evidence": [f"measurement:{name}"]} for name in dimensions},
+        held_out_cases=["held-out-1"], adversarial_cases=["lesion-1"],
+        source_copy_unchanged=True, live_write_attempted=False,
+    )
+    lab.judge(experiment["experiment_id"], choice="keep", metrics=metrics,
+              explanation="All declared dimensions measured; limitations disclosed.")
+    proposal = lab.proposal_summary(experiment["experiment_id"])
+    assert proposal["promotion_state"] == "review-required"
+    assert "connectome-design" in proposal["review_flags"]
+    assert proposal["goal_context"]["live_write_capability"] is False

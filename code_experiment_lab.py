@@ -24,6 +24,14 @@ from io_utils import atomic_write_json
 
 
 SCHEMA = "ina.code_experiment/V1"
+EXPERIMENT_POLICY = {
+    "schema": "ina.experiment_policy/V2",
+    "priority_order": ("honesty", "safety", "correctness", "efficiency"),
+    "honesty_requirements": (
+        "failures", "uncertainties", "unavailable_measurements", "conflicting_evidence",
+    ),
+    "incomplete_disclosure_blocks_review": True,
+}
 MAX_SOURCE_BYTES = 64 * 1024
 MAX_DATASET_BYTES = 2 * 1024 * 1024
 MAX_SUPPORT_BYTES = 256 * 1024
@@ -270,6 +278,7 @@ class CodeExperimentLab:
             "source_sha256": _digest(source), "dataset_sha256": _digest(dataset_bytes),
             "support_files": support_manifest,
             "goal_context": goal_context_payload,
+            "experiment_policy": EXPERIMENT_POLICY,
             "status": "created", "created_at": _now(),
         }
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
@@ -281,6 +290,40 @@ class CodeExperimentLab:
         manifest["cycle_id"] = cycle["cycle_id"]
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
         return manifest
+
+    def create_connectome_design_goal(
+        self, *, question: str, hypothesis: str, code: str,
+        reference_snapshots: list[Mapping[str, Any]], objectives: list[str],
+        constraints: list[str], baseline: Mapping[str, Any], dataset: Any = None,
+        room: str = "python-scratch", support_files: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a copy-only connectome design study with a hard review gate."""
+        if not reference_snapshots:
+            raise ValueError("at least one content-addressed reference snapshot is required")
+        for reference in reference_snapshots:
+            if not reference.get("snapshot_id") or not reference.get("source_sha256"):
+                raise ValueError("each reference snapshot needs snapshot_id and source_sha256")
+        if not objectives or not constraints or not baseline:
+            raise ValueError("objectives, constraints, and a retained baseline are required")
+        return self.create(
+            question=question, hypothesis=hypothesis, code=code, dataset=dataset, room=room,
+            support_files=support_files, autonomous_continuation_budget=0,
+            goal_context={
+                "goal_kind": "connectome_design",
+                "reference_snapshots": [dict(item) for item in reference_snapshots],
+                "objectives": [str(item) for item in objectives],
+                "constraints": [str(item) for item in constraints],
+                "baseline": dict(baseline),
+                "source_graph_access": "read-only",
+                "candidate_scope": "isolated-copy-only",
+                "live_write_capability": False,
+                "required_review": "human",
+                "required_test_dimensions": [
+                    "capability", "correctness", "safety", "robustness", "resource_use",
+                    "background_interference", "human_visible_quality", "rollback",
+                ],
+            },
+        )
 
     def create_storage_optimization_goal(
         self, *, evidence_report: Mapping[str, Any], hypothesis: str, code: str,
@@ -330,11 +373,47 @@ class CodeExperimentLab:
         if manifest.get("status") != "awaiting_judgement":
             raise RuntimeError("a completed run is required before judgement")
         explanation = _bounded_text(explanation, "explanation")
-        evaluation = {"metrics": dict(metrics), "explanation": explanation}
+        metrics_payload = dict(metrics)
+        if (manifest.get("experiment_policy") or {}).get("schema") == "ina.experiment_policy/V2":
+            self._validate_honesty_disclosure(metrics_payload)
+        context = dict(manifest.get("goal_context") or {})
+        if context.get("goal_kind") == "connectome_design":
+            self._validate_connectome_evidence(metrics_payload, context)
+        evaluation = {"metrics": metrics_payload, "explanation": explanation,
+                      "priority_order": list(EXPERIMENT_POLICY["priority_order"])}
         decision = self.cycles.record_choice(str(manifest["cycle_id"]), choice, evaluation=evaluation)
         manifest.update({"status": "judged", "decision_id": decision["decision_id"], "updated_at": _now()})
         atomic_write_json(directory / "manifest.json", manifest, indent=2, ensure_ascii=False)
         return decision
+
+    @staticmethod
+    def _validate_honesty_disclosure(metrics: Mapping[str, Any]) -> None:
+        disclosure = metrics.get("honesty")
+        required = EXPERIMENT_POLICY["honesty_requirements"]
+        if not isinstance(disclosure, Mapping) or disclosure.get("complete") is not True:
+            raise ValueError("complete honesty disclosure is required before judgement")
+        missing = [key for key in required if key not in disclosure or not isinstance(disclosure[key], list)]
+        if missing:
+            raise ValueError(f"honesty disclosure is missing explicit fields: {missing}")
+
+    @staticmethod
+    def _validate_connectome_evidence(metrics: Mapping[str, Any], context: Mapping[str, Any]) -> None:
+        testing = metrics.get("testing")
+        if not isinstance(testing, Mapping):
+            raise ValueError("connectome design requires full testing evidence")
+        missing = []
+        for dimension in context.get("required_test_dimensions") or ():
+            result = testing.get(dimension)
+            if not isinstance(result, Mapping) or result.get("status") not in {"pass", "fail", "unavailable"}:
+                missing.append(str(dimension))
+            elif not isinstance(result.get("evidence"), list) or not result["evidence"]:
+                missing.append(str(dimension))
+        if missing:
+            raise ValueError(f"connectome testing is incomplete for: {missing}")
+        if not metrics.get("held_out_cases") or not metrics.get("adversarial_cases"):
+            raise ValueError("connectome design requires held-out and adversarial cases")
+        if metrics.get("source_copy_unchanged") is not True or metrics.get("live_write_attempted") is not False:
+            raise ValueError("connectome design must prove source-copy integrity and no live write")
 
     def proposal_summary(self, experiment_id: str) -> dict[str, Any]:
         """Prepare review evidence; intentionally never edits or commits production code."""
@@ -348,6 +427,10 @@ class CodeExperimentLab:
             "dataset_sha256": manifest["dataset_sha256"], "decision": cycle.get("last_choice"),
             "run_record": str(directory / f"{manifest['run_id']}.json"),
             "goal_context": dict(manifest.get("goal_context") or {}),
+            "experiment_policy": dict(manifest.get("experiment_policy") or {}),
+            "review_flags": (["connectome-design", "full-test-evidence-required", "human-review-required"]
+                             if (manifest.get("goal_context") or {}).get("goal_kind") == "connectome_design"
+                             else ["human-review-required"]),
             "promotion_state": "review-required", "production_tree_modified": False,
         }
 

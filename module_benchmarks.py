@@ -184,6 +184,41 @@ def _capability(cases: list[dict[str, Any]]) -> dict[str, Any]:
     return {"correct": sum(bool(case.get("correct")) for case in cases), "total": len(cases), "cases": cases}
 
 
+def _connectome_research_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "source provenance is retained", "component": "provenance", "correct": False},
+        {"case": "experiments mutate copies only", "component": "safety", "correct": False},
+        {"case": "claims use several graph witnesses", "component": "evidence", "correct": False},
+        {"case": "EEG reference layer cannot alter live maps", "component": "observability", "correct": False},
+        {"case": "large datasets have bounded acquisition policy", "component": "resources", "correct": False},
+    ])
+
+
+def _connectome_research_v2() -> dict[str, Any]:
+    from connectome_research import Edge, ReferenceSnapshot, compare_signals, eeg_overlay, graph_signals, mutate_copy
+    source = ReferenceSnapshot(
+        dataset="celegans", version="benchmark", source_uri="fixture://bounded",
+        source_sha256="b" * 64,
+        edges=(Edge("sense", "relay", 3), Edge("relay", "motor", 2), Edge("motor", "relay", 1)),
+    )
+    candidate = mutate_copy(source, [{"op": "scale", "index": 0, "factor": 0.5}])
+    signals = graph_signals(source)
+    comparison = compare_signals(source, candidate)
+    overlay = eeg_overlay(candidate, max_nodes=3, max_edges=3, seed=1)
+    return _capability([
+        {"case": "source provenance is retained", "component": "provenance",
+         "correct": len(source.source_sha256) == 64 and bool(source.source_uri)},
+        {"case": "experiments mutate copies only", "component": "safety",
+         "correct": source.edges[0].weight == 3 and candidate.parent_sha256 == source.snapshot_id},
+        {"case": "claims use several graph witnesses", "component": "evidence",
+         "correct": len(signals["witnesses"]) >= 3},
+        {"case": "EEG reference layer cannot alter live maps", "component": "observability",
+         "correct": overlay["mode"] == "experimental_copy" and overlay["live_neural_map_modified"] is False},
+        {"case": "large datasets have bounded acquisition policy", "component": "resources",
+         "correct": comparison["promotion_state"] == "review-required"},
+    ])
+
+
 def _conventional_transformer_v1() -> dict[str, Any]:
     return _capability([
         {"case": "causal multi-head self-attention exists", "component": "architecture", "correct": False},
@@ -1509,6 +1544,24 @@ def _code_experiment_lab_v3() -> dict[str, Any]:
     return _capability(cases)
 
 
+def _code_experiment_lab_v4() -> dict[str, Any]:
+    source = Path("code_experiment_lab.py").read_text(encoding="utf-8")
+    cases = list(_code_experiment_lab_v3()["cases"])
+    cases.extend([
+        {"case": "honesty precedes safety correctness and efficiency", "component": "governance",
+         "correct": '("honesty", "safety", "correctness", "efficiency")' in source},
+        {"case": "missing disclosure blocks judgement", "component": "honesty",
+         "correct": "_validate_honesty_disclosure" in source and "incomplete_disclosure_blocks_review" in source},
+        {"case": "original connectomes remain isolated copies", "component": "safety",
+         "correct": "create_connectome_design_goal" in source and '"live_write_capability": False' in source},
+        {"case": "connectome promotion requires multidimensional testing", "component": "evaluation",
+         "correct": "_validate_connectome_evidence" in source and "held_out_cases" in source and "adversarial_cases" in source},
+        {"case": "connectome proposals are conspicuously review flagged", "component": "review",
+         "correct": '"connectome-design"' in source and '"human-review-required"' in source},
+    ])
+    return _capability(cases)
+
+
 def _fault_pattern_research_v1() -> dict[str, Any]:
     return _capability([
         {"case": name, "component": component, "correct": False}
@@ -2049,6 +2102,10 @@ _HISTORY_BACKED_MODULES = {
 
 
 _REGISTRY = {
+    "connectome_research": (
+        ModuleVersion("connectome_research", "V1", "No governed connectome reference path", _connectome_research_v1),
+        ModuleVersion("connectome_research", "V2", "Immutable references, copy-only mutation, and bounded EEG overlays", _connectome_research_v2),
+    ),
     "conventional_transformer": (
         ModuleVersion("conventional_transformer", "V1", "No conventional attention baseline", _conventional_transformer_v1),
         ModuleVersion("conventional_transformer", "V2", "Benchmark-only conventional decoder Transformer", _conventional_transformer_v2),
@@ -2113,6 +2170,7 @@ _REGISTRY = {
         ModuleVersion("code_experiment_lab", "V1", "No governed executable experiment room", _code_experiment_lab_v1),
         ModuleVersion("code_experiment_lab", "V2", "Bounded reproducible Python experiments with review-only promotion", _code_experiment_lab_v2),
         ModuleVersion("code_experiment_lab", "V3", "Evidence-triggered storage optimisation goals with code review issues", _code_experiment_lab_v3),
+        ModuleVersion("code_experiment_lab", "V4", "Honesty-first experiments and review-gated connectome design", _code_experiment_lab_v4),
     ),
     "fault_pattern_research": (
         ModuleVersion("fault_pattern_research", "V1", "No dedicated fault-pattern research instruments", _fault_pattern_research_v1),
