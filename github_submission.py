@@ -462,6 +462,33 @@ def _save_finding_state(child: str, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def submitted_issue_for_entry(child: str, entry_id: Any) -> Optional[Dict[str, Any]]:
+    """Return the latest inspectable GitHub submission record for an outbox entry."""
+    target = str(entry_id or "").strip()
+    if not target:
+        return None
+    for item in reversed(_load_history_entries(child)):
+        if str(item.get("id") or item.get("entry_id") or "").strip() != target:
+            continue
+        if str(item.get("status") or "").strip().lower() != "submitted":
+            continue
+        issue_url = str(item.get("issue_url") or "").strip()
+        if issue_url:
+            return {"entry_id": target, "issue_number": item.get("issue_number"), "issue_url": issue_url}
+    return None
+
+
+def _clean_issue_references(values: Optional[Iterable[Any]]) -> List[str]:
+    references: List[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in references:
+            continue
+        if text.startswith(("https://github.com/", "http://github.com/")) or re.fullmatch(r"#[1-9]\d*", text):
+            references.append(text)
+    return references[:8]
+
+
 def report_github_finding(
     child: str,
     title: str,
@@ -478,6 +505,7 @@ def report_github_finding(
     impact: Optional[str] = None,
     suggestion: Optional[str] = None,
     touched_files: Optional[List[str]] = None,
+    related_issues: Optional[List[str]] = None,
     dedupe_key: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
@@ -511,8 +539,12 @@ def report_github_finding(
     if steps:
         lines.extend(["", "## Reproduction Steps"])
         lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
+    issue_references = _clean_issue_references(related_issues)
+    previous = submitted_issue_for_entry(child, prior.get("entry_id"))
+    if previous and previous["issue_url"] not in issue_references:
+        issue_references.insert(0, previous["issue_url"])
     meta = dict(metadata or {})
-    meta.update({"source": meta.get("source") or "ina_finding", "component": str(component or "unknown"), "severity": str(severity or "medium").lower(), "confidence": round(score, 3), "finding_fingerprint": fingerprint, "evidence": [str(item).strip() for item in (evidence or []) if str(item).strip()], "touched_files": [str(item).strip() for item in (touched_files or []) if str(item).strip()]})
+    meta.update({"source": meta.get("source") or "ina_finding", "component": str(component or "unknown"), "severity": str(severity or "medium").lower(), "confidence": round(score, 3), "finding_fingerprint": fingerprint, "evidence": [str(item).strip() for item in (evidence or []) if str(item).strip()], "touched_files": [str(item).strip() for item in (touched_files or []) if str(item).strip()], "related_issues": issue_references})
     entry_id = append_github_issue_entry(child, title_text, "\n".join(lines), kind=normalized_kind, labels=labels_for_kind(normalized_kind, cfg), metadata=meta, delivery_choice=delivery_choice)
     if not entry_id: return {"queued": False, "reason": "queue_write_failed", "fingerprint": fingerprint}
     normalized_choice = str(delivery_choice or "submit").strip().lower()
@@ -521,7 +553,7 @@ def report_github_finding(
     state[fingerprint] = {"entry_id": entry_id, "kind": normalized_kind, "title": title_text, "last_queued_at": now.isoformat()}
     try: _save_finding_state(child, state)
     except Exception: pass
-    return {"queued": True, "entry_id": entry_id, "kind": normalized_kind, "fingerprint": fingerprint, "delivery_choice": normalized_choice}
+    return {"queued": True, "entry_id": entry_id, "kind": normalized_kind, "fingerprint": fingerprint, "delivery_choice": normalized_choice, "related_issues": issue_references}
 
 def _entry_timestamp(entry: Dict[str, Any]) -> Optional[datetime]:
     created_at = entry.get("created_at")
@@ -732,6 +764,9 @@ def build_issue_body(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None
     touched_files = metadata.get("touched_files") if isinstance(metadata.get("touched_files"), list) else []
     evidence = metadata.get("evidence") if isinstance(metadata.get("evidence"), list) else []
     review_notes = metadata.get("review_notes") if isinstance(metadata.get("review_notes"), list) else []
+    related_issues = _clean_issue_references(
+        metadata.get("related_issues") if isinstance(metadata.get("related_issues"), list) else []
+    )
     confidence = metadata.get("confidence")
     source = str(metadata.get("source") or "internal")
     submission_mode = str(metadata.get("submission_mode") or "").strip().lower()
@@ -767,6 +802,11 @@ def build_issue_body(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None
             text = str(item or "").strip()
             if text:
                 lines.append(f"- {text}")
+
+    if related_issues:
+        lines.append("")
+        lines.append("## Related Issues")
+        lines.extend(f"- {reference}" for reference in related_issues)
 
     if touched_files:
         lines.append("")
@@ -882,5 +922,6 @@ __all__ = [
     "report_github_finding",
     "resolve_github_token",
     "submit_issue",
+    "submitted_issue_for_entry",
     "typed_outbox_path",
 ]

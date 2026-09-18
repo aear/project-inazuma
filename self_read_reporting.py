@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from github_submission import get_current_child, get_github_submission_config, load_completed_history_ids, load_config
+from github_submission import (
+    get_current_child,
+    get_github_submission_config,
+    load_completed_history_ids,
+    load_config,
+    submitted_issue_for_entry,
+)
 
 INCIDENT_LOG_FILENAME = "self_read_incidents.jsonl"
 INCIDENT_STATE_FILENAME = "self_read_incident_state.json"
@@ -117,6 +123,7 @@ def _queue_broken_pipe_issue(
     path_text: Optional[str],
     source_message: Optional[str],
     fingerprint: str,
+    related_issues: Optional[list[str]] = None,
 ) -> Optional[str]:
     cfg = load_config()
     policy = get_github_submission_config(cfg)
@@ -180,6 +187,7 @@ def _queue_broken_pipe_issue(
             "notify_discord_on_submit": True,
             "discord_reason": "self_read_broken_pipe",
             "discord_explanation": explanation,
+            "related_issues": list(related_issues or []),
         },
     )
 
@@ -216,6 +224,9 @@ def report_self_read_broken_pipe(
 
     issue_entry_id = None
     if should_queue_issue:
+        previous_issue = submitted_issue_for_entry(
+            child_name, prior.get("last_issue_entry_id") if isinstance(prior, dict) else None,
+        )
         issue_entry_id = _queue_broken_pipe_issue(
             child=child_name,
             component=component,
@@ -225,6 +236,7 @@ def report_self_read_broken_pipe(
             path_text=path_text,
             source_message=source_message,
             fingerprint=fingerprint,
+            related_issues=[previous_issue["issue_url"]] if previous_issue else [],
         )
 
     incident = {

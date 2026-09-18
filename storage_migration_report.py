@@ -122,6 +122,9 @@ def _render_abstract(report: Dict[str, Any]) -> str:
     decisions = report.get("decisions", {})
     tiers = sorted({str(item.get("tier") or "unknown") for item in decisions.values() if isinstance(item, dict)})
     organisation_attention = bool(report.get("directories", {}).get("fragment_root", {}).get("files", 0))
+    fragment_root = report.get("directories", {}).get("fragment_root", {})
+    legacy_files = int(fragment_root.get("files") or 0)
+    scan_status = "truncated" if fragment_root.get("sample_truncated") else "complete"
     migrations = report.get("recent_migrations") or []
     migration_health = "attention needed" if any(item.get("status") != "ok" or item.get("failed") or item.get("conflicts") for item in migrations) else ("verified" if migrations else "no recent recorded activity")
     lines = [
@@ -129,11 +132,37 @@ def _render_abstract(report: Dict[str, Any]) -> str:
         f"- Placement policy: {'active' if decisions else 'awaiting observations'}",
         f"- Rebuildable storage tiers currently in use: {', '.join(tiers) if tiers else 'not disclosed'}",
         f"- Organisation status: {'maintenance recommended' if organisation_attention else 'settled'}",
+        f"- Bounded organisation evidence: {legacy_files} legacy root file(s); fragment-root scan {scan_status}",
         f"- Recent migration verification: {migration_health}",
         "- No durable memories were moved by this report.", "",
         "Further internal detail is withheld by default. Ina may choose to explain more publicly or send a private report to her guardian via Discord.",
     ]
     return "\n".join(lines)
+
+
+def _public_actionable_evidence(report: Dict[str, Any]) -> list[str]:
+    """Expose bounded review evidence without publishing private paths or contents."""
+    fragment_root = report.get("directories", {}).get("fragment_root", {})
+    evidence = [
+        f"legacy_root_files={int(fragment_root.get('files') or 0)}",
+        f"fragment_scan_truncated={str(bool(fragment_root.get('sample_truncated'))).lower()}",
+    ]
+    migrations = [item for item in (report.get("recent_migrations") or []) if isinstance(item, dict)]
+    evidence.append(
+        "migration_attention=" + str(any(
+            item.get("status") != "ok" or item.get("failed") or item.get("conflicts")
+            for item in migrations
+        )).lower()
+    )
+    return evidence
+
+
+def _report_confidence(report: Dict[str, Any]) -> float:
+    """Calibrate confidence to bounded observation completeness, never certainty."""
+    fragment_root = report.get("directories", {}).get("fragment_root", {})
+    if not fragment_root.get("available", True) or fragment_root.get("sample_truncated"):
+        return 0.55
+    return 0.85
 
 
 def _render_detailed(report: Dict[str, Any]) -> str:
@@ -220,7 +249,10 @@ def maybe_queue_daily_migration_report(child: str, config: Dict[str, Any], *, no
             "disclosure": detail,
             "state_changed": changed,
         }
-        result = report_github_finding(child, f"Daily storage migration report — {report['date']}", body, kind="issue", component="adaptive_storage", severity="low", confidence=1.0, evidence=[] if detail == "abstract" else [f"adaptive state updated at {report.get('adaptive_state_updated_at')}"], suggestion="Ina may disclose more publicly or route detail privately through Discord.", touched_files=[] if detail == "abstract" else ["adaptive_storage.py", "storage_layout.py", "memory_graph.py"], dedupe_key=f"daily-storage-migration:{report['date']}", metadata=public_metadata, cfg=config)
+        evidence = _public_actionable_evidence(report)
+        if detail == "detailed":
+            evidence.append(f"adaptive state updated at {report.get('adaptive_state_updated_at')}")
+        result = report_github_finding(child, f"Daily storage migration report — {report['date']}", body, kind="issue", component="adaptive_storage", severity="low", confidence=_report_confidence(report), evidence=evidence, suggestion="Review the bounded evidence before approving any maintenance; route private detail through Discord if needed.", touched_files=[] if detail == "abstract" else ["adaptive_storage.py", "storage_layout.py", "memory_graph.py"], dedupe_key=f"daily-storage-migration:{report['date']}", metadata=public_metadata, cfg=config)
         result.update(delivery="github", detail_level=detail)
     elif delivery == "discord":
         entry_id = append_typed_outbox_notice(child, _render_detailed(report), target="owner_dm", metadata={"source": "daily_storage_migration_report", "privacy": "private", "chosen_by": "ina_preference"})

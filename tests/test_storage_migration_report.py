@@ -8,7 +8,7 @@ def _report(*, legacy_files=0, failed=0, fast_score=3.0):
         "date": "2026-09-17", "adaptive_state_updated_at": "now",
         "decisions": {"index": {"tier": "fast", "fast_score": fast_score, "durable_score": 2.0}},
         "devices": {"fast": {"failures": 0, "free_ratio": 0.8}},
-        "directories": {"fragment_root": {"files": legacy_files, "sample_truncated": False}},
+        "directories": {"fragment_root": {"available": True, "files": legacy_files, "sample_truncated": False}},
         "memory_tiers": {},
         "recent_migrations": ([{"status": "error", "failed": failed}] if failed else []),
         "recommendations": [], "safety": "recommendation_only",
@@ -49,3 +49,27 @@ def test_unchanged_daily_state_is_recorded_without_queueing(tmp_path, monkeypatc
     assert result["queued"] is False
     assert result["reason"] == "unchanged"
     assert calls == []
+
+
+def test_actionable_abstract_exposes_bounded_evidence_and_calibrates_confidence(tmp_path, monkeypatch):
+    child = "Ina"
+    report = _report(legacy_files=7)
+    policy = {
+        **smr.DEFAULT_POLICY, "enabled": True, "interval_hours": 1,
+        "state_path": str(tmp_path / "state.json"),
+        "preference_path": str(tmp_path / "preferences.json"),
+    }
+    cfg = {"storage_migration_reporting": policy}
+    captured = {}
+    monkeypatch.setattr(smr, "build_daily_migration_report", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(smr, "report_github_finding", lambda *_args, **kwargs: captured.update(kwargs) or {"queued": True})
+
+    result = smr.maybe_queue_daily_migration_report(
+        child, cfg, now=datetime(2026, 9, 18, tzinfo=timezone.utc),
+    )
+
+    assert result["queued"] is True
+    assert captured["confidence"] == 0.85
+    assert "legacy_root_files=7" in captured["evidence"]
+    assert "fragment_scan_truncated=false" in captured["evidence"]
+    assert "7 legacy root file(s); fragment-root scan complete" in smr._render_abstract(report)

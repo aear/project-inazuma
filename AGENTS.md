@@ -287,6 +287,11 @@ an existing threshold is a floor, not the target. For material changes:
 - Interpret diagnostic termination from the invoked signals: a deliberate `SIGABRT` used for faulthandler stack capture may report `Aborted` or `core dumped`, while exit 137 means `SIGKILL` (often a timeout escalation). Neither alone proves an OOM kill or spontaneous kernel action; corroborate with the command, captured stacks, and host evidence.
 - On hosts where `asyncio.run()` stalls while shutting down its default executor after completed `asyncio.to_thread()` work, record full-suite completion as unavailable, retain focused results, and confirm with a minimal standalone reproducer. Do not weaken production isolation or remove legitimate thread offloading merely to make that interpreter-specific test shutdown disappear.
 
+### Codex authorship attribution
+
+- Prefix Codex-authored GitHub comments, issue additions, and review feedback with `[Codex]` so Ina's reports remain distinguishable from developer interpretation.
+- Preserve Ina's original wording and provenance. Add clarification as a separately attributed response rather than silently rewriting her submission.
+
 ## Experiential action design
 
 - Experience Engine owns the optional domain-neutral cycle: intent, one bounded attempt, observation, evaluation, then keep/revise/revisit/stop. Attempts are retained, and revision/revisit cycles link to their parent cycle.

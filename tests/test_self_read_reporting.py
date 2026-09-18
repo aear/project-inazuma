@@ -85,3 +85,34 @@ def test_unresolved_broken_pipe_entry_stays_deduplicated_after_cooldown(monkeypa
         assert second["duplicate_within_cooldown"] is True
     finally:
         _cleanup_child(child)
+
+
+def test_resubmitted_broken_pipe_points_to_previous_github_issue(monkeypatch):
+    child = "TestSelfReadRelatedIssue"
+    _cleanup_child(child)
+    calls = []
+    try:
+        monkeypatch.setattr(srr, "_queue_broken_pipe_issue", lambda **kwargs: calls.append(kwargs) or f"entry_{len(calls)}")
+        first = srr.report_self_read_broken_pipe(
+            child=child, component="status_pipe", operation="status_log_write",
+            error=BrokenPipeError(32, "Broken pipe"),
+        )
+        from github_submission import log_history
+        log_history(
+            child, first["issue_entry_id"], "submitted", issue_number=38,
+            issue_url="https://github.com/aear/project-inazuma/issues/38",
+        )
+        state_path = srr.self_read_incident_state_path(child)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["broken_pipe"][first["fingerprint"]]["last_reported_at"] = "2000-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        second = srr.report_self_read_broken_pipe(
+            child=child, component="status_pipe", operation="status_log_write",
+            error=BrokenPipeError(32, "Broken pipe"),
+        )
+
+        assert second["issue_entry_id"] == "entry_2"
+        assert calls[1]["related_issues"] == ["https://github.com/aear/project-inazuma/issues/38"]
+    finally:
+        _cleanup_child(child)

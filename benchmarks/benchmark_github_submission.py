@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import json
+import inspect
 
+import github_submission
+import self_read_reporting
 from github_submission import get_github_submission_config
-from storage_migration_report import _report_signal, _signal_is_actionable
+from storage_migration_report import (
+    _public_actionable_evidence,
+    _report_confidence,
+    _report_signal,
+    _signal_is_actionable,
+)
 
 
 def benchmark_v1() -> dict:
@@ -59,17 +67,55 @@ def benchmark_v3() -> dict:
     }
 
 
+def benchmark_v4() -> dict:
+    """Follow-ups retain explicit provenance to earlier submitted issues."""
+    source = inspect.getsource(github_submission.report_github_finding)
+    renderer = inspect.getsource(github_submission.build_issue_body)
+    self_read_source = inspect.getsource(self_read_reporting.report_self_read_broken_pipe)
+    return {
+        "version": "V4",
+        "automatic_prior_issue_link": "submitted_issue_for_entry" in source,
+        "explicit_related_issue_path": "related_issues" in source,
+        "inspectable_related_issue_section": "## Related Issues" in renderer,
+        "self_read_resubmission_link": "submitted_issue_for_entry" in self_read_source,
+    }
+
+
+def benchmark_v5() -> dict:
+    """Actionable storage reports expose bounded evidence without false certainty."""
+    report = {
+        "directories": {"fragment_root": {"available": True, "files": 7, "sample_truncated": False}},
+        "recent_migrations": [],
+    }
+    evidence = _public_actionable_evidence(report)
+    return {
+        "version": "V5",
+        "bounded_legacy_count": "legacy_root_files=7" in evidence,
+        "scan_completeness_exposed": "fragment_scan_truncated=false" in evidence,
+        "confidence_below_certainty": _report_confidence(report) < 1.0,
+    }
+
+
 def main() -> int:
-    result = {"benchmark": "github_submission_choice", "versions": [benchmark_v1(), benchmark_v2(), benchmark_v3()]}
+    result = {"benchmark": "github_submission_choice", "versions": [benchmark_v1(), benchmark_v2(), benchmark_v3(), benchmark_v4(), benchmark_v5()]}
     print(json.dumps(result, indent=2, sort_keys=True))
     choice = result["versions"][1]
     candidate = result["versions"][2]
+    followup = result["versions"][3]
+    storage_evidence = result["versions"][4]
     return 0 if (
         choice["eligible_ids"] == ["submit"]
         and choice["credential_shaped_token_env_rejected"]
         and all(candidate[key] for key in (
             "local_maintenance_before_auth", "score_drift_is_not_a_new_report",
             "actionable_transition_detected", "explicit_choice",
+        ))
+        and all(followup[key] for key in (
+            "automatic_prior_issue_link", "explicit_related_issue_path",
+            "inspectable_related_issue_section", "self_read_resubmission_link",
+        ))
+        and all(storage_evidence[key] for key in (
+            "bounded_legacy_count", "scan_completeness_exposed", "confidence_below_certainty",
         ))
     ) else 1
 

@@ -53,3 +53,35 @@ def test_structured_finding_can_be_held_by_ina():
         assert gs.read_pending_entries(child, cfg=policy()) == []
         assert not gs.github_delivery_request_path(child).exists()
     finally: cleanup(child)
+
+def test_repeat_finding_links_the_previously_submitted_issue():
+    child = "TestInaFindingFollowup"; cleanup(child)
+    try:
+        first = gs.report_github_finding(
+            child, "Revisit self read", "First pass.", component="self_read",
+            confidence=.8, cfg=policy(finding_cooldown_minutes=0),
+        )
+        gs.log_history(
+            child, first["entry_id"], "submitted", issue_number=38,
+            issue_url="https://github.com/aear/project-inazuma/issues/38",
+        )
+        state_path = gs.github_finding_state_path(child)
+        state = json.loads(state_path.read_text())
+        state[first["fingerprint"]]["last_queued_at"] = "2000-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state))
+        second = gs.report_github_finding(
+            child, "Revisit self read", "A new pass found more context.",
+            component="self_read", confidence=.9,
+            related_issues=["#12", "not-a-reference"],
+            cfg=policy(finding_cooldown_minutes=0),
+        )
+        assert second["queued"]
+        assert second["related_issues"] == [
+            "https://github.com/aear/project-inazuma/issues/38", "#12",
+        ]
+        entries = [json.loads(line) for line in gs.github_outbox_path(child).read_text().splitlines()]
+        rendered = gs.build_issue_body(entries[-1], policy())
+        assert "## Related Issues" in rendered
+        assert "issues/38" in rendered and "- #12" in rendered
+        assert "not-a-reference" not in rendered
+    finally: cleanup(child)
