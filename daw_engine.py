@@ -1216,6 +1216,13 @@ def save_project(project: DawProject, path: str | os.PathLike[str]) -> Path:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
+        from creative_versioning import preserve_creative_version
+        preserve_creative_version(
+            destination,
+            medium="music",
+            label=project.name,
+            metadata={"project_schema_version": PROJECT_SCHEMA_VERSION},
+        )
     except Exception:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

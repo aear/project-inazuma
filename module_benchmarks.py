@@ -1164,6 +1164,55 @@ def _file_explorer_v2() -> dict[str, Any]:
     ])
 
 
+def _creative_versioning_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "successive saves retain immutable content", "component": "continuity", "correct": False},
+        {"case": "versions have content hashes", "component": "provenance", "correct": False},
+        {"case": "repeated identical saves avoid duplicate snapshots", "component": "storage", "correct": False},
+        {"case": "working copy remains editable", "component": "reversibility", "correct": True},
+    ])
+
+
+def _creative_versioning_v2() -> dict[str, Any]:
+    import tempfile
+    from creative_versioning import preserve_creative_version
+    with tempfile.TemporaryDirectory(prefix="ina_creative_versions_") as directory:
+        source = Path(directory) / "work.bin"
+        source.write_bytes(b"one")
+        first = preserve_creative_version(source, medium="drawing", label="work")
+        repeated = preserve_creative_version(source, medium="drawing", label="work")
+        source.write_bytes(b"two")
+        second = preserve_creative_version(source, medium="drawing", label="work")
+        first_bytes = Path(first["snapshot_path"]).read_bytes()
+    return _capability([
+        {"case": "successive saves retain immutable content", "component": "continuity", "correct": first_bytes == b"one" and first["sha256"] != second["sha256"]},
+        {"case": "versions have content hashes", "component": "provenance", "correct": len(first["sha256"]) == 64},
+        {"case": "repeated identical saves avoid duplicate snapshots", "component": "storage", "correct": repeated["created_snapshot"] is False and repeated["snapshot_path"] == first["snapshot_path"]},
+        {"case": "working copy remains editable", "component": "reversibility", "correct": True},
+    ])
+
+
+def _personal_tool_reachability_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "private note is runtime reachable", "component": "notes", "correct": False},
+        {"case": "code experiment lifecycle is runtime reachable", "component": "experiments", "correct": False},
+        {"case": "private text expression has a non-delivery destination", "component": "expression", "correct": False},
+        {"case": "tools never trigger themselves", "component": "agency", "correct": True},
+    ])
+
+
+def _personal_tool_reachability_v2() -> dict[str, Any]:
+    from personal_tool_runtime import capability_catalog
+    catalog = capability_catalog()
+    commands = catalog["commands"]
+    return _capability([
+        {"case": "private note is runtime reachable", "component": "notes", "correct": "write_note" in commands},
+        {"case": "code experiment lifecycle is runtime reachable", "component": "experiments", "correct": {"experiment_create", "experiment_run", "experiment_judge"}.issubset(commands)},
+        {"case": "private text expression has a non-delivery destination", "component": "expression", "correct": commands.get("realise_private_text", {}).get("delivery") == "none"},
+        {"case": "tools never trigger themselves", "component": "agency", "correct": catalog["voluntary"] is True and catalog["automatic_trigger"] is False},
+    ])
+
+
 def _measure_historical_continuity_recall() -> dict[str, Any]:
     import tempfile, tracemalloc
     module = _v1_module("continuity_manager.py")
@@ -2147,6 +2196,8 @@ _REGISTRY = {
     "experience_cycle": (ModuleVersion("experience_cycle", "V1", "Historical event and episode logging", _experience_cycle_v1), ModuleVersion("experience_cycle", "V2", "Optional bounded intent-attempt-observation-evaluation cycles", _experience_cycle_v2)),
     "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),
+    "creative_versioning": (ModuleVersion("creative_versioning", "V1", "Working copies without explicit creative lineage", _creative_versioning_v1), ModuleVersion("creative_versioning", "V2", "Hash-addressed music and drawing lineage", _creative_versioning_v2)),
+    "personal_tool_reachability": (ModuleVersion("personal_tool_reachability", "V1", "Private tools exist without a shared runtime command surface", _personal_tool_reachability_v1), ModuleVersion("personal_tool_reachability", "V2", "Voluntary notes, private text expression, and governed experiments", _personal_tool_reachability_v2)),
     "continuity_recall": (
         ModuleVersion("continuity_recall", "V1", "Historical isolated continuity snapshots", _continuity_recall_v1),
         ModuleVersion("continuity_recall", "V2", "Federated bounded recall with descriptive bias telemetry", _continuity_recall_v2),

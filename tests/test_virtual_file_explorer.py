@@ -65,3 +65,12 @@ def test_personal_drive_derives_from_configured_durable_hdd(tmp_path):
     personal = next(drive for drive in drives if drive.id == "ina_hdd")
     assert personal.root == tmp_path / "durable" / "Ina Files" / "Ina"
     assert personal.writable is True
+
+
+def test_private_notes_have_an_explicit_bounded_write_path(tmp_path):
+    fs = _filesystem(tmp_path)
+    note = fs.write_note("first thought", "I want to return to this.")
+
+    assert note.name == "first thought.txt"
+    assert note.parent.name == "Notes"
+    assert note.read_text(encoding="utf-8") == "I want to return to this."

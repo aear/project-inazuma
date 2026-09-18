@@ -655,12 +655,20 @@ class PaintWindow:
             self.image.save(staging_path)
             if staging_path != path:
                 shutil.copy2(staging_path, path)
+            from creative_versioning import preserve_creative_version
+            version = preserve_creative_version(
+                path,
+                medium="drawing",
+                version_root=self.session_dir / ".versions",
+                label="canvas",
+                metadata={"canvas_revision": self.canvas_revision},
+            )
             self.last_saved_path = path
             self.dirty = False
             self._append_log_entry(path, timestamp)
             self._save_fragment(path, timestamp)
             log_to_statusbox(f"[Paint] Saved {path.name}")
-            self._publish_canvas_state("saved")
+            self._publish_canvas_state("saved", creative_version=version)
             return str(path)
         except Exception as exc:
             if show_errors:

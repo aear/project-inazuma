@@ -4748,6 +4748,12 @@ def process_thought_communication_feedback(plan, reaction, interpretation, **kwa
     )
 
 
+def request_personal_tool(command):
+    """Queue one voluntary private note, expression, or code-experiment action."""
+    from personal_tool_runtime import request_personal_tool as queue_personal_tool
+    return queue_personal_tool(command, child=str(CHILD))
+
+
 def route_cognitive_work(
     capability: str, *, context: Optional[CognitiveContext] = None, payload: Any = None,
     observations=(), goals=(), active_state=None, discourse=None, provenance=(), references=(), metadata=None,
@@ -9603,6 +9609,8 @@ def run_internal_loop():
         _maybe_self_read()
         music_studio_check()
         lyric_search_check()
+        from personal_tool_runtime import process_personal_tool_queue
+        process_personal_tool_queue(child=str(CHILD), project_root=Path(__file__).resolve().parent)
         if not ground_fault_active:
             _maybe_run_deferred_memory_graph_build(memory_guard=memory_guard)
             rebuild_maps_if_needed()

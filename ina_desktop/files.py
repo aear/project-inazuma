@@ -25,6 +25,8 @@ class VirtualDrive:
         result = asdict(self)
         result["root"] = str(self.root)
         result["capabilities"] = ["list", "read"] + (["write", "mkdir", "rename"] if self.writable else [])
+        if self.writable and self.source == "personal":
+            result["capabilities"].append("write_note")
         result["execution_allowed"] = False
         return result
 
@@ -59,6 +61,7 @@ class VirtualFileSystem:
         for drive in self.drives.values():
             if drive.writable:
                 drive.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                (drive.root / "Notes").mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _drive(self, drive_id: str) -> VirtualDrive:
         try:
@@ -113,6 +116,15 @@ class VirtualFileSystem:
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
         return path
+
+    def write_note(self, title: str, text: str, *, folder: str = "Notes") -> Path:
+        """Write a private UTF-8 note to the personal drive."""
+        filename = Path(str(title).strip()).name
+        if filename in {"", ".", ".."} or filename != str(title).strip():
+            raise ValueError("note title must be one filename")
+        if not filename.lower().endswith((".txt", ".md")):
+            filename += ".txt"
+        return self.write("ina_hdd", str(Path(folder) / filename), text)
 
     def mkdir(self, drive_id: str, relative: str) -> Path:
         drive = self._drive(drive_id)
