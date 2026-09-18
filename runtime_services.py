@@ -136,12 +136,15 @@ def shutdown_runtime_service_supervisor(
     child: str,
     *,
     grace_seconds: float = 6.0,
+    progress=None,
 ) -> Dict[str, Any]:
     """Stop supervised bridges before GUI exit, then clean up legacy stragglers."""
     status = _safe_json(supervisor_status_path(child))
     pid = int(status.get("supervisor_pid", 0) or 0)
     graceful = False
     errors = []
+    if progress is not None:
+        progress("supervisor", ["runtime_services"] if _is_supervisor_process(pid) else [])
     if _is_supervisor_process(pid):
         try:
             process = psutil.Process(pid)
@@ -150,11 +153,15 @@ def shutdown_runtime_service_supervisor(
             graceful = True
         except (psutil.Error, OSError) as exc:
             errors.append(str(exc))
+    if progress is not None:
+        progress("services", list(SERVICE_COMMANDS))
     cleanup = stop_runtime_services(
         Path(__file__).resolve().parent,
         grace_seconds=max(1.0, min(3.0, float(grace_seconds))),
     )
     errors.extend(cleanup.get("errors") or [])
+    if progress is not None:
+        progress("complete", [])
     return {
         "ok": graceful or not cleanup.get("matched"),
         "supervisor_pid": pid or None,
@@ -328,21 +335,37 @@ class RuntimeServiceSupervisor:
 
         for timer in self.timers.values():
             timer.cancel()
+        live_processes = []
         for name, process in list(self.processes.items()):
             if process.poll() is None:
                 try:
                     process.terminate()
+                    live_processes.append((name, process))
                 except Exception:
                     continue
-        for name, process in list(self.processes.items()):
+        deadline = time.monotonic() + 5.0
+        while live_processes and time.monotonic() < deadline:
+            live_processes = [
+                (name, process) for name, process in live_processes
+                if process.poll() is None
+            ]
+            if live_processes:
+                time.sleep(0.05)
+        stragglers = {name for name, _process in live_processes}
+        for name, process in live_processes:
             try:
-                process.wait(timeout=5.0)
+                process.kill()
             except Exception:
+                pass
+        for name, process in list(self.processes.items()):
+            if name in stragglers:
                 try:
-                    process.kill()
+                    process.wait(timeout=1.0)
                 except Exception:
                     pass
-            self._service_state(name, status="stopped", pid=None)
+            self._service_state(
+                name, status="forced" if name in stragglers else "stopped", pid=None,
+            )
         self.state["status"] = "stopped"
         self._publish()
 

@@ -30,6 +30,9 @@ from runtime_services import (
 )
 from ina_desktop.client import launch_environment
 from birth_system import boot
+from lifecycle_status import (
+    format_lifecycle_status, read_lifecycle_status, update_lifecycle_status,
+)
 from emotion_engine import SLIDERS as EMOTION_SLIDERS, load_baseline
 from emotion_processor import process_emotion
 from monitoring_dashboard import MonitoringWindow
@@ -205,6 +208,9 @@ operator_permission_detail_var = None
 operator_permission_command_box = None
 operator_permission_feedback_box = None
 operator_permission_last_marker = None
+lifecycle_status_var = None
+lifecycle_progress_var = None
+_shutdown_in_progress = False
 
 
 def configure_app_icon(window):
@@ -485,6 +491,10 @@ def start_model():
     append_status("Start Button clicked.\n")
     append_status("Launching Birth System...\n")
     child = config.get("current_child", "default_child")
+    update_lifecycle_status(
+        child, operation="boot", phase="requested", message="Boot requested",
+        completed=0, total=6, started_monotonic=time.monotonic(),
+    )
 
     def _boot():
         global model_running
@@ -1819,8 +1829,15 @@ def open_module_benchmarks():
     ModuleBenchmarkWindow(root)
 
 def emergency_shutdown():
-    global model_running
+    global model_running, _shutdown_in_progress
+    if _shutdown_in_progress:
+        append_status("[Shutdown] A shutdown is already in progress.\n")
+        return
+    _shutdown_in_progress = True
     model_running = False
+    update_ai_count_label()
+    child_name = str(config.get("current_child") or "Inazuma_Yagami")
+    started = time.monotonic()
     now = datetime.now(timezone.utc).isoformat()
     shutdown_payload = {
         "timestamp": now,
@@ -1834,10 +1851,18 @@ def emergency_shutdown():
     update_inastate("dreaming", False)
     update_inastate("runtime_disruption", True)
 
-    print("[Emergency] Triggering immediate shutdown...")
-    result = stop_core_runtime(Path(__file__).resolve().parent)
-    update_inastate("runtime_mode", "bridge_only")
-    print(f"[Emergency] Core modules halted; bridges preserved: {result}")
+    update_lifecycle_status(child_name, operation="shutdown", phase="stopping_core", message="Stopping cognition; communication bridges remain available", completed=0, total=1, started_monotonic=started, remaining=["core runtime"])
+    append_status("[Emergency] Stopping core runtime; bridges will remain available.\n")
+
+    def _stop():
+        global _shutdown_in_progress
+        result = stop_core_runtime(Path(__file__).resolve().parent)
+        update_inastate("runtime_mode", "bridge_only")
+        update_lifecycle_status(child_name, operation="shutdown", phase="bridge_only", message="Core stopped; communication bridges preserved", completed=1, total=1, started_monotonic=started, safe_to_reboot=False, details={"result": result})
+        append_status(f"[Emergency] Core halted; bridges preserved: {result}.\n")
+        _shutdown_in_progress = False
+
+    threading.Thread(target=_stop, daemon=True).start()
 
 
 def tuck_in():
@@ -1874,54 +1899,79 @@ def reboot_model():
     status_box.see(tk.END)
 
     emergency_shutdown()
-    time.sleep(1)
 
-    start_model()
-    time.sleep(3)
+    def _wait_then_start():
+        deadline = time.monotonic() + 15.0
+        while _shutdown_in_progress and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if _shutdown_in_progress:
+            append_status("[Reboot] Core shutdown did not finish within 15 seconds; restart deferred.\n", tag="error")
+            return
+        root.after(0, start_model)
+        append_status("[Reboot] Shutdown completed; boot sequence requested.\n")
 
-    wake_up()
-    status_box.insert(tk.END, "[Reboot] Reboot complete.\n")
-    status_box.see(tk.END)
+    threading.Thread(target=_wait_then_start, daemon=True).start()
 
 
 
 def quit_program():
-    if model_running:
-        status_box.insert(tk.END, "Quit blocked: model is currently running.\n")
-        status_box.see(tk.END)
-        messagebox.showwarning("Model Active", "A model is currently running. Please stop it before quitting.")
+    global _shutdown_in_progress
+    if _shutdown_in_progress:
+        append_status("[Shutdown] Already in progress; wait for safe-to-reboot status.\n")
         return
-
-    if messagebox.askokcancel("Quit Program", "Are you sure you want to quit?"):
+    prompt = "Ina is active. Stop the complete runtime and quit?" if model_running else "Are you sure you want to quit?"
+    if messagebox.askokcancel("Quit Program", prompt):
+        _shutdown_in_progress = True
         status_box.insert(tk.END, "Quit Program confirmed. Exiting...\n")
         status_box.see(tk.END)
         save_config()
         child_name = str(config.get("current_child") or "Inazuma_Yagami")
+        started = time.monotonic()
         shutdown_payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "gui_quit",
             "mode": "orderly",
-            "clean": True,
+            "clean": False,
             "runtime_mode": "stopped",
         }
         update_inastate("shutdown_intent", shutdown_payload)
-        update_inastate("last_shutdown", shutdown_payload)
-        service_result = shutdown_runtime_service_supervisor(child_name)
-        status_box.insert(
-            tk.END,
-            "[Services] Discord voice and supervised services disconnected "
-            f"before GUI exit (graceful={service_result.get('graceful', False)}).\n",
-        )
-        status_box.see(tk.END)
-        current_pid = os.getpid()
-        parent = psutil.Process(current_pid)
-        children = parent.children(recursive=True)
-        for child in children:
+        update_lifecycle_status(child_name, operation="shutdown", phase="requested", message="Orderly shutdown requested", completed=0, total=4, started_monotonic=started, remaining=["supervisor", "services", "child processes", "storage flush"])
+
+        def _shutdown():
+            def progress(phase, remaining):
+                completed = {"supervisor": 1, "services": 2, "complete": 3}.get(phase, 0)
+                update_lifecycle_status(child_name, operation="shutdown", phase=f"stopping_{phase}", message=f"Stopping {phase.replace('_', ' ')}", completed=completed, total=4, started_monotonic=started, remaining=remaining)
+
+            service_result = shutdown_runtime_service_supervisor(child_name, progress=progress)
+            append_status("[Services] Supervised services disconnected " f"(graceful={service_result.get('graceful', False)}).\n")
+            current_pid = os.getpid()
+            parent = psutil.Process(current_pid)
+            children = parent.children(recursive=True)
+            for child_process in children:
+                try:
+                    child_process.terminate()
+                except Exception:
+                    pass
+            _gone, alive = psutil.wait_procs(children, timeout=5.0) if children else ([], [])
+            for child_process in alive:
+                try:
+                    child_process.kill()
+                except Exception:
+                    pass
+            forced_pids = [child_process.pid for child_process in alive]
+            update_lifecycle_status(child_name, operation="shutdown", phase="flushing_storage", message="Runtime stopped; flushing filesystem writes", completed=3, total=4, started_monotonic=started, remaining=["storage flush"], details={"forced_child_pids": forced_pids})
             try:
-                child.terminate()
-            except Exception:
+                os.sync()
+            except AttributeError:
                 pass
-        root.quit()
+            shutdown_payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+            shutdown_payload["clean"] = bool(service_result.get("graceful", False) and not alive)
+            update_inastate("last_shutdown", shutdown_payload)
+            update_lifecycle_status(child_name, operation="shutdown", phase="stopped", message="Orderly shutdown complete", completed=4, total=4, started_monotonic=started, safe_to_reboot=True, details={"services_graceful": service_result.get("graceful", False)})
+            append_status("[Shutdown] Complete. It is safe to close or reboot.\n")
+            root.after(250, root.quit)
+
+        threading.Thread(target=_shutdown, daemon=True).start()
     else:
         status_box.insert(tk.END, "Quit Program cancelled.\n")
         status_box.see(tk.END)
@@ -2003,7 +2053,7 @@ root.config(menu=menu_bar)
 main_frame = ttk.Frame(root, padding=(18, 14))
 main_frame.pack(expand=True, fill=tk.BOTH)
 main_frame.columnconfigure(0, weight=1)
-main_frame.rowconfigure(2, weight=1)
+main_frame.rowconfigure(3, weight=1)
 
 header_frame = ttk.Frame(main_frame)
 header_frame.grid(row=0, column=0, sticky='ew', pady=(0, 12))
@@ -2030,8 +2080,24 @@ canvas.pack(side=tk.LEFT)
 canvas.create_oval(8, 8, 46, 46, outline=PALETTE['accent'], width=3)
 ai_text_id = canvas.create_text(27, 27, text='0', fill=PALETTE['accent'], font=('Helvetica', 14, 'bold'))
 
+lifecycle_frame_status = ttk.LabelFrame(main_frame, text='Lifecycle status', style='Section.TLabelframe', padding=8)
+lifecycle_frame_status.grid(row=1, column=0, sticky='ew', pady=(0, 12))
+lifecycle_frame_status.columnconfigure(0, weight=1)
+lifecycle_status_var = tk.StringVar(value='Lifecycle status unavailable')
+lifecycle_progress_var = tk.DoubleVar(value=0.0)
+ttk.Label(lifecycle_frame_status, textvariable=lifecycle_status_var, wraplength=900, justify=tk.LEFT).grid(row=0, column=0, sticky='ew')
+ttk.Progressbar(lifecycle_frame_status, variable=lifecycle_progress_var, maximum=100.0).grid(row=1, column=0, sticky='ew', pady=(6, 0))
+
+def _refresh_lifecycle_display():
+    child_name = str(config.get('current_child') or 'Inazuma_Yagami')
+    status = read_lifecycle_status(child_name)
+    lifecycle_status_var.set(format_lifecycle_status(status))
+    progress = status.get('progress') if isinstance(status, dict) else None
+    lifecycle_progress_var.set(float(progress) * 100.0 if isinstance(progress, (int, float)) else 0.0)
+    root.after(500, _refresh_lifecycle_display)
+
 paths_container = ttk.LabelFrame(main_frame, text='Content folders', style='Section.TLabelframe', padding=10)
-paths_container.grid(row=1, column=0, sticky='ew', pady=(0, 12))
+paths_container.grid(row=2, column=0, sticky='ew', pady=(0, 12))
 paths_container.columnconfigure(1, weight=1)
 
 ttk.Label(paths_container, text='Books').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=4)
@@ -2049,7 +2115,7 @@ music_entry.bind('<Return>', commit_music_folder)
 ttk.Button(paths_container, text='Browse…', command=browse_music_folder).grid(row=1, column=2, padx=(8, 0), pady=4)
 
 status_container = ttk.LabelFrame(main_frame, text='Activity log', style='Section.TLabelframe', padding=8)
-status_container.grid(row=2, column=0, sticky='nsew', pady=(0, 12))
+status_container.grid(row=3, column=0, sticky='nsew', pady=(0, 12))
 status_container.columnconfigure(0, weight=1)
 status_container.rowconfigure(0, weight=1)
 status_scrollbar = ttk.Scrollbar(status_container)
@@ -2069,7 +2135,7 @@ status_box.tag_config('error', foreground=PALETTE['danger'])
 status_scrollbar.config(command=status_box.yview)
 
 controls = ttk.Frame(main_frame)
-controls.grid(row=3, column=0, sticky='ew')
+controls.grid(row=4, column=0, sticky='ew')
 controls.columnconfigure(0, weight=1)
 controls.columnconfigure(1, weight=1)
 
@@ -2117,4 +2183,5 @@ root.bind_all("<Control-Shift-M>", _shortcut_memory_too_high)
 
 root.protocol("WM_DELETE_WINDOW", quit_program)
 status_log_server()
+_refresh_lifecycle_display()
 root.mainloop()

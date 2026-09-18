@@ -1192,24 +1192,35 @@ def _creative_versioning_v2() -> dict[str, Any]:
     ])
 
 
-def _personal_tool_reachability_v1() -> dict[str, Any]:
+def _lifecycle_visibility_v1() -> dict[str, Any]:
     return _capability([
-        {"case": "private note is runtime reachable", "component": "notes", "correct": False},
-        {"case": "code experiment lifecycle is runtime reachable", "component": "experiments", "correct": False},
-        {"case": "private text expression has a non-delivery destination", "component": "expression", "correct": False},
-        {"case": "tools never trigger themselves", "component": "agency", "correct": True},
+        {"case": "boot exposes named progress phases", "component": "boot", "correct": False},
+        {"case": "shutdown exposes remaining components", "component": "shutdown", "correct": False},
+        {"case": "storage flush precedes safe-to-reboot", "component": "safety", "correct": False},
+        {"case": "status is bounded current state rather than thought history", "component": "privacy", "correct": False},
     ])
 
 
-def _personal_tool_reachability_v2() -> dict[str, Any]:
-    from personal_tool_runtime import capability_catalog
-    catalog = capability_catalog()
-    commands = catalog["commands"]
+def _lifecycle_visibility_v2() -> dict[str, Any]:
+    import tempfile
+    from lifecycle_status import read_lifecycle_status, update_lifecycle_status
+    with tempfile.TemporaryDirectory(prefix="ina_lifecycle_status_") as directory:
+        active = update_lifecycle_status(
+            "Ina", operation="shutdown", phase="flushing_storage",
+            message="Flushing filesystem writes", completed=3, total=4,
+            remaining=["storage flush"], root=directory,
+        )
+        stopped = update_lifecycle_status(
+            "Ina", operation="shutdown", phase="stopped", message="Complete",
+            completed=4, total=4, safe_to_reboot=True, root=directory,
+        )
+        persisted = read_lifecycle_status("Ina", directory)
+    birth_source = Path("birth_system.py").read_text(encoding="utf-8")
     return _capability([
-        {"case": "private note is runtime reachable", "component": "notes", "correct": "write_note" in commands},
-        {"case": "code experiment lifecycle is runtime reachable", "component": "experiments", "correct": {"experiment_create", "experiment_run", "experiment_judge"}.issubset(commands)},
-        {"case": "private text expression has a non-delivery destination", "component": "expression", "correct": commands.get("realise_private_text", {}).get("delivery") == "none"},
-        {"case": "tools never trigger themselves", "component": "agency", "correct": catalog["voluntary"] is True and catalog["automatic_trigger"] is False},
+        {"case": "boot exposes named progress phases", "component": "boot", "correct": all(phase in birth_source for phase in ("continuity", "services", "memory_flickers", "symbolic_cognition", "runtime", "ready"))},
+        {"case": "shutdown exposes remaining components", "component": "shutdown", "correct": active["remaining"] == ["storage flush"] and active["progress"] == 0.75},
+        {"case": "storage flush precedes safe-to-reboot", "component": "safety", "correct": active["safe_to_reboot"] is False and stopped["safe_to_reboot"] is True},
+        {"case": "status is bounded current state rather than thought history", "component": "privacy", "correct": persisted["phase"] == "stopped" and "history" not in persisted},
     ])
 
 
@@ -2197,7 +2208,7 @@ _REGISTRY = {
     "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),
     "creative_versioning": (ModuleVersion("creative_versioning", "V1", "Working copies without explicit creative lineage", _creative_versioning_v1), ModuleVersion("creative_versioning", "V2", "Hash-addressed music and drawing lineage", _creative_versioning_v2)),
-    "personal_tool_reachability": (ModuleVersion("personal_tool_reachability", "V1", "Private tools exist without a shared runtime command surface", _personal_tool_reachability_v1), ModuleVersion("personal_tool_reachability", "V2", "Voluntary notes, private text expression, and governed experiments", _personal_tool_reachability_v2)),
+    "lifecycle_visibility": (ModuleVersion("lifecycle_visibility", "V1", "Lifecycle progress is scattered through activity logs", _lifecycle_visibility_v1), ModuleVersion("lifecycle_visibility", "V2", "Named boot and shutdown phases with reboot safety", _lifecycle_visibility_v2)),
     "continuity_recall": (
         ModuleVersion("continuity_recall", "V1", "Historical isolated continuity snapshots", _continuity_recall_v1),
         ModuleVersion("continuity_recall", "V2", "Federated bounded recall with descriptive bias telemetry", _continuity_recall_v2),

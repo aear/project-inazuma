@@ -17,6 +17,7 @@ from model_manager import update_inastate, load_config, get_inastate
 from gui_hook import log_to_statusbox
 from safe_popen import safe_popen
 from runtime_services import ensure_runtime_service_supervisor
+from lifecycle_status import update_lifecycle_status
 from who_am_i import run_reflection
 from io_utils import atomic_write_json
 from memory_index import indexed_fragment_rows, resolve_indexed_fragment
@@ -195,14 +196,21 @@ def launch_symbolic_startup(child):
 
 def run_birth_sequence(child):
     start = time.time()
+    started_monotonic = time.monotonic()
+    update_lifecycle_status(
+        child, operation="boot", phase="initialising", message="Preparing Ina's runtime",
+        completed=0, total=6, started_monotonic=started_monotonic,
+    )
     log_to_statusbox(f"[Birth] Starting full sequence for: {child}")
     print(f"[Birth] Starting full sequence for: {child}")
     log_birth_event("Birth sequence started", child)
 
     try:
         ensure_defaults(child)
+        update_lifecycle_status(child, operation="boot", phase="continuity", message="Loading continuity core", completed=1, total=6, started_monotonic=started_monotonic)
         load_continuity_boot_core(child)
 
+        update_lifecycle_status(child, operation="boot", phase="services", message="Starting supervised world, Discord, and desktop services", completed=2, total=6, started_monotonic=started_monotonic)
         service_supervisor_pid = ensure_runtime_service_supervisor(child)
         if service_supervisor_pid:
             log_to_statusbox(f"[Birth] Runtime services supervised by pid={service_supervisor_pid}.")
@@ -214,6 +222,7 @@ def run_birth_sequence(child):
             log_to_statusbox("[Birth] Runtime service supervisor failed to start.")
 
         flick_start = datetime.now(timezone.utc).isoformat()
+        update_lifecycle_status(child, operation="boot", phase="memory_flickers", message="Loading bounded memory flickers", completed=3, total=6, started_monotonic=started_monotonic)
         scanned, matched = trigger_birth_flickers(child)
         flick_end = datetime.now(timezone.utc).isoformat()
 
@@ -225,9 +234,11 @@ def run_birth_sequence(child):
         })
 
         log_to_statusbox("[Birth] Launching symbolic cognition modules...")
+        update_lifecycle_status(child, operation="boot", phase="symbolic_cognition", message="Launching bounded symbolic cognition modules", completed=4, total=6, started_monotonic=started_monotonic)
         launch_symbolic_startup(child)
 
         log_to_statusbox("[Birth] Launching runtime...")
+        update_lifecycle_status(child, operation="boot", phase="runtime", message="Starting the cognitive runtime", completed=5, total=6, started_monotonic=started_monotonic)
         safe_popen(["python", "model_manager.py"])
 
         time.sleep(1)
@@ -243,8 +254,10 @@ def run_birth_sequence(child):
             "end": datetime.now(timezone.utc).isoformat(),
             "total_duration_sec": round(elapsed, 2)
         })
+        update_lifecycle_status(child, operation="boot", phase="ready", message="Ina is ready", completed=6, total=6, started_monotonic=started_monotonic, safe_to_reboot=False)
 
     except Exception as e:
+        update_lifecycle_status(child, operation="boot", phase="failed", message=f"Boot failed: {e}", completed=0, total=0, started_monotonic=started_monotonic, safe_to_reboot=True)
         log_to_statusbox(f"[Birth ERROR] {e}")
         log_birth_event(f"Boot failure: {str(e)}", child)
         print(f"[Birth ERROR] {e}")
