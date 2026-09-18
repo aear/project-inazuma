@@ -17,6 +17,7 @@ from github_submission import (
 INCIDENT_LOG_FILENAME = "self_read_incidents.jsonl"
 INCIDENT_STATE_FILENAME = "self_read_incident_state.json"
 BROKEN_PIPE_COOLDOWN_MINUTES = 180
+MAX_CANONICAL_INCIDENT_SCAN = 10000
 
 
 def self_read_incident_log_path(child: str) -> Path:
@@ -89,6 +90,36 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def _canonical_submitted_issue(
+    child: str, fingerprint: str, prior: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve the first submitted issue for a recurring incident fingerprint."""
+    candidates = []
+    if isinstance(prior, dict):
+        candidates.append(prior.get("canonical_issue_entry_id"))
+    path = self_read_incident_log_path(child)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= MAX_CANONICAL_INCIDENT_SCAN:
+                    break
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if item.get("fingerprint") == fingerprint and item.get("github_entry_id"):
+                    candidates.append(item.get("github_entry_id"))
+    except OSError:
+        pass
+    if isinstance(prior, dict):
+        candidates.append(prior.get("last_issue_entry_id"))
+    for entry_id in candidates:
+        submitted = submitted_issue_for_entry(child, entry_id)
+        if submitted:
+            return submitted
+    return None
 
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:
@@ -224,9 +255,7 @@ def report_self_read_broken_pipe(
 
     issue_entry_id = None
     if should_queue_issue:
-        previous_issue = submitted_issue_for_entry(
-            child_name, prior.get("last_issue_entry_id") if isinstance(prior, dict) else None,
-        )
+        previous_issue = _canonical_submitted_issue(child_name, fingerprint, prior)
         issue_entry_id = _queue_broken_pipe_issue(
             child=child_name,
             component=component,
@@ -258,6 +287,10 @@ def report_self_read_broken_pipe(
     incidents[fingerprint] = {
         "last_reported_at": now.isoformat(),
         "last_issue_entry_id": issue_entry_id or (prior.get("last_issue_entry_id") if isinstance(prior, dict) else None),
+        "canonical_issue_entry_id": (
+            previous_issue.get("entry_id") if should_queue_issue and previous_issue else
+            (prior.get("canonical_issue_entry_id") if isinstance(prior, dict) else None) or issue_entry_id
+        ),
         "component": incident["component"],
         "operation": incident["operation"],
         "error": error_text,

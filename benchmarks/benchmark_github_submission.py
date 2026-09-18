@@ -72,12 +72,14 @@ def benchmark_v4() -> dict:
     source = inspect.getsource(github_submission.report_github_finding)
     renderer = inspect.getsource(github_submission.build_issue_body)
     self_read_source = inspect.getsource(self_read_reporting.report_self_read_broken_pipe)
+    canonical_source = inspect.getsource(self_read_reporting._canonical_submitted_issue)
     return {
         "version": "V4",
         "automatic_prior_issue_link": "submitted_issue_for_entry" in source,
         "explicit_related_issue_path": "related_issues" in source,
         "inspectable_related_issue_section": "## Related Issues" in renderer,
-        "self_read_resubmission_link": "submitted_issue_for_entry" in self_read_source,
+        "self_read_resubmission_link": "_canonical_submitted_issue" in self_read_source,
+        "canonical_incident_chain": "MAX_CANONICAL_INCIDENT_SCAN" in canonical_source,
     }
 
 
@@ -113,6 +115,7 @@ def main() -> int:
         and all(followup[key] for key in (
             "automatic_prior_issue_link", "explicit_related_issue_path",
             "inspectable_related_issue_section", "self_read_resubmission_link",
+            "canonical_incident_chain",
         ))
         and all(storage_evidence[key] for key in (
             "bounded_legacy_count", "scan_completeness_exposed", "confidence_below_certainty",

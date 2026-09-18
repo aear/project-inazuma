@@ -114,5 +114,7 @@ def test_resubmitted_broken_pipe_points_to_previous_github_issue(monkeypatch):
 
         assert second["issue_entry_id"] == "entry_2"
         assert calls[1]["related_issues"] == ["https://github.com/aear/project-inazuma/issues/38"]
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["broken_pipe"][first["fingerprint"]]["canonical_issue_entry_id"] == first["issue_entry_id"]
     finally:
         _cleanup_child(child)

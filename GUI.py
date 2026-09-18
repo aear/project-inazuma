@@ -39,6 +39,7 @@ from self_questions_window import SelfQuestionsWindow
 from io_utils import load_json_dict
 from collections import deque
 from tk_context_actions import install_text_context_actions
+from status_pipe import open_persistent_fifo_reader
 
 STATUS_RETENTION_SEC = float(os.environ.get("INA_STATUS_RETENTION_SEC", "600"))
 _status_buffer = deque()
@@ -101,7 +102,7 @@ def status_log_server():
                                 tag = "error" if msg.startswith("[ERROR]") else None
                                 append_status(msg, tag)
                 else:
-                    with open(STATUS_PIPE_PATH, "r") as pipe:
+                    with open_persistent_fifo_reader(STATUS_PIPE_PATH) as pipe:
                         for msg in pipe:
                             if msg.strip():
                                 tag = "error" if msg.startswith("[ERROR]") else None
