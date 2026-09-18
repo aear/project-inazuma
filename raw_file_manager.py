@@ -3522,7 +3522,23 @@ def self_read_and_train():
 
         if source_key == "public_music":
             from public_music_library import admitted_track
+            admission_started = time.perf_counter()
             admission = admitted_track(Path(base_root), rel_str)
+            try:
+                from dynamic_benchmarking import record_measurement
+                fast_mount = str((config.get("storage_layout") or {}).get("fast_mount") or "")
+                resolved_path = str(Path(path).resolve())
+                record_measurement(
+                    child, "public_music", "verified_track_read", config,
+                    origin="self_read_hash_validation",
+                    tier="fast" if fast_mount and resolved_path.startswith(fast_mount + os.sep) else "durable",
+                    elapsed_seconds=time.perf_counter() - admission_started,
+                    bytes_processed=Path(path).stat().st_size if Path(path).is_file() else 0,
+                    success=bool(admission.get("admitted")), cache_state="unknown",
+                    user_visible=False, evidence={"relative_path": rel_str},
+                )
+            except Exception as measurement_error:
+                log_to_statusbox(f"[DynamicBenchmark] Observation unavailable: {measurement_error}")
             if not admission.get("admitted"):
                 log_to_statusbox(
                     f"[SelfRead] BLOCKED {path.name} — public music provenance: "
@@ -3535,6 +3551,7 @@ def self_read_and_train():
         )
 
         try:
+            operation_started = time.perf_counter()
             navigation = prior.get("media_navigation") if isinstance(prior, dict) else {}
             navigation = navigation if isinstance(navigation, dict) else {}
             selected_seek_fraction = media_seek_fraction(read_reason, prior)
@@ -3597,6 +3614,22 @@ def self_read_and_train():
                 return False
 
             result = list(result or [])
+            if source_key == "public_music" and category == "audio":
+                try:
+                    from dynamic_benchmarking import record_measurement
+                    fast_mount = str((config.get("storage_layout") or {}).get("fast_mount") or "")
+                    resolved_path = str(Path(path).resolve())
+                    record_measurement(
+                        child, "public_music", "audio_decode", config,
+                        origin="self_read_audio_decode",
+                        tier="fast" if fast_mount and resolved_path.startswith(fast_mount + os.sep) else "durable",
+                        elapsed_seconds=time.perf_counter() - operation_started,
+                        bytes_processed=Path(path).stat().st_size, success=bool(result),
+                        cache_state="unknown", user_visible=True,
+                        evidence={"relative_path": rel_str, "read_reason": read_reason},
+                    )
+                except Exception as measurement_error:
+                    log_to_statusbox(f"[DynamicBenchmark] Observation unavailable: {measurement_error}")
             if not result:
                 return False
 
