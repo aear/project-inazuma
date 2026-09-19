@@ -1388,6 +1388,19 @@ def build_dual_symbolic_message(
         provenance=gloss_sources.values(),
     )
 
+    mutual_intelligibility_assessment = None
+    listener_model = expression_context.get("listener_model")
+    clarity_assessments = expression_context.get("realisation_assessments")
+    if isinstance(listener_model, dict) and isinstance(clarity_assessments, (list, tuple)):
+        from social_expression import assess_mutual_intelligibility
+        mutual_intelligibility_assessment = assess_mutual_intelligibility(
+            expression_intent,
+            clarity_assessments,
+            listener_model=listener_model,
+            bridge_willingness=expression_context.get("bridge_willingness", 0.0),
+            willingness_witnesses=expression_context.get("willingness_witnesses") or (),
+        )
+
     return {
         "text": combined,
         "native_text": native_text,
@@ -1400,6 +1413,7 @@ def build_dual_symbolic_message(
         "expression_intent": expression_intent,
         "expression_realisation": native_realisation,
         "expression_realisations": [native_realisation, text_realisation],
+        "mutual_intelligibility_assessment": mutual_intelligibility_assessment,
     }
 
 
@@ -1420,7 +1434,21 @@ def select_symbolic_message_text(
         return None, "none"
 
     raw_preference = preference
+    embedded_assessment = message.get("mutual_intelligibility_assessment")
+    if isinstance(embedded_assessment, dict):
+        raw_preference = {"mutual_intelligibility_assessment": embedded_assessment}
     if isinstance(raw_preference, dict):
+        assessment = raw_preference.get("mutual_intelligibility_assessment")
+        if isinstance(assessment, dict) and assessment.get("schema") == "ina.mutual_intelligibility_assessment/V1":
+            assessed_mode = str(assessment.get("mode") or "")
+            if assessed_mode == "native_only":
+                native = str(message.get("native_text") or "").strip()
+                return native or None, "native"
+            if assessed_mode == "native_with_english_bridge":
+                combined = str(message.get("text") or "").strip()
+                return combined or None, "mixed"
+            if assessed_mode in {"clarify", "abstain"}:
+                return None, assessed_mode
         raw_preference = (
             raw_preference.get("mode")
             or raw_preference.get("language_mode")

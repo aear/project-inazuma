@@ -133,6 +133,56 @@ def test_symbolic_message_language_choice_keeps_native_translation():
     assert lp.select_symbolic_message_text(payload, "auto") == (payload["text"], "mixed")
 
 
+def test_symbolic_message_honours_evidence_gated_intelligibility_mode():
+    payload = {
+        "text": "Native: glyph_wave\nHuman guess: hello there",
+        "native_text": "glyph_wave",
+        "gloss_text": "hello there",
+    }
+    assessed = {"schema": "ina.mutual_intelligibility_assessment/V1", "mode": "native_only"}
+    assert lp.select_symbolic_message_text(
+        payload, {"mutual_intelligibility_assessment": assessed},
+    ) == ("glyph_wave", "native")
+    assessed["mode"] = "native_with_english_bridge"
+    assert lp.select_symbolic_message_text(
+        payload, {"mutual_intelligibility_assessment": assessed},
+    ) == (payload["text"], "mixed")
+    assessed["mode"] = "clarify"
+    assert lp.select_symbolic_message_text(
+        payload, {"mutual_intelligibility_assessment": assessed},
+    ) == (None, "clarify")
+
+
+def test_dual_message_embeds_and_uses_reachable_intelligibility_assessment(monkeypatch):
+    monkeypatch.setattr(
+        lp, "load_symbol_to_token", lambda child, base_path=None: {"sym_care": {"word": "care"}},
+    )
+    from social_expression import build_listener_hypotheses
+    listener = build_listener_hypotheses("person:sakura", [
+        {"witness_id": "conversation:1", "proposition_reference": "language:english",
+         "state": "may_know", "confidence": .9, "provenance": ["conversation:1"]},
+        {"witness_id": "history:1", "proposition_reference": "language:english",
+         "state": "may_know", "confidence": .9, "provenance": ["history:1"]},
+    ])
+    def evidence(prefix):
+        return {key: [f"{prefix}:{key}:1", f"{prefix}:{key}:2"]
+                for key in ("fidelity", "recoverability", "uncertainty_preservation")}
+    payload = lp.build_dual_symbolic_message(["sym_care"], context={
+        "space_identity": "person:sakura", "listener_model": listener,
+        "bridge_willingness": .8,
+        "willingness_witnesses": ["choice:current", "preference:stable"],
+        "realisation_assessments": [
+            {"realisation_id": "native:planned", "medium": "native_symbol", "fidelity": .95,
+             "recoverability": .2, "uncertainty_preservation": .9, "witnesses": evidence("native")},
+            {"realisation_id": "text:planned", "medium": "text", "language": "english",
+             "fidelity": .9, "recoverability": .9, "uncertainty_preservation": .8,
+             "witnesses": evidence("english")},
+        ],
+    })
+    assert payload["mutual_intelligibility_assessment"]["mode"] == "native_with_english_bridge"
+    assert lp.select_symbolic_message_text(payload, "auto") == (payload["text"], "mixed")
+
+
 def test_english_choice_does_not_hide_an_untranslated_native_message():
     payload = {
         "text": "Native: glyph_private\nHuman guess: glyph_private",

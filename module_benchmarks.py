@@ -2010,6 +2010,55 @@ def _communicative_meaning_v3() -> dict[str, Any]:
     ])
 
 
+def _communicative_meaning_v4() -> dict[str, Any]:
+    baseline = _communicative_meaning_v3()
+    from expression_core import create_expression_intent
+    from social_expression import assess_mutual_intelligibility, build_listener_hypotheses
+    intent = create_expression_intent(
+        "share meaning", meaning_references=["meaning:care"],
+        audience_references=["person:sakura"], allowed_media=["native_symbol", "text"],
+    )
+    listener = build_listener_hypotheses("person:sakura", [
+        {"witness_id": "conversation:1", "proposition_reference": "language:english",
+         "state": "may_know", "confidence": .9, "provenance": ["conversation:1"]},
+        {"witness_id": "history:1", "proposition_reference": "language:english",
+         "state": "may_know", "confidence": .9, "provenance": ["history:1"]},
+    ])
+    def candidate(identifier, medium, fidelity, recoverability, language=""):
+        return {
+            "realisation_id": identifier, "medium": medium, "language": language,
+            "fidelity": fidelity, "recoverability": recoverability,
+            "uncertainty_preservation": .85,
+            "witnesses": {key: [f"{identifier}:{key}:1", f"{identifier}:{key}:2"]
+                          for key in ("fidelity", "recoverability", "uncertainty_preservation")},
+        }
+    native_clear = candidate("native:clear", "native_symbol", .95, .9)
+    native_private = candidate("native:private", "native_symbol", .95, .3)
+    english = candidate("text:english", "text", .85, .9, "english")
+    common = {"listener_model": listener, "bridge_willingness": .8,
+              "willingness_witnesses": ["choice:current", "preference:stable"]}
+    clear = assess_mutual_intelligibility(intent, [native_clear, english], **common)
+    bridged = assess_mutual_intelligibility(intent, [native_private, english], **common)
+    declined = assess_mutual_intelligibility(
+        intent, [native_private, english], listener_model=listener, bridge_willingness=.1,
+        willingness_witnesses=["choice:current", "preference:stable"],
+    )
+    weak_english = dict(english)
+    weak_english["witnesses"] = {key: ["one:model"] for key in english["witnesses"]}
+    unclear = assess_mutual_intelligibility(intent, [native_private, weak_english], **common)
+    return _capability([*baseline["cases"],
+        {"case": "listener-recoverable native expression remains native-only",
+         "component": "native_autonomy", "correct": clear["mode"] == "native_only"},
+        {"case": "faithful native expression gains a voluntary English bridge when needed",
+         "component": "mutual_intelligibility", "correct": bridged["mode"] == "native_with_english_bridge"},
+        {"case": "English bridge is not an internal representation or automatic expression",
+         "component": "representation", "correct": not bridged["english_is_internal_representation"]
+         and not bridged["automatic_expression"]},
+        {"case": "declining the bridge preserves native expression",
+         "component": "willingness", "correct": declined["mode"] == "native_only"},
+        {"case": "single-origin English evidence causes clarification rather than fluent invention",
+         "component": "evidence", "correct": unclear["mode"] == "clarify"},
+    ])
 def _transformer_comparison_v1() -> dict[str, Any]:
     return _capability([
         {"case": "comparison is task-specific", "component": "diagnosis", "correct": False},
@@ -2257,6 +2306,7 @@ _REGISTRY = {
         ModuleVersion("communicative_meaning", "V1", "State and lexical output without a communicative meaning boundary", _communicative_meaning_v1),
         ModuleVersion("communicative_meaning", "V2", "Bounded evidence-backed meaning alternatives and abstention", _communicative_meaning_v2),
         ModuleVersion("communicative_meaning", "V3", "Listener hypotheses and evidence-gated communicative repair", _communicative_meaning_v3),
+        ModuleVersion("communicative_meaning", "V4", "Listener-relative native clarity and voluntary English bridging", _communicative_meaning_v4),
     ),
     "transformer_comparison": (
         ModuleVersion("transformer_comparison", "V1", "No task-specific architecture comparison guidance", _transformer_comparison_v1),

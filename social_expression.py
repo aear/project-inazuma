@@ -13,12 +13,14 @@ import uuid
 
 LISTENER_MODEL_SCHEMA = "ina.listener_hypothesis_set/V1"
 REPAIR_SCHEMA = "ina.communicative_repair_assessment/V1"
+INTELLIGIBILITY_SCHEMA = "ina.mutual_intelligibility_assessment/V1"
 MAX_WITNESSES = 32
 MAX_HYPOTHESES = 12
 MAX_RECORD_BYTES = 64 * 1024
 LISTENER_STATES = frozenset({
     "may_know", "may_not_know", "may_infer", "may_misunderstand", "unknown",
 })
+BRIDGE_MODES = frozenset({"native_only", "native_with_english_bridge", "clarify", "abstain"})
 
 
 def _now() -> str:
@@ -160,3 +162,134 @@ def assess_communicative_repair(
         "automatic_expression": False,
         "created_at": _now(),
     })
+
+
+def assess_mutual_intelligibility(
+    intent: Mapping[str, Any],
+    realisation_assessments: Iterable[Mapping[str, Any]],
+    *,
+    listener_model: Mapping[str, Any],
+    bridge_willingness: float,
+    willingness_witnesses: Iterable[Any],
+    minimum_fidelity: float = 0.7,
+    minimum_recoverability: float = 0.7,
+    minimum_uncertainty_preservation: float = 0.6,
+) -> dict[str, Any]:
+    """Choose an optional listener bridge without ranking a language as thought.
+
+    Each candidate retains separate fidelity, listener-recoverability, and
+    uncertainty-preservation dimensions.  A usable candidate needs two
+    independent evidence origins for every dimension; several scores derived
+    from one model therefore remain one witness.  The result is advisory and
+    never emits, rewrites, or rewards an expression.
+    """
+    if intent.get("schema") != "ina.expression_intent/V1" or not intent.get("intent_id"):
+        raise ValueError("a valid expression intent is required")
+    if listener_model.get("schema") != LISTENER_MODEL_SCHEMA:
+        raise ValueError("a valid listener hypothesis set is required")
+    audience = set(_refs(intent.get("audience_references"), 16))
+    listener = str(listener_model.get("audience_reference") or "").strip()
+    if audience and listener not in audience:
+        raise ValueError("listener model does not match the expression audience")
+
+    thresholds = {
+        "fidelity": _unit(minimum_fidelity),
+        "recoverability": _unit(minimum_recoverability),
+        "uncertainty_preservation": _unit(minimum_uncertainty_preservation),
+    }
+    candidates = []
+    for raw in tuple(realisation_assessments)[:8]:
+        if not isinstance(raw, Mapping):
+            continue
+        medium = str(raw.get("medium") or "").strip()
+        language = str(raw.get("language") or "").strip().casefold()
+        scores = {key: _unit(raw.get(key)) for key in thresholds}
+        supplied = raw.get("witnesses") if isinstance(raw.get("witnesses"), Mapping) else {}
+        evidence = {key: _refs(supplied.get(key), 16) for key in thresholds}
+        corroborated = {key: len(set(evidence[key])) >= 2 for key in thresholds}
+        faithful = all(corroborated.values()) and all(
+            scores[key] >= thresholds[key]
+            for key in ("fidelity", "uncertainty_preservation")
+        )
+        candidates.append({
+            "realisation_id": str(raw.get("realisation_id") or "")[:500],
+            "medium": medium[:80],
+            "language": language[:40],
+            "scores": scores,
+            "witnesses": evidence,
+            "corroborated_dimensions": corroborated,
+            "faithful": faithful,
+        })
+
+    native = next((row for row in candidates if row["medium"] == "native_symbol"), None)
+    english = next((row for row in candidates
+                    if row["medium"] == "text" and row["language"] == "english"), None)
+    english_listener_origins = {
+        origin
+        for hypothesis in listener_model.get("hypotheses") or ()
+        if isinstance(hypothesis, Mapping)
+        and str(hypothesis.get("proposition_reference") or "").casefold()
+        in {"language:english", "language:en"}
+        and hypothesis.get("state") in {"may_know", "may_infer"}
+        and _unit(hypothesis.get("confidence")) >= 0.5
+        for support in hypothesis.get("support") or ()
+        if isinstance(support, Mapping)
+        for origin in support.get("provenance") or ()
+    }
+    willingness = _unit(bridge_willingness)
+    willingness_origins = _refs(willingness_witnesses, 16)
+    willing = willingness >= 0.5 and len(set(willingness_origins)) >= 2
+
+    native_faithful = bool(native and native["faithful"])
+    native_understandable = bool(
+        native_faithful and native["scores"]["recoverability"] >= thresholds["recoverability"]
+    )
+    english_usable = bool(
+        english and english["faithful"]
+        and english["scores"]["recoverability"] >= thresholds["recoverability"]
+        and len(english_listener_origins) >= 2
+    )
+    if native_understandable:
+        mode = "native_only"
+        reason = "native_is_faithful_and_listener_recoverable"
+    elif native_faithful and english_usable and willing:
+        mode = "native_with_english_bridge"
+        reason = "native_is_faithful_but_listener_recoverability_needs_a_voluntary_bridge"
+    elif native_faithful and not willing:
+        mode = "native_only"
+        reason = "bridge_not_voluntarily_chosen"
+    elif native_faithful:
+        mode = "clarify"
+        reason = "no_corroborated_faithful_english_bridge"
+    else:
+        mode = "abstain"
+        reason = "native_fidelity_not_corroborated"
+    assert mode in BRIDGE_MODES
+
+    return _bounded({
+        "schema": INTELLIGIBILITY_SCHEMA,
+        "assessment_id": _id("mutual_intelligibility"),
+        "intent_id": str(intent["intent_id"]),
+        "listener_model_id": str(listener_model.get("listener_model_id") or "")[:500],
+        "audience_reference": listener[:500],
+        "dimensions": ["native_fidelity", "listener_recoverability", "uncertainty_preservation"],
+        "thresholds": thresholds,
+        "candidates": candidates,
+        "english_listener_evidence_origins": sorted(english_listener_origins)[:16],
+        "bridge_willingness": willingness,
+        "willingness_witnesses": willingness_origins,
+        "willingness_corroborated": len(set(willingness_origins)) >= 2,
+        "mode": mode,
+        "reason": reason,
+        "automatic_expression": False,
+        "english_is_internal_representation": False,
+        "engagement_is_understanding_evidence": False,
+        "created_at": _now(),
+    })
+
+
+__all__ = [
+    "LISTENER_MODEL_SCHEMA", "REPAIR_SCHEMA", "INTELLIGIBILITY_SCHEMA", "BRIDGE_MODES",
+    "build_listener_hypotheses", "assess_communicative_repair",
+    "assess_mutual_intelligibility",
+]
