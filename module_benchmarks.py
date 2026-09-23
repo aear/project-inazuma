@@ -376,6 +376,30 @@ def _thought_processor_v5() -> dict[str, Any]:
     ])
 
 
+def _thought_processor_v6() -> dict[str, Any]:
+    baseline = _thought_processor_v5()
+    from thought_processor import ThoughtProcessor
+    processor = ThoughtProcessor()
+    thought = processor.process_non_linguistic(
+        {"candidate": "cause:a"}, confidence=.5, provenance=["observation:1"],
+    )
+    plan = processor.prepare_communication(
+        "answer carefully", [thought], allowed_media=["text"],
+        cognition_event={
+            "signals": {"uncertainty": .9, "causal": .8},
+            "candidate_answer": "cause:a", "required_evidence": ["causal", "temporal"],
+            "evidence": {"causal": ["observation:1"]},
+        },
+    )
+    return _capability([*baseline["cases"],
+        {"case": "communication planning exposes its bounded cognition plan", "component": "integration",
+         "correct": plan["experience_cognition"]["schema"] == "ina.experience_cognition/V1"},
+        {"case": "communication intent names missing evidence without embedding thought", "component": "uncertainty",
+         "correct": plan["expression_intent"]["uncertainty"]["missing_evidence"] == ["temporal"]
+         and "text" not in plan["expression_intent"]},
+    ])
+
+
 def _q_decoder_v1() -> dict[str, Any]:
     module = _v1_module("transformers/QTransformer.py", package="transformers")
     transformer = module.QTransformer()
@@ -1851,6 +1875,37 @@ def _expression_core_v5() -> dict[str, Any]:
     ])
 
 
+def _expression_core_v6() -> dict[str, Any]:
+    baseline = _expression_core_v5()
+    from experience_cognition import plan_experience_cognition
+    from expression_core import TextRealiser, create_expression_intent
+    intent = create_expression_intent("answer carefully", allowed_media=["text"])
+    unknown = plan_experience_cognition({
+        "signals": {"uncertainty": .95, "causal": .8},
+        "candidate_answer": "cause:a", "required_evidence": ["causal"], "evidence": {},
+    })
+    unsupported_blocked = False
+    try:
+        TextRealiser().realise(
+            intent, cognition_plan=unknown,
+            content={"text": "Certainly cause A.", "response_kind": "expression"},
+        )
+    except PermissionError:
+        unsupported_blocked = True
+    admitted = TextRealiser().realise(
+        intent, cognition_plan=unknown,
+        content={"text": "I don't know yet.", "response_kind": "acknowledge_unknown"},
+    )
+    return _capability([*baseline["cases"],
+        {"case": "unknown blocks unsupported definite text", "component": "uncertainty",
+         "correct": unsupported_blocked},
+        {"case": "unknown may be expressed directly", "component": "agency",
+         "correct": admitted["content"]["epistemic_status"] == "unknown"},
+        {"case": "missing evidence does not force continued cognition", "component": "cadence",
+         "correct": unknown["epistemic_state"]["continuation_required"] is False},
+    ])
+
+
 def _self_inquiry_journey_v1() -> dict[str, Any]:
     return _capability([
         {"case": "deep introspection requires an explicit request", "component": "agency", "correct": False},
@@ -2114,6 +2169,76 @@ def _conversational_expression_v1() -> dict[str, Any]:
     ])
 
 
+def _experience_cognition_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "events activate only relevant cognitive routes", "component": "routing", "correct": False},
+        {"case": "no relevant signal may result in no route", "component": "agency", "correct": False},
+        {"case": "relation lenses preserve disagreement", "component": "attention", "correct": False},
+        {"case": "derived state propagation preserves sources", "component": "state", "correct": False},
+        {"case": "cognitive depth is trigger-driven and finite", "component": "cadence", "correct": False},
+        {"case": "future hypotheses span explicit horizons", "component": "prediction", "correct": False},
+        {"case": "predictions state how they can be disproved", "component": "uncertainty", "correct": False},
+        {"case": "unknown is valid and names missing evidence", "component": "uncertainty", "correct": False},
+        {"case": "coordination does not read or write memory", "component": "boundary", "correct": False},
+    ])
+
+
+def _experience_cognition_v2() -> dict[str, Any]:
+    from experience_cognition import plan_experience_cognition
+    plan = plan_experience_cognition(
+        {"signals": {
+            "contradiction": .9, "uncertainty": .8, "causal": .75,
+            "social": .1, "temporal": .1,
+        }, "required_evidence": ["causal", "temporal"],
+        "evidence": {"causal": ["event:cause"], "contradiction": ["witness:conflict"]}},
+        transient_candidates=[{
+            "state_id": "derived:1", "relevance": .9, "confidence": .8,
+            "salience": .8, "independent_witnesses": 2,
+            "source_references": ["experience:1"],
+        }],
+        prediction_candidates=[
+            {"horizon": "immediate", "prediction": "motion continues", "confidence": .7,
+             "source_references": ["event:cause"], "disconfirming_observations": ["motion stops"]},
+            {"horizon": "near", "prediction": "contact occurs", "confidence": .5,
+             "source_references": ["event:cause"], "disconfirming_observations": ["distance grows"]},
+            {"horizon": "later", "prediction": "trajectory settles", "confidence": .3,
+             "source_references": ["event:cause"], "disconfirming_observations": ["acceleration persists"]},
+        ],
+        max_routes=2, max_steps=3,
+    )
+    selected = [row["route"] for row in plan["routing"]["selected"]]
+    lenses = {row["lens"]: row for row in plan["attention_lenses"]}
+    predictions = plan["predictions"]
+    transient = plan["transient_state"]["candidates"][0]
+    empty = plan_experience_cognition({"signals": {}})
+    return _capability([
+        {"case": "events activate only relevant cognitive routes", "component": "routing",
+         "correct": selected == ["hindsight", "prediction"]},
+        {"case": "no relevant signal may result in no route", "component": "agency",
+         "correct": empty["routing"]["abstained"] and not empty["routing"]["selected"]},
+        {"case": "relation lenses preserve disagreement", "component": "attention",
+         "correct": lenses["causal"]["salience"] > lenses["social"]["salience"]
+         and lenses["causal"]["evidence_references"] != lenses["social"]["evidence_references"]},
+        {"case": "derived state propagation preserves sources", "component": "state",
+         "correct": transient["action"] == "propagate" and transient["source_experience_unchanged"]},
+        {"case": "cognitive depth is trigger-driven and finite", "component": "cadence",
+         "correct": 1 < plan["computation"]["steps"] <= 3 and plan["computation"]["may_stop_early"]},
+        {"case": "future hypotheses span explicit horizons", "component": "prediction",
+         "correct": all(predictions["horizons"][name] for name in ("immediate", "near", "later"))},
+        {"case": "predictions state how they can be disproved", "component": "uncertainty",
+         "correct": all(row["disconfirming_observations"] for rows in predictions["horizons"].values() for row in rows)},
+        {"case": "unknown is valid and names missing evidence", "component": "uncertainty",
+         "correct": plan["epistemic_state"]["status"] == "unknown"
+         and plan["epistemic_state"]["answer"] is None
+         and plan["epistemic_state"]["missing_evidence"] == ["temporal"]
+         and not plan["epistemic_state"]["continuation_required"]},
+        {"case": "coordination does not read or write memory", "component": "boundary",
+         "correct": plan["memory_boundary"] == {
+             "reads_fragment_store": False, "writes_memory": False, "trains_parameters": False,
+         }},
+    ])
+
+
 def _conversational_expression_v2() -> dict[str, Any]:
     from github_history_bridge import commit_memory_witness
     from lm_studio_adapter import grounding_subjects, is_explicit_grounding_request
@@ -2254,6 +2379,10 @@ _REGISTRY = {
     "native_test_support": (ModuleVersion("native_test_support", "V1", "External pytest required", _native_tests_v1), ModuleVersion("native_test_support", "V2", "Dependency-free pytest subset", _native_tests_v2)),
     "self_read_language": (ModuleVersion("self_read_language", "V1", "Music assets without explicit language roles", _self_read_language_v1), ModuleVersion("self_read_language", "V2", "Vocal, spoken, and written self-read alignment", _self_read_language_v2)),
     "experience_cycle": (ModuleVersion("experience_cycle", "V1", "Historical event and episode logging", _experience_cycle_v1), ModuleVersion("experience_cycle", "V2", "Optional bounded intent-attempt-observation-evaluation cycles", _experience_cycle_v2)),
+    "experience_cognition": (
+        ModuleVersion("experience_cognition", "V1", "All cognitive paths receive undifferentiated event handling", _experience_cognition_v1),
+        ModuleVersion("experience_cognition", "V2", "Sparse routed lenses, transient gating, adaptive depth, and horizon predictions", _experience_cognition_v2),
+    ),
     "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),
     "creative_versioning": (ModuleVersion("creative_versioning", "V1", "Working copies without explicit creative lineage", _creative_versioning_v1), ModuleVersion("creative_versioning", "V2", "Hash-addressed music and drawing lineage", _creative_versioning_v2)),
@@ -2297,6 +2426,7 @@ _REGISTRY = {
         ModuleVersion("expression_core", "V3", "Intents reference uncertain medium-neutral communicative meanings", _expression_core_v3),
         ModuleVersion("expression_core", "V4", "Requested effects select corroborated cross-modal affordances", _expression_core_v4),
         ModuleVersion("expression_core", "V5", "Near-equivalent affordances may use bounded superposition", _expression_core_v5),
+        ModuleVersion("expression_core", "V6", "Text realisation respects known, uncertain, and unknown cognition", _expression_core_v6),
         ModuleVersion("self_inquiry_journey", "V1", "No voluntary staged route for deeper self-understanding", _self_inquiry_journey_v1),
         ModuleVersion("self_inquiry_journey", "V2", "Meditation offers a finite witness-led self-inquiry journey", _self_inquiry_journey_v2),
         ModuleVersion("identity_system", "V1", "Single-profile self-reflection without aspect coordination", _identity_system_v1),
@@ -2326,6 +2456,7 @@ _REGISTRY = {
         ModuleVersion("thought_processor", "V3", "Emotion, instinct, cognition, and memory guide one inspectable decision", _thought_processor_v3),
         ModuleVersion("thought_processor", "V4", "Communication supplies evidence for bounded thought revision", _thought_processor_v4),
         ModuleVersion("thought_processor", "V5", "Communication planning references bounded meaning hypotheses", _thought_processor_v5),
+        ModuleVersion("thought_processor", "V6", "Communication planning coordinates bounded ELM cognition before text", _thought_processor_v6),
     ),
 }
 

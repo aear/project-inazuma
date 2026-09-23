@@ -37,7 +37,11 @@ except ModuleNotFoundError as exc:
     raise
 
 from comms_core import CommsCore, CommsResponse, load_secret
-from communicative_meaning import build_conversation_examples, interpret_communicative_meaning
+from communicative_meaning import (
+    build_conversation_examples, build_expression_cognition_event,
+    interpret_communicative_meaning,
+)
+from experience_cognition import plan_experience_cognition
 from conversation_scene import scene_with_memory_consideration
 from backend_discord import (
     make_sender_info_from_discord,
@@ -2287,8 +2291,13 @@ def process_inbound_message(msg) -> CommsResponse:
         context_id=meaning_context_id,
     )
     metadata["communicative_meaning_shadow"] = communicative_meaning_shadow
+    expression_cognition_shadow = plan_experience_cognition(
+        build_expression_cognition_event(communicative_meaning_shadow)
+    )
+    metadata["experience_cognition_shadow"] = expression_cognition_shadow
     metadata["conversation_meaning_examples"] = conversation_examples
     metadata["communicative_meaning_shadow_output_unchanged"] = True
+    metadata["experience_cognition_shadow_output_unchanged"] = True
     emotion_signal = format_emotion_signal(state)
     code_pointer_signal = format_code_pointer_signal(state)
     song_candidate = resolve_song_expression_candidate(state, child=child)

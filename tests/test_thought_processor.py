@@ -120,6 +120,26 @@ def test_thoughts_prepare_communication_without_exposing_internal_content():
     assert "text" not in intent
 
 
+def test_communication_plan_integrates_cognition_before_text_realisation():
+    processor = ThoughtProcessor()
+    thought = processor.process_non_linguistic(
+        {"candidate": "cause:a"}, confidence=.5, provenance=["observation:1"],
+    )
+    plan = processor.prepare_communication(
+        "answer causal question", [thought], allowed_media=["text"],
+        cognition_event={
+            "signals": {"uncertainty": .9, "causal": .8},
+            "candidate_answer": "cause:a", "required_evidence": ["causal", "temporal"],
+            "evidence": {"causal": ["observation:1"]},
+        },
+    )
+    assert plan["experience_cognition"]["epistemic_state"]["status"] == "unknown"
+    assert plan["text_expression_guidance"]["allowed_response_kinds"] == [
+        "acknowledge_unknown", "ask_for_evidence", "silence",
+    ]
+    assert plan["expression_intent"]["uncertainty"]["missing_evidence"] == ["temporal"]
+
+
 def test_communication_feedback_becomes_evidence_for_revision_not_reward():
     processor = ThoughtProcessor()
     original = processor.process_linguistic("The plan is clear.", confidence=0.6)

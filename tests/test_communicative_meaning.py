@@ -5,7 +5,23 @@ from communicative_meaning import (
     MEANING_SET_SCHEMA,
     build_conversation_examples,
     interpret_communicative_meaning,
+    build_expression_cognition_event,
 )
+
+
+def test_meaning_set_projects_to_cognition_without_retrieval_or_invention():
+    supported = interpret_communicative_meaning([
+        _witness("thought:1", "ask", "concept:need"),
+    ])
+    event = build_expression_cognition_event(supported)
+    assert event["candidate_answer"] == supported["candidates"][0]["candidate_id"]
+    assert event["evidence"]["social"] == ["thought:1"]
+    assert "memory" not in event and "retrieval" not in event
+
+    absent = interpret_communicative_meaning([{"witness_id": "affect:1", "stance": {"warmth": .8}}])
+    unknown = build_expression_cognition_event(absent)
+    assert unknown["candidate_answer"] is None
+    assert unknown["signals"]["uncertainty"] == 1.0
 from expression_core import create_expression_intent
 from thought_processor import ThoughtProcessor
 

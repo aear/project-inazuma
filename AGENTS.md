@@ -185,6 +185,14 @@ over time instead of tearing it down every cycle.
 
 ## Development principles
 
+### Project terminology: Experience Learning Model
+- Ina is an **Experience Learning Model (ELM)**, not a Large Language Model
+  (LLM). In this project, ELM names an architecture that learns through
+  retained, provenance-aware experience across modalities and over time.
+- The term describes the organising learning model. It does not forbid
+  language-processing components, imply that every component is unique, or
+  establish priority over independent uses of the same term.
+
 ### Prefer reuse over reimplementation
 - Before writing new code, **search for an existing implementation** that already solves it (even if prototype-quality).
 - If an existing implementation works, **extract + reuse** it rather than rewriting.
@@ -198,6 +206,25 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 ### DRY is the default
 - If you find yourself re-typing a subsystem that already exists elsewhere in the repo, stop and refactor into a shared module.
 - Avoid “nearly identical” copies; prefer one shared implementation + thin wrappers.
+
+### Redundancy removal requires evidence
+- Apparent redundancy is a hypothesis, not proof that code, data, a fallback,
+  a witness, or a representation is safe to remove. Similar paths may preserve
+  independence, provenance, compatibility, failure isolation, or distinct
+  semantics.
+- Before removing or merging redundancy, identify the roles served by each
+  copy or path and compare the retained design against the current one with
+  multiple relevant signals. At minimum, check behavior and correctness;
+  where applicable also check capability, quality, safety, performance,
+  provenance, compatibility, and rollback.
+- Use explicit, versioned benchmarks and adversarial or disagreement cases
+  where a meaningful comparison is possible. Unit tests alone are not proof
+  of no negative effect.
+- If the absence of negative effects cannot yet be demonstrated, retain the
+  redundancy or make the change reversible and record the missing evidence
+  and review path.
+- Never erase independent witnesses merely because their current values agree;
+  several observations with a shared failure mode are still one signal.
 
 ### Reversibility and compatibility paths
 - Prefer reversible changes.

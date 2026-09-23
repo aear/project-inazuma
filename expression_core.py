@@ -317,14 +317,51 @@ class ExpressionRealiser(Protocol):
     def realise(self, intent: Mapping[str, Any], **kwargs: Any) -> Mapping[str, Any]: ...
 
 
+def text_expression_guidance(cognition_plan: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Convert an ELM cognition plan into bounded text-realisation constraints."""
+    if not isinstance(cognition_plan, Mapping):
+        return {
+            "status": "not_supplied", "allowed_response_kinds": ["expression"],
+            "requires_epistemic_acknowledgement": False, "missing_evidence": [],
+        }
+    if cognition_plan.get("schema") != "ina.experience_cognition/V1":
+        raise ValueError("a valid experience cognition plan is required")
+    epistemic = cognition_plan.get("epistemic_state")
+    epistemic = epistemic if isinstance(epistemic, Mapping) else {}
+    status = str(epistemic.get("status") or "unknown")
+    if status == "unknown":
+        allowed = ["acknowledge_unknown", "ask_for_evidence", "silence"]
+    elif status == "uncertain":
+        allowed = ["qualified_expression", "ask_for_evidence", "silence"]
+    else:
+        allowed = ["expression", "qualified_expression", "silence"]
+    return {
+        "status": status,
+        "allowed_response_kinds": allowed,
+        "requires_epistemic_acknowledgement": status in {"unknown", "uncertain"},
+        "missing_evidence": list(epistemic.get("missing_evidence") or ())[:8],
+        "optional_observations": list(epistemic.get("optional_observations") or ())[:8],
+        "conflict_retained": bool(epistemic.get("conflict_retained")),
+        "continuation_required": False,
+    }
+
+
 class TextRealiser:
     name = "expression.text"
     version = "V1"
     medium = "text"
 
     def realise(self, intent: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        content = dict(kwargs.get("content") or {})
+        guidance = text_expression_guidance(kwargs.get("cognition_plan"))
+        response_kind = str(content.get("response_kind") or "expression")
+        if response_kind not in guidance["allowed_response_kinds"]:
+            raise PermissionError(
+                f"epistemic status {guidance['status']} does not allow text response kind {response_kind}"
+            )
+        content["epistemic_status"] = guidance["status"]
         return create_realisation(
-            intent, medium=self.medium, content=dict(kwargs.get("content") or {}),
+            intent, medium=self.medium, content=content,
             conventions=kwargs.get("conventions"), provenance=kwargs.get("provenance"),
             realiser=self.name, version=self.version,
         )
@@ -368,7 +405,7 @@ __all__ = [
     "INTENT_SCHEMA", "REALISATION_SCHEMA", "REACTION_SCHEMA", "INTERPRETATION_SCHEMA",
     "REQUEST_SCHEMA", "AFFORDANCE_SCHEMA", "SELECTION_SCHEMA",
     "ExpressionRealiser", "ExpressionTraceStore", "TextRealiser", "NativeSymbolRealiser",
-    "create_expression_intent",
+    "create_expression_intent", "text_expression_guidance",
     "create_requested_effect", "create_expression_affordance", "select_expression_affordance",
     "create_realisation", "create_reaction_observation", "create_reaction_interpretation",
 ]

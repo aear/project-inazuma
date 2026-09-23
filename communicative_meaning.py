@@ -230,6 +230,51 @@ def interpret_communicative_meaning(
     })
 
 
+def build_expression_cognition_event(meaning_set: Mapping[str, Any]) -> dict[str, Any]:
+    """Project bounded meaning evidence into cognition signals for expression.
+
+    This projection references meaning witnesses only.  It performs no recall
+    and does not turn affect or conversational pressure into a proposition.
+    """
+    if meaning_set.get("schema") != MEANING_SET_SCHEMA:
+        raise ValueError("a valid communicative meaning set is required")
+    candidates = [
+        dict(item) for item in list(meaning_set.get("candidates") or ())[:MAX_CANDIDATES]
+        if isinstance(item, Mapping)
+    ]
+    abstention = meaning_set.get("abstention")
+    abstention = abstention if isinstance(abstention, Mapping) else {}
+    leading = candidates[0] if candidates else {}
+    support_refs = [
+        str(row.get("witness_id"))[:256]
+        for row in list(leading.get("support") or ())[:16]
+        if isinstance(row, Mapping) and row.get("witness_id")
+    ]
+    contradiction_refs = [
+        str(row.get("witness_id"))[:256]
+        for candidate in candidates
+        for row in list(candidate.get("contradictions") or ())[:16]
+        if isinstance(row, Mapping) and row.get("witness_id")
+    ][:16]
+    confidence = _unit(leading.get("confidence", 0.0)) if leading else 0.0
+    ambiguous = str(abstention.get("reason") or "") == "meaning_ambiguous"
+    evidence: dict[str, list[str]] = {}
+    if support_refs:
+        evidence["social"] = support_refs
+    if contradiction_refs:
+        evidence["contradiction"] = contradiction_refs
+    return {
+        "signals": {
+            "uncertainty": 1.0 if abstention.get("active") else round(1.0 - confidence, 6),
+            "contradiction": .8 if contradiction_refs else (.6 if ambiguous else 0.0),
+            "social": 1.0,
+            "affect": max((max((item.get("stance") or {}).values(), default=0.0) for item in candidates), default=0.0),
+        },
+        "candidate_answer": leading.get("candidate_id") if leading and not abstention.get("active") else None,
+        "required_evidence": ["social"],
+        "evidence": evidence,
+        "meaning_set_reference": str(meaning_set.get("meaning_set_id") or "")[:256],
+    }
 def build_conversation_examples(
     turns: Iterable[Mapping[str, Any]], *, context_id: str = "",
     include_surface: bool = False, max_turns: int = 12,
@@ -276,4 +321,5 @@ def build_conversation_examples(
 __all__ = [
     "MEANING_SET_SCHEMA", "MEANING_INTERPRETATION_SCHEMA", "CONVERSATION_EXAMPLES_SCHEMA",
     "interpret_communicative_meaning", "build_conversation_examples",
+    "build_expression_cognition_event",
 ]

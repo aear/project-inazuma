@@ -63,3 +63,14 @@ def test_existing_logger_opts_into_cycles_without_changing_event_payloads(tmp_pa
     cycle = logger.start_experience_cycle("one look", domain="vision", payload_references=["frame-1"])
     attempt = logger.complete_experience_attempt(cycle["cycle_id"], attempt_reference="look-1", choice="keep")
     assert attempt["cycle_id"] == cycle["cycle_id"]
+
+
+def test_cycle_engine_exposes_cognition_without_touching_storage(tmp_path):
+    engine = ExperienceCycleEngine("Ina", base_path=tmp_path)
+    before = list(tmp_path.rglob("*"))
+    plan = engine.plan_cognition({"signals": {"contradiction": .9, "uncertainty": .8}})
+    after = list(tmp_path.rglob("*"))
+
+    assert plan["routing"]["selected"][0]["route"] == "hindsight"
+    assert plan["memory_boundary"]["writes_memory"] is False
+    assert before == after

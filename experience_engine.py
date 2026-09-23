@@ -15,6 +15,7 @@ import uuid
 from io_utils import atomic_write_json, load_json_dict
 from experience_cycle_storage import CycleTierPolicy
 from experience_cycle_index import ExperienceCycleIndex
+from experience_cognition import plan_experience_cognition
 
 
 SCHEMA = "ina.experience_cycle/V2"
@@ -154,6 +155,22 @@ class ExperienceCycleEngine:
         manifest = self._write_json(root, "manifests", cycle["cycle_id"], cycle)
         self.index.upsert(cycle, manifest)
         return cycle
+
+    @staticmethod
+    def plan_cognition(
+        event: Mapping[str, Any], *,
+        transient_candidates: Iterable[Mapping[str, Any]] = (),
+        prediction_candidates: Iterable[Mapping[str, Any]] = (),
+        max_routes: int = 4, max_steps: int = 5,
+    ) -> dict[str, Any]:
+        """Coordinate one event without reading or writing Experience storage."""
+        return plan_experience_cognition(
+            event,
+            transient_candidates=transient_candidates,
+            prediction_candidates=prediction_candidates,
+            max_routes=max_routes,
+            max_steps=max_steps,
+        )
 
     def load_cycle(self, cycle_id: str) -> dict[str, Any]:
         cycle = load_json_dict(self._manifest_path(cycle_id))

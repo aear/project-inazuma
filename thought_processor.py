@@ -14,7 +14,9 @@ import uuid
 from cognition_runtime.cognitive_context import CognitiveContext, _bounded
 from expression_core import (
     INTERPRETATION_SCHEMA, REACTION_SCHEMA, create_expression_intent,
+    text_expression_guidance,
 )
+from experience_cognition import plan_experience_cognition
 from semantic_event import build_native_intent, build_semantic_event
 
 
@@ -279,6 +281,9 @@ class ThoughtProcessor:
         dimensions: Mapping[str, Any] | None = None, max_thoughts: int = 8,
         thought_ids: Iterable[str] | None = None,
         meaning_set: Mapping[str, Any] | None = None,
+        cognition_event: Mapping[str, Any] | None = None,
+        transient_candidates: Iterable[Mapping[str, Any]] = (),
+        prediction_candidates: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """Select thought references and prepare an output-neutral expression intent."""
         bounded = tuple(thoughts)[:64]
@@ -309,12 +314,26 @@ class ThoughtProcessor:
                 for item in list(meaning_set.get("candidates") or ())[:8]
                 if isinstance(item, Mapping) and item.get("candidate_id")
             ]
+        cognition_plan = None
+        guidance = text_expression_guidance(None)
+        if cognition_event is not None:
+            cognition_plan = plan_experience_cognition(
+                cognition_event,
+                transient_candidates=transient_candidates,
+                prediction_candidates=prediction_candidates,
+            )
+            guidance = text_expression_guidance(cognition_plan)
         intent = create_expression_intent(
             purpose, semantic_references=linguistic,
             meaning_references=meaning_references,
             concept_references=concepts, affect_references=affects,
             audience_references=audience_references, dimensions=dimensions,
-            uncertainty={"thoughts": uncertain[:8]}, allowed_media=allowed_media,
+            uncertainty={
+                "thoughts": uncertain[:8],
+                "epistemic_status": guidance["status"],
+                "missing_evidence": guidance["missing_evidence"],
+                "conflict_retained": guidance.get("conflict_retained", False),
+            }, allowed_media=allowed_media,
             provenance=tuple(dict.fromkeys(
                 (*thought_references, *(source for item in selected for source in item.provenance))
             )),
@@ -325,6 +344,8 @@ class ThoughtProcessor:
             "selected_thought_ids": [item.thought_id for item in selected],
             "expression_intent": intent,
             "communicative_meaning_set": dict(meaning_set) if isinstance(meaning_set, Mapping) else None,
+            "experience_cognition": cognition_plan,
+            "text_expression_guidance": guidance,
             "context_ids": list(dict.fromkeys(item.context_id for item in selected if item.context_id)),
         }
 

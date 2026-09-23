@@ -421,6 +421,11 @@ def test_discord_meaning_shadow_keeps_conversation_surface_out_and_output_unchan
     assert result.text == "A grounded response."
     assert result.metadata["communicative_meaning_shadow_output_unchanged"] is True
     assert result.metadata["communicative_meaning_shadow"]["abstention"]["reason"] == "no_supported_meaning"
+    assert result.metadata["experience_cognition_shadow_output_unchanged"] is True
+    cognition = result.metadata["experience_cognition_shadow"]
+    assert cognition["epistemic_state"]["status"] == "unknown"
+    assert cognition["epistemic_state"]["answer"] is None
+    assert cognition["memory_boundary"]["writes_memory"] is False
     examples = result.metadata["conversation_meaning_examples"]
     assert examples["surface_included"] is False
     assert "surface_text" not in examples["examples"][0]

@@ -79,6 +79,45 @@ def test_concrete_realisers_translate_one_intent_independently():
     assert text["content"] != native["content"]
 
 
+def test_text_realiser_respects_unknown_without_forcing_speech():
+    from experience_cognition import plan_experience_cognition
+    intent = create_expression_intent("answer carefully", allowed_media=["text"])
+    cognition = plan_experience_cognition({
+        "signals": {"uncertainty": .95, "causal": .8},
+        "required_evidence": ["causal"], "evidence": {},
+    })
+    with pytest.raises(PermissionError, match="unknown"):
+        TextRealiser().realise(
+            intent, cognition_plan=cognition,
+            content={"text": "It definitely happened.", "response_kind": "expression"},
+        )
+    admitted = TextRealiser().realise(
+        intent, cognition_plan=cognition,
+        content={"text": "I don't know yet.", "response_kind": "acknowledge_unknown"},
+    )
+    assert admitted["content"]["epistemic_status"] == "unknown"
+
+
+def test_uncertain_text_can_qualify_or_ask_but_not_claim_certainty():
+    from experience_cognition import plan_experience_cognition
+    intent = create_expression_intent("share a tentative interpretation", allowed_media=["text"])
+    cognition = plan_experience_cognition({
+        "signals": {"uncertainty": .6, "contradiction": .7},
+        "candidate_answer": "candidate:1",
+        "evidence": {"contradiction": ["witness:a", "witness:b"]},
+    })
+    qualified = TextRealiser().realise(
+        intent, cognition_plan=cognition,
+        content={"text": "I might be reading that wrong.", "response_kind": "qualified_expression"},
+    )
+    assert qualified["content"]["epistemic_status"] == "uncertain"
+    with pytest.raises(PermissionError, match="uncertain"):
+        TextRealiser().realise(
+            intent, cognition_plan=cognition,
+            content={"text": "That is certainly true.", "response_kind": "expression"},
+        )
+
+
 def test_requested_effect_selects_direct_cross_modal_affordance_over_words():
     intent = create_expression_intent("join harmless play", allowed_media=["text", "voice"])
     request = create_requested_effect(intent, effects=[
