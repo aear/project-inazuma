@@ -26,3 +26,26 @@ only when both complete exact results agree. The cognition runtime exposes the
 same mechanism as `experiential_counting`, capped at 100,000 observations per
 invocation. Quantity-bearing experience events route to the counting specialist
 through `experience_cognition.py`.
+
+## Learned cadence
+
+`counting_cadence.py` lets Ina learn whether to accumulate observed units
+linearly or in verified groups. A task may offer any sensible positive group
+sizes up to the bounded maximum; 2, 5, and 10 are defaults, not privileged
+answers. This is group or skip counting, not mathematical logarithmic
+estimation. Every unit still passes through the experiential counter, and an
+incomplete final group is retained as a remainder.
+
+The cadence learner is a finite, inspectable online bandit. Feedback rewards
+exact results and independent recount agreement more strongly than fewer
+accumulator steps. If grouping is not reliable, stride 1 is mandatory. No
+learning runs merely because time passed, and learned cadence changes how the
+count is accumulated—not what observations are admitted.
+
+`compare_linear_and_grouped(...)` supports concurrent dual counting. One
+accumulator advances linearly while a second closes verified groups and retains
+the final remainder. Their comparison detects arithmetic, grouping, or lost
+remainder errors during the same pass. The result explicitly records that both
+accumulators shared one observation stream: agreement validates accumulation,
+but a separate enumeration is still needed to corroborate that perception did
+not omit the same unit before both counters received it.

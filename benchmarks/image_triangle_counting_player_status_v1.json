@@ -1,0 +1,14 @@
+{
+  "schema": "ina.benchmark.image_triangle_counting/V1",
+  "benchmark_id": "player-status-triangles-v1",
+  "description": "Count geometric slots and active colour states without reading captions.",
+  "regions": [
+    {"name": "full_health_and_shields", "box": [0.165, 0.035, 0.370, 0.575], "expected": {"total": 24, "red": 6, "blue": 18}},
+    {"name": "minor_shield_damage", "box": [0.545, 0.025, 0.670, 0.280], "expected": {"total": 24, "red": 6, "blue": 15, "empty": 3}},
+    {"name": "heavy_shield_damage", "box": [0.700, 0.025, 0.825, 0.280], "expected": {"total": 24, "red": 6, "blue": 6, "empty": 12}},
+    {"name": "shields_depleted", "box": [0.855, 0.025, 0.990, 0.280], "expected": {"total": 24, "red": 6, "blue": 0, "empty": 18}},
+    {"name": "minor_health_damage", "box": [0.545, 0.370, 0.670, 0.645], "expected": {"total": 24, "red": 3, "blue": 18, "empty": 3}},
+    {"name": "heavy_health_damage", "box": [0.700, 0.370, 0.825, 0.645], "expected": {"total": 24, "red": 2, "blue": 12, "empty": 10}},
+    {"name": "critical_health", "box": [0.855, 0.370, 0.990, 0.645], "expected": {"total": 24, "red": 1, "blue": 4, "empty": 19}}
+  ]
+}

@@ -237,6 +237,14 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
   and no unit remains unresolved. A budget stop is an incomplete lower bound.
 - When verification matters, recount through a separate enumeration; two
   transformations of the same stored total are not independent evidence.
+- Group counting may use any bounded, task-sensible group size, but every member
+  must still be individually admitted before the accumulator advances by the
+  group size. Preserve incomplete remainders. Learned cadence must prefer exact,
+  independently verified outcomes over fewer accumulator steps, and fall back
+  to groups of one when grouping is unreliable.
+- Linear and group accumulators may run concurrently and compare their results.
+  Label this accumulation agreement, not an independent recount: a shared
+  observation stream gives both paths the same perceptual omissions.
 
 ### Reversibility and compatibility paths
 - Prefer reversible changes.

@@ -2248,6 +2248,62 @@ def _experiential_counting_v2() -> dict[str, Any]:
     ])
 
 
+def _experiential_counting_v3() -> dict[str, Any]:
+    from counting_cadence import CadenceLearner, count_with_cadence
+    grouped = count_with_cadence(iter(range(12)), unit="beat", rule="one onset", stride=5)
+    learner = CadenceLearner()
+    learner.learn(1, exact=True, recount_agreed=True, steps=20, observations=20)
+    learner.learn(2, exact=True, recount_agreed=True, steps=10, observations=20)
+    learner.learn(5, exact=True, recount_agreed=True, steps=4, observations=20)
+    learner.learn(10, exact=False, recount_agreed=False, steps=2, observations=20)
+    flexible = CadenceLearner(candidates=(1, 3, 7, 12))
+    for stride in flexible.candidates:
+        flexible.learn(stride, exact=True, recount_agreed=True,
+                       steps=(84 + stride - 1) // stride, observations=84)
+    return _capability([
+        {"case": "linear cadence remains available", "component": "fallback",
+         "correct": count_with_cadence(iter(range(3)), unit="item", rule="one item", stride=1)["value"] == 3},
+        {"case": "grouped cadence still observes every unit", "component": "cardinality",
+         "correct": grouped["value"] == grouped["observed"] == 12},
+        {"case": "grouped cadence retains a remainder", "component": "grouping",
+         "correct": [row["size"] for row in grouped["verified_groups"]] == [5, 5, 2]},
+        {"case": "learner favours verified efficient cadence", "component": "learning",
+         "correct": learner.choose(grouping_reliable=True) == 5},
+        {"case": "failed shortcut cannot win on efficiency", "component": "safety",
+         "correct": learner.rewards[10] < learner.rewards[5]},
+        {"case": "unreliable grouping forces stride one", "component": "uncertainty",
+         "correct": learner.choose(grouping_reliable=False) == 1},
+        {"case": "grouped exact counting is not approximate estimation", "component": "honesty",
+         "correct": grouped["approximate"] is False and grouped["cadence"] == "grouped_skip_counting"},
+        {"case": "task may offer non-default sensible group sizes", "component": "generality",
+         "correct": flexible.choose(grouping_reliable=True, maximum_stride=8) == 7},
+    ])
+
+
+def _experiential_counting_v4() -> dict[str, Any]:
+    from counting_cadence import compare_linear_and_grouped
+    comparison = compare_linear_and_grouped(
+        iter(range(23)), unit="triangle", rule="one observed triangular face", group_size=5,
+    )
+    exact_groups = compare_linear_and_grouped(
+        iter(range(24)), unit="triangle", rule="one observed triangular face", group_size=6,
+    )
+    return _capability([
+        {"case": "linear and grouped accumulators run over the same pass", "component": "concurrency",
+         "correct": comparison["concurrent_accumulators"] == 2 and comparison["observed"] == 23},
+        {"case": "concurrent accumulators agree", "component": "corroboration",
+         "correct": comparison["linear_value"] == comparison["grouped_value"] == 23},
+        {"case": "non-divisible totals preserve remainder", "component": "remainder",
+         "correct": comparison["closed_group_total"] == 20 and comparison["remainder"] == 3},
+        {"case": "exact groups need no manufactured remainder", "component": "boundary",
+         "correct": exact_groups["value"] == 24 and exact_groups["remainder"] == 0},
+        {"case": "agreement is scoped to accumulation", "component": "honesty",
+         "correct": comparison["validates"] == "accumulation_agreement"},
+        {"case": "shared stream is not called an independent recount", "component": "evidence",
+         "correct": comparison["shared_observation_stream"] and comparison["independent_enumerations"] == 1},
+    ])
+
+
 def _experience_cognition_v2() -> dict[str, Any]:
     from experience_cognition import plan_experience_cognition
     plan = plan_experience_cognition(
@@ -2451,6 +2507,8 @@ _REGISTRY = {
     "experiential_counting": (
         ModuleVersion("experiential_counting", "V1", "Domain totals and inferred quantities without a shared counting act", _experiential_counting_v1),
         ModuleVersion("experiential_counting", "V2", "Discrete observation counting with identity, boundaries, and recount verification", _experiential_counting_v2),
+        ModuleVersion("experiential_counting", "V3", "Learned exact linear or grouped counting cadence with verified remainders", _experiential_counting_v3),
+        ModuleVersion("experiential_counting", "V4", "Concurrent linear and grouped accumulation with scoped agreement evidence", _experiential_counting_v4),
     ),
     "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),
