@@ -24,6 +24,11 @@ def test_router_can_abstain_instead_of_forcing_activity():
     assert routed["selected"] == []
 
 
+def test_quantity_routes_to_actual_counting_capability():
+    routed = route_experience({"signals": {"quantity": 1.0, "sensory": .5}}, max_routes=2)
+    assert routed["selected"][0]["route"] == "counting"
+
+
 def test_attention_lenses_keep_disagreement_visible():
     lenses = inspect_attention_lenses({
         "signals": {"causal": .9, "social": .1, "contradiction": .8},

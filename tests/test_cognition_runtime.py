@@ -146,6 +146,23 @@ def test_model_manager_facade_routes_multiple_capabilities_compatibly(monkeypatc
     assert all(item.provenance == ("test",) for item in results)
 
 
+def test_model_manager_registers_reachable_actual_counting_capability(monkeypatch):
+    monkeypatch.setattr(mm, "_COGNITION_RUNTIME", None)
+    runtime = mm.get_cognition_runtime()
+    spec = runtime.registry.require("experiential_counting")
+    result = runtime.route(
+        "experiential_counting", mm.build_cognitive_context(provenance=["test:count"]),
+        payload={
+            "unit": "beat", "rule": "one observed onset",
+            "observations": ["kick", "snare", "kick"], "observation_budget": 10,
+        },
+    )
+    assert spec.implementation == "experiential_counting.count_payload"
+    assert result.value["value"] == 3
+    assert result.value["counted_by_observation"] is True
+    assert result.provenance == ("test:count",)
+
+
 def test_result_bus_rejects_unbounded_inline_payload():
     bus = ResultBus(max_inline_bytes=1024)
     try:

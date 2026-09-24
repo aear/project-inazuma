@@ -63,8 +63,9 @@ from operator_permissions import (
 from github_submission import append_github_issue_entry, get_github_submission_config, github_delivery_request_path, labels_for_kind, report_github_finding, request_github_delivery
 from transformers.fractal_multidimensional_transformers import FractalTransformer
 from cognition_runtime import (
-    CapabilityRegistry, CognitionRuntime, CognitiveContext, ExistingSchedulerAdapter,
-    ResourceBudget, ResultBus, capability_specs_from_task_profiles,
+    CapabilityRegistry, CapabilitySpec, CognitionRuntime, CognitiveContext,
+    CostEstimate, ExistingSchedulerAdapter, ResourceBudget, ResultBus,
+    capability_specs_from_task_profiles,
 )
 from cognition_runtime.default_capabilities import build_task_profiles
 from thought_processor import ThoughtProcessor
@@ -4663,6 +4664,21 @@ def get_cognition_runtime() -> CognitionRuntime:
             registry = CapabilityRegistry(
                 capability_specs_from_task_profiles(_PROCESS_TASK_PROFILES, limits)
             )
+            registry.register(CapabilitySpec(
+                name="experiential_counting",
+                description="Count discrete supplied observations one at a time under an explicit rule.",
+                version="V1",
+                accepts={"payload": "bounded observations plus unit and counting rule"},
+                returns={"value": "exact count or honest lower bound"},
+                expected_cost=CostEstimate(
+                    ram_bytes=16 * 1024 * 1024, cpu_percent=10.0,
+                    io_class="none", elapsed_seconds=1.0,
+                ),
+                supported_context=frozenset({"observations", "goals", "references", "metadata"}),
+                confidence_semantics="exact only after an exhausted observation boundary with no unresolved units",
+                backend="python-local", implementation="experiential_counting.count_payload",
+                concurrency_groups=("bounded_cognition",),
+            ))
             bus = ResultBus(max_contributions=max(128, int(limits.get("history_limit", 512))))
             scheduler = ExistingSchedulerAdapter(
                 registry, _RESOURCE_BUDGET, bus, enqueue=request_scheduler_task,
@@ -4670,6 +4686,12 @@ def get_cognition_runtime() -> CognitionRuntime:
             _COGNITION_RUNTIME = CognitionRuntime(
                 registry, bus, scheduler=scheduler,
                 max_parallel=int(limits.get("max_parallel_tasks", 2)),
+            )
+            from experiential_counting import count_payload
+            _COGNITION_RUNTIME.install_handler(
+                "experiential_counting",
+                lambda _context, payload: count_payload(payload),
+                source="experiential_counting.V1",
             )
         return _COGNITION_RUNTIME
 

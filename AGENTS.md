@@ -226,6 +226,18 @@ If unsure whether to reuse: **default to reuse**, then note the tradeoff in the 
 - Never erase independent witnesses merely because their current values agree;
   several observations with a shared failure mode are still one signal.
 
+### Counting means observing discrete units
+- A claimed count must advance by admitting one discrete observation at a time
+  under an explicit domain rule. Do not substitute container length, dimensions,
+  duration arithmetic, metadata totals, language-model estimation, or a
+  caller-supplied number for the act of counting.
+- Repeated equal observations still count in occurrence mode. Distinct-object
+  counting requires explicit stable identities and reports duplicates.
+- Report an exact count only after the defined observation boundary is exhausted
+  and no unit remains unresolved. A budget stop is an incomplete lower bound.
+- When verification matters, recount through a separate enumeration; two
+  transformations of the same stored total are not independent evidence.
+
 ### Reversibility and compatibility paths
 - Prefer reversible changes.
 - Document why strange code exists, especially compatibility paths and non-obvious fallbacks.
@@ -313,6 +325,27 @@ an existing threshold is a floor, not the target. For material changes:
 - Keep harness and broad-suite diagnostics in standalone processes outside Ina's runtime tree. Use unbuffered output and an explicit time limit for broad runs, then reproduce a suspected stall with the smallest focused test before attributing it to Ina.
 - Interpret diagnostic termination from the invoked signals: a deliberate `SIGABRT` used for faulthandler stack capture may report `Aborted` or `core dumped`, while exit 137 means `SIGKILL` (often a timeout escalation). Neither alone proves an OOM kill or spontaneous kernel action; corroborate with the command, captured stacks, and host evidence.
 - On hosts where `asyncio.run()` stalls while shutting down its default executor after completed `asyncio.to_thread()` work, record full-suite completion as unavailable, retain focused results, and confirm with a minimal standalone reproducer. Do not weaken production isolation or remove legitimate thread offloading merely to make that interpreter-specific test shutdown disappear.
+
+### Keep the Codex harness current from authoritative evidence
+- Whenever work touches Codex, ChatGPT, OpenAI APIs, plugins, skills, MCP,
+  authentication, models, approvals, tool calls, streaming, protocol events, or
+  harness-visible capabilities, consult current official OpenAI documentation
+  before designing or changing the integration. Prefer the read-only OpenAI
+  developer documentation MCP server when available; otherwise use only the
+  official OpenAI documentation domains.
+- Public documentation describes supported behavior, but may not enumerate the
+  installed app-server protocol. For exact event, request, response, or schema
+  work, also generate or inspect the schema from the locally installed Codex
+  version. Record disagreements and do not invent undocumented fields.
+- Compare new or changed capabilities with the standalone harness. If the
+  harness is missing a useful supported capability, add a bounded, user-routed
+  implementation or record why it is unavailable. Documentation discovery does
+  not authorize automatic approvals, credential copying, paid API fallback, or
+  joining Ina's runtime/process tree.
+- Harness updates require focused protocol tests, the versioned historical
+  harness comparison, authentication-safety checks, and explicit disclosure of
+  anything that was documented but could not be verified locally. Never update
+  merely because time passed; the trigger is relevant work or observed drift.
 
 ### Codex authorship attribution
 

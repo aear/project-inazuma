@@ -2183,6 +2183,71 @@ def _experience_cognition_v1() -> dict[str, Any]:
     ])
 
 
+def _experiential_counting_v1() -> dict[str, Any]:
+    return _capability([
+        {"case": "count advances once per admitted observation", "component": "cardinality", "correct": False},
+        {"case": "repeated equal occurrences remain countable", "component": "occurrence", "correct": False},
+        {"case": "distinct counting uses explicit identities", "component": "identity", "correct": False},
+        {"case": "budget stop reports an incomplete lower bound", "component": "honesty", "correct": False},
+        {"case": "unresolved units prevent an exact claim", "component": "uncertainty", "correct": False},
+        {"case": "group totals derive from the same observed units", "component": "grouping", "correct": False},
+        {"case": "verification performs a separate recount", "component": "verification", "correct": False},
+        {"case": "declared totals cannot bypass counting", "component": "safety", "correct": False},
+    ])
+
+
+def _experiential_counting_v2() -> dict[str, Any]:
+    from experiential_counting import ExperientialCounter, count_payload, verify_by_recount
+    occurrences = ExperientialCounter(
+        "beat", rule="one observed onset",
+    ).observe_many(iter(["kick", "kick", "snare", "kick"]))
+    unique = ExperientialCounter(
+        "version", rule="one distinct immutable id", mode="unique",
+        identity_of=lambda item: item["id"], group_of=lambda item: item["kind"],
+    ).observe_many([
+        {"id": "v1", "kind": "major"}, {"id": "v2", "kind": "minor"},
+        {"id": "v2", "kind": "minor"}, {"id": "v3", "kind": "minor"},
+    ])
+    partial = ExperientialCounter("pixel", rule="one yielded raster position").observe_many(
+        iter(range(20)), budget=3,
+    )
+    unresolved = ExperientialCounter(
+        "mark", rule="one classifiable mark",
+        admit=lambda item: (_ for _ in ()).throw(ValueError("unresolved")) if item is None else True,
+    ).observe_many(["a", None])
+    verification = verify_by_recount(
+        lambda: iter([1, 2, 3]), unit="item", rule="one yielded item",
+    )
+    shortcut_rejected = False
+    try:
+        count_payload({
+            "unit": "pixel", "rule": "one pixel", "declared_total": 100,
+            "observations": (),
+        })
+    except ValueError:
+        shortcut_rejected = True
+    return _capability([
+        {"case": "count advances once per admitted observation", "component": "cardinality",
+         "correct": occurrences["value"] == occurrences["observed"] == 4},
+        {"case": "repeated equal occurrences remain countable", "component": "occurrence",
+         "correct": occurrences["value"] == 4},
+        {"case": "distinct counting uses explicit identities", "component": "identity",
+         "correct": unique["value"] == 3 and unique["duplicates"] == 1},
+        {"case": "budget stop reports an incomplete lower bound", "component": "honesty",
+         "correct": partial["status"] == "incomplete" and partial["lower_bound"] == 3},
+        {"case": "unresolved units prevent an exact claim", "component": "uncertainty",
+         "correct": unresolved["status"] == "complete_with_unresolved"},
+        {"case": "group totals derive from the same observed units", "component": "grouping",
+         "correct": unique["groups"] == {"major": 1, "minor": 2}
+         and sum(unique["groups"].values()) == unique["value"]},
+        {"case": "verification performs a separate recount", "component": "verification",
+         "correct": verification["status"] == "verified"
+         and verification["independent_enumerations"] == 2},
+        {"case": "declared totals cannot bypass counting", "component": "safety",
+         "correct": shortcut_rejected},
+    ])
+
+
 def _experience_cognition_v2() -> dict[str, Any]:
     from experience_cognition import plan_experience_cognition
     plan = plan_experience_cognition(
@@ -2382,6 +2447,10 @@ _REGISTRY = {
     "experience_cognition": (
         ModuleVersion("experience_cognition", "V1", "All cognitive paths receive undifferentiated event handling", _experience_cognition_v1),
         ModuleVersion("experience_cognition", "V2", "Sparse routed lenses, transient gating, adaptive depth, and horizon predictions", _experience_cognition_v2),
+    ),
+    "experiential_counting": (
+        ModuleVersion("experiential_counting", "V1", "Domain totals and inferred quantities without a shared counting act", _experiential_counting_v1),
+        ModuleVersion("experiential_counting", "V2", "Discrete observation counting with identity, boundaries, and recount verification", _experiential_counting_v2),
     ),
     "adaptive_storage_decision": (ModuleVersion("adaptive_storage_decision", "V1", "Device probes without operation-attributed autonomous placement", _adaptive_storage_decision_v1), ModuleVersion("adaptive_storage_decision", "V2", "Evidence-gated reversible autonomous placement with audit reports", _adaptive_storage_decision_v2)),
     "virtual_file_explorer": (ModuleVersion("virtual_file_explorer", "V1", "No virtual media-drive explorer", _file_explorer_v1), ModuleVersion("virtual_file_explorer", "V2", "Capability-scoped media and personal drives", _file_explorer_v2)),

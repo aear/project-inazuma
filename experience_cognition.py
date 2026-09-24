@@ -17,7 +17,7 @@ MAX_COGNITIVE_STEPS = 5
 HORIZONS = ("immediate", "near", "later")
 SIGNALS = (
     "novelty", "contradiction", "uncertainty", "stakes", "affect",
-    "social", "temporal", "causal", "sensory", "identity",
+    "social", "temporal", "causal", "sensory", "identity", "quantity",
 )
 EVIDENCE_DIMENSIONS = ("causal", "temporal", "sensory", "social", "affective", "contradiction")
 
@@ -29,6 +29,7 @@ ROUTE_WEIGHTS: dict[str, dict[str, float]] = {
     "continuity": {"temporal": .35, "identity": .35, "contradiction": .20, "causal": .10},
     "communication": {"social": .45, "uncertainty": .25, "affect": .15, "stakes": .15},
     "world_model": {"sensory": .35, "causal": .30, "novelty": .20, "temporal": .15},
+    "counting": {"quantity": .70, "sensory": .15, "uncertainty": .15},
 }
 
 LENS_SIGNALS: dict[str, tuple[str, ...]] = {
