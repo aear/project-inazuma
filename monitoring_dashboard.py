@@ -938,6 +938,29 @@ def _transformer_benchmarks(
     return cards, rows
 
 
+def _developmental_readiness(
+    history_path: Path = Path('benchmark_results/developmental_readiness.jsonl'),
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
+    """Render retained readiness evidence without running or promoting anything."""
+    from developmental_readiness import build_report, load_evidence
+    report = build_report(load_evidence(history_path))
+    rows = []
+    for domain in report['domains'].values():
+        blockers = domain['blocking_gates']
+        state = domain['readiness'].replace('_', ' ')
+        if blockers or not domain['toolchain_available']:
+            state += ' · highlight'
+        value = f"{len(domain['passed_gates'])}/{len(domain['gates'])} gates · {domain['evidence_count']} evidence"
+        rows.append((domain['label'], value, state, _modified(history_path), json.dumps(domain, indent=2)))
+    cards = [
+        ('Domains', str(len(report['domains']))),
+        ('Sandbox ready', str(report['summary']['sandbox_ready'])),
+        ('Review ready', str(report['summary']['review_ready'])),
+        ('Promotion', 'human review only'),
+    ]
+    return cards, rows
+
+
 COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]]] = {
     'Mind': _mind,
     'Continuity': _continuity,
@@ -947,6 +970,7 @@ COLLECTORS: dict[str, Callable[[], tuple[list[tuple[str, str]], list[tuple[str, 
     'Memory': _memory,
     'Reports': _reports,
     'Model comparisons': _transformer_benchmarks,
+    'Observatory': _developmental_readiness,
     'Communication': _communication,
     'Actions': _actions,
     'System': _system,
