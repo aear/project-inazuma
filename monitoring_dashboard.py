@@ -943,7 +943,10 @@ def _developmental_readiness(
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     """Render retained readiness evidence without running or promoting anything."""
     from developmental_readiness import build_report, load_evidence
+    from creativity_observatory import build_profile, load_evidence as load_creativity
     report = build_report(load_evidence(history_path))
+    creativity_path = Path('benchmark_results/creativity_evidence.jsonl')
+    creativity = build_profile(load_creativity(creativity_path))
     rows = []
     for domain in report['domains'].values():
         blockers = domain['blocking_gates']
@@ -952,10 +955,17 @@ def _developmental_readiness(
             state += ' · highlight'
         value = f"{len(domain['passed_gates'])}/{len(domain['gates'])} gates · {domain['evidence_count']} evidence"
         rows.append((domain['label'], value, state, _modified(history_path), json.dumps(domain, indent=2)))
+    for domain, profile in creativity['domains'].items():
+        label = report['domains'][domain]['label']
+        value = f"{profile['evidenced_dimensions']}/{len(profile['dimensions'])} dimensions · {profile['evidence_count']} evidence"
+        state = profile['status'].replace('_', ' ')
+        if profile['status'] != 'multidimensionally_evidenced':
+            state += ' · highlight'
+        rows.append((f'Creativity · {label}', value, state, _modified(creativity_path), json.dumps(profile, indent=2)))
     cards = [
         ('Domains', str(len(report['domains']))),
         ('Sandbox ready', str(report['summary']['sandbox_ready'])),
-        ('Review ready', str(report['summary']['review_ready'])),
+        ('Creative profiles', str(len(creativity['domains']))),
         ('Promotion', 'human review only'),
     ]
     return cards, rows

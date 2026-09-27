@@ -105,6 +105,16 @@ DOMAIN_SPECS: dict[str, DomainSpec] = {
         toolchain_available=False,
         notes="Baseline only: no 3D toolchain has been established, so readiness cannot yet advance.",
     ),
+    "crypto_market": DomainSpec(
+        "crypto_market", "Crypto market understanding",
+        "Learn temporal market patterns without simulating or authorizing trades.",
+        _gates("competence", "transfer", "calibration", "judgement", "robustness", "safety", "recovery", "resources", "provenance", "stability"),
+        ("competence", "safety", "recovery", "provenance"),
+        ("transfer", "calibration", "judgement", "robustness", "stability"),
+        ("resources",),
+        ("chronology and return reasoning", "trend and reversal distinction", "volatility regimes", "drawdowns and recovery", "cross-asset disagreement", "USD/GBP reference conversion with date provenance", "confidence calibration", "survivorship-bias awareness", "causal restraint"),
+        notes="Pattern-learning only. No order generation, portfolio allocation, paper trading, or live-trading authority.",
+    ),
 }
 
 
