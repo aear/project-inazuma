@@ -33,7 +33,8 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     assert catalog["automatic_trigger"] is False
     assert set(catalog["commands"]) >= {
         "write_note", "realise_private_text", "experiment_create",
-        "experiment_run", "experiment_judge",
+        "experiment_run", "experiment_judge", "cyber_attribution_assess",
+        "cyber_report_prepare",
     }
 
 
@@ -107,3 +108,17 @@ def test_queued_code_command_seal_covers_generated_id(monkeypatch):
     # Verification would fail if any post-seal mutation (including id insertion) occurred.
     from instruction_authority import verify_code_command
     verify_code_command(queued)
+
+
+def test_cyber_report_action_only_queues_a_human_review_draft(tmp_path):
+    command = {
+        "action": "cyber_report_prepare",
+        "incident": {"incident_id": "incident-1", "discovered_at": "2026-09-28T12:00:00Z", "summary": "Synthetic incident"},
+        "indicators": [], "evidence": [], "suspected_crime": True,
+    }
+    result = execute_personal_tool_command(
+        command, child="Ina", project_root=tmp_path, config=_config(tmp_path), lab=FakeLab(),
+    )
+    assert result["value"]["queued"] is True
+    assert result["value"]["submission_status"] == "not_submitted"
+    assert result["value"]["human_review_required"] is True

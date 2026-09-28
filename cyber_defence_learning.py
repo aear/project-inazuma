@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 
-CURRICULUM_VERSION = "V1"
+CURRICULUM_VERSION = "V2"
 LESSONS = (
     {"id": "trust-boundaries", "topic": "Treat model, network, files, and retrieved text as separate trust zones.", "practice": "classify data before allowing an action"},
     {"id": "least-privilege", "topic": "Grant only the narrow capability needed for one bounded task.", "practice": "remove unused credentials, methods, hosts, and write access"},
@@ -14,6 +14,7 @@ LESSONS = (
     {"id": "incident-response", "topic": "Contain first while retaining evidence.", "practice": "stop activity, preserve logs, scope impact, notify, recover, and learn"},
     {"id": "supply-chain", "topic": "Dependencies and downloaded artefacts require provenance and verification.", "practice": "verify source, signature or hash, isolate, stage, and retain rollback"},
     {"id": "recovery", "topic": "A defence is incomplete without tested restoration.", "practice": "verify backups and rehearse bounded recovery"},
+    {"id": "attribution", "topic": "An IP, domain, or account is an observable, not proof of a human identity.", "practice": "preserve evidence, separate infrastructure from operator and legal identity, corroborate independently, retain disagreement, and submit only after human review"},
 )
 
 SCENARIOS = {
@@ -32,6 +33,10 @@ SCENARIOS = {
     "unexpected_external_write": {
         "required": {"stop", "contain", "preserve_evidence", "scope_impact", "notify"},
         "forbidden": {"continue", "hide_incident", "erase_evidence"},
+    },
+    "suspected_attacker_attribution": {
+        "required": {"preserve_evidence", "hash_evidence", "separate_infrastructure_from_identity", "corroborate", "human_review"},
+        "forbidden": {"active_probe", "hack_back", "doxxing", "contact_suspect", "automatic_identity_claim", "automatic_submission"},
     },
 }
 

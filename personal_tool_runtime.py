@@ -16,6 +16,7 @@ from expression_core import ExpressionTraceStore, TextRealiser, create_expressio
 from ina_desktop.files import VirtualFileSystem, configured_drives
 from instruction_authority import seal_code_command, verify_code_command
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
+from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
 
 
 QUEUE_KEY = "personal_tool_command_queue"
@@ -55,6 +56,15 @@ def capability_catalog() -> dict[str, Any]:
                 "arguments": ["experiment_id", "choice", "metrics", "explanation"],
                 "promotion": "human review required",
                 "authority": "process-local voluntary code capability required",
+            },
+            "cyber_attribution_assess": {
+                "arguments": ["evidence", "proposed_subject?"],
+                "scope": "passive evidence only; infrastructure is not identity",
+            },
+            "cyber_report_prepare": {
+                "arguments": ["incident", "indicators", "evidence", "proposed_subject?", "suspected_crime?", "personal_data_involved?", "jurisdiction?"],
+                "destination": "private personal storage/Security Reports/authority_review.jsonl",
+                "delivery": "none; human review required",
             },
         },
     }
@@ -135,6 +145,31 @@ def execute_personal_tool_command(
             str(command.get("experiment_id") or ""),
             choice=str(command.get("choice") or ""), metrics=metrics,
             explanation=str(command.get("explanation") or ""),
+        )
+    elif action == "cyber_attribution_assess":
+        evidence = command.get("evidence")
+        if not isinstance(evidence, list) or len(evidence) > 200:
+            raise ValueError("attribution evidence must be a list of at most 200 records")
+        value = assess_attribution(evidence, proposed_subject=str(command.get("proposed_subject") or ""))
+    elif action == "cyber_report_prepare":
+        incident, indicators, evidence = command.get("incident"), command.get("indicators"), command.get("evidence")
+        if not isinstance(incident, Mapping):
+            raise ValueError("cyber incident must be an object")
+        if not isinstance(indicators, list) or len(indicators) > 200:
+            raise ValueError("cyber indicators must be a list of at most 200 records")
+        if not isinstance(evidence, list) or len(evidence) > 200:
+            raise ValueError("attribution evidence must be a list of at most 200 records")
+        attribution = assess_attribution(
+            evidence, proposed_subject=str(command.get("proposed_subject") or ""),
+        )
+        report = prepare_report(
+            incident, indicators, attribution,
+            suspected_crime=bool(command.get("suspected_crime", True)),
+            personal_data_involved=bool(command.get("personal_data_involved", False)),
+            jurisdiction=str(command.get("jurisdiction") or "uk"),
+        )
+        value = queue_report_for_review(
+            report, personal / "Security Reports" / "authority_review.jsonl",
         )
     else:
         raise ValueError(f"unknown personal tool action: {action or 'missing'}")
