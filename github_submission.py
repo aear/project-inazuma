@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from external_access import ExternalPolicy, validate_external_url
+
 from discord_runtime import typed_outbox_path as resolve_typed_outbox_path
 from outbox_event_store import durable_database_path, record_configured_event, record_event
 
@@ -855,7 +857,10 @@ def submit_issue(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) ->
         raise RuntimeError("repo_full_name is not configured")
     token = resolve_github_token(cfg, policy)
 
-    url = f"{policy['api_base']}/repos/{repo_full_name}/issues"
+    url = validate_external_url(
+        f"{policy['api_base']}/repos/{repo_full_name}/issues",
+        ExternalPolicy("github_submission", ("api.github.com",), max_response_bytes=1024 * 1024),
+    )
     payload = {
         "title": build_issue_title(entry, policy),
         "body": build_issue_body(entry, policy),
@@ -875,7 +880,10 @@ def submit_issue(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) ->
     )
     try:
         with urlrequest.urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise RuntimeError("GitHub issue response exceeds byte budget")
+            result = json.loads(body.decode("utf-8"))
     except urlerror.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
         if exc.code == 401:

@@ -650,7 +650,9 @@ class WorldServer:
                 pass
 
     async def _start_tcp_server(self) -> None:
-        self._tcp_server = await asyncio.start_server(self._handle_client, self._tcp_host, self._tcp_port)
+        self._tcp_server = await asyncio.start_server(
+            self._handle_client, self._tcp_host, self._tcp_port, limit=256 * 1024,
+        )
 
     async def _start_unix_server(self) -> None:
         if self._unix_socket and os.path.exists(self._unix_socket):

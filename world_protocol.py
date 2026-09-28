@@ -6,9 +6,9 @@ import json
 from typing import Any, Dict
 
 DEFAULT_UNIX_SOCKET = "/tmp/inazuma_world.sock"
-DEFAULT_TCP_HOST = "0.0.0.0"
+DEFAULT_TCP_HOST = "127.0.0.1"
 DEFAULT_TCP_PORT = 7777
-DEFAULT_STREAM_HOST = "0.0.0.0"
+DEFAULT_STREAM_HOST = "127.0.0.1"
 DEFAULT_STREAM_PORT = 6969
 DEFAULT_LOCAL_PLAYER_SOCKET = "/tmp/inazuma_player.sock"
 

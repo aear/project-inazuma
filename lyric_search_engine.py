@@ -10,10 +10,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from external_access import ExternalPolicy, ExternalSession
+
 
 WIKISOURCE_API = "https://en.wikisource.org/w/api.php"
 USER_AGENT = "Project-Inazuma-LyricSearch/1.0 (local research tool)"
 MAX_RESULTS = 8
+WIKISOURCE_POLICY = ExternalPolicy(
+    "wikisource_lyrics", ("en.wikisource.org",), max_response_bytes=512 * 1024,
+    timeout_seconds=8, max_requests=1, allowed_content_types=("application/json",),
+)
 
 
 def _clean(value: Any, limit: int = 240) -> str:
@@ -60,10 +66,9 @@ def search_wikisource(
         "action": "opensearch", "search": f"{_clean(query)} song lyrics",
         "limit": max(1, min(int(limit), MAX_RESULTS)), "namespace": 0, "format": "json",
     })
-    request = urllib.request.Request(f"{WIKISOURCE_API}?{params}", headers={"User-Agent": USER_AGENT})
-    response = (opener or urllib.request.urlopen)(request, timeout=8.0)
-    with response:
-        payload = json.loads(response.read(512 * 1024).decode("utf-8"))
+    session = ExternalSession(WIKISOURCE_POLICY, opener=opener or urllib.request.urlopen)
+    response = session.get(f"{WIKISOURCE_API}?{params}", headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    payload = json.loads(response["body"].decode("utf-8"))
     if not isinstance(payload, list) or len(payload) < 4:
         return []
     titles, descriptions, urls = payload[1:4]

@@ -13,7 +13,7 @@ def _evidence(gate, origin, number, *, domain="code_game", evaluator_type="objec
 
 
 def test_initial_domains_include_creative_code_and_future_3d():
-    assert set(DOMAIN_SPECS) == {"music", "image", "code_game", "model_3d", "crypto_market"}
+    assert set(DOMAIN_SPECS) == {"music", "image", "code_game", "model_3d", "crypto_market", "language_english", "research", "cyber_defence"}
     report = build_report([])
     assert all(row["readiness"] == "not_assessed" for row in report["domains"].values())
     assert report["domains"]["model_3d"]["toolchain_available"] is False
@@ -60,10 +60,13 @@ def test_evidence_ledger_is_append_only_and_bounded_on_read(tmp_path):
 def test_monitor_collector_is_read_only_and_exposes_all_domains(tmp_path):
     from monitoring_dashboard import _developmental_readiness
     missing = tmp_path / "does-not-exist.jsonl"
-    cards, rows = _developmental_readiness(missing)
-    assert len(rows) == 9
+    cards, rows = _developmental_readiness(
+        missing, creativity_path=tmp_path / "no-creativity.jsonl",
+        assessment_path=tmp_path / "no-assessments.json",
+    )
+    assert len(rows) == 12
     labels = {row[0] for row in rows}
-    assert {"Music", "Image", "Code / playable game", "3D modelling", "Crypto market understanding"} <= labels
+    assert {"Music", "Image", "Code / playable game", "3D modelling", "Crypto market understanding", "English comprehension and expression", "Research", "Cyber defence"} <= labels
     assert {"Creativity · Music", "Creativity · Image", "Creativity · Code / playable game", "Creativity · 3D modelling"} <= labels
     assert ("Promotion", "human review only") in cards
     assert not missing.exists()

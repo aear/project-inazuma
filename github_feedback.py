@@ -8,6 +8,8 @@ from urllib import parse as urlparse
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from external_access import ExternalPolicy, validate_external_url
+
 from github_submission import (
     get_current_child,
     GitHubAuthError,
@@ -163,6 +165,10 @@ def load_submitted_issue_refs(child: str, *, limit: int = 20) -> List[Dict[str, 
 
 
 def _github_get_json(url: str, token: str) -> Any:
+    url = validate_external_url(url, ExternalPolicy(
+        "github_feedback", ("api.github.com",), max_response_bytes=1024 * 1024,
+        timeout_seconds=20, max_requests=1, allowed_content_types=("application/json",),
+    ))
     req = urlrequest.Request(
         url,
         method="GET",
@@ -175,7 +181,10 @@ def _github_get_json(url: str, token: str) -> Any:
     )
     try:
         with urlrequest.urlopen(req, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise RuntimeError("GitHub feedback response exceeds byte budget")
+            return json.loads(body.decode("utf-8"))
     except urlerror.HTTPError as exc:
         if exc.code == 401:
             raise GitHubAuthError("GitHub authentication was rejected") from exc

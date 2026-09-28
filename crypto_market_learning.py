@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib import parse, request
 
 from io_utils import flush_for_durability
+from external_access import ExternalPolicy, ExternalSession
 
 
 SCHEMA = "ina.crypto_market_snapshot/V1"
@@ -23,6 +24,11 @@ SOURCE_NAME = "Coin Metrics Community API"
 SOURCE_ENDPOINT = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 DEFAULT_ASSETS = ("btc", "eth", "ltc", "xrp", "doge", "ada", "bch", "xmr")
 USER_AGENT = "Project-Inazuma-Developmental-Observatory/1.0"
+COIN_METRICS_POLICY = ExternalPolicy(
+    "coin_metrics_history", ("community-api.coinmetrics.io",),
+    max_response_bytes=2 * 1024 * 1024, timeout_seconds=30, max_requests=4,
+    allowed_content_types=("application/json",),
+)
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
@@ -50,10 +56,10 @@ def fetch_daily_prices(
         raise ValueError(f"asset must be one of: {', '.join(DEFAULT_ASSETS)}")
     url = _source_url(symbol)
     rows: list[dict[str, Any]] = []
+    session = ExternalSession(COIN_METRICS_POLICY, opener=opener)
     while url:
-        req = request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-        with opener(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        response = session.get(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        payload = json.loads(response["body"].decode("utf-8"))
         for item in payload.get("data") or ():
             if str(item.get("asset", "")).lower() != symbol:
                 continue

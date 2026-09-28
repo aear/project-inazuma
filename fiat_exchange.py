@@ -12,11 +12,17 @@ import math
 from typing import Any, Callable
 from urllib import parse, request
 
+from external_access import ExternalPolicy, ExternalSession
+
 
 SCHEMA = "ina.fiat_exchange_reference/V1"
 SOURCE_NAME = "European Central Bank reference rates"
 SOURCE_ENDPOINT = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD+GBP.EUR.SP00.A"
 USER_AGENT = "Project-Inazuma-Developmental-Observatory/1.0"
+ECB_POLICY = ExternalPolicy(
+    "ecb_reference_rates", ("data-api.ecb.europa.eu",), max_response_bytes=1024 * 1024,
+    timeout_seconds=20, max_requests=1, allowed_content_types=("text/csv",),
+)
 
 
 def _url(start: date) -> str:
@@ -34,9 +40,9 @@ def fetch_usd_gbp_reference(
     if lookback_days < 7 or stale_after_days < 1:
         raise ValueError("lookback_days must be >= 7 and stale_after_days must be >= 1")
     url = _url(observed_now.date() - timedelta(days=lookback_days))
-    req = request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/csv"})
-    with opener(req, timeout=timeout) as response:
-        body = response.read().decode("utf-8-sig")
+    session = ExternalSession(ECB_POLICY, opener=opener)
+    response = session.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/csv"})
+    body = response["body"].decode("utf-8-sig")
     by_date: dict[str, dict[str, float]] = {}
     for row in csv.DictReader(StringIO(body)):
         currency = str(row.get("CURRENCY") or "").upper()

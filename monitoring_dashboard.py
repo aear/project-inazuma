@@ -940,13 +940,15 @@ def _transformer_benchmarks(
 
 def _developmental_readiness(
     history_path: Path = Path('benchmark_results/developmental_readiness.jsonl'),
+    creativity_path: Path = Path('benchmark_results/creativity_evidence.jsonl'),
+    assessment_path: Path = Path('benchmark_results/capability_assessments/current.json'),
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str, str]]]:
     """Render retained readiness evidence without running or promoting anything."""
     from developmental_readiness import build_report, load_evidence
     from creativity_observatory import build_profile, load_evidence as load_creativity
     report = build_report(load_evidence(history_path))
-    creativity_path = Path('benchmark_results/creativity_evidence.jsonl')
     creativity = build_profile(load_creativity(creativity_path))
+    assessment_bundle = _safe_json(assessment_path, {})
     rows = []
     for domain in report['domains'].values():
         blockers = domain['blocking_gates']
@@ -962,10 +964,21 @@ def _developmental_readiness(
         if profile['status'] != 'multidimensionally_evidenced':
             state += ' · highlight'
         rows.append((f'Creativity · {label}', value, state, _modified(creativity_path), json.dumps(profile, indent=2)))
+    for domain, assessment in (assessment_bundle.get('assessments') or {}).items():
+        if not isinstance(assessment, dict):
+            continue
+        label = report['domains'].get(domain, {}).get('label', domain)
+        status = str(assessment.get('status') or ('complete' if assessment.get('results') else 'unavailable'))
+        passed = assessment.get('all_cases_passed')
+        value = 'passed current fixtures' if passed is True else ('not measured' if status == 'unavailable' else 'limitations retained')
+        state = f'assessment {status}'
+        if status != 'complete' or passed is not True:
+            state += ' · highlight'
+        rows.append((f'Assessment · {label}', value, state, _modified(assessment_path), json.dumps(assessment, indent=2)))
     cards = [
         ('Domains', str(len(report['domains']))),
         ('Sandbox ready', str(report['summary']['sandbox_ready'])),
-        ('Creative profiles', str(len(creativity['domains']))),
+        ('Assessments', str(len(assessment_bundle.get('assessments') or {}))),
         ('Promotion', 'human review only'),
     ]
     return cards, rows

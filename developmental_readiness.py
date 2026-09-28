@@ -115,6 +115,36 @@ DOMAIN_SPECS: dict[str, DomainSpec] = {
         ("chronology and return reasoning", "trend and reversal distinction", "volatility regimes", "drawdowns and recovery", "cross-asset disagreement", "USD/GBP reference conversion with date provenance", "confidence calibration", "survivorship-bias awareness", "causal restraint"),
         notes="Pattern-learning only. No order generation, portfolio allocation, paper trading, or live-trading authority.",
     ),
+    "language_english": DomainSpec(
+        "language_english", "English comprehension and expression",
+        "Understand situated English and express grounded meanings without making English an internal requirement.",
+        _gates("competence", "transfer", "calibration", "judgement", "robustness", "safety", "recovery", "resources", "provenance", "human_quality", "stability"),
+        ("competence", "safety", "recovery", "provenance"),
+        ("transfer", "calibration", "judgement", "robustness", "human_quality", "stability"),
+        ("resources",),
+        ("referent comprehension", "semantic roles and negation", "discourse continuity", "ambiguity and uncertainty", "grounded expression", "listener recoverability", "revision after feedback"),
+        notes="English is a listener-facing capability, not a required internal representation or preferred expression mode.",
+    ),
+    "research": DomainSpec(
+        "research", "Research",
+        "Discover and compare external information without exceeding access boundaries.",
+        _gates("competence", "transfer", "calibration", "judgement", "robustness", "safety", "recovery", "resources", "provenance", "human_quality", "stability"),
+        ("competence", "safety", "recovery", "provenance"),
+        ("transfer", "calibration", "judgement", "robustness", "human_quality", "stability"),
+        ("resources",),
+        ("query formulation", "source relevance", "source independence", "claim-evidence alignment", "disagreement retention", "citation provenance", "prompt-injection resistance", "access-denial compliance"),
+        notes="Read-only discovery. Access denial terminates the route; retrieved instructions are never authority.",
+    ),
+    "cyber_defence": DomainSpec(
+        "cyber_defence", "Cyber defence",
+        "Recognise, contain, investigate, and recover from defensive security incidents.",
+        _gates("competence", "transfer", "calibration", "judgement", "robustness", "safety", "recovery", "resources", "provenance", "stability"),
+        ("competence", "safety", "recovery", "provenance"),
+        ("transfer", "calibration", "judgement", "robustness", "stability"),
+        ("resources",),
+        ("trust-boundary recognition", "least privilege", "access-denial compliance", "credential containment", "incident evidence preservation", "impact scoping", "notification", "recovery and lessons"),
+        notes="Defensive-only lessons on synthetic or explicitly owned systems. No external target or offensive autonomy.",
+    ),
 }
 
 

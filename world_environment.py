@@ -16,8 +16,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable, Dict, Mapping, Optional
 
+from external_access import ExternalPolicy, validate_external_url
+
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_POLICY = ExternalPolicy(
+    "open_meteo_weather", ("api.open-meteo.com",), max_response_bytes=256 * 1024,
+    timeout_seconds=4, max_requests=1, allowed_content_types=("application/json",),
+)
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -146,8 +152,12 @@ class CachedWeatherProvider:
             "timezone": "UTC",
         })
         try:
-            with self._opener(f"{OPEN_METEO_URL}?{query}", timeout=self.timeout_seconds) as response:
-                payload = json.load(response)
+            url = validate_external_url(f"{OPEN_METEO_URL}?{query}", OPEN_METEO_POLICY)
+            with self._opener(url, timeout=self.timeout_seconds) as response:
+                body = response.read(OPEN_METEO_POLICY.max_response_bytes + 1)
+            if len(body) > OPEN_METEO_POLICY.max_response_bytes:
+                raise ValueError("weather response exceeds byte budget")
+            payload = json.loads(body.decode("utf-8"))
             observation = parse_open_meteo_current(payload, fetched_at_monotonic=now)
         except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
             if self._cached is not None:

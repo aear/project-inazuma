@@ -4912,8 +4912,18 @@ class HouseViewer(QtWidgets.QMainWindow):
             f"?lat={lat}&lng={lon}&formatted=0"
         )
         try:
+            from external_access import ExternalPolicy, validate_external_url
+            policy = ExternalPolicy(
+                "sunrise_sunset", ("api.sunrise-sunset.org",),
+                max_response_bytes=128 * 1024, timeout_seconds=4, max_requests=1,
+                allowed_content_types=("application/json",),
+            )
+            url = validate_external_url(url, policy)
             with urllib.request.urlopen(url, timeout=4.0) as resp:
-                data = json.load(resp)
+                body = resp.read(policy.max_response_bytes + 1)
+            if len(body) > policy.max_response_bytes:
+                raise ValueError("sunrise response exceeds byte budget")
+            data = json.loads(body.decode("utf-8"))
         except (urllib.error.URLError, ValueError, OSError):
             cache["fetched_at"] = time.time()
             return self._sunrise_sunset_fallback(today)

@@ -1329,7 +1329,7 @@ def _resolve_attachment_limit(cfg):
         return DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
     try:
         limit = int(float(raw) * 1024 * 1024)
-        return limit if limit > 0 else DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
+        return min(limit, DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES) if limit > 0 else DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
     except Exception:
         logger.warning("Invalid discord image attachment max size; using default.")
         return DEFAULT_IMAGE_ATTACHMENT_MAX_BYTES
@@ -1340,10 +1340,25 @@ def _resolve_attachment_count(cfg):
     if raw is None:
         return DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT
     try:
-        return max(0, int(raw))
+        return min(DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT, max(0, int(raw)))
     except Exception:
         logger.warning("Invalid discord max_image_attachments value; using default.")
         return DEFAULT_IMAGE_ATTACHMENT_MAX_COUNT
+
+
+def _image_signature_matches(data: bytes, extension: str) -> bool:
+    ext = str(extension).lower()
+    signatures = {
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".jpg": (b"\xff\xd8\xff",), ".jpeg": (b"\xff\xd8\xff",),
+        ".gif": (b"GIF87a", b"GIF89a"),
+        ".bmp": (b"BM",),
+        ".webp": (b"RIFF",),
+    }
+    prefixes = signatures.get(ext, ())
+    if not any(data.startswith(prefix) for prefix in prefixes):
+        return False
+    return ext != ".webp" or len(data) >= 12 and data[8:12] == b"WEBP"
 
 
 def _format_image_attachment_note(attachments):
@@ -3188,7 +3203,11 @@ class InaDiscordClient(discord.Bot):
             if not ext:
                 continue
 
-            if attachment.size and max_bytes and attachment.size > max_bytes:
+            declared_size = getattr(attachment, "size", None)
+            if not isinstance(declared_size, int) or declared_size <= 0:
+                logger.info("Skipping image attachment %s with unknown size.", attachment.filename)
+                continue
+            if max_bytes and declared_size > max_bytes:
                 logger.info(
                     "Skipping image attachment %s (%s bytes > %s limit).",
                     attachment.filename,
@@ -3213,6 +3232,12 @@ class InaDiscordClient(discord.Bot):
                     len(data),
                     max_bytes,
                 )
+                continue
+            if len(data) != declared_size:
+                logger.info("Skipping image attachment %s due to declared-size mismatch.", attachment.filename)
+                continue
+            if not _image_signature_matches(data, ext):
+                logger.info("Skipping image attachment %s due to signature mismatch.", attachment.filename)
                 continue
 
             try:

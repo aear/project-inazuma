@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -35,15 +36,22 @@ class OBSWebSocketBridge:
         enabled: bool = True,
         use_replay_buffer: bool = False,
         replay_min_interval: float = 120.0,
+        allow_mutations: bool = False,
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
-        self.host = host
+        normalized_host = str(host or "localhost").strip().lower()
+        if normalized_host not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("OBS WebSocket host must be loopback")
+        self.host = normalized_host
         self.port = int(port)
+        if not 1 <= self.port <= 65535:
+            raise ValueError("OBS WebSocket port must be 1..65535")
         self.password = password or ""
         self.source = source
         self.enabled = bool(enabled)
         self.use_replay_buffer = bool(use_replay_buffer)
         self.replay_min_interval = float(replay_min_interval)
+        self.allow_mutations = bool(allow_mutations)
         self.logger = logger
 
         self._last_error: Optional[str] = None
@@ -65,11 +73,12 @@ class OBSWebSocketBridge:
         return cls(
             host=cfg.get("host", "localhost"),
             port=int(cfg.get("port", 4455)),
-            password=cfg.get("password", "") or "",
+            password=os.getenv(str(cfg.get("password_env") or "OBS_WEBSOCKET_PASSWORD"), ""),
             source=cfg.get("source"),
             enabled=cfg.get("enabled", True),
             use_replay_buffer=cfg.get("use_replay_buffer", False),
             replay_min_interval=float(cfg.get("replay_min_interval", 120)),
+            allow_mutations=cfg.get("allow_mutations", False),
             logger=logger,
         )
 
@@ -82,7 +91,7 @@ class OBSWebSocketBridge:
 
     @property
     def can_save_replay(self) -> bool:
-        return self.is_available and self.use_replay_buffer
+        return self.is_available and self.use_replay_buffer and self.allow_mutations
 
     def capture_frame(self) -> Optional[np.ndarray]:
         """Fetch a composited frame from the current OBS program scene."""
@@ -115,7 +124,7 @@ class OBSWebSocketBridge:
 
     def set_record_directory(self, directory: str) -> bool:
         """Ask OBS to route recordings to a specific directory."""
-        if not self.is_available or not directory:
+        if not self.is_available or not self.allow_mutations or not directory:
             return False
         try:
             ok = bool(self._run_async(self._set_record_directory(directory)))
@@ -128,7 +137,7 @@ class OBSWebSocketBridge:
 
     def set_program_scene(self, scene_name: str) -> bool:
         """Switch OBS to a named program scene."""
-        if not self.is_available or not scene_name:
+        if not self.is_available or not self.allow_mutations or not scene_name:
             return False
         try:
             ok = bool(self._run_async(self._set_program_scene(scene_name)))
@@ -145,7 +154,7 @@ class OBSWebSocketBridge:
     def _make_client(self):
         if simpleobsws is None:
             return None
-        params = simpleobsws.IdentificationParameters(ignoreNonFatalRequestChecks=True)
+        params = simpleobsws.IdentificationParameters(ignoreNonFatalRequestChecks=False)
         url = f"ws://{self.host}:{self.port}"
         return simpleobsws.WebSocketClient(
             url=url, password=self.password, identification_parameters=params
@@ -246,13 +255,15 @@ class OBSWebSocketBridge:
 
     @staticmethod
     def _decode_image(data_url: Optional[str]) -> Optional[np.ndarray]:
-        if not data_url or "," not in data_url:
+        if not data_url or "," not in data_url or len(data_url) > 12 * 1024 * 1024:
             return None
         try:
             encoded = data_url.split(",", 1)[1]
             raw = base64.b64decode(encoded)
             arr = np.frombuffer(raw, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None or frame.size > 4096 * 4096 * 4:
+                return None
             return frame
         except Exception:
             return None
