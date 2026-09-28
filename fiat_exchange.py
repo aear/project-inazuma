@@ -30,7 +30,7 @@ def _url(start: date) -> str:
 
 
 def fetch_usd_gbp_reference(
-    *, opener: Callable[..., Any] = request.urlopen,
+    *, opener: Callable[..., Any] | None = None,
     now: datetime | None = None, lookback_days: int = 14,
     stale_after_days: int = 7, timeout: float = 20.0,
 ) -> dict[str, Any]:

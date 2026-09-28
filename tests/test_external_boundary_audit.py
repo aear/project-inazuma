@@ -6,7 +6,7 @@ def test_external_boundary_inventory_names_residual_risk_instead_of_claiming_com
     assert report["boundary_count"] >= 14
     assert report["missing_owners"] == []
     assert report["residual_review"] == []
-    assert set(report["live_unverified"]) == {"discord", "obs_websocket"}
+    assert set(report["live_unverified"]) == {"codex_harness", "discord", "obs_websocket"}
     assert report["complete"] is False
     assert report["claim"] == "registered_runtime_boundaries_only_not_proof_of_absence"
 
@@ -20,3 +20,4 @@ def test_high_consequence_boundaries_have_explicit_controls():
     assert "loopback_default" in by_id["world_tcp_and_stream"]["controls"]
     assert "image_signature_check" in by_id["discord"]["controls"]
     assert "mutations_disabled_by_default" in by_id["obs_websocket"]["controls"]
+    assert "host_header_gate" in by_id["codex_harness"]["controls"]

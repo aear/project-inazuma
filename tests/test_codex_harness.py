@@ -137,6 +137,20 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "diff-del" in source
     assert "upsertLifecycleEvent" in source
     assert "target.dataset.diffAttached" in source
+    assert "history.replaceState(null,'',location.pathname)" in source
+
+
+def test_http_authority_rejects_dns_rebinding_host_and_cross_origin():
+    import codex_harness
+    handler = object.__new__(codex_harness.HarnessHandler)
+    handler.path = "/api/status?token=secret"
+    handler.server = type("Server", (), {"access_token": "secret", "server_port": 43123})()
+    handler.headers = {"Host": "attacker.example:43123"}
+    assert handler._authorized() is False
+    handler.headers = {"Host": "127.0.0.1:43123", "Origin": "https://attacker.example"}
+    assert handler._authorized() is False
+    handler.headers = {"Host": "127.0.0.1:43123", "Origin": "http://127.0.0.1:43123"}
+    assert handler._authorized() is True
 
 
 def test_image_attachment_preview_benchmark_v1_remove_only_vs_v2_persistent_zoom():

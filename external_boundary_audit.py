@@ -15,7 +15,7 @@ BOUNDARIES = (
     {"id": "weather", "owner": "world_environment.py", "kind": "https_read", "status": "hardened", "controls": ("exact_host", "byte_budget", "timeout", "stale_fallback")},
     {"id": "sunrise", "owner": "house_viewer.py", "kind": "https_read", "status": "hardened", "controls": ("exact_host", "byte_budget", "timeout", "offline_fallback")},
     {"id": "world_tcp_and_stream", "owner": "world_protocol.py", "kind": "local_network", "status": "loopback_default_explicit_override", "controls": ("loopback_default", "bounded_stream_reader")},
-    {"id": "codex_harness", "owner": "codex_harness.py", "kind": "local_http_and_subprocess", "status": "locally_hardened", "controls": ("loopback", "launch_token", "subscription_auth", "user_approvals")},
+    {"id": "codex_harness", "owner": "codex_harness.py", "kind": "local_http_and_subprocess", "status": "hardened_live_verification_unavailable", "controls": ("loopback", "host_header_gate", "origin_gate", "launch_token", "subscription_auth", "workspace_scope", "user_approvals")},
     {"id": "lm_studio", "owner": "lm_studio_adapter.py", "kind": "local_http", "status": "loopback_default", "controls": ("loopback_default",)},
     {"id": "discord", "owner": "discord_bridge.py", "kind": "authenticated_service", "status": "hardened_live_adversarial_unavailable", "controls": ("channel_policy", "bounded_retention", "manual_and_urge_gates", "bounded_known_attachment_size", "image_signature_check")},
     {"id": "obs_websocket", "owner": "obs_bridge.py", "kind": "local_websocket", "status": "hardened_live_verification_unavailable", "controls": ("loopback_only", "environment_password", "mutations_disabled_by_default", "bounded_image")},

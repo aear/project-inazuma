@@ -49,7 +49,7 @@ def _source_url(asset: str) -> str:
 
 
 def fetch_daily_prices(
-    asset: str, *, opener: Callable[..., Any] = request.urlopen, timeout: float = 30.0,
+    asset: str, *, opener: Callable[..., Any] | None = None, timeout: float = 30.0,
 ) -> tuple[list[dict[str, Any]], str]:
     symbol = str(asset).strip().lower()
     if symbol not in DEFAULT_ASSETS:
@@ -79,7 +79,7 @@ def fetch_daily_prices(
 
 def acquire_snapshot(
     *, root: Path | str = ".", assets: Iterable[str] = DEFAULT_ASSETS,
-    opener: Callable[..., Any] = request.urlopen, observed_at: str | None = None,
+    opener: Callable[..., Any] | None = None, observed_at: str | None = None,
 ) -> Path:
     requested = tuple(dict.fromkeys(str(asset).strip().lower() for asset in assets))
     if not 5 <= len(requested) <= 10:

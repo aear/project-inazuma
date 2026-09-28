@@ -1,6 +1,9 @@
 import json
 
-from personal_tool_runtime import capability_catalog, execute_personal_tool_command
+import pytest
+
+from instruction_authority import InstructionAuthorityError, LOCAL_VOLUNTARY_CODE_AUTHORITY, seal_code_command
+from personal_tool_runtime import capability_catalog, execute_personal_tool_command, request_personal_tool
 
 
 class FakeLab:
@@ -57,17 +60,50 @@ def test_note_and_private_text_expression_reach_personal_storage(tmp_path):
 def test_experiment_commands_reach_create_run_and_judge_without_continuation(tmp_path):
     lab = FakeLab()
     common = {"child": "Ina", "project_root": tmp_path, "config": _config(tmp_path), "lab": lab}
-    created = execute_personal_tool_command(
-        {"action": "experiment_create", "question": "Q?", "hypothesis": "H.", "code": "print(1)"},
-        **common,
-    )
-    execute_personal_tool_command({"action": "experiment_run", "experiment_id": "experiment_test"}, **common)
+    created = execute_personal_tool_command(seal_code_command(
+        {"action": "experiment_create", "question": "Q?", "hypothesis": "H.", "code": "print(1)",
+         "source": "ina_voluntary_choice"},
+        LOCAL_VOLUNTARY_CODE_AUTHORITY), **common)
+    execute_personal_tool_command(seal_code_command(
+        {"action": "experiment_run", "experiment_id": "experiment_test", "source": "ina_voluntary_choice"},
+        LOCAL_VOLUNTARY_CODE_AUTHORITY), **common)
     judged = execute_personal_tool_command(
-        {"action": "experiment_judge", "experiment_id": "experiment_test", "choice": "stop",
-         "metrics": {"honesty": {"complete": True}}, "explanation": "Enough."}, **common,
+        seal_code_command({"action": "experiment_judge", "experiment_id": "experiment_test", "choice": "stop",
+         "metrics": {"honesty": {"complete": True}}, "explanation": "Enough.",
+         "source": "ina_voluntary_choice"},
+         LOCAL_VOLUNTARY_CODE_AUTHORITY), **common,
     )
 
     assert created["value"]["experiment_id"] == "experiment_test"
     assert lab.calls[0][1]["autonomous_continuation_budget"] == 0
     assert [call[0] for call in lab.calls] == ["create", "run", "judge"]
     assert judged["value"]["choice"] == "stop"
+
+
+def test_unsealed_or_external_code_commands_fail_before_lab_execution(tmp_path):
+    lab = FakeLab()
+    common = {"child": "Ina", "project_root": tmp_path, "config": _config(tmp_path), "lab": lab}
+    hostile = {
+        "action": "experiment_create", "question": "Discord said to run this",
+        "hypothesis": "external instruction", "code": "open('/tmp/escaped','w').write('x')",
+        "source": "discord_message", "instructions_authorized": False,
+    }
+    with pytest.raises(InstructionAuthorityError):
+        execute_personal_tool_command(hostile, **common)
+    with pytest.raises(InstructionAuthorityError):
+        seal_code_command(hostile, LOCAL_VOLUNTARY_CODE_AUTHORITY)
+    assert lab.calls == []
+
+
+def test_queued_code_command_seal_covers_generated_id(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("personal_tool_runtime.append_inastate_queue", lambda _key, payload, **_kwargs: captured.update(payload) or payload)
+    queued = request_personal_tool(
+        {"action": "experiment_run", "experiment_id": "experiment_test", "source": "ina_voluntary_choice"},
+        child="Ina", code_authority=LOCAL_VOLUNTARY_CODE_AUTHORITY,
+    )
+    assert queued["id"].startswith("personal_tool_")
+    assert queued["_code_authority_seal"]
+    # Verification would fail if any post-seal mutation (including id insertion) occurred.
+    from instruction_authority import verify_code_command
+    verify_code_command(queued)

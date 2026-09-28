@@ -810,6 +810,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
         return
 
     def _authorized(self) -> bool:
+        host = str(self.headers.get("Host") or "").lower()
+        permitted_hosts = {
+            f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}",
+            f"[::1]:{self.server.server_port}",
+        }
+        if host not in permitted_hosts:
+            return False
+        origin = str(self.headers.get("Origin") or "")
+        if origin and origin not in {f"http://{item}" for item in permitted_hosts}:
+            return False
         query = parse_qs(urlparse(self.path).query)
         supplied = self.headers.get("X-Harness-Token") or (query.get("token") or [""])[0]
         return secrets.compare_digest(str(supplied), self.server.access_token)
@@ -835,6 +845,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
@@ -874,11 +886,17 @@ class HarnessHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             declared_length = int(self.headers.get("Content-Length", "0"))
+            if declared_length < 0:
+                raise ValueError("invalid content length")
             if declared_length > MAX_REQUEST_BYTES:
                 self._json({"error": "request body is too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 return
             length = min(MAX_REQUEST_BYTES, declared_length)
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                raise ValueError("application/json is required")
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
             if parsed.path == "/api/run":
                 self._json(self.server.client.send_prompt(
                     payload.get("prompt", ""), model=payload.get("model"),

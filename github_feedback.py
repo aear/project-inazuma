@@ -8,7 +8,7 @@ from urllib import parse as urlparse
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from external_access import ExternalPolicy, validate_external_url
+from external_access import ExternalPolicy, ExternalSession
 
 from github_submission import (
     get_current_child,
@@ -165,28 +165,20 @@ def load_submitted_issue_refs(child: str, *, limit: int = 20) -> List[Dict[str, 
 
 
 def _github_get_json(url: str, token: str) -> Any:
-    url = validate_external_url(url, ExternalPolicy(
+    policy = ExternalPolicy(
         "github_feedback", ("api.github.com",), max_response_bytes=1024 * 1024,
         timeout_seconds=20, max_requests=1, allowed_content_types=("application/json",),
-    ))
-    req = urlrequest.Request(
-        url,
-        method="GET",
-        headers={
+    )
+    try:
+        response = ExternalSession(policy).get(url, headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
             "User-Agent": "project-inazuma-github-feedback",
             "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=20) as response:
-            body = response.read(1024 * 1024 + 1)
-            if len(body) > 1024 * 1024:
-                raise RuntimeError("GitHub feedback response exceeds byte budget")
-            return json.loads(body.decode("utf-8"))
-    except urlerror.HTTPError as exc:
-        if exc.code == 401:
+        })
+        return json.loads(response["body"].decode("utf-8"))
+    except Exception as exc:
+        if "401" in str(exc):
             raise GitHubAuthError("GitHub authentication was rejected") from exc
         raise
 

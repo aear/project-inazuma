@@ -14,6 +14,7 @@ from code_experiment_lab import CodeExperimentLab
 from config_layers import load_config
 from expression_core import ExpressionTraceStore, TextRealiser, create_expression_intent
 from ina_desktop.files import VirtualFileSystem, configured_drives
+from instruction_authority import seal_code_command, verify_code_command
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 
 
@@ -44,20 +45,28 @@ def capability_catalog() -> dict[str, Any]:
             "experiment_create": {
                 "arguments": ["question", "hypothesis", "code", "dataset?"],
                 "continuation_budget": 0,
+                "authority": "process-local voluntary code capability required",
             },
-            "experiment_run": {"arguments": ["experiment_id"]},
+            "experiment_run": {
+                "arguments": ["experiment_id"],
+                "authority": "process-local voluntary code capability required",
+            },
             "experiment_judge": {
                 "arguments": ["experiment_id", "choice", "metrics", "explanation"],
                 "promotion": "human review required",
+                "authority": "process-local voluntary code capability required",
             },
         },
     }
 
 
-def request_personal_tool(command: Mapping[str, Any], *, child: str | None = None) -> dict[str, Any]:
+def request_personal_tool(
+    command: Mapping[str, Any], *, child: str | None = None, code_authority: object | None = None,
+) -> dict[str, Any]:
     """Queue one chosen command; callers must supply the action and content."""
     payload = dict(command)
     payload.setdefault("id", f"personal_tool_{datetime.now(timezone.utc).timestamp():.6f}")
+    payload = seal_code_command(payload, code_authority)
     return append_inastate_queue(QUEUE_KEY, payload, queue_limit=QUEUE_LIMIT, child=child)
 
 
@@ -75,6 +84,7 @@ def execute_personal_tool_command(
     root = Path(project_root)
     cfg = dict(config or load_config(root / "config.json"))
     action = str(command.get("action") or "").strip().lower()
+    verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
     if action == "write_note":

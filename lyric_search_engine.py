@@ -66,7 +66,7 @@ def search_wikisource(
         "action": "opensearch", "search": f"{_clean(query)} song lyrics",
         "limit": max(1, min(int(limit), MAX_RESULTS)), "namespace": 0, "format": "json",
     })
-    session = ExternalSession(WIKISOURCE_POLICY, opener=opener or urllib.request.urlopen)
+    session = ExternalSession(WIKISOURCE_POLICY, opener=opener)
     response = session.get(f"{WIKISOURCE_API}?{params}", headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     payload = json.loads(response["body"].decode("utf-8"))
     if not isinstance(payload, list) or len(payload) < 4:

@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable, Dict, Mapping, Optional
 
-from external_access import ExternalPolicy, validate_external_url
+from external_access import ExternalAccessBlocked, ExternalPolicy, ExternalSession
 
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -124,7 +124,7 @@ class CachedWeatherProvider:
         longitude: float = -0.03,
         cache_seconds: float = 3600.0,
         timeout_seconds: float = 4.0,
-        opener: Callable[..., object] = urllib.request.urlopen,
+        opener: Callable[..., object] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.latitude = float(latitude)
@@ -152,14 +152,14 @@ class CachedWeatherProvider:
             "timezone": "UTC",
         })
         try:
-            url = validate_external_url(f"{OPEN_METEO_URL}?{query}", OPEN_METEO_POLICY)
-            with self._opener(url, timeout=self.timeout_seconds) as response:
-                body = response.read(OPEN_METEO_POLICY.max_response_bytes + 1)
-            if len(body) > OPEN_METEO_POLICY.max_response_bytes:
-                raise ValueError("weather response exceeds byte budget")
-            payload = json.loads(body.decode("utf-8"))
+            injected = None
+            if self._opener is not None:
+                injected = lambda req, timeout: self._opener(req.full_url, timeout)
+            session = ExternalSession(OPEN_METEO_POLICY, opener=injected)
+            response = session.get(f"{OPEN_METEO_URL}?{query}", headers={"Accept": "application/json"})
+            payload = json.loads(response["body"].decode("utf-8"))
             observation = parse_open_meteo_current(payload, fetched_at_monotonic=now)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
+        except (ExternalAccessBlocked, OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
             if self._cached is not None:
                 observation = replace(self._cached, stale=True)
             else:

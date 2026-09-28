@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from external_access import ExternalPolicy, validate_external_url
+from external_access import ExternalPolicy, ExternalSession
 
 from discord_runtime import typed_outbox_path as resolve_typed_outbox_path
 from outbox_event_store import durable_database_path, record_configured_event, record_event
@@ -857,39 +857,30 @@ def submit_issue(entry: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) ->
         raise RuntimeError("repo_full_name is not configured")
     token = resolve_github_token(cfg, policy)
 
-    url = validate_external_url(
-        f"{policy['api_base']}/repos/{repo_full_name}/issues",
-        ExternalPolicy("github_submission", ("api.github.com",), max_response_bytes=1024 * 1024),
-    )
+    url = f"{policy['api_base']}/repos/{repo_full_name}/issues"
     payload = {
         "title": build_issue_title(entry, policy),
         "body": build_issue_body(entry, policy),
         "labels": _clean_labels(entry.get("labels"), policy.get("labels", [])),
     }
-    req = urlrequest.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
+    external_policy = ExternalPolicy(
+        "github_submission", ("api.github.com",), max_response_bytes=1024 * 1024,
+        timeout_seconds=20, max_requests=1, allowed_content_types=("application/json",),
+        allowed_methods=("POST",),
+    )
+    try:
+        response = ExternalSession(external_policy).request(
+            "POST", url, body=json.dumps(payload).encode("utf-8"), headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "User-Agent": "project-inazuma-github-bridge",
             "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=20) as response:
-            body = response.read(1024 * 1024 + 1)
-            if len(body) > 1024 * 1024:
-                raise RuntimeError("GitHub issue response exceeds byte budget")
-            result = json.loads(body.decode("utf-8"))
-    except urlerror.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
-        if exc.code == 401:
-            raise GitHubAuthError("GitHub authentication was rejected") from exc
-        raise RuntimeError(f"GitHub issue create failed: HTTP {exc.code}: {body[:400]}") from exc
+        })
+        result = json.loads(response["body"].decode("utf-8"))
     except Exception as exc:
+        if "401" in str(exc):
+            raise GitHubAuthError("GitHub authentication was rejected") from exc
         raise RuntimeError(f"GitHub issue create failed: {exc}") from exc
 
     issue_number = result.get("number")

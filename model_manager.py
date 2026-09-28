@@ -4772,8 +4772,11 @@ def process_thought_communication_feedback(plan, reaction, interpretation, **kwa
 
 def request_personal_tool(command):
     """Queue one voluntary private note, expression, or code-experiment action."""
+    from instruction_authority import LOCAL_VOLUNTARY_CODE_AUTHORITY
     from personal_tool_runtime import request_personal_tool as queue_personal_tool
-    return queue_personal_tool(command, child=str(CHILD))
+    return queue_personal_tool(
+        command, child=str(CHILD), code_authority=LOCAL_VOLUNTARY_CODE_AUTHORITY,
+    )
 
 
 def route_cognitive_work(

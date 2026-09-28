@@ -4,11 +4,18 @@ from __future__ import annotations
 import argparse
 from io import BytesIO
 import subprocess
+from urllib import parse
 
 from crypto_market_learning import DEFAULT_ASSETS, acquire_snapshot
+from external_access import resolve_public_addresses
 
 
 class _CurlResponse(BytesIO):
+    def __init__(self, payload, *, address, addresses):
+        super().__init__(payload)
+        self.destination_verified = True
+        self.connected_address = address
+        self.resolved_addresses = addresses
     def __enter__(self):
         return self
     def __exit__(self, *_args):
@@ -18,11 +25,15 @@ class _CurlResponse(BytesIO):
 
 def _curl_opener(req, timeout):
     """CLI transport for providers that reject Python urllib's TLS fingerprint."""
+    parsed = parse.urlsplit(req.full_url)
+    addresses = resolve_public_addresses(parsed.hostname or "")
+    address = addresses[0]
     completed = subprocess.run(
-        ["curl", "-L", "--fail", "--silent", "--show-error", "--max-time", str(int(timeout)), req.full_url],
+        ["curl", "--fail", "--silent", "--show-error", "--max-time", str(int(timeout)),
+         "--resolve", f"{parsed.hostname}:443:{address}", req.full_url],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    return _CurlResponse(completed.stdout)
+    return _CurlResponse(completed.stdout, address=address, addresses=addresses)
 
 
 def main() -> int:
