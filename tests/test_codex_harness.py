@@ -15,6 +15,7 @@ from codex_harness import (
     diff_event_payload,
     image_inputs,
     rate_limit_payload,
+    reset_credits_payload,
     subscription_environment,
     token_usage_payload,
 )
@@ -33,6 +34,55 @@ def test_subscription_environment_removes_usage_billing_credentials():
     assert environment["OMP_NUM_THREADS"] == "1"
     assert environment["OPENBLAS_NUM_THREADS"] == "1"
     assert environment["INA_CODEX_HARNESS"] == "1"
+
+
+def test_reset_credit_snapshot_is_bounded_and_does_not_consume_anything():
+    payload = reset_credits_payload({"availableCount": 2, "credits": [
+        {"id": "one", "status": "available", "resetType": "codexRateLimits", "secret": "drop"},
+    ]})
+    assert payload == {"available_count": 2, "credits": [{
+        "id": "one", "resetType": "codexRateLimits", "status": "available",
+        "title": None, "description": None, "grantedAt": None, "expiresAt": None,
+    }]}
+
+
+def test_model_catalog_exposes_supported_names_not_hidden_entries():
+    client = object.__new__(AppServerClient)
+    calls = []
+    client.request = lambda method, params: calls.append((method, params)) or {"data": [
+        {"id": "shown", "model": "gpt-shown", "displayName": "Shown", "isDefault": True,
+         "supportedReasoningEfforts": [{"reasoningEffort": "high"}], "inputModalities": ["text"]},
+        {"id": "hidden", "model": "gpt-hidden", "hidden": True},
+    ]}
+    assert client.models()["models"] == [{
+        "id": "shown", "model": "gpt-shown", "display_name": "Shown", "description": None,
+        "is_default": True, "default_reasoning_effort": None,
+        "supported_reasoning_efforts": ["high"], "service_tiers": [], "input_modalities": ["text"],
+    }]
+    assert calls == [("model/list", {"limit": 100})]
+
+
+def test_usage_reset_requires_phrase_and_calls_installed_schema_method():
+    client = object.__new__(AppServerClient)
+    client.running_turn = False
+    client.rate_limits = {}
+    client.rate_limit_reset_credits = {}
+    calls = []
+
+    def request(method, params):
+        calls.append((method, params))
+        if method == "account/rateLimits/read":
+            return {"rateLimits": {}, "rateLimitResetCredits": {"availableCount": 0, "credits": []}}
+        return {"outcome": "consumed"}
+
+    client.request = request
+    with pytest.raises(ValueError, match="confirmation"):
+        client.consume_rate_limit_reset(credit_id=None, confirmation="no")
+    result = client.consume_rate_limit_reset(credit_id="credit-1", confirmation="RESET CODEX USAGE")
+    assert calls[0][0] == "account/rateLimitResetCredit/consume"
+    assert calls[0][1]["creditId"] == "credit-1"
+    assert calls[0][1]["idempotencyKey"]
+    assert result["outcome"] == "consumed"
 
 
 def test_event_history_bounds_count_and_payload_size():
@@ -138,6 +188,10 @@ def test_gui_is_local_asset_with_explicit_approval_and_no_api_key_field():
     assert "upsertLifecycleEvent" in source
     assert "target.dataset.diffAttached" in source
     assert "history.replaceState(null,'',location.pathname)" in source
+    assert "/api/models" in source
+    assert "RESET CODEX USAGE" in source
+    assert "/api/git/prepare" in source
+    assert "PUSH REVIEWED COMMIT" in source
 
 
 def test_http_authority_rejects_dns_rebinding_host_and_cross_origin():
@@ -293,6 +347,8 @@ def _notification_client(tmp_path):
     client.latest_diff = None
     client.token_usage = token_usage_payload({})
     client.rate_limits = rate_limit_payload({})
+    client.rate_limit_reset_credits = reset_credits_payload({})
+    client.git = type("Git", (), {"status": lambda self: {"branch": None, "dirty": False}})()
     return client
 
 

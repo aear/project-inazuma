@@ -15,6 +15,7 @@ from config_layers import load_config
 from expression_core import ExpressionTraceStore, TextRealiser, create_expression_intent
 from ina_desktop.files import VirtualFileSystem, configured_drives
 from instruction_authority import seal_code_command, verify_code_command
+from lexical_reference import lookup_definition, lookup_related_words
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
 
@@ -65,6 +66,14 @@ def capability_catalog() -> dict[str, Any]:
                 "arguments": ["incident", "indicators", "evidence", "proposed_subject?", "suspected_crime?", "personal_data_involved?", "jurisdiction?"],
                 "destination": "private personal storage/Security Reports/authority_review.jsonl",
                 "delivery": "none; human review required",
+            },
+            "english_dictionary_lookup": {
+                "arguments": ["term"], "source": "English Wiktionary",
+                "retention": "reference result only; no automatic memory write",
+            },
+            "english_thesaurus_lookup": {
+                "arguments": ["term", "relation?", "limit?"], "source": "Datamuse",
+                "retention": "reference result only; no automatic memory write",
             },
         },
     }
@@ -170,6 +179,13 @@ def execute_personal_tool_command(
         )
         value = queue_report_for_review(
             report, personal / "Security Reports" / "authority_review.jsonl",
+        )
+    elif action == "english_dictionary_lookup":
+        value = lookup_definition(str(command.get("term") or ""))
+    elif action == "english_thesaurus_lookup":
+        value = lookup_related_words(
+            str(command.get("term") or ""), relation=str(command.get("relation") or "synonym"),
+            limit=int(command.get("limit") or 20),
         )
     else:
         raise ValueError(f"unknown personal tool action: {action or 'missing'}")

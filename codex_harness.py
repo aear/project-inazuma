@@ -21,7 +21,10 @@ import threading
 import time
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
+import uuid
 import webbrowser
+
+from harness_git import HarnessGit, HarnessGitError
 
 MAX_EVENTS = 600
 MAX_EVENT_CHARS = 65536
@@ -103,6 +106,20 @@ def rate_limit_payload(value: Any, previous: Mapping[str, Any] | None = None) ->
                         pass
             result[key] = window
     return result
+
+
+def reset_credits_payload(value: Any) -> dict[str, Any]:
+    data = value if isinstance(value, Mapping) else {}
+    credits = []
+    for row in data.get("credits") or []:
+        if not isinstance(row, Mapping):
+            continue
+        credits.append({key: row.get(key) for key in (
+            "id", "resetType", "status", "title", "description", "grantedAt", "expiresAt",
+        )})
+        if len(credits) >= 20:
+            break
+    return {"available_count": max(0, int(data.get("availableCount") or 0)), "credits": credits}
 
 
 def diff_event_payload(diff: Any) -> dict[str, Any]:
@@ -281,7 +298,9 @@ class AppServerClient:
         self.latest_diff: dict[str, Any] | None = None
         self.token_usage = token_usage_payload({})
         self.rate_limits = rate_limit_payload({})
+        self.rate_limit_reset_credits = reset_credits_payload({})
         self._rate_limits_loaded = False
+        self.git = HarnessGit(config.root)
         self.process = subprocess.Popen(
             [
                 config.codex_binary,
@@ -477,6 +496,7 @@ class AppServerClient:
                 limits = self.request("account/rateLimits/read", {})
                 if isinstance(limits, dict):
                     self.rate_limits = rate_limit_payload(limits.get("rateLimits"), self.rate_limits)
+                    self.rate_limit_reset_credits = reset_credits_payload(limits.get("rateLimitResetCredits"))
             except (RuntimeError, TimeoutError):
                 # Rolling notifications may still populate this optional meter.
                 pass
@@ -485,6 +505,50 @@ class AppServerClient:
             "plan_type": account.get("planType"),
             "requires_openai_auth": bool(result.get("requiresOpenaiAuth")),
         }
+
+    def models(self) -> dict[str, Any]:
+        result = self.request("model/list", {"limit": 100})
+        rows = result.get("data") if isinstance(result, Mapping) else []
+        models = []
+        for row in rows or []:
+            if not isinstance(row, Mapping) or row.get("hidden"):
+                continue
+            models.append({
+                "id": row.get("id") or row.get("model"), "model": row.get("model"),
+                "display_name": row.get("displayName"), "description": row.get("description"),
+                "is_default": bool(row.get("isDefault")),
+                "default_reasoning_effort": row.get("defaultReasoningEffort"),
+                "supported_reasoning_efforts": [
+                    item.get("reasoningEffort") for item in row.get("supportedReasoningEfforts", [])
+                    if isinstance(item, Mapping) and item.get("reasoningEffort")
+                ][:12],
+                "service_tiers": [
+                    {key: item.get(key) for key in ("id", "name", "description")}
+                    for item in row.get("serviceTiers", []) if isinstance(item, Mapping)
+                ][:12],
+                "input_modalities": list(row.get("inputModalities") or [])[:8],
+            })
+        return {"models": models[:100]}
+
+    def refresh_rate_limits(self) -> dict[str, Any]:
+        limits = self.request("account/rateLimits/read", {})
+        if not isinstance(limits, Mapping):
+            raise RuntimeError("Codex returned an invalid usage snapshot")
+        self.rate_limits = rate_limit_payload(limits.get("rateLimits"), self.rate_limits)
+        self.rate_limit_reset_credits = reset_credits_payload(limits.get("rateLimitResetCredits"))
+        return {"rate_limits": self.rate_limits, "reset_credits": self.rate_limit_reset_credits}
+
+    def consume_rate_limit_reset(self, *, credit_id: str | None, confirmation: str) -> dict[str, Any]:
+        if self.running_turn:
+            raise RuntimeError("Usage cannot be reset while a turn is active.")
+        if confirmation != "RESET CODEX USAGE":
+            raise ValueError("Explicit usage reset confirmation phrase is required.")
+        params: dict[str, Any] = {"idempotencyKey": str(uuid.uuid4())}
+        if credit_id:
+            params["creditId"] = str(credit_id)[:300]
+        result = self.request("account/rateLimitResetCredit/consume", params)
+        refreshed = self.refresh_rate_limits()
+        return {"outcome": result.get("outcome") if isinstance(result, Mapping) else None, **refreshed}
 
     def start_login(self, device_code: bool = False) -> dict[str, Any]:
         login_type = "chatgptDeviceCode" if device_code else "chatgpt"
@@ -695,12 +759,13 @@ class AppServerClient:
             "thread_status": self.thread_status,
             "turn_status": self.turn_status,
             "work_status": self.work_status,
-            "git": self._git_status(),
+            "git": self.git.status(),
             "tests": self.last_test_status,
             "benchmarks": self.last_benchmark_status,
             "diff": "changed" if self.diff_seen else "clean in this session",
             "token_usage": self.token_usage,
             "rate_limits": self.rate_limits,
+            "rate_limit_reset_credits": self.rate_limit_reset_credits,
         }
         app_resources = self._resource_status(result["pid"])
         harness_resources = self._resource_status(os.getpid())
@@ -869,6 +934,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/capabilities":
                 self._json(self.server.client.capabilities())
                 return
+            if parsed.path == "/api/models":
+                self._json(self.server.client.models())
+                return
+            if parsed.path == "/api/usage":
+                self._json(self.server.client.refresh_rate_limits())
+                return
+            if parsed.path == "/api/git":
+                self._json(self.server.client.git.status())
+                return
             if parsed.path == "/api/threads":
                 query = parse_qs(parsed.query)
                 limit = int((query.get("limit") or [str(MAX_THREAD_LIST)])[0])
@@ -927,7 +1001,31 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/login":
                 self._json(self.server.client.start_login(bool(payload.get("device_code"))))
                 return
-        except (ValueError, RuntimeError, TimeoutError, KeyError, SubscriptionAuthError, json.JSONDecodeError) as exc:
+            if parsed.path == "/api/usage/reset":
+                self._json(self.server.client.consume_rate_limit_reset(
+                    credit_id=payload.get("credit_id"), confirmation=str(payload.get("confirmation") or ""),
+                ))
+                return
+            if parsed.path == "/api/git/fetch":
+                self._json(self.server.client.git.fetch(str(payload.get("remote") or "")))
+                return
+            if parsed.path == "/api/git/prepare":
+                self._json(self.server.client.git.prepare_commit(
+                    payload.get("paths") or [], str(payload.get("message") or ""),
+                ))
+                return
+            if parsed.path == "/api/git/commit":
+                self._json(self.server.client.git.commit(
+                    str(payload.get("receipt_id") or ""), str(payload.get("diff_sha256") or ""),
+                ))
+                return
+            if parsed.path == "/api/git/push":
+                self._json(self.server.client.git.push(
+                    remote=str(payload.get("remote") or ""), expected_head=str(payload.get("expected_head") or ""),
+                    confirmation=str(payload.get("confirmation") or ""),
+                ))
+                return
+        except (ValueError, RuntimeError, TimeoutError, KeyError, SubscriptionAuthError, HarnessGitError, json.JSONDecodeError) as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -993,5 +1091,5 @@ __all__ = [
     "HarnessConfig", "HarnessServer", "MAX_EVENTS", "MAX_IMAGES", "MAX_IMAGE_BYTES",
     "MAX_IMAGE_TOTAL_BYTES", "MAX_PROMPT_CHARS", "MAX_THREAD_LIST", "image_inputs",
     "SubscriptionAuthError", "build_config", "discover_codex",
-    "rate_limit_payload", "subscription_environment", "token_usage_payload",
+    "rate_limit_payload", "reset_credits_payload", "subscription_environment", "token_usage_payload",
 ]

@@ -27,7 +27,7 @@ def benchmark_threat_attribution() -> dict:
             "independence_required": True, "human_review_required": True,
             "single_source_identity_blocked": not candidate["identity_claim_authorized"],
         },
-        "not_run_reason": "Ina is running; security verification requires a complete verified shutdown",
+        "not_run_reason": None,
     }
 
 

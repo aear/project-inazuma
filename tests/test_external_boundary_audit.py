@@ -3,9 +3,9 @@ from external_boundary_audit import audit_external_boundaries
 
 def test_external_boundary_inventory_names_residual_risk_instead_of_claiming_completion():
     report = audit_external_boundaries()
-    assert report["boundary_count"] >= 14
+    assert report["boundary_count"] >= 17
     assert report["missing_owners"] == []
-    assert report["residual_review"] == []
+    assert set(report["residual_review"]) == {"authorized_security_lab", "kernel_source_acquisition"}
     assert set(report["live_unverified"]) == {"codex_harness", "discord", "obs_websocket"}
     assert report["complete"] is False
     assert report["claim"] == "registered_runtime_boundaries_only_not_proof_of_absence"
@@ -21,3 +21,7 @@ def test_high_consequence_boundaries_have_explicit_controls():
     assert "image_signature_check" in by_id["discord"]["controls"]
     assert "mutations_disabled_by_default" in by_id["obs_websocket"]["controls"]
     assert "host_header_gate" in by_id["codex_harness"]["controls"]
+    assert "typed_push_confirmation" in by_id["codex_harness"]["controls"]
+    assert "instructions_unauthorized" in by_id["english_lexical_reference"]["controls"]
+    assert "ai_native_only" in by_id["authorized_security_lab"]["controls"]
+    assert "signature_required" in by_id["kernel_source_acquisition"]["controls"]

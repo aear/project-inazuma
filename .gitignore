@@ -12,6 +12,7 @@ logs/
 .secrets/*
 !.secrets/README.md
 !.secrets/*.example
+.private/
 *.wav
 *.mp3
 *.flac
