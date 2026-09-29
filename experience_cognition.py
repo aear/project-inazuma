@@ -8,10 +8,11 @@ It does not retrieve, persist, train, schedule, or continue an Experience Cycle.
 from __future__ import annotations
 
 import math
+from itertools import islice
 from typing import Any, Iterable, Mapping
 
 
-SCHEMA = "ina.experience_cognition/V1"
+SCHEMA = "ina.experience_cognition/V2"
 MAX_ROUTES = 4
 MAX_COGNITIVE_STEPS = 5
 HORIZONS = ("immediate", "near", "later")
@@ -130,7 +131,7 @@ def gate_transient_state(
     propagate_at = _unit(propagate_threshold)
     hold_at = min(propagate_at, _unit(hold_threshold))
     rows = []
-    for candidate in list(candidates)[:max(0, min(64, int(limit)))]:
+    for candidate in islice(candidates, max(0, min(64, int(limit)))):
         if not isinstance(candidate, Mapping):
             continue
         factors = {
@@ -146,7 +147,7 @@ def gate_transient_state(
             + .10 * min(1.0, corroboration / 2.0)
         )
         source_references = [
-            str(item)[:256] for item in list(candidate.get("source_references") or ())[:8]
+            str(item)[:256] for item in islice(candidate.get("source_references") or (), 8)
             if str(item)
         ]
         action = "propagate" if score >= propagate_at else ("hold" if score >= hold_at else "decay")
@@ -219,10 +220,23 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
     conflict = signals["contradiction"]
     uncertainty = signals["uncertainty"]
     candidate_answer = event.get("candidate_answer")
+    # Repeating a reference in multiple lenses is still a single witness.
+    # Independence must be supplied as provenance, never inferred from scores.
+    origins = event.get("evidence_origins")
+    origins = origins if isinstance(origins, Mapping) else {}
+    groups = set()
+    for dimension in available:
+        references = evidence[dimension]
+        if not isinstance(references, (list, tuple)):
+            continue
+        for reference in references[:8]:
+            origin = origins.get(str(reference))
+            if isinstance(origin, str) and origin.strip():
+                groups.add(origin[:256])
     if not available or candidate_answer is None or (missing and uncertainty >= .75):
         status = "unknown"
         confidence = 0.0
-    elif conflict >= .55 or uncertainty >= .45 or missing:
+    elif conflict >= .55 or uncertainty >= .45 or missing or len(groups) < 2:
         status = "uncertain"
         confidence = max(0.0, min(.74, 1.0 - max(conflict, uncertainty)))
     else:
@@ -238,6 +252,9 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
     }
     return {
         "status": status,
+        "independent_evidence_groups": sorted(groups),
+        "corroboration_available": len(groups) >= 2,
+        "confidence_is_calibrated": False,
         "answer": None if status == "unknown" else candidate_answer,
         "confidence": round(confidence, 6),
         "available_evidence": available,
@@ -263,13 +280,13 @@ def build_multi_horizon_predictions(
     limit = max(1, min(8, int(limit_per_horizon)))
     grouped = {horizon: [] for horizon in HORIZONS}
     rejected = []
-    for candidate in list(candidates)[:64]:
+    for candidate in islice(candidates, 64):
         if not isinstance(candidate, Mapping):
             continue
         horizon = str(candidate.get("horizon") or "").lower()
         description = str(candidate.get("prediction") or "")[:1000]
-        sources = [str(item)[:256] for item in list(candidate.get("source_references") or ())[:8] if str(item)]
-        disconfirm = [str(item)[:512] for item in list(candidate.get("disconfirming_observations") or ())[:8] if str(item)]
+        sources = [str(item)[:256] for item in islice(candidate.get("source_references") or (), 8) if str(item)]
+        disconfirm = [str(item)[:512] for item in islice(candidate.get("disconfirming_observations") or (), 8) if str(item)]
         if horizon not in grouped or not description or not sources or not disconfirm:
             rejected.append({
                 "prediction": description, "horizon": horizon,

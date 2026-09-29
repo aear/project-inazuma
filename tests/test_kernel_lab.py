@@ -10,7 +10,8 @@ def test_source_requires_digest_and_signature_before_build_authority():
     unsigned = source_manifest("6.18.54", sha256="a" * 64, signature_verified=False)
     signed = source_manifest("6.18.54", sha256="a" * 64, signature_verified=True)
     assert unsigned["build_authorized"] is False
-    assert signed["build_authorized"] is True
+    assert signed["build_authorized"] is False
+    assert signed["caller_claimed_signature_verified"] is True
     assert signed["host_install_authorized"] is False
 
 

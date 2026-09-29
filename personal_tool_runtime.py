@@ -181,7 +181,7 @@ def execute_personal_tool_command(
             report, personal / "Security Reports" / "authority_review.jsonl",
         )
     elif action == "english_dictionary_lookup":
-        value = lookup_definition(str(command.get("term") or ""))
+        value = lookup_definition(str(command.get("term") or ""), provider=str(command.get("provider") or "wiktionary"))
     elif action == "english_thesaurus_lookup":
         value = lookup_related_words(
             str(command.get("term") or ""), relation=str(command.get("relation") or "synonym"),

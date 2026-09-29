@@ -38,3 +38,8 @@ def test_reference_term_rejects_urls_and_instruction_payloads():
     for term in ("https://example.test", "word; rm -rf", "x" * 81):
         with pytest.raises(ValueError):
             lookup_definition(term, session=Session({}))
+
+
+def test_definition_budget_applies_across_all_parts_of_speech():
+    session = Session({'en': [{'definitions': [{'definition': 'definition'}] * 12}] * 12})
+    assert len(lookup_definition('word', session=session)['definitions']) == 48

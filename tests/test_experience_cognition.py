@@ -125,3 +125,22 @@ def test_composed_plan_respects_custom_memory_boundary():
     assert plan["memory_boundary"] == {
         "reads_fragment_store": False, "writes_memory": False, "trains_parameters": False,
     }
+
+
+def test_shared_origin_does_not_become_independent_by_repetition():
+    event = {'candidate_answer': 'hypothesis', 'evidence': {'causal': ['a'], 'sensory': ['b']},
+             'evidence_origins': {'a': 'same source', 'b': 'same source'}}
+    assert assess_uncertainty(event)['status'] == 'uncertain'
+    event['evidence_origins']['b'] = 'independent source'
+    assert assess_uncertainty(event)['status'] == 'known'
+    event['signals'] = {'contradiction': .9}
+    assert assess_uncertainty(event)['status'] == 'uncertain'
+
+
+def test_bounded_cognition_does_not_consume_unbounded_iterators():
+    def candidates():
+        for index in range(64):
+            yield {'state_id': str(index)}
+        raise AssertionError('input budget exceeded')
+    assert len(gate_transient_state(candidates(), limit=64)['candidates']) == 64
+    assert len(build_multi_horizon_predictions(candidates())['rejected']) == 64

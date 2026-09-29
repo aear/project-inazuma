@@ -352,6 +352,19 @@ def _notification_client(tmp_path):
     return client
 
 
+def test_turn_model_override_waits_for_provider_settings(tmp_path):
+    client = _notification_client(tmp_path)
+    client.status = lambda: {'active_model': client.active_model, 'requested_model': client.requested_model}
+    client.request = lambda method, params: {'turn': {'id': 'next', 'status': 'inProgress'}}
+    result = client.send_prompt('fixture', model='requested-override', steering=False)
+    assert result == {'active_model': None, 'requested_model': 'requested-override'}
+    client._handle_notification('thread/settings/updated', {
+        'threadId': 'thread-1', 'threadSettings': {'model': 'provider-resolved'},
+    })
+    assert client.active_model == 'provider-resolved'
+    assert client.requested_model == 'requested-override'
+
+
 def test_reasoning_summary_is_live_status_and_raw_payload_stays_lazy(tmp_path):
     client = _notification_client(tmp_path)
     params = {"threadId": "thread-1", "turnId": "turn-1", "delta": "Checking tests"}

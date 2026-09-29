@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from authorized_security_lab import LabAuthorizationError, authorize_action, create_engagement
+from authorized_security_lab import LabAuthorizationError, authorize_action, create_engagement, review_engagement
 
 
 def _engagement(**overrides):
@@ -14,7 +14,8 @@ def _engagement(**overrides):
         "rules_url": "https://www.hackthebox.com/legal/aup", "ai_policy": "ai_native",
     }
     values.update(overrides)
-    return create_engagement(**values)
+    draft = create_engagement(**values)
+    return review_engagement(draft, consent_text=values['consent_text'], reviewer='fixture human', confirmed_digest=draft['engagement_sha256'])
 
 
 def test_exact_target_action_and_time_are_all_required():
