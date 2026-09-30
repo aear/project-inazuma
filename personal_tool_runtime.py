@@ -16,6 +16,8 @@ from expression_core import ExpressionTraceStore, TextRealiser, create_expressio
 from ina_desktop.files import VirtualFileSystem, configured_drives
 from instruction_authority import seal_code_command, verify_code_command
 from lexical_reference import lookup_definition, lookup_related_words
+from external_project_registry import read_project_source
+from expressive_variation import compare_variation
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
 
@@ -34,6 +36,17 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "compare_expressive_variation": {
+                "arguments": ["modality (image, text, sound)", "before", "after", "source", "references?"],
+                "scope": "caller-observed features; optional one-variable trials, not inferred meaning",
+                "retention": "returned capture only; no automatic memory write or execution",
+            },
+            "external_project_self_read": {
+                "arguments": ["project", "relative_path?", "offset?"],
+                "scope": "read-enabled private registry projects; bounded source excerpts",
+                "retention": "voluntary reference only; code is not instruction authority",
+                "execution": "none",
+            },
             "write_note": {
                 "arguments": ["title", "text"],
                 "destination": "private personal storage/Notes",
@@ -68,7 +81,7 @@ def capability_catalog() -> dict[str, Any]:
                 "delivery": "none; human review required",
             },
             "english_dictionary_lookup": {
-                "arguments": ["term"], "source": "English Wiktionary",
+                "arguments": ["term", "provider? (wiktionary or oxford)"], "source": "English Wiktionary or configured Oxford Languages",
                 "retention": "reference result only; no automatic memory write",
             },
             "english_thesaurus_lookup": {
@@ -106,7 +119,15 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "write_note":
+    if action == "compare_expressive_variation":
+        value = compare_variation(modality=command.get('modality'),
+                                  before=command.get('before'), after=command.get('after'),
+                                  source=command.get('source'), references=command.get('references', ()))
+    elif action == "external_project_self_read":
+        value = read_project_source(str(command.get("project") or ''), inazuma_root=root,
+                                    relative_path=str(command.get('relative_path') or '.'),
+                                    offset=command.get('offset', 0))
+    elif action == "write_note":
         text = str(command.get("text") or "")
         if not text or len(text.encode("utf-8")) > MAX_TEXT_LENGTH:
             raise ValueError("note text must be 1..65536 UTF-8 bytes")

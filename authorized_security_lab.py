@@ -142,6 +142,8 @@ def execute_tcp_connect(engagement: Mapping[str, Any], *, target: str) -> dict[s
     with _LOCK:
         if nonce in _CONSUMED:
             raise LabAuthorizationError("one-attempt engagement already consumed")
+        if len(_CONSUMED) >= 1024:
+            raise LabAuthorizationError("session attempt budget exhausted; human review process restart required")
         _CONSUMED.add(nonce)
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as connection:

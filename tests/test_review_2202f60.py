@@ -115,6 +115,40 @@ def test_execution_enforces_peer_port_and_single_attempt(monkeypatch):
         lab.execute_tcp_connect(approved, target=approved['target'])
 
 
+def test_execution_rejects_peer_mismatch_and_expired_approval(monkeypatch):
+    _, approved = engagement()
+    with pytest.raises(lab.LabAuthorizationError, match='expired'):
+        lab.authorize_action(approved, target=approved['target'], action='tcp_connect',
+                             now=datetime.now(timezone.utc)+timedelta(days=1))
+    class WrongPeer:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, value): pass
+        def connect(self, address): pass
+        def getpeername(self): return ('127.0.0.1', 443)
+    monkeypatch.setattr(lab.socket, 'socket', lambda *args: WrongPeer())
+    with pytest.raises(lab.LabAuthorizationError, match='peer'):
+        lab.execute_tcp_connect(approved, target=approved['target'])
+
+
+def test_commit_uses_reviewed_snapshot_and_preserves_unrelated_staging(tmp_path, monkeypatch):
+    client = repo(tmp_path)
+    (tmp_path / 'a').write_text('reviewed\n')
+    (tmp_path / 'unrelated').write_text('keep staged\n')
+    git(tmp_path, 'add', 'unrelated')
+    review = client.prepare_commit(['a'], 'reviewed')
+    original = client._run
+    def race(args, **kwargs):
+        if 'commit-tree' in args:
+            (tmp_path / 'a').write_text('unreviewed race\n')
+        return original(args, **kwargs)
+    monkeypatch.setattr(client, '_run', race)
+    client.commit(review['receipt_id'], review['diff_sha256'])
+    assert git(tmp_path, 'show', 'HEAD:a') == 'reviewed'
+    assert git(tmp_path, 'diff', '--cached', '--name-only') == 'unrelated'
+    assert 'unreviewed race' in git(tmp_path, 'diff', '--', 'a')
+
+
 def test_kernel_boolean_and_forged_receipt_never_grant_build():
     result = source_manifest('6.18.54', sha256='a'*64, signature_verified=True,
                              verification={'sha256': 'a'*64, 'seal': 'fake'})
@@ -155,6 +189,10 @@ def test_model_notification_cannot_be_spoofed_by_other_thread():
     assert client.active_model is None
     client._handle_notification('thread/settings/updated', {'threadId':'current', 'threadSettings':{'model':'resolved'}})
     assert client.active_model == 'resolved' and client.requested_model == 'requested'
+    client._handle_notification('model/rerouted', {'threadId':'current', 'turnId':'stale', 'toModel':'wrong'})
+    assert client.active_model == 'resolved'
+    client._handle_notification('model/rerouted', {'threadId':'current', 'turnId':'turn', 'toModel':'rerouted'})
+    assert client.active_model == 'rerouted' and client.requested_model == 'requested'
 
 
 def test_commit_message_is_editable_draft_and_never_commits(tmp_path):

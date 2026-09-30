@@ -43,3 +43,23 @@ def test_reference_term_rejects_urls_and_instruction_payloads():
 def test_definition_budget_applies_across_all_parts_of_speech():
     session = Session({'en': [{'definitions': [{'definition': 'definition'}] * 12}] * 12})
     assert len(lookup_definition('word', session=session)['definitions']) == 48
+
+
+def test_oxford_without_explicit_enablement_makes_no_request(monkeypatch):
+    monkeypatch.setenv('INA_OXFORD_API_ENABLED', '0')
+    session = Session({})
+    assert lookup_definition('word', provider='oxford', session=session)['status'] == 'unavailable'
+    assert session.urls == []
+
+
+def test_oxford_preserves_senses_and_never_returns_credentials(monkeypatch):
+    monkeypatch.setenv('INA_OXFORD_API_ENABLED', '1')
+    monkeypatch.setenv('OXFORD_APP_ID', 'synthetic-app-id')
+    monkeypatch.setenv('OXFORD_APP_KEY', 'synthetic-private-key')
+    session = Session({'results':[{'lexicalEntries':[{'lexicalCategory':{'text':'noun'},
+        'entries':[{'senses':[{'id':'sense-1','definitions':['definition']}]}]}]}]})
+    result = lookup_definition('Word', provider='oxford', session=session)
+    assert result['language'] == 'en-gb'
+    assert result['definitions'] == [{'part_of_speech':'noun', 'sense_id':'sense-1','definition':'definition'}]
+    assert 'synthetic-private-key' not in json.dumps(result)
+    assert not result['instructions_authorized'] and not result['automatic_memory_write_authorized']

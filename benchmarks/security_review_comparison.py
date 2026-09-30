@@ -28,6 +28,7 @@ def measure(root, label):
     kernel = load(label + '_kernel', root / 'kernel_lab.py')
     cognition = load(label + '_cognition', root / 'experience_cognition.py')
     lexical = load(label + '_lexical', root / 'lexical_reference.py')
+    projects = load(label + '_projects', root / 'external_project_registry.py')
     signals = {}
     with tempfile.TemporaryDirectory(prefix='ina_review_bench_') as folder:
         work = Path(folder)
@@ -87,6 +88,17 @@ def measure(root, label):
         def get(self, url, headers=None):
             return {'url':url, 'body':json.dumps({'en':[{'definitions':[{'definition':'sense'}]*12}]*12}).encode()}
     signals['definition_budget_enforced'] = len(lexical.lookup_definition('word', session=Session())['definitions']) <= 48
+    with tempfile.TemporaryDirectory(prefix='ina_project_bench_') as folder:
+        work = Path(folder)
+        ina, external = work / 'ina', work / 'external'
+        ina.mkdir(); external.mkdir()
+        projects.register_project(name='Fixture', path=external, inazuma_root=ina)
+        signals['revocable_source_reader'] = False
+        if hasattr(projects, 'read_project_source'):
+            try:
+                projects.read_project_source('Fixture', inazuma_root=ina)
+            except projects.ProjectRegistryError:
+                signals['revocable_source_reader'] = True
     return signals
 
 

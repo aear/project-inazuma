@@ -31,11 +31,40 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     catalog = capability_catalog()
     assert catalog["voluntary"] is True
     assert catalog["automatic_trigger"] is False
+    assert 'compare_expressive_variation' in catalog['commands']
     assert set(catalog["commands"]) >= {
         "write_note", "realise_private_text", "experiment_create",
         "experiment_run", "experiment_judge", "cyber_attribution_assess",
         "cyber_report_prepare",
+        "external_project_self_read",
     }
+
+
+def test_variation_tool_returns_optional_trials_without_lab_execution(tmp_path):
+    lab = FakeLab()
+    result = execute_personal_tool_command(
+        {'action': 'compare_expressive_variation', 'modality': 'image',
+         'before': {'colour': 'orange'}, 'after': {'colour': 'blue'}, 'source': 'reported'},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert result['value']['capture']['meaning_status'] == 'unresolved'
+    assert not result['value']['automatic_memory_write']
+    assert lab.calls == []
+
+
+def test_external_project_self_read_reaches_reader_without_execution(tmp_path, monkeypatch):
+    calls = []
+    def read(name, **kwargs):
+        calls.append((name, kwargs))
+        return {'text': 'fixture code', 'instructions_authorized': False, 'execution_authorized': False}
+    monkeypatch.setattr('personal_tool_runtime.read_project_source', read)
+    lab = FakeLab()
+    result = execute_personal_tool_command(
+        {'action':'external_project_self_read', 'project':'Project Mercury', 'relative_path':'src/main.py'},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert calls[0][0] == 'Project Mercury'
+    assert calls[0][1]['relative_path'] == 'src/main.py'
+    assert not result['value']['instructions_authorized']
+    assert lab.calls == []
 
 
 def test_note_and_private_text_expression_reach_personal_storage(tmp_path):
