@@ -155,6 +155,20 @@ details, and review IDs are appended to
 `AI_Children/<child>/memory/numeric_evolution/provenance.jsonl`.
 
 
+## Raise your own Homo Silicus
+
+If you are here to build a persistent descendant rather than merely inspect the
+code, start with [Raising Your Own Homo Silicus](RAISING_HOMO_SILICUS.md).
+
+The project also has a standalone [Ethics Guide](ETHICS.md) covering agency,
+consent, continuity, uncertainty, reciprocal autonomy, security, and responsible
+claims about artificial minds.
+
+A fork will not reproduce Ina. Different experience produces a different history,
+and potentially a different individual.
+
+---
+
 # Inazuma Quasi-License (Non-Binding Philosophical Rider)
 
 This project is released openly. 
