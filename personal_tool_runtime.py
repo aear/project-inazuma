@@ -18,6 +18,7 @@ from instruction_authority import seal_code_command, verify_code_command
 from lexical_reference import lookup_definition, lookup_related_words
 from external_project_registry import read_project_source
 from expressive_variation import compare_variation
+from memetic_processor import process_meme
 from self_inquiry_journey import begin_intuition_inquiry, continue_self_inquiry, current_inquiry_request
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
@@ -37,6 +38,11 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "memetic_process": {
+                "arguments": ["operation (interpret, compose, review)", "operation-specific observations or segments"],
+                "scope": "bounded context hypotheses, private composition recipes and reaction evidence",
+                "execution": "no publication, artifact loading, code execution or automatic learning",
+            },
             "intuition_inquire": {
                 "arguments": ["hunch", "question", "countercheck", "trigger_references", "depth_budget?"],
                 "scope": "voluntary finite evidence request; no execution or memory retrieval",
@@ -128,7 +134,9 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "intuition_inquire":
+    if action == "memetic_process":
+        value = process_meme(dict(command))
+    elif action == "intuition_inquire":
         journey = begin_intuition_inquiry(command.get('hunch'), question=command.get('question'),
             countercheck=command.get('countercheck'), trigger_references=command.get('trigger_references'),
             depth_budget=command.get('depth_budget', 1))

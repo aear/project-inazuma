@@ -31,6 +31,7 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     catalog = capability_catalog()
     assert catalog["voluntary"] is True
     assert catalog["automatic_trigger"] is False
+    assert 'memetic_process' in catalog['commands']
     assert {'intuition_inquire', 'intuition_review'} <= set(catalog['commands'])
     assert 'compare_expressive_variation' in catalog['commands']
     assert set(catalog["commands"]) >= {
@@ -39,6 +40,17 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
         "cyber_report_prepare",
         "external_project_self_read",
     }
+
+
+def test_memetic_tool_reaches_expression_core_without_lab_or_publication(tmp_path):
+    lab = FakeLab()
+    result = execute_personal_tool_command(
+        {'action': 'memetic_process', 'operation': 'compose', 'purpose': 'An in-joke',
+         'segments': [{'kind': 'text', 'text': 'The spiral returns.'}]},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert result['value']['draft']['schema'] == 'ina.expression_realisation/V1'
+    assert not result['value']['delivered']
+    assert lab.calls == []
 
 
 def test_intuition_tools_reach_review_without_executing_investigation(tmp_path):
