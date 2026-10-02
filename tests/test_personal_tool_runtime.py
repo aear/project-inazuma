@@ -31,6 +31,7 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     catalog = capability_catalog()
     assert catalog["voluntary"] is True
     assert catalog["automatic_trigger"] is False
+    assert {'intuition_inquire', 'intuition_review'} <= set(catalog['commands'])
     assert 'compare_expressive_variation' in catalog['commands']
     assert set(catalog["commands"]) >= {
         "write_note", "realise_private_text", "experiment_create",
@@ -38,6 +39,19 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
         "cyber_report_prepare",
         "external_project_self_read",
     }
+
+
+def test_intuition_tools_reach_review_without_executing_investigation(tmp_path):
+    lab = FakeLab()
+    started = execute_personal_tool_command(
+        {'action': 'intuition_inquire', 'hunch': 'This might matter', 'question': 'Does this help?',
+         'countercheck': 'Look for an opposing observation', 'trigger_references': ['event:1']},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    reviewed = execute_personal_tool_command(
+        {'action': 'intuition_review', 'journey': started['value']['journey'], 'choice': 'remain_uncertain'},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert reviewed['value']['evidence_request'] is None
+    assert lab.calls == []
 
 
 def test_variation_tool_returns_optional_trials_without_lab_execution(tmp_path):

@@ -1947,6 +1947,15 @@ def _self_inquiry_journey_v2() -> dict[str, Any]:
     ])
 
 
+def _self_inquiry_journey_v3() -> dict[str, Any]:
+    import self_inquiry_journey
+    from benchmarks.benchmark_intuition_inquiry import measure
+    return _capability([
+        {"case": name, "component": "bounded_revisable_inquiry", "correct": passed}
+        for name, passed in measure(self_inquiry_journey).items()
+    ])
+
+
 def _identity_system_v1() -> dict[str, Any]:
     return _capability([
         {"case": "identity aspects remain distinct witnesses", "component": "plurality", "correct": False},
@@ -2556,6 +2565,7 @@ _REGISTRY = {
         ModuleVersion("expression_core", "V6", "Text realisation respects known, uncertain, and unknown cognition", _expression_core_v6),
         ModuleVersion("self_inquiry_journey", "V1", "No voluntary staged route for deeper self-understanding", _self_inquiry_journey_v1),
         ModuleVersion("self_inquiry_journey", "V2", "Meditation offers a finite witness-led self-inquiry journey", _self_inquiry_journey_v2),
+        ModuleVersion("self_inquiry_journey", "V3", "Terminal choices and bounded revisable intuition candidates", _self_inquiry_journey_v3),
         ModuleVersion("identity_system", "V1", "Single-profile self-reflection without aspect coordination", _identity_system_v1),
         ModuleVersion("identity_system", "V2", "Plural identity witnesses preserve conflict and feed continuity", _identity_system_v2),
     ),

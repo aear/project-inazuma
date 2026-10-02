@@ -1,8 +1,57 @@
 import pytest
 
 from self_inquiry_journey import (
-    begin_self_inquiry, continue_self_inquiry, current_inquiry_request,
+    begin_self_inquiry, continue_self_inquiry, current_inquiry_request, begin_intuition_inquiry,
 )
+
+
+def test_terminal_inquiry_cannot_be_reopened():
+    for choice in ('stop', 'remain_uncertain'):
+        journey = begin_self_inquiry('Investigate?', trigger_references=['event:1'], depth_budget=3)
+        stopped = continue_self_inquiry(journey, choice=choice)
+        with pytest.raises(PermissionError, match='terminal'):
+            continue_self_inquiry(stopped, choice='deeper')
+
+
+def test_intuition_preserves_error_correction_without_certifying_truth():
+    original = begin_intuition_inquiry('Something about this matters', question='Does the contrast help?',
+        countercheck='Compare a version without the contrast', trigger_references=['drawing:1'], depth_budget=2)
+    assert not original['intuition']['explanation_required']
+    assert current_inquiry_request(original)['countercheck']
+    first = continue_self_inquiry(original, choice='deeper', hypotheses=[
+        {'hypothesis': 'Contrast helps', 'confidence': .8, 'evidence_references': ['review:a']}])
+    revised = continue_self_inquiry(first, choice='remain_uncertain', observation_references=['review:b'],
+        hypotheses=[{'hypothesis': 'It may depend on context', 'confidence': .3,
+                     'evidence_references': ['review:a'], 'counterevidence_references': ['review:b']}])
+    assert revised['hypothesis_history'][-1]['previous'][0]['confidence'] == .8
+    assert revised['hypotheses'][0]['counterevidence_references'] == ['review:b']
+    assert not revised['hypotheses'][0]['authoritative']
+    assert revised['intuition']['truth_status'] == 'unresolved'
+    assert original['hypotheses'] == []
+    assert first['hypotheses'][0]['confidence'] == .8
+
+
+def test_inquiry_does_not_overconsume_duplicate_witnesses_or_candidates():
+    def refs():
+        for _ in range(32):
+            yield 'same'
+        raise AssertionError('overconsumed references')
+    journey = begin_self_inquiry('Bounded?', trigger_references=refs())
+    def candidates():
+        for _ in range(8):
+            yield {'hypothesis': 'Maybe'}
+        raise AssertionError('overconsumed hypotheses')
+    result = continue_self_inquiry(journey, choice='stop', hypotheses=candidates())
+    assert len(result['hypotheses']) == 8
+
+
+def test_no_revision_preserves_candidates_and_nonfinite_confidence_is_rejected():
+    journey = begin_self_inquiry('Question?', trigger_references=['event:1'], depth_budget=2)
+    first = continue_self_inquiry(journey, choice='deeper', hypotheses=[{'hypothesis': 'Maybe'}])
+    result = continue_self_inquiry(first, choice='stop')
+    assert result['hypotheses'] == first['hypotheses']
+    with pytest.raises(ValueError, match='finite'):
+        continue_self_inquiry(journey, choice='stop', hypotheses=[{'hypothesis': 'Maybe', 'confidence': float('nan')}])
 
 
 def test_self_inquiry_is_voluntary_bounded_and_code_is_a_late_witness():

@@ -7,6 +7,9 @@ their evidence and may satisfy or decline the bounded requests.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from itertools import islice
+from copy import deepcopy
+import math
 from typing import Any, Iterable, Mapping
 import uuid
 
@@ -28,7 +31,7 @@ def _now() -> str:
 
 def _references(values: Iterable[Any] | None, limit: int = 32) -> list[str]:
     result = []
-    for value in values or ():
+    for value in islice(values or (), limit):
         item = str(value or "").strip()
         if item and item not in result:
             result.append(item[:500])
@@ -75,6 +78,7 @@ def current_inquiry_request(journey: Mapping[str, Any]) -> dict[str, Any] | None
     return {
         "journey_id": journey.get("journey_id"), "stage_index": index,
         "stage": stage.get("name"), "prompt": stage.get("prompt"),
+        **({"countercheck": stage['countercheck']} if 'countercheck' in stage else {}),
         "evidence_route": stage.get("evidence_route"),
         "query_references": list(journey.get("trigger_references") or ())[:32],
         "limits": {"records": 16, "code_files": 4, "may_defer": True},
@@ -90,6 +94,8 @@ def continue_self_inquiry(
     if journey.get("schema") != SCHEMA:
         raise ValueError("a valid self-inquiry journey is required")
     selected = str(choice or "").strip().lower()
+    if current_inquiry_request(journey) is None:
+        raise PermissionError("self-inquiry is terminal; begin a new explicitly chosen inquiry")
     if selected not in {"deeper", "stop", "remain_uncertain"}:
         raise ValueError("choice must be deeper, stop, or remain_uncertain")
     result = dict(journey)
@@ -98,17 +104,30 @@ def continue_self_inquiry(
         "references": _references(observation_references, 16), "recorded_at": _now(),
     }]
     normalized_hypotheses = []
-    for raw in list(hypotheses or ())[:8]:
+    for raw in islice(hypotheses or (), 8):
         hypothesis = str(raw.get("hypothesis") or "").strip()
         if not hypothesis:
             continue
+        confidence = float(raw.get("confidence", 0.0))
+        if not math.isfinite(confidence):
+            raise ValueError("hypothesis confidence must be finite")
         normalized_hypotheses.append({
             "hypothesis": hypothesis[:1000],
-            "confidence": max(0.0, min(1.0, float(raw.get("confidence", 0.0)))),
+            "confidence": max(0.0, min(1.0, confidence)),
             "evidence_references": _references(raw.get("evidence_references"), 16),
+            "counterevidence_references": _references(raw.get("counterevidence_references"), 16),
             "authoritative": False,
         })
-    result["hypotheses"] = normalized_hypotheses
+    # Retain earlier candidates when evidence is revised, including disagreements.
+    result["hypothesis_history"] = deepcopy(list(journey.get("hypothesis_history") or ())[-4:])
+    if hypotheses is not None:
+        result["hypothesis_history"].append({
+            "stage_index": journey.get("stage_index", 0),
+            "previous": deepcopy(list(journey.get("hypotheses") or ())),
+            "replacement": deepcopy(normalized_hypotheses),
+            "observation_references": list(result["observations"][-1]["references"]),
+        })
+        result["hypotheses"] = normalized_hypotheses
     if selected in {"stop", "remain_uncertain"}:
         result["status"] = selected
     else:
@@ -122,7 +141,31 @@ def continue_self_inquiry(
     return result
 
 
+def begin_intuition_inquiry(hunch: str, *, trigger_references: Iterable[Any],
+                           question: str, countercheck: str, depth_budget: int = 1) -> dict[str, Any]:
+    """Create a voluntary investigation of a hunch, not a truth certificate.
+
+    The hunch needs no explanation. Investigation requires a question and a way
+    to look for error. Requests neither execute actions nor retrieve memory.
+    """
+    for text in (hunch, countercheck):
+        if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            raise ValueError('hunch and countercheck must be 1..1000 characters')
+    journey = begin_self_inquiry(question, trigger_references=trigger_references,
+                                 depth_budget=depth_budget)
+    journey['intuition'] = {
+        'schema': 'ina.intuition_inquiry/V1', 'hunch': hunch,
+        'countercheck': countercheck, 'truth_status': 'unresolved',
+        'explanation_required': False, 'confidence_is_calibrated': False,
+        'automatic_execution': False, 'grants_authority': False,
+    }
+    journey['stages'][0]['prompt'] = question
+    journey['stages'][0]['countercheck'] = countercheck
+    return journey
+
+
 __all__ = [
     "SCHEMA", "MAX_DEPTH", "begin_self_inquiry", "current_inquiry_request",
     "continue_self_inquiry",
+    "begin_intuition_inquiry",
 ]

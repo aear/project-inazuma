@@ -18,6 +18,7 @@ from instruction_authority import seal_code_command, verify_code_command
 from lexical_reference import lookup_definition, lookup_related_words
 from external_project_registry import read_project_source
 from expressive_variation import compare_variation
+from self_inquiry_journey import begin_intuition_inquiry, continue_self_inquiry, current_inquiry_request
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
 
@@ -36,6 +37,14 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "intuition_inquire": {
+                "arguments": ["hunch", "question", "countercheck", "trigger_references", "depth_budget?"],
+                "scope": "voluntary finite evidence request; no execution or memory retrieval",
+            },
+            "intuition_review": {
+                "arguments": ["journey", "choice (deeper, stop, remain_uncertain)", "observation_references?", "hypotheses?"],
+                "scope": "revisable candidates with retained prior hypotheses; no truth certification",
+            },
             "compare_expressive_variation": {
                 "arguments": ["modality (image, text, sound)", "before", "after", "source", "references?"],
                 "scope": "caller-observed features; optional one-variable trials, not inferred meaning",
@@ -119,7 +128,19 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "compare_expressive_variation":
+    if action == "intuition_inquire":
+        journey = begin_intuition_inquiry(command.get('hunch'), question=command.get('question'),
+            countercheck=command.get('countercheck'), trigger_references=command.get('trigger_references'),
+            depth_budget=command.get('depth_budget', 1))
+        value = {'journey': journey, 'evidence_request': current_inquiry_request(journey)}
+    elif action == "intuition_review":
+        supplied = command.get('journey')
+        if not isinstance(supplied, Mapping) or not supplied.get('intuition'):
+            raise ValueError('an intuition inquiry is required')
+        journey = continue_self_inquiry(supplied, choice=command.get('choice'),
+            observation_references=command.get('observation_references'), hypotheses=command.get('hypotheses'))
+        value = {'journey': journey, 'evidence_request': current_inquiry_request(journey)}
+    elif action == "compare_expressive_variation":
         value = compare_variation(modality=command.get('modality'),
                                   before=command.get('before'), after=command.get('after'),
                                   source=command.get('source'), references=command.get('references', ()))
