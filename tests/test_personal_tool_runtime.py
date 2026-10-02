@@ -31,6 +31,7 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     catalog = capability_catalog()
     assert catalog["voluntary"] is True
     assert catalog["automatic_trigger"] is False
+    assert 'cyber_evidence_verify' in catalog['commands']
     assert 'predictive_landscape' in catalog['commands']
     assert 'memetic_process' in catalog['commands']
     assert {'intuition_inquire', 'intuition_review'} <= set(catalog['commands'])
@@ -41,6 +42,19 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
         "cyber_report_prepare",
         "external_project_self_read",
     }
+
+
+def test_byte_verifier_tool_reaches_checker_without_lab(tmp_path):
+    import base64
+    from threat_attribution import hash_evidence, validate_evidence
+    lab = FakeLab()
+    result = execute_personal_tool_command(
+        {'action': 'cyber_evidence_verify', 'content_base64': base64.b64encode(b'fixture').decode(),
+         'evidence': {'evidence_id': 'fixture', 'evidence_type': 'owned_system_log',
+                      'sha256': hash_evidence(b'fixture'), 'origin': 'fixture', 'independence_group': 'fixture'}},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert validate_evidence(result['value'])['artifact_bytes_verified']
+    assert lab.calls == []
 
 
 def test_landscape_tool_is_reachable_without_execution(tmp_path):

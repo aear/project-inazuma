@@ -393,7 +393,8 @@ def _thought_processor_v6() -> dict[str, Any]:
     )
     return _capability([*baseline["cases"],
         {"case": "communication planning exposes its bounded cognition plan", "component": "integration",
-         "correct": plan["experience_cognition"]["schema"] == "ina.experience_cognition/V1"},
+         "correct": plan["experience_cognition"]["schema"] in {
+             "ina.experience_cognition/V1", "ina.experience_cognition/V2", "ina.experience_cognition/V3"}},
         {"case": "communication intent names missing evidence without embedding thought", "component": "uncertainty",
          "correct": plan["expression_intent"]["uncertainty"]["missing_evidence"] == ["temporal"]
          and "text" not in plan["expression_intent"]},
@@ -2329,6 +2330,39 @@ def _experiential_counting_v4() -> dict[str, Any]:
     ])
 
 
+def _expression_cognition_compatibility_v7() -> dict[str, Any]:
+    from expression_core import text_expression_guidance
+    cases = []
+    for version in ('V1', 'V2', 'V3'):
+        result = text_expression_guidance({'schema': 'ina.experience_cognition/' + version,
+                                          'epistemic_state': {'status': 'unknown'}})
+        cases.append({'case': version + ' preserves uncertainty', 'component': 'compatibility',
+                      'correct': 'expression' not in result['allowed_response_kinds']})
+    result = text_expression_guidance({'schema': 'ina.experience_cognition/V3',
+                                      'epistemic_state': {'status': 'invented'}})
+    cases.append({'case': 'invalid state is unknown', 'component': 'uncertainty',
+                  'correct': result['status'] == 'unknown'})
+    return _capability(cases)
+
+
+def _threat_attribution_v3() -> dict[str, Any]:
+    import threat_attribution
+    from benchmarks.benchmark_evidence_verification import measure
+    return _capability([
+        {"case": name, "component": "evidence_verification", "correct": passed}
+        for name, passed in measure(threat_attribution).items()
+    ])
+
+
+def _experience_cognition_v3() -> dict[str, Any]:
+    import experience_cognition
+    from benchmarks.benchmark_cognition_refinement import measure
+    return _capability([
+        {"case": name, "component": "evidence_and_discrimination", "correct": passed}
+        for name, passed in measure(experience_cognition).items()
+    ])
+
+
 def _experience_cognition_v2() -> dict[str, Any]:
     from experience_cognition import plan_experience_cognition
     plan = plan_experience_cognition(
@@ -2528,6 +2562,10 @@ _REGISTRY = {
     "experience_cognition": (
         ModuleVersion("experience_cognition", "V1", "All cognitive paths receive undifferentiated event handling", _experience_cognition_v1),
         ModuleVersion("experience_cognition", "V2", "Sparse routed lenses, transient gating, adaptive depth, and horizon predictions", _experience_cognition_v2),
+        ModuleVersion("experience_cognition", "V3", "Validated references, explicit counterevidence and discriminating checks", _experience_cognition_v3),
+    ),
+    "threat_attribution": (
+        ModuleVersion("threat_attribution", "V3", "Byte-check receipts distinct from custody and identity claims", _threat_attribution_v3),
     ),
     "experiential_counting": (
         ModuleVersion("experiential_counting", "V1", "Domain totals and inferred quantities without a shared counting act", _experiential_counting_v1),
@@ -2585,6 +2623,7 @@ _REGISTRY = {
         ModuleVersion("expression_core", "V4", "Requested effects select corroborated cross-modal affordances", _expression_core_v4),
         ModuleVersion("expression_core", "V5", "Near-equivalent affordances may use bounded superposition", _expression_core_v5),
         ModuleVersion("expression_core", "V6", "Text realisation respects known, uncertain, and unknown cognition", _expression_core_v6),
+        ModuleVersion("expression_core", "V7", "Cognition version compatibility and unknown-state fallback", _expression_cognition_compatibility_v7),
         ModuleVersion("self_inquiry_journey", "V1", "No voluntary staged route for deeper self-understanding", _self_inquiry_journey_v1),
         ModuleVersion("self_inquiry_journey", "V2", "Meditation offers a finite witness-led self-inquiry journey", _self_inquiry_journey_v2),
         ModuleVersion("self_inquiry_journey", "V3", "Terminal choices and bounded revisable intuition candidates", _self_inquiry_journey_v3),

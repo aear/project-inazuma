@@ -6,7 +6,53 @@ from experience_cognition import (
     inspect_attention_lenses,
     plan_experience_cognition,
     route_experience,
+    compare_hypotheses,
 )
+
+
+def test_empty_and_malformed_references_do_not_count_as_evidence():
+    for references in ([None], ['  '], {'not': 'a witness'}, 1):
+        result = assess_uncertainty({'candidate_answer': 'guess', 'evidence': {'causal': references}})
+        assert result['status'] == 'unknown'
+        assert result['available_evidence'] == []
+
+
+def test_counterevidence_overrides_omitted_contradiction_score():
+    event = {'candidate_answer': 'candidate', 'evidence': {'causal': ['a'], 'sensory': ['b']},
+        'evidence_origins': {'a': 'origin:a', 'b': 'origin:b'}, 'counterevidence_references': ['opposing:1']}
+    result = assess_uncertainty(event)
+    assert result['status'] == 'uncertain'
+    assert result['conflict_retained']
+    assert result['counterevidence_references'] == ['opposing:1']
+
+
+def test_hypothesis_check_distinguishes_instead_of_repeating_confirmation():
+    event = {'hypotheses': [{'id': 'a', 'claim': 'sensor failed'}, {'id': 'b', 'claim': 'object moved'}],
+        'observation_candidates': [
+            {'id': 'repeat', 'question': 'Read same sensor?', 'expected_outcomes': {'a': 'changed', 'b': 'changed'}},
+            {'id': 'independent', 'question': 'Inspect with separate sensor?',
+             'expected_outcomes': {'a': 'unchanged', 'b': 'changed'}}]}
+    result = compare_hypotheses(event)
+    assert result['suggested_check'] == 'independent'
+    assert result['checks'][0]['indistinguishable_pairs'] == [['a', 'b']]
+    assert not result['automatic_execution']
+    from experience_engine import ExperienceCycleEngine
+    assert ExperienceCycleEngine.plan_cognition(event)['hypothesis_comparison'] == result
+
+
+def test_missing_outcomes_and_duplicate_ids_cannot_fake_discrimination():
+    result = compare_hypotheses({'hypotheses': [{'id': 'a', 'claim': 'A'}, {'id': 'b', 'claim': 'B'},
+        {'id': 'b', 'claim': 'duplicate'}], 'observation_candidates': [
+        {'id': 'x', 'question': 'Check?', 'expected_outcomes': {'a': 'yes'}}]})
+    assert result['suggested_check'] is None
+    assert result['checks'][0]['missing_prediction_pairs'] == [['a', 'b']]
+    assert 'missing_or_duplicate_id' in result['rejected']
+
+
+def test_alternative_budget_and_empty_case_are_explicit():
+    assert compare_hypotheses({})['suggested_check'] is None
+    result = compare_hypotheses({'hypotheses': [{'id': str(i), 'claim': 'Maybe'} for i in range(10)]})
+    assert result['input_truncated'] and len(result['alternatives']) == 8
 
 
 def test_sparse_router_selects_relevant_routes_and_preserves_rejections():

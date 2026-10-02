@@ -324,11 +324,15 @@ def text_expression_guidance(cognition_plan: Mapping[str, Any] | None) -> dict[s
             "status": "not_supplied", "allowed_response_kinds": ["expression"],
             "requires_epistemic_acknowledgement": False, "missing_evidence": [],
         }
-    if cognition_plan.get("schema") != "ina.experience_cognition/V1":
+    if cognition_plan.get("schema") not in {
+        "ina.experience_cognition/V1", "ina.experience_cognition/V2", "ina.experience_cognition/V3",
+    }:
         raise ValueError("a valid experience cognition plan is required")
     epistemic = cognition_plan.get("epistemic_state")
     epistemic = epistemic if isinstance(epistemic, Mapping) else {}
     status = str(epistemic.get("status") or "unknown")
+    if status not in {'known', 'uncertain', 'unknown'}:
+        status = 'unknown'
     if status == "unknown":
         allowed = ["acknowledge_unknown", "ask_for_evidence", "silence"]
     elif status == "uncertain":

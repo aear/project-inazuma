@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import hmac
+import secrets
+from itertools import islice
 import ipaddress
 import json
 import os
@@ -16,7 +19,8 @@ import re
 from typing import Any, Iterable, Mapping
 
 
-SCHEMA = "ina.threat_attribution/V1"
+SCHEMA = "ina.threat_attribution/V2"
+_EVIDENCE_KEY = secrets.token_bytes(32)
 ALLOWED_INDICATOR_KINDS = frozenset({
     "ip", "domain", "url", "file_sha256", "email", "account", "certificate_sha256",
     "user_agent", "malware_family", "ttp", "provider_case_reference",
@@ -103,14 +107,14 @@ def hash_evidence(content: bytes) -> str:
 def validate_evidence(record: Mapping[str, Any]) -> dict[str, Any]:
     evidence_type = str(record.get("evidence_type") or "").strip().lower()
     acquisition = str(record.get("acquisition") or "passive").strip().lower()
-    if acquisition in FORBIDDEN_ACQUISITION:
+    if acquisition in FORBIDDEN_ACQUISITION or acquisition != 'passive':
         raise AttributionPolicyError(f"forbidden evidence acquisition: {acquisition}")
     if evidence_type not in PASSIVE_EVIDENCE_TYPES:
         raise AttributionPolicyError(f"unsupported evidence type: {evidence_type or 'missing'}")
     digest = str(record.get("sha256") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise AttributionPolicyError("evidence requires a valid SHA-256 digest")
-    return {
+    normalized = {
         "evidence_id": _bounded_text(record.get("evidence_id"), 200, "evidence_id"),
         "evidence_type": evidence_type,
         "sha256": digest,
@@ -121,22 +125,63 @@ def validate_evidence(record: Mapping[str, Any]) -> dict[str, Any]:
         "acquisition": acquisition,
         "chain_of_custody_recorded": bool(record.get("chain_of_custody_recorded", False)),
     }
+    receipt = record.get('verification_receipt')
+    valid = False
+    if isinstance(receipt, dict):
+        body = {key: receipt[key] for key in ('record', 'steps') if key in receipt}
+        if len(json.dumps(body, ensure_ascii=True)) <= 32768:
+            signature = hmac.new(_EVIDENCE_KEY, _canonical(body), hashlib.sha256).hexdigest()
+            valid = (isinstance(receipt.get('seal'), str) and hmac.compare_digest(signature, receipt['seal'])
+                     and body.get('record') == normalized)
+    return {**normalized, 'artifact_bytes_verified': valid,
+            'custody_scope': 'local_byte_check_only' if valid else 'caller_declared_only',
+            'historical_custody_verified': False, 'source_identity_verified': False}
+
+
+def _canonical(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
+
+
+def verify_evidence_bytes(record: Mapping[str, Any], content: bytes) -> dict[str, Any]:
+    """Check bounded supplied bytes and seal one local handling witness.
+
+    No claim is made about the original collector, prior custody, source identity
+    or truth of the content. Receipts expire on process restart. No files are read.
+    """
+    if not isinstance(content, bytes) or len(content) > 1024 * 1024:
+        raise AttributionPolicyError('evidence bytes must be at most 1 MiB')
+    normalized = validate_evidence(record)
+    if not hmac.compare_digest(hash_evidence(content), normalized['sha256']):
+        raise AttributionPolicyError('evidence bytes do not match declared SHA-256')
+    metadata = {key: value for key, value in normalized.items() if key not in {
+        'artifact_bytes_verified', 'custody_scope', 'historical_custody_verified', 'source_identity_verified'}}
+    body = {'record': metadata, 'steps': [{
+        'action': 'supplied_bytes_hash_checked', 'at': datetime.now(timezone.utc).isoformat(),
+        'sha256': normalized['sha256'], 'size_bytes': len(content)}]}
+    return {**metadata, 'verification_receipt': {**body,
+        'seal': hmac.new(_EVIDENCE_KEY, _canonical(body), hashlib.sha256).hexdigest()}}
 
 
 def assess_attribution(evidence: Iterable[Mapping[str, Any]], *, proposed_subject: str = "") -> dict[str, Any]:
-    rows = [validate_evidence(item) for item in evidence]
+    admitted = list(islice(evidence, 201))
+    if len(admitted) > 200:
+        raise AttributionPolicyError('attribution accepts at most 200 evidence records')
+    rows = [validate_evidence(item) for item in admitted]
+    if len({row['evidence_id'] for row in rows}) != len(rows):
+        raise AttributionPolicyError('duplicate evidence identifiers require explicit reconciliation')
     subject = str(proposed_subject or "").strip()[:500]
     supporting = [row for row in rows if subject and row["supports_subject"] == subject]
     contradicting = [row for row in rows if subject and row["contradicts_subject"] == subject]
     independent_support = {row["independence_group"] for row in supporting}
     identity_witnesses = [row for row in supporting if row["evidence_type"] in IDENTITY_WITNESS_TYPES]
-    custody_complete = bool(supporting) and all(row["chain_of_custody_recorded"] for row in supporting)
+    custody_complete = False  # Historical custody cannot be established by caller flags.
+    bytes_checked = bool(supporting) and all(row['artifact_bytes_verified'] for row in supporting)
     if not subject:
         status, level = "unknown", "infrastructure_only"
     elif contradicting:
         status, level = "disputed", "identity_unresolved"
-    elif len(independent_support) >= 2 and identity_witnesses and custody_complete:
-        status, level = "corroborated_hypothesis", "candidate_legal_identity"
+    elif len(independent_support) >= 2 and identity_witnesses and bytes_checked:
+        status, level = "review_candidate", "identity_unresolved"
     elif supporting:
         status, level = "insufficient", "infrastructure_or_operator_hypothesis"
     else:
@@ -149,7 +194,12 @@ def assess_attribution(evidence: Iterable[Mapping[str, Any]], *, proposed_subjec
         "independent_support_count": len(independent_support),
         "authoritative_identity_witness_count": len(identity_witnesses),
         "chain_of_custody_complete": custody_complete,
-        "identity_claim_authorized": status == "corroborated_hypothesis",
+        "artifact_bytes_verified": bytes_checked,
+        "verified_evidence_ids": [row['evidence_id'] for row in rows if row['artifact_bytes_verified']],
+        "unverified_evidence_ids": [row['evidence_id'] for row in rows if not row['artifact_bytes_verified']],
+        "source_identity_verified": False,
+        "independence_is_caller_declared": True,
+        "identity_claim_authorized": False,
         "public_disclosure_authorized": False, "retaliation_authorized": False,
         "automatic_submission_authorized": False,
         "caveat": "Infrastructure may be compromised or shared; attribution remains a reviewable hypothesis.",
@@ -231,4 +281,5 @@ def queue_report_for_review(report: Mapping[str, Any], outbox_path: Path | str) 
 __all__ = [
     "AUTHORITY_ROUTES", "AttributionPolicyError", "assess_attribution", "authority_routes",
     "hash_evidence", "make_indicator", "prepare_report", "queue_report_for_review", "validate_evidence",
+    "verify_evidence_bytes",
 ]

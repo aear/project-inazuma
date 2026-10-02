@@ -198,3 +198,10 @@ def test_near_equivalent_viable_affordances_can_use_bounded_superposition():
     assert set(selection["viable_affordance_ids"]) == {vocal["affordance_id"], gesture["affordance_id"]}
     assert "considered" not in selection
     assert "assessments" not in selection and "witnesses" not in selection
+def test_cognition_versions_and_unrecognised_states_fail_uncertain():
+    from expression_core import text_expression_guidance
+    for version in ('V1', 'V2', 'V3'):
+        result = text_expression_guidance({'schema': 'ina.experience_cognition/' + version,
+                                           'epistemic_state': {'status': 'invented'}})
+        assert result['status'] == 'unknown'
+        assert 'expression' not in result['allowed_response_kinds']

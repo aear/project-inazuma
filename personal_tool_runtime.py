@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import base64
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,7 +23,7 @@ from memetic_processor import process_meme
 from predictive_landscape import revise_landscape
 from self_inquiry_journey import begin_intuition_inquiry, continue_self_inquiry, current_inquiry_request
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
-from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
+from threat_attribution import assess_attribution, prepare_report, queue_report_for_review, verify_evidence_bytes
 
 
 QUEUE_KEY = "personal_tool_command_queue"
@@ -39,6 +40,11 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "cyber_evidence_verify": {
+                "arguments": ["evidence", "content_base64"],
+                "scope": "verify at most 64 KiB of explicitly supplied bytes; no file reads or source-identity claim",
+                "retention": "process-local sealed byte-check receipt, not proof of historical custody",
+            },
             "predictive_landscape": {
                 "arguments": ["specification", "previous_model?"],
                 "scope": "3D scenario coordinates, conditional paths and optional bounded intuition inquiry",
@@ -215,6 +221,14 @@ def execute_personal_tool_command(
             choice=str(command.get("choice") or ""), metrics=metrics,
             explanation=str(command.get("explanation") or ""),
         )
+    elif action == "cyber_evidence_verify":
+        encoded = command.get('content_base64')
+        if not isinstance(encoded, str) or len(encoded) > 87384:
+            raise ValueError('encoded evidence exceeds 64 KiB byte budget')
+        content = base64.b64decode(encoded, validate=True)
+        if len(content) > 65536:
+            raise ValueError('evidence exceeds 64 KiB byte budget')
+        value = verify_evidence_bytes(command.get('evidence') or {}, content)
     elif action == "cyber_attribution_assess":
         evidence = command.get("evidence")
         if not isinstance(evidence, list) or len(evidence) > 200:

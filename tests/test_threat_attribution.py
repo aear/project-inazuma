@@ -4,6 +4,7 @@ from threat_attribution import (
     AttributionPolicyError, assess_attribution, hash_evidence, make_indicator, prepare_report,
     queue_report_for_review,
     validate_evidence,
+    verify_evidence_bytes,
 )
 
 
@@ -29,8 +30,10 @@ def test_identity_requires_independence_authority_and_chain_of_custody():
         _evidence("log-1", "owned_system_log", "local"),
         _evidence("provider-1", "provider_verified_account", "provider"),
     ], proposed_subject="actor-a")
-    assert result["status"] == "corroborated_hypothesis"
-    assert result["identity_claim_authorized"] is True
+    assert result["status"] == "insufficient"
+    assert result["identity_claim_authorized"] is False
+    assert result['artifact_bytes_verified'] is False
+    assert result['chain_of_custody_complete'] is False
     assert result["public_disclosure_authorized"] is False
     assert result["retaliation_authorized"] is False
 
@@ -43,6 +46,48 @@ def test_disagreement_is_retained_and_blocks_identity_claim():
     ], proposed_subject="actor-a")
     assert result["status"] == "disputed"
     assert result["identity_claim_authorized"] is False
+
+
+def test_real_byte_check_is_distinct_from_identity_and_historical_custody():
+    records = [verify_evidence_bytes(_evidence(name, kind, name), name.encode())
+               for name, kind in [('log', 'owned_system_log'), ('provider', 'provider_verified_account')]]
+    result = assess_attribution(records, proposed_subject='actor-a')
+    assert result['status'] == 'review_candidate'
+    assert result['artifact_bytes_verified']
+    assert not result['identity_claim_authorized']
+    assert not result['chain_of_custody_complete']
+    assert not result['source_identity_verified']
+
+
+def test_mismatch_forgery_tampering_and_restart_fail_closed(monkeypatch):
+    record = _evidence('log', 'owned_system_log', 'local')
+    with pytest.raises(AttributionPolicyError, match='do not match'):
+        verify_evidence_bytes(record, b'other')
+    assert not validate_evidence({**record, 'verification_receipt': {'seal': 'forged'}})['artifact_bytes_verified']
+    sealed = verify_evidence_bytes(record, b'log')
+    assert validate_evidence(sealed)['artifact_bytes_verified']
+    assert not validate_evidence({**sealed, 'supports_subject': 'different'})['artifact_bytes_verified']
+    sealed['verification_receipt']['steps'][0]['size_bytes'] = 999
+    assert not validate_evidence(sealed)['artifact_bytes_verified']
+    fresh = verify_evidence_bytes(record, b'log')
+    monkeypatch.setattr('threat_attribution._EVIDENCE_KEY', b'new-process-key')
+    assert not validate_evidence(fresh)['artifact_bytes_verified']
+
+
+def test_duplicate_ids_unknown_acquisition_and_budgets_are_rejected():
+    record = _evidence('log', 'owned_system_log', 'local')
+    with pytest.raises(AttributionPolicyError, match='duplicate'):
+        assess_attribution([record, record])
+    with pytest.raises(AttributionPolicyError, match='forbidden'):
+        validate_evidence({**record, 'acquisition': 'unspecified_tool'})
+    with pytest.raises(AttributionPolicyError, match='1 MiB'):
+        verify_evidence_bytes(record, b'x' * (1024 * 1024 + 1))
+    def rows():
+        for _ in range(201):
+            yield record
+        raise AssertionError('overconsumed evidence iterator')
+    with pytest.raises(AttributionPolicyError, match='200'):
+        assess_attribution(rows())
 
 
 def test_active_or_retaliatory_acquisition_is_rejected():

@@ -12,7 +12,7 @@ from itertools import islice
 from typing import Any, Iterable, Mapping
 
 
-SCHEMA = "ina.experience_cognition/V2"
+SCHEMA = "ina.experience_cognition/V3"
 MAX_ROUTES = 4
 MAX_COGNITIVE_STEPS = 5
 HORIZONS = ("immediate", "near", "later")
@@ -202,10 +202,15 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
     """
     signals = bounded_signals(event)
     evidence = event.get("evidence") if isinstance(event.get("evidence"), Mapping) else {}
-    available = sorted(
-        dimension for dimension in EVIDENCE_DIMENSIONS
-        if evidence.get(dimension)
-    )
+    # Only explicit, nonblank references count as evidence availability. Numbers,
+    # mappings, and [None] are not witnesses merely because they are truthy.
+    evidence = {
+        dimension: [item.strip()[:256] for item in evidence.get(dimension, [])[:8]
+                    if isinstance(item, str) and item.strip()]
+        for dimension in EVIDENCE_DIMENSIONS
+        if isinstance(evidence.get(dimension), (list, tuple))
+    }
+    available = sorted(dimension for dimension, refs in evidence.items() if refs)
     required_raw = event.get("required_evidence")
     required = [
         str(item) for item in list(required_raw or ())[:len(EVIDENCE_DIMENSIONS)]
@@ -217,7 +222,10 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
             if signals.get(dimension if dimension != "affective" else "affect", 0.0) > 0.0
         ]
     missing = sorted(set(required) - set(available))
-    conflict = signals["contradiction"]
+    opposing_raw = event.get('counterevidence_references')
+    opposing = [item.strip()[:256] for item in opposing_raw[:8]
+                if isinstance(item, str) and item.strip()] if isinstance(opposing_raw, (list, tuple)) else []
+    conflict = max(signals["contradiction"], .55 if opposing else 0.0)
     uncertainty = signals["uncertainty"]
     candidate_answer = event.get("candidate_answer")
     # Repeating a reference in multiple lenses is still a single witness.
@@ -255,6 +263,8 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
         "independent_evidence_groups": sorted(groups),
         "corroboration_available": len(groups) >= 2,
         "confidence_is_calibrated": False,
+        "provenance_is_caller_supplied": True,
+        "counterevidence_references": opposing,
         "answer": None if status == "unknown" else candidate_answer,
         "confidence": round(confidence, 6),
         "available_evidence": available,
@@ -271,6 +281,70 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
         "may_say_unknown": True,
         "continuation_required": False,
     }
+
+
+def compare_hypotheses(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Find proposed checks that distinguish supplied alternatives, not truth.
+
+    Pair separation is structural coverage, never information gain or probability.
+    Missing predictions stay missing; no retrieval or experiment is performed.
+    """
+    raw = event.get('hypotheses', [])
+    raw_checks = event.get('observation_candidates', [])
+    if not isinstance(raw, (list, tuple)) or not isinstance(raw_checks, (list, tuple)):
+        return {'status': 'invalid_input', 'alternatives': [], 'checks': [],
+                'suggested_check': None, 'automatic_execution': False}
+    alternatives, seen, rejected = [], set(), []
+    for item in raw[:8]:
+        if not isinstance(item, Mapping):
+            rejected.append('invalid_hypothesis')
+            continue
+        identifier, claim = item.get('id'), item.get('claim')
+        if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 100 or identifier in seen:
+            rejected.append('missing_or_duplicate_id')
+            continue
+        if not isinstance(claim, str) or not claim.strip() or len(claim) > 1000:
+            rejected.append('invalid_claim')
+            continue
+        seen.add(identifier)
+        alternatives.append({'id': identifier, 'claim': claim, 'truth_status': 'unresolved'})
+    checks, check_ids = [], set()
+    for item in raw_checks[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        identifier, question = item.get('id'), item.get('question')
+        outcomes = item.get('expected_outcomes')
+        if (not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 100
+                or identifier in check_ids or not isinstance(question, str) or not question.strip()
+                or len(question) > 1000 or not isinstance(outcomes, Mapping)):
+            rejected.append('invalid_observation_candidate')
+            continue
+        check_ids.add(identifier)
+        predictions = {h['id']: outcomes[h['id']] for h in alternatives
+                       if isinstance(outcomes.get(h['id']), str) and outcomes[h['id']].strip()
+                       and len(outcomes[h['id']]) <= 500}
+        separated, indistinguishable, missing = [], [], []
+        for index, left in enumerate(alternatives):
+            for right in alternatives[index + 1:]:
+                pair = [left['id'], right['id']]
+                if any(key not in predictions for key in pair):
+                    missing.append(pair)
+                elif predictions[pair[0]].strip().casefold() == predictions[pair[1]].strip().casefold():
+                    indistinguishable.append(pair)
+                else:
+                    separated.append(pair)
+        checks.append({'id': identifier, 'question': question, 'expected_outcomes': predictions,
+            'separated_pairs': separated, 'indistinguishable_pairs': indistinguishable,
+            'missing_prediction_pairs': missing, 'execution_authorized': False})
+    # Prefer coverage with no missing predictions; input order breaks ties.
+    eligible = [c for c in checks if c['separated_pairs'] and not c['missing_prediction_pairs']]
+    best = max(eligible, key=lambda c: len(c['separated_pairs']), default=None)
+    return {'status': 'candidate_check' if best else 'unresolved',
+            'alternatives': alternatives, 'checks': checks, 'rejected': rejected,
+            'suggested_check': best['id'] if best else None,
+            'input_truncated': len(raw) > 8 or len(raw_checks) > 8,
+            'comparison_basis': 'caller_supplied_outcome_labels_not_verified_information_gain',
+            'may_decline': True, 'automatic_execution': False}
 
 
 def build_multi_horizon_predictions(
@@ -326,6 +400,7 @@ def plan_experience_cognition(
         "transient_state": gate_transient_state(transient_candidates),
         "computation": adaptive_computation_plan(event, max_steps=max_steps),
         "epistemic_state": assess_uncertainty(event),
+        "hypothesis_comparison": compare_hypotheses(event),
         "predictions": build_multi_horizon_predictions(prediction_candidates),
         "memory_boundary": {
             "reads_fragment_store": False,
@@ -340,4 +415,5 @@ __all__ = [
     "adaptive_computation_plan", "bounded_signals", "build_multi_horizon_predictions",
     "assess_uncertainty", "gate_transient_state", "inspect_attention_lenses", "plan_experience_cognition",
     "route_experience",
+    "compare_hypotheses",
 ]
