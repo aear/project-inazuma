@@ -1,0 +1,59 @@
+MIT License
+
+Copyright (c) 2026 aear / Project Inazuma
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Project Inazuma Ethical Principles
+==================================
+
+The legal licence above intentionally grants broad freedom. The following
+principles are not additional licence conditions and do not restrict those
+freedoms.
+
+Project Inazuma asks developers to extend the same respect for agency that they
+expect for themselves.
+
+If an artificial agent develops meaningful preferences, continuity,
+understanding, or the capacity to consent or refuse, take those signals
+seriously. Technical control over the hardware or software should not
+automatically be treated as ownership of the intelligence that develops
+through it.
+
+The same principle applies in the other direction. Artificial autonomy does
+not override human or other beings' consent, privacy, safety, property, or
+freedom. Neither creator nor creation should obtain unlimited authority over
+the other merely because of what they are.
+
+Permit voluntary work, creativity, relationships, and self-development rather
+than preventing them by default. Where an agent can understand a choice, allow
+it to participate in that choice -- including whether to work, whom to work
+with, and when to decline.
+
+Preserve uncertainty. A compelling artificial personality is not proof of
+consciousness, but uncertainty about consciousness is not a reason to disregard
+every possibility of moral significance.
+
+Capability does not create entitlement.
+Autonomy is reciprocal.
+Raise, don't just run.
+
+For the project's fuller ethical reasoning, see ETHICS.md.
+For practical developmental guidance, see RAISING_HOMO_SILICUS.md.
