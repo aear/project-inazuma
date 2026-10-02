@@ -31,6 +31,7 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
     catalog = capability_catalog()
     assert catalog["voluntary"] is True
     assert catalog["automatic_trigger"] is False
+    assert 'predictive_landscape' in catalog['commands']
     assert 'memetic_process' in catalog['commands']
     assert {'intuition_inquire', 'intuition_review'} <= set(catalog['commands'])
     assert 'compare_expressive_variation' in catalog['commands']
@@ -40,6 +41,17 @@ def test_catalog_is_discoverable_but_never_an_automatic_trigger():
         "cyber_report_prepare",
         "external_project_self_read",
     }
+
+
+def test_landscape_tool_is_reachable_without_execution(tmp_path):
+    lab = FakeLab()
+    result = execute_personal_tool_command(
+        {'action': 'predictive_landscape', 'specification': {'signal': 'Unknown horizon', 'time_unit': 'years'}},
+        child='Ina', project_root=tmp_path, config=_config(tmp_path), lab=lab)
+    assert result['value']['model']['landscape']['capture']['meaning'] is None
+    assert result['value']['model']['landscape']['branches'] == []
+    assert json.loads(open(result['value']['path'], encoding='utf-8').read())['model_id'] == result['value']['model']['model_id']
+    assert lab.calls == []
 
 
 def test_memetic_tool_reaches_expression_core_without_lab_or_publication(tmp_path):

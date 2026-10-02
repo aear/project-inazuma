@@ -1956,6 +1956,14 @@ def _self_inquiry_journey_v3() -> dict[str, Any]:
     ])
 
 
+def _predictive_landscape_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_predictive_landscape import measure
+    return _capability([
+        {"case": name, "component": "conditional_spatial_scenarios", "correct": passed}
+        for name, passed in measure().items()
+    ])
+
+
 def _memetic_processor_v1() -> dict[str, Any]:
     from benchmarks.benchmark_memetic_processor import measure
     return _capability([
@@ -2566,6 +2574,9 @@ _REGISTRY = {
     ),
     "memetic_processor": (
         ModuleVersion("memetic_processor", "V1", "Bounded contextual meme drafts and reaction evidence", _memetic_processor_v1),
+    ),
+    "predictive_landscape": (
+        ModuleVersion("predictive_landscape", "V1", "Bounded spatial timeline analogue", _predictive_landscape_v1),
     ),
     "expression_core": (
         ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),

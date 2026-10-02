@@ -19,6 +19,7 @@ from lexical_reference import lookup_definition, lookup_related_words
 from external_project_registry import read_project_source
 from expressive_variation import compare_variation
 from memetic_processor import process_meme
+from predictive_landscape import revise_landscape
 from self_inquiry_journey import begin_intuition_inquiry, continue_self_inquiry, current_inquiry_request
 from runtime_state import append_inastate_queue, drain_inastate_queue, get_inastate, update_inastate
 from threat_attribution import assess_attribution, prepare_report, queue_report_for_review
@@ -38,6 +39,11 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "predictive_landscape": {
+                "arguments": ["specification", "previous_model?"],
+                "scope": "3D scenario coordinates, conditional paths and optional bounded intuition inquiry",
+                "execution": "private versioned map snapshots only; no forecasts certified, scheduling or publication",
+            },
             "memetic_process": {
                 "arguments": ["operation (interpret, compose, review)", "operation-specific observations or segments"],
                 "scope": "bounded context hypotheses, private composition recipes and reaction evidence",
@@ -134,7 +140,11 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "memetic_process":
+    if action == "predictive_landscape":
+        model = revise_landscape(command.get('specification') or {}, command.get('previous_model'))
+        path = fs.write_note(model['model_id'], json.dumps(model, ensure_ascii=False), folder='Predictive Landscapes')
+        value = {'model': model, 'path': str(path), 'private': True, 'scheduled_work': False}
+    elif action == "memetic_process":
         value = process_meme(dict(command))
     elif action == "intuition_inquire":
         journey = begin_intuition_inquiry(command.get('hunch'), question=command.get('question'),
