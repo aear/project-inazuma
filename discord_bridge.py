@@ -1045,6 +1045,41 @@ def inspect_song_opus_sidecar(
 
 
 def encode_selected_text_expression(
+    text: str, *, child: str, language_preference: object,
+    max_symbols: int, context: Optional[dict] = None,
+) -> tuple[str, dict]:
+    """Keep a selected expression available if optional symbolic rendering fails.
+
+    This fallback preserves supplied wording; it does not generate or validate
+    a new reply. Unknown/incomplete mappings still follow the normal path.
+    """
+    try:
+        return _encode_selected_text_expression(
+            text, child=child, language_preference=language_preference,
+            max_symbols=max_symbols, context=context,
+        )
+    except PermissionError:
+        # A denied realisation is not a transient rendering outage.
+        raise
+    except Exception as exc:
+        logger.warning('Selected-expression rendering unavailable (%s).', type(exc).__name__)
+        preference = language_preference
+        if isinstance(preference, dict):
+            assessment = preference.get('mutual_intelligibility_assessment')
+            preference = (assessment.get('mode') if isinstance(assessment, dict) else None) or preference.get('mode') or preference.get('language_mode') or preference.get('preference')
+        decline_english = str(preference or '').strip().lower().replace('-', '_') in {'native_only', 'abstain', 'clarify'}
+        return '' if decline_english else str(text or '').strip(), {
+            'effective_language_mode': 'selected_text_rendering_unavailable',
+            'native_translation_complete': False,
+            'native_translation_rejections': ['symbolic_rendering_failed'],
+            'rendering_error_type': type(exc).__name__,
+            'selected_wording_preserved': not decline_english,
+            'english_fallback_declined': decline_english,
+            'requested_language_mode': language_preference,
+        }
+
+
+def _encode_selected_text_expression(
     text: str,
     *,
     child: str,
@@ -1216,6 +1251,18 @@ def encode_selected_text_expression(
         "discourse": supplied_discourse,
         "ambiguity_glosses": ambiguity_glosses,
     }
+    chosen_rendering, chosen_mode = select_symbolic_message_text(complete_dual, language_preference)
+    assessment = complete_dual.get('mutual_intelligibility_assessment')
+    if not isinstance(assessment, dict) and isinstance(language_preference, dict):
+        assessment = language_preference.get('mutual_intelligibility_assessment')
+    explicit_mode = language_preference
+    if isinstance(explicit_mode, dict):
+        explicit_mode = explicit_mode.get('mode') or explicit_mode.get('language_mode') or explicit_mode.get('preference')
+    native_only = str(explicit_mode or '').strip().lower().replace('-', '_') == 'native_only'
+    assessed_choice = isinstance(assessment, dict) and assessment.get('schema') == 'ina.mutual_intelligibility_assessment/V1'
+    if chosen_mode in {'clarify', 'abstain'} or (chosen_mode == 'native' and (native_only or assessed_choice)):
+        return chosen_rendering or '', {**translation_metadata, 'effective_language_mode': chosen_mode,
+                                        'language_choice_preserved': True}
     if not translation_complete:
         _, requested_mode = select_symbolic_message_text(
             complete_dual, language_preference

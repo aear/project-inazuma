@@ -1348,6 +1348,10 @@ def build_dual_symbolic_message(
     native_text = " ".join(native_tokens)
     fallback_text = str(fallback_human_text or "").strip()
     gloss_text = explicit_human_text or " ".join(guessed_words)
+    from quotation_provenance import trace_gloss_quotations
+    quotation_provenance = trace_gloss_quotations(
+        guessed_words if not explicit_human_text else [], normalized, gloss_sources,
+    )
     if fallback_text and gloss_text == native_text:
         gloss_text = fallback_text
     if not gloss_text:
@@ -1383,7 +1387,7 @@ def build_dual_symbolic_message(
     text_realisation = TextRealiser().realise(
         expression_intent,
         content={"text": gloss_text, "combined_compatibility_text": combined,
-                 "tokens": list(guessed_words)},
+                 "tokens": list(guessed_words), "quotation_provenance": quotation_provenance},
         conventions=[human_label, expression_context.get("source")],
         provenance=gloss_sources.values(),
     )
@@ -1410,6 +1414,7 @@ def build_dual_symbolic_message(
         "unresolved_symbols": unresolved_symbols,
         "native_sources": native_sources,
         "gloss_sources": gloss_sources,
+        "quotation_provenance": quotation_provenance,
         "expression_intent": expression_intent,
         "expression_realisation": native_realisation,
         "expression_realisations": [native_realisation, text_realisation],
@@ -1455,10 +1460,12 @@ def select_symbolic_message_text(
             or raw_preference.get("preference")
         )
     normalized = str(raw_preference or "auto").strip().lower().replace("-", "_")
+    if normalized == 'native_only':
+        native = str(message.get('native_text') or '').strip()
+        return native or None, 'native'
     aliases = {
         "en": "english",
         "english_only": "english",
-        "native_only": "native",
         "dual": "mixed",
         "bilingual": "mixed",
     }

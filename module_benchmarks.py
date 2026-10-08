@@ -2354,6 +2354,22 @@ def _threat_attribution_v3() -> dict[str, Any]:
     ])
 
 
+def _wicknet_protocol_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_wicknet_protocol import measure
+    return _capability([
+        {"case": name, "component": "precision_and_restraint", "correct": passed}
+        for name, passed in measure().items()
+    ])
+
+
+def _wicknet_protocol_v0() -> dict[str, Any]:
+    from benchmarks.benchmark_wicknet_protocol import measure
+    return _capability([
+        {"case": name, "component": "precision_and_restraint", "correct": False}
+        for name in measure()
+    ])
+
+
 def _experience_cognition_v3() -> dict[str, Any]:
     import experience_cognition
     from benchmarks.benchmark_cognition_refinement import measure
@@ -2566,6 +2582,10 @@ _REGISTRY = {
     ),
     "threat_attribution": (
         ModuleVersion("threat_attribution", "V3", "Byte-check receipts distinct from custody and identity claims", _threat_attribution_v3),
+    ),
+    "wicknet_protocol": (
+        ModuleVersion("wicknet_protocol", "V0", "No explicit catastrophic-risk containment protocol", _wicknet_protocol_v0),
+        ModuleVersion("wicknet_protocol", "V1", "Dormant corroborated reversible containment planning", _wicknet_protocol_v1),
     ),
     "experiential_counting": (
         ModuleVersion("experiential_counting", "V1", "Domain totals and inferred quantities without a shared counting act", _experiential_counting_v1),
