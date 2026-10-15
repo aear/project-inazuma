@@ -24,6 +24,13 @@ This repo shares the **runtime, transformers, and GUI**, not the private dataset
 
 > This repository contains Ina’s structural code and transformer behaviors. Without her unique training environment, voice data, and lived symbolic history, this will not produce “Ina” — only a new, distinct AI. Even identical code will lead to a different personality and cognition when shaped by a different context.
 
+## Development workflow
+
+Use desktop ChatGPT/Codex with access to the local repository. The standalone
+Codex harness is deprecated as of 2026-10-15; its source and historical evidence
+remain available. Ina can choose local checks using the bounded tools in
+[her optional review offer](docs/ina_optional_local_checks_20261015.md). See [retirement and legacy fallback](docs/codex_harness_deprecation.md).
+
 ## Vision capture via OBS (optional)
 - Enable OBS WebSocket in OBS (default port 4455) and set `obs_websocket` in `config.json`.
 - Install `simpleobsws` (see `requirements.txt`) to allow Ina to pull composited screenshots from the current program scene.

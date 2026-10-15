@@ -78,7 +78,10 @@ def record_media_lesson(child: str, fragment: Mapping[str, Any], *, base_path: P
     return True
 
 
-def load_output_guidance(child: str, consumer: str, *, base_path: Path | None = None) -> dict[str, Any]:
+def load_output_guidance(child: str, consumer: str, *, base_path: Path | None = None,
+                         selection: str = "recent", alignment_keys: tuple[str, ...] = ()) -> dict[str, Any]:
+    if selection not in {"recent", "aligned"}:
+        raise ValueError("selection must be recent or aligned")
     state = load_json_dict(_path(child, base_path))
     domains = state.get("domains") if isinstance(state.get("domains"), dict) else {}
     consumer = str(consumer or "text").casefold()
@@ -86,6 +89,30 @@ def load_output_guidance(child: str, consumer: str, *, base_path: Path | None = 
     elif consumer == "daw": keys = ("language", "written")
     elif consumer == "speech": keys = ("language",)
     else: keys = ("written", "language")
+    if selection == "aligned":
+        requested = set(_bounded(alignment_keys, 8))
+        buckets = []
+        for key in keys:
+            rows = [dict(row) for row in list(domains.get(key) or ())[-MAX_LESSONS_PER_DOMAIN:]
+                    if isinstance(row, Mapping)
+                    and not (consumer == "daw" and row.get("role") == "video_essay")]
+            rows.reverse()
+            # Stable ranking keeps recency for ties. Match keys, not text from
+            # arbitrary source instructions; source authority remains unchanged.
+            rows.sort(key=lambda row: -len(requested & set(_bounded(row.get("alignment_keys"), 2))))
+            buckets.append(rows)
+        selected = []
+        # One temporary view across relevant domains; never rewrite witnesses.
+        for offset in range(MAX_GUIDANCE_ITEMS):
+            for rows in buckets:
+                if offset < len(rows):
+                    selected.append(rows[offset])
+                if len(selected) == MAX_GUIDANCE_ITEMS:
+                    break
+            if len(selected) == MAX_GUIDANCE_ITEMS:
+                break
+        return {"schema": SCHEMA, "consumer": consumer, "lessons": selected,
+                "bounded": True, "selection": "aligned", "alignment_keys": sorted(requested)}
     selected = []
     for key in keys:
         for row in reversed(list(domains.get(key) or ())):

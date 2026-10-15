@@ -1,0 +1,38 @@
+# Core numeric/audio/vision
+--only-binary=numpy
+numpy>=2.1.0,<3
+opencv-python
+pydub
+sounddevice
+Pillow
+PyMuPDF
+
+# Audio feature extraction
+
+
+# UI and interaction
+# Native psutil is preferred; ina_process provides the Linux fallback used if installation fails.
+PyQt5
+pyqtgraph
+PyOpenGL
+pyautogui
+mss
+psutil
+# Discord bot (voice capture needs discord.sinks; use py-cord which ships it)
+audioop-lts; python_version >= "3.13"
+# Discord requires DAVE/E2EE voice. Pycord added send-side DAVE in 2.8.0;
+# older releases fail the handshake with 4017 and can surface 4006 on retry.
+py-cord[voice]>=2.8,<3
+davey>=0.1.6,<0.2
+
+# OBS control (optional)
+simpleobsws
+
+# Experimental / optional
+qiskit
+
+# Development and candidate correctness gates
+pytest>=8,<9
+
+# Local `transformers` package lives in this repo; no PyPI install needed.
+# Windows-only named-pipe helper `pywin32_namedpipe` is a placeholder and is not listed here.

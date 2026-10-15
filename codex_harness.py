@@ -1,4 +1,4 @@
-"""Lightweight standalone GUI harness for Codex's local app-server protocol."""
+"""Deprecated standalone Codex harness; use the desktop workflow. See docs/codex_harness_deprecation.md."""
 from __future__ import annotations
 
 import argparse
@@ -17,6 +17,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import tempfile
 import time
@@ -1146,11 +1147,24 @@ def build_config(root: Path | str, codex_binary: str | None = None) -> HarnessCo
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-deprecated", action="store_true",
+                        help="explicitly launch the retained legacy harness")
+    parser.add_argument("--deprecation-status", action="store_true",
+                        help="print retirement status without launching anything")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--codex-binary")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    if args.deprecation_status:
+        print(json.dumps({"status": "deprecated", "date": "2026-10-15",
+                          "replacement": "desktop ChatGPT/Codex local workflow",
+                          "legacy_launch_requires": "--allow-deprecated"}))
+        return 0
+    if not args.allow_deprecated:
+        parser.exit(2, "The standalone Codex harness is deprecated. Use the desktop workflow. "
+                       "For an intentional legacy fallback, pass --allow-deprecated.\n")
+    print("Warning: launching the deprecated standalone Codex harness.", file=sys.stderr)
     config = build_config(args.root, args.codex_binary)
     try:
         os.nice(5)

@@ -10,7 +10,6 @@ logs/
 
 # --- SENSITIVE MEDIA ---
 .secrets/*
-!.secrets/README.md
 !.secrets/*.example
 .private/*
 *.wav
@@ -62,4 +61,12 @@ logs/comms_core.jsonl
 logic_pause.flag
 Project Inazuma.code-workspace
 .secrets/github_token.example
+
+# Retained synthetic review evidence; contains no live memory or credentials.
+!docs/evidence/review_efficiency_20261015.json
+
+# Distribute dependency declarations and credential documentation, never tokens.
+!requirements.txt
+
 .secrets/README.md
+!docs/evidence/maintenance_window_20261015.json

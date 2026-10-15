@@ -38,6 +38,7 @@ from self_read_policy import SELF_READ_FOCUS_ENV, self_read_focus_from_emotions
 from learned_media_lessons import load_output_guidance
 from creative_experience import begin_experience, record_experiment, experience_command_fields
 from runtime_state import (
+    get_inastate_snapshot, update_inastate_many,
     append_inastate_queue, get_inastate as _runtime_get_inastate,
     increment_inastate_metric as _runtime_increment_metric,
     set_inastate_metric as _runtime_set_metric, update_inastate as _runtime_update_inastate,
@@ -6038,18 +6039,19 @@ def _maybe_auto_meal(
 
 
 def monitor_hunger():
-    emo_snapshot = get_inastate("emotion_snapshot") or {}
+    state = get_inastate_snapshot(child=CHILD)
+    emo_snapshot = state.get("emotion_snapshot") or {}
     emo = emo_snapshot.get("values") or emo_snapshot
-    hunger = _clamp01(get_inastate("hunger_level") or 0.65, default=0.65)
-    fitness = _clamp01(get_inastate("fitness_level") or 0.55, default=0.55)
-    energy = _clamp01(get_inastate("current_energy") or 0.5, default=0.5)
-    sleep_pressure = _clamp01(get_inastate("sleep_pressure") or 0.0, default=0.0)
+    hunger = _clamp01(state.get("hunger_level") or 0.65, default=0.65)
+    fitness = _clamp01(state.get("fitness_level") or 0.55, default=0.55)
+    energy = _clamp01(state.get("current_energy") or 0.5, default=0.5)
+    sleep_pressure = _clamp01(state.get("sleep_pressure") or 0.0, default=0.0)
     intensity = abs(float(emo.get("intensity", 0.0) or 0.0))
     stress = max(float(emo.get("stress", 0.0) or 0.0), 0.0)
     now = time.time()
     offers_store = _load_offer_store(now)
     active_offers = _active_offers(offers_store)
-    last_update = float(get_inastate("last_hunger_update_ts") or now)
+    last_update = float(state.get("last_hunger_update_ts") or now)
     dt = max(1.0, now - last_update)
     activity_multiplier = 1.0 + (stress + intensity) * 0.25
     hunger = max(
@@ -6082,9 +6084,11 @@ def monitor_hunger():
         options=options,
         offers_meta=active_offers,
     )
-    update_inastate("hunger_level", round(hunger, 4))
-    update_inastate("fitness_level", round(fitness, 4))
-    update_inastate("last_hunger_update_ts", now)
+    update_inastate_many({
+        "hunger_level": round(hunger, 4),
+        "fitness_level": round(fitness, 4),
+        "last_hunger_update_ts": now,
+    }, child=CHILD)
     _maybe_auto_meal(hunger, energy, fitness, intensity, sleep_pressure, options)
 
 def boredom_check():

@@ -1,0 +1,192 @@
+{
+  "schema": "ina.maintenance_window_evidence/V1",
+  "date": "2026-10-15",
+  "suite": {
+    "passed": 1063,
+    "skipped": 2,
+    "warnings": 8,
+    "scope": "full isolated pytest suite using actual updated project dependencies"
+  },
+  "skips": [
+    "optional local editor workspace",
+    "optional native vector kernel not built"
+  ],
+  "live_memory_migrated": false,
+  "ina_restarted": false,
+  "external_network_in_test_sandbox": false,
+  "tools": {
+    "tools": {
+      "V1": {
+        "total": 1,
+        "correct": 0,
+        "cases": [
+          {
+            "case": "bounded maintenance tools available",
+            "component": "availability",
+            "correct": false
+          }
+        ],
+        "baseline_revision": "e13c6b4517f4df9859148a5f96cca0b4814bb9d0",
+        "status": "unavailable_historically"
+      },
+      "V2": {
+        "total": 6,
+        "correct": 6,
+        "cases": [
+          {
+            "case": "trial produces verified independent fixture output",
+            "component": "maintenance_outcome",
+            "correct": true
+          },
+          {
+            "case": "stale confirmation does not execute",
+            "component": "maintenance_outcome",
+            "correct": true
+          },
+          {
+            "case": "chosen upgrade changes actual schema and preserves selected identities",
+            "component": "maintenance_outcome",
+            "correct": true
+          },
+          {
+            "case": "chosen rollback removes only derived ordering index",
+            "component": "maintenance_outcome",
+            "correct": true
+          },
+          {
+            "case": "source bytes retained and private receipts written",
+            "component": "maintenance_outcome",
+            "correct": true
+          },
+          {
+            "case": "decline does not schedule work",
+            "component": "maintenance_outcome",
+            "correct": true
+          }
+        ],
+        "live_memory_accessed": false,
+        "ina_choice_observed": false
+      }
+    },
+    "registered": [
+      {
+        "module": "memory_maintenance_tools",
+        "version": "V1",
+        "correct": 0,
+        "total": 1
+      },
+      {
+        "module": "memory_maintenance_tools",
+        "version": "V2",
+        "correct": 6,
+        "total": 6
+      },
+      {
+        "module": "review_efficiency",
+        "version": "V1",
+        "correct": 7,
+        "total": 22
+      },
+      {
+        "module": "review_efficiency",
+        "version": "V2",
+        "correct": 22,
+        "total": 22
+      }
+    ]
+  },
+  "packages": {
+    "py-cord": "2.8.1",
+    "davey": "0.1.7",
+    "PyNaCl": "1.6.2"
+  },
+  "wheels": [
+    {
+      "filename": "aiohappyeyeballs-2.7.1-py3-none-any.whl",
+      "sha256": "9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "aiohttp-3.14.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "94684b879ac1d71e4238850c99b62dc1b28d9086b156a2555f082010b85a865c",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "aiosignal-1.4.0-py3-none-any.whl",
+      "sha256": "053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "attrs-26.1.0-py3-none-any.whl",
+      "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "sha256": "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "davey-0.1.7-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "sha256": "51e374db5bb2176edd15c1bc160019259b0f08f01bf843d1e51062493fc37035",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+      "sha256": "cba69cb73723c3f329622e34bdbf5ce1f80c21c290ff04256cff1cd3c2036ed2",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "idna-3.20-py3-none-any.whl",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "multidict-7.1.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "33389fe084e5426d9fd85d7d9ca91a29cd0d88a83c7c96e411aca49a3f9967bc",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "propcache-0.5.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "cc07876cfb079b6f6f36d21ce75784ad6c2c6b563eeac0ed26c2fa2669b85df9",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "py_cord-2.8.1-py3-none-any.whl",
+      "sha256": "8b97a61cceb4ca9000fc3ac1190fa4c45ef6a521d88707953f7eeadc1bd57071",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "pycparser-3.11-py3-none-any.whl",
+      "sha256": "51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "pynacl-1.6.2-cp38-abi3-manylinux_2_34_x86_64.whl",
+      "sha256": "c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "source": "https://pypi.org/"
+    },
+    {
+      "filename": "yarl-1.25.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "30eec96e8a91bd588ce897c9543f6d5d8d34b28fbcba28a4dedf20ebeae9fe57",
+      "source": "https://pypi.org/"
+    }
+  ],
+  "limitations": [
+    "live Discord service not tested",
+    "live musical/drawing/speech quality not measured",
+    "no live index upgrade or memory relocation",
+    "test-only thread limits; production cadence unchanged"
+  ],
+  "implementation_identity": {
+    "status": "recorded",
+    "head": "e13c6b4517f4df9859148a5f96cca0b4814bb9d0",
+    "changes_sha256": "2d30167c28a7324b30c7f0a39abf8258f7527bec67cb8c8c61ff5b81c54a3c70",
+    "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+  }
+}

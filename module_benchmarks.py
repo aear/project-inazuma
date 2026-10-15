@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from historical_source import historical_module, historical_text, resolve_revision
+from historical_source import historical_module, historical_text, resolve_revision, working_tree_identity
 
 from discourse_context import build_discourse_context, resolution_for
 
@@ -91,6 +91,15 @@ def _semantic_topology_v2() -> dict[str, Any]:
     return _semantic_topology_cases(True)
 
 
+def _semantic_topology_v3() -> dict[str, Any]:
+    """Only observed word-sense outcomes; V2's wiring cases remain historical."""
+    outcome = _semantic_topology_cases(True)
+    cases = [{**case, "component": "word_sense", "measurement_kind": "behaviour"}
+             for case in outcome["cases"] if "actual" in case and "expected" in case]
+    return {"correct": sum(bool(case["correct"]) for case in cases),
+            "total": len(cases), "cases": cases}
+
+
 @dataclass(frozen=True)
 class ModuleVersion:
     module: str
@@ -112,6 +121,7 @@ class ModuleBenchmarkResult:
     cases: tuple[dict[str, Any], ...]
     component_scores: dict[str, dict[str, Any]]
     run_at: str
+    implementation_identity: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -2540,9 +2550,18 @@ _REGISTRY = {
         ModuleVersion("conventional_transformer", "V1", "No conventional attention baseline", _conventional_transformer_v1),
         ModuleVersion("conventional_transformer", "V2", "Benchmark-only conventional decoder Transformer", _conventional_transformer_v2),
     ),
+    "memory_maintenance_tools": (
+        ModuleVersion("memory_maintenance_tools", "V1", "Pinned historical catalog availability", lambda: __import__("benchmarks.benchmark_memory_maintenance_tools", fromlist=["evaluate"]).evaluate("V1")),
+        ModuleVersion("memory_maintenance_tools", "V2", "Chosen synthetic trial, upgrade, rollback and private receipts", lambda: __import__("benchmarks.benchmark_memory_maintenance_tools", fromlist=["evaluate"]).evaluate("V2")),
+    ),
+    "review_efficiency": (
+        ModuleVersion("review_efficiency", "V1", "Pinned pre-review behaviour on common fixtures", lambda: __import__("benchmarks.benchmark_review_efficiency", fromlist=["evaluate"]).evaluate("V1")),
+        ModuleVersion("review_efficiency", "V2", "Candidate state I/O, index, language, guidance and retirement", lambda: __import__("benchmarks.benchmark_review_efficiency", fromlist=["evaluate"]).evaluate("V2")),
+    ),
     "semantic_topology": (
         ModuleVersion("semantic_topology", "V1", "One word to one scalar winning link", _semantic_topology_v1),
-        ModuleVersion("semantic_topology", "V2", "One word to bounded ranked meanings with contextual activation", _semantic_topology_v2),
+        ModuleVersion("semantic_topology", "V2", "Historical mixed behaviour and wiring checks", _semantic_topology_v2),
+        ModuleVersion("semantic_topology", "V3", "Observed word-sense outcomes only; narrower evaluator", _semantic_topology_v3),
     ),
     "discourse": (
         ModuleVersion("discourse", "V1", "Legacy lexical stopword behavior", _legacy_discourse),
@@ -2688,6 +2707,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
     if not specs:
         raise ValueError(f"unknown benchmark module: {module}")
     selected = set(versions or ())
+    identity = working_tree_identity()
     results = []
     for spec in specs:
         if selected and spec.version not in selected:
@@ -2702,6 +2722,8 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
             accuracy=round(correct / total, 6) if total else 0.0,
             correct=correct, total=total, elapsed_seconds=round(elapsed, 6),
             source_revision=(
+                str(outcome["baseline_revision"])
+                if spec.module in {"review_efficiency", "memory_maintenance_tools"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"
@@ -2715,6 +2737,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 for component in sorted({str(case.get("component") or "overall") for case in outcome.get("cases", ())})
             },
             run_at=datetime.now(timezone.utc).isoformat(),
+            implementation_identity=identity,
         ))
     return tuple(results)
 

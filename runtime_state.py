@@ -2,7 +2,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from origin_record import normalize_origins
 from self_question_loop import evidence_hash, formulate_help_request, make_resolution_plan, question_key
@@ -50,6 +50,27 @@ def _load_inastate_state(child: Optional[str] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def get_inastate_snapshot(*, child: Optional[str] = None) -> Dict[str, Any]:
+    """Read one detached, uncached snapshot for a coherent group of lookups."""
+    return _load_inastate_state(child)
+
+
+def update_inastate_many(values: Mapping[str, Any], *, child: Optional[str] = None) -> None:
+    """Merge a set of replacements against the latest state under one lock.
+
+    Values are replacements, not read/modify/write operations. Queue claims and
+    counter increments must continue using their dedicated atomic operations.
+    """
+    replacements = dict(values)
+    if not replacements:
+        return
+    target_child = child or _current_child()
+    with file_lock(_inastate_lock_path(target_child)):
+        state = _load_inastate_state(target_child)
+        state.update(replacements)
+        atomic_write_json(_inastate_path(target_child), state, indent=4)
+
+
 def get_inastate(key: str, default: Any = None, *, child: Optional[str] = None) -> Any:
     """Read one runtime-state value, optionally for a child other than the active one."""
     state = _load_inastate_state(child)
@@ -60,11 +81,7 @@ def get_inastate(key: str, default: Any = None, *, child: Optional[str] = None) 
 
 def update_inastate(key: str, value: Any, *, child: Optional[str] = None) -> None:
     """Atomically replace one runtime-state value for the selected child."""
-    target_child = child or _current_child()
-    with file_lock(_inastate_lock_path(target_child)):
-        state = _load_inastate_state(target_child)
-        state[key] = value
-        atomic_write_json(_inastate_path(target_child), state, indent=4)
+    update_inastate_many({key: value}, child=child)
 
 
 def increment_inastate_metric(metric: str, amount: int = 1, *, child: Optional[str] = None) -> None:

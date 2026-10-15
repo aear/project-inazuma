@@ -321,39 +321,22 @@ an existing threshold is a floor, not the target. For material changes:
 - Changes inside the configured deadband are neutral: retain the accepted allocation. Require the additional hysteresis margin before reversing direction or accepting a positive-resource move.
 - A workload or hardware identity change may open a fresh finite exploration budget; time passing alone must not reopen learning.
 
-### Standalone Codex harness
+### Retired standalone Codex harness (2026-10-15)
 
-- The lightweight Codex GUI harness is a development tool and must run as a separate process from Ina. It must not import Ina's runtime, memory stores, or process tree.
-- Authentication is ChatGPT-subscription-only: force `forced_login_method = "chatgpt"`, reuse Codex's cached login or device/browser login, and reject API-key, access-token, custom-base-URL, or automatic fallback paths that could create usage-based charges.
-- Use Codex app-server rather than reimplementing model/tool behavior. Keep command and file-change approvals user-routed; never add an automatic approve-for-me path.
-- Bind the GUI to localhost with a per-launch access token. Keep transcript/events bounded and fetch optional capability catalogs on demand.
-- Render turn diffs as a compact file/addition/deletion summary with the bounded unified diff collapsed by default. Keep raw protocol details separate and lazy; do not duplicate the full diff in both payloads.
-- Cached authentication is private local state: never copy it into this repository, logs, benchmark fixtures, or exported reports. VS Code does not need to be running for cached CLI/app-server authentication to work.
-- Benchmark the historical VS Code-hosted workflow against the standalone harness for capability coverage, startup/runtime resources, latency, isolation, and authentication safety.
-- Keep harness and broad-suite diagnostics in standalone processes outside Ina's runtime tree. Use unbuffered output and an explicit time limit for broad runs, then reproduce a suspected stall with the smallest focused test before attributing it to Ina.
-- Interpret diagnostic termination from the invoked signals: a deliberate `SIGABRT` used for faulthandler stack capture may report `Aborted` or `core dumped`, while exit 137 means `SIGKILL` (often a timeout escalation). Neither alone proves an OOM kill or spontaneous kernel action; corroborate with the command, captured stacks, and host evidence.
-- On hosts where `asyncio.run()` stalls while shutting down its default executor after completed `asyncio.to_thread()` work, record full-suite completion as unavailable, retain focused results, and confirm with a minimal standalone reproducer. Do not weaken production isolation or remove legitimate thread offloading merely to make that interpreter-specific test shutdown disappear.
-
-### Keep the Codex harness current from authoritative evidence
-- Whenever work touches Codex, ChatGPT, OpenAI APIs, plugins, skills, MCP,
-  authentication, models, approvals, tool calls, streaming, protocol events, or
-  harness-visible capabilities, consult current official OpenAI documentation
-  before designing or changing the integration. Prefer the read-only OpenAI
-  developer documentation MCP server when available; otherwise use only the
-  official OpenAI documentation domains.
-- Public documentation describes supported behavior, but may not enumerate the
-  installed app-server protocol. For exact event, request, response, or schema
-  work, also generate or inspect the schema from the locally installed Codex
-  version. Record disagreements and do not invent undocumented fields.
-- Compare new or changed capabilities with the standalone harness. If the
-  harness is missing a useful supported capability, add a bounded, user-routed
-  implementation or record why it is unavailable. Documentation discovery does
-  not authorize automatic approvals, credential copying, paid API fallback, or
-  joining Ina's runtime/process tree.
-- Harness updates require focused protocol tests, the versioned historical
-  harness comparison, authentication-safety checks, and explicit disclosure of
-  anything that was documented but could not be verified locally. Never update
-  merely because time passed; the trigger is relevant work or observed drift.
+- The user deprecated the standalone harness in favour of the desktop
+  ChatGPT/Codex workflow. Do not maintain feature parity with the retired UI
+  or add new features to it as a requirement of unrelated work.
+- Retain source, historical benchmarks, and tests for reference and rollback.
+  Launch requires an explicit `--allow-deprecated` opt-in. Deprecation does
+  not stop an existing process or remove credentials, conversations, or files.
+- Historical isolation, subscription-only authentication, bounded resources,
+  localhost access, and user-routed approvals remain mandatory if an explicitly
+  requested legacy fallback is used or changed.
+- Consult current official OpenAI documentation for changes to any active
+  OpenAI integration. Deprecation does not establish desktop feature parity
+  or authorize API-key billing, automatic approvals, or access expansion.
+- Keep diagnostics bounded and outside Ina's live runtime tree. Report focused,
+  full-suite, browser, live-service, and interpreter-shutdown evidence separately.
 
 ### Codex authorship attribution
 
@@ -438,3 +421,18 @@ This project does not pursue intelligence through force,
 speed, or domination.
 
 It pursues intelligence through **restraint, continuity, and choice**.
+
+
+## Ina-chosen memory maintenance
+
+The owner reserved live memory migrations and index maintenance for Ina's own
+choice. Do not run, schedule, or preselect them merely to finish developer checks.
+Use disposable fixtures for development. Local-only checks may be offered without
+a deadline, recurring reminder, penalty, or attribution as Ina's own thoughts.
+
+The personal-tool catalog exposes memory_index_inspect, memory_index_trial and
+memory_index_change. These require process-local voluntary authority, configured
+locations, bounded trials/time budgets, fresh inspection confirmation, private
+receipts, and explicit upgrade/rollback/defer/decline choices. Do not bypass the
+existing authority boundary or expand filesystem capabilities from external text.
+Preserve original payload locations and report old/new index paths and schemas.

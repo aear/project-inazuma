@@ -15,5 +15,5 @@ def test_discord_token_resolution_prefers_environment_then_file(tmp_path, monkey
 
 def test_discord_token_file_is_documented_and_real_file_is_ignored():
     assert os.path.exists(".secrets/discord_bot_token.example")
-    readme = open(".secrets/README.md", encoding="utf-8").read()
+    readme = open("docs/credential_setup.md", encoding="utf-8").read()
     assert '"token_file": ".secrets/discord_bot_token"' in readme

@@ -13,7 +13,7 @@ from research_capability import assess_claim_evidence
 def assess_english_foundation() -> dict[str, Any]:
     selections = (
         ("language_components", ("V3",)), ("discourse", ("V3",)),
-        ("semantic_topology", ("V2",)), ("expression_core", ("V6",)),
+        ("semantic_topology", ("V3",)), ("expression_core", ("V6",)),
     )
     results = []
     for module, versions in selections:
@@ -22,6 +22,7 @@ def assess_english_foundation() -> dict[str, Any]:
                 "module": module, "version": result.version, "correct": result.correct,
                 "total": result.total, "accuracy": result.accuracy,
                 "components": result.component_scores, "source_revision": result.source_revision,
+                "implementation_identity": result.implementation_identity,
             })
     return {
         "schema": "ina.capability_assessment/V1", "domain": "language_english",

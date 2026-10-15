@@ -74,7 +74,7 @@ def test_module_benchmark_compares_retained_versions_deterministically():
 
 
 def test_semantic_topology_benchmark_compares_scalar_and_contextual_versions():
-    v1, v2 = benchmark_module("semantic_topology")
+    v1, v2 = benchmark_module("semantic_topology", ("V1", "V2"))
     assert (v1.version, v2.version) == ("V1", "V2")
     assert v1.source_revision != "working-tree"
     assert v2.accuracy > v1.accuracy

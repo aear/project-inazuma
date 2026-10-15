@@ -50,6 +50,6 @@ def test_monitor_highlights_review_candidate(tmp_path):
 
 def test_versioned_comparison_and_social_expression_benchmarks():
     comparison_v1, comparison_v2 = benchmark_module("transformer_comparison")
-    meaning_v1, meaning_v2, meaning_v3 = benchmark_module("communicative_meaning")
+    meaning_v1, meaning_v2, meaning_v3 = benchmark_module("communicative_meaning", ("V1", "V2", "V3"))
     assert (comparison_v1.correct, comparison_v2.correct) == (0, 4)
     assert meaning_v3.correct == meaning_v3.total == 6

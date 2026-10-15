@@ -10,17 +10,17 @@ from typing import Any, Iterable, Mapping
 from io_utils import atomic_write_json, load_json_dict
 from origin_record import make_origin
 
-_TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[.!?,]")
+_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*|[^\W\d_]+(?:['’][^\W\d_]+)?|[^\s]", re.UNICODE)
 _CONTRACTIONS = {
     "didn't": ("did", "not"), "doesn't": ("does", "not"), "don't": ("do", "not"),
     "isn't": ("is", "not"), "wasn't": ("was", "not"), "can't": ("can", "not"),
     "won't": ("will", "not"), "shouldn't": ("should", "not"), "wouldn't": ("would", "not"),
     "i'm": ("i", "am"), "you're": ("you", "are"), "that's": ("that", "is"),
 }
-_LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did": "do", "was": "be", "is": "be", "are": "be", "am": "be"}
-_PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had"}
+_LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did": "do", "was": "be", "is": "be", "are": "be", "am": "be", "were": "be", "does": "do", "has": "have", "had": "have", "ran": "run", "running": "run"}
+_PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had", "ran"}
 _MODALS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
-_VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive"}
+_VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive", "run"}
 _PRONOUNS = {"i", "me", "my", "you", "your", "he", "him", "his", "she", "her", "hers", "they", "them", "their", "it", "its", "we", "us", "our"}
 
 
@@ -31,9 +31,14 @@ def _lemma_word(word: str) -> str:
         return word[:-3] + "y"
     if word.endswith("ed") and len(word) > 4:
         stem = word[:-2]
-        return stem[:-1] if len(stem) > 2 and stem[-1] == stem[-2] else stem
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            return stem[:-1]
+        return stem + "e" if stem + "e" in _VERBS else stem
     if word.endswith("ing") and len(word) > 5:
-        return word[:-3]
+        stem = word[:-3]
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            stem = stem[:-1]
+        return stem + "e" if stem + "e" in _VERBS else stem
     if word.endswith("s") and len(word) > 3:
         return word[:-1]
     return word
@@ -42,14 +47,20 @@ def _lemma_word(word: str) -> str:
 def morphology(text: str) -> list[dict[str, Any]]:
     result = []
     for surface in _TOKEN_RE.findall(text):
-        lowered = surface.casefold()
+        lowered = surface.casefold().replace("’", "'")
         expanded = _CONTRACTIONS.get(lowered, (lowered,))
         for index, normalized in enumerate(expanded):
             if normalized in ".!?,":
                 result.append({"surface": surface, "normalized": normalized, "lemma": normalized, "features": {"punctuation": True}})
                 continue
+            if re.fullmatch(r"\d+(?:[.,]\d+)*", normalized):
+                result.append({"surface": surface, "normalized": normalized, "lemma": normalized,
+                               "features": {"quantity": True}})
+                continue
             lemma = _lemma_word(normalized)
             features: dict[str, Any] = {}
+            if not re.fullmatch(r"[a-z]+(?:'[a-z]+)?", normalized):
+                features["unresolved_surface"] = True
             if lowered in _CONTRACTIONS:
                 features.update({"contraction": lowered, "expansion_index": index})
             if normalized == "not": features["negation"] = True
@@ -112,7 +123,9 @@ class ConstructionLearner:
 def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> dict[str, Any]:
     candidates = [i for i, word in enumerate(words) if _lemma_word(word) in _VERBS or word in _MODALS]
     verb_at = candidates[0] if candidates else None
-    if len(candidates) > 1 and words[candidates[0]] in ({"do", "did", "does"} | _MODALS):
+    if (len(candidates) > 1
+            and _lemma_word(words[candidates[0]]) in ({"do", "be", "have"} | _MODALS)
+            and all(word in {"not", "never"} for word in words[candidates[0] + 1:candidates[1]])):
         verb_at = candidates[1]
     subject = words[0] if words and verb_at not in (None, 0) else None
     predicate_word = words[verb_at] if verb_at is not None else None
@@ -123,8 +136,15 @@ def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> d
     if predicate == "tell":
         if tail: arguments["addressee"] = tail[0]
     elif predicate == "give":
-        if tail: arguments["recipient"] = tail[0]
-        if len(tail) > 1: arguments["theme"] = " ".join(tail[1:])
+        if "to" in tail:
+            at = tail.index("to")
+            if at: arguments["theme"] = " ".join(tail[:at])
+            if at + 1 < len(tail): arguments["recipient"] = " ".join(tail[at + 1:])
+        elif tail and tail[0] not in {"a", "an", "the"} and len(tail) > 1:
+            arguments["recipient"] = tail[0]
+            arguments["theme"] = " ".join(tail[1:])
+        elif tail:
+            arguments["theme"] = " ".join(tail)
     elif tail:
         arguments["theme"] = " ".join(tail)
     return {
@@ -200,7 +220,12 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
         "negation_scope": {"confidence": 0.95 if any(c.get("negated") for c in clauses) else 1.0, "reasons": []},
         "referents": {"confidence": 1.0 if not referents else (1.0 if all(r.get("resolved") for r in referents) else 0.45), "reasons": ["multiple plausible possessors"] if any(len(r["candidates"]) > 1 for r in referents) else []},
         "pragmatics": {"confidence": pragmatic["confidence"], "reasons": [] if context.get("tone") else ["prosody/context not supplied"]},
-        "morphology": {"confidence": 0.98, "reasons": []},
+        "morphology": {
+            "confidence": 0.45 if any(t["features"].get("unresolved_surface") for t in tokens)
+                or not tokens or not all(c.get("predicate") for c in clauses) else 0.85,
+            "reasons": ["unsupported surface or construction"] if any(t["features"].get("unresolved_surface") for t in tokens)
+                or not tokens or not all(c.get("predicate") for c in clauses) else ["heuristic analysis; not empirically calibrated"],
+        },
     }
     alternatives = []
     for ref in referents:
@@ -212,11 +237,11 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 2, "text": text, "morphology": tokens, "clauses": clauses,
+        "version": 3, "text": text, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V2", inputs={"text": text}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V3", inputs={"text": text}, trigger="utterance_received")],
     }
 
 

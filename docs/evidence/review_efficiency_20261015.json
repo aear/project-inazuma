@@ -1,0 +1,551 @@
+{
+  "V1": {
+    "correct": 7,
+    "total": 22,
+    "cases": [
+      {
+        "case": "hunger caller retains values",
+        "component": "state_correctness",
+        "correct": true
+      },
+      {
+        "case": "hunger caller groups its reads and writes",
+        "component": "state_resources",
+        "correct": false
+      },
+      {
+        "case": "I run.",
+        "component": "predicate",
+        "correct": false,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": null,
+          "predicate": null,
+          "arguments": {},
+          "negated": false,
+          "negation_scope": null,
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "i",
+            "run"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "i"
+        }
+      },
+      {
+        "case": "She ran.",
+        "component": "predicate",
+        "correct": false,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": null,
+          "predicate": null,
+          "arguments": {},
+          "negated": false,
+          "negation_scope": null,
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "she",
+            "ran"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "she"
+        }
+      },
+      {
+        "case": "We are running.",
+        "component": "predicate",
+        "correct": false,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "we",
+          "predicate": "be",
+          "arguments": {
+            "theme": "running"
+          },
+          "negated": false,
+          "negation_scope": null,
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "we",
+            "are",
+            "running"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "we"
+        }
+      },
+      {
+        "case": "I do not run.",
+        "component": "predicate",
+        "correct": false,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "i",
+          "predicate": "do",
+          "arguments": {
+            "theme": "run"
+          },
+          "negated": true,
+          "negation_scope": "c0",
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "i",
+            "do",
+            "not",
+            "run"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "i"
+        }
+      },
+      {
+        "case": "I am happy to run.",
+        "component": "auxiliary_compatibility",
+        "correct": true,
+        "actual": "be",
+        "expected": "be"
+      },
+      {
+        "case": "I have a book to give.",
+        "component": "auxiliary_compatibility",
+        "correct": true,
+        "actual": "have",
+        "expected": "have"
+      },
+      {
+        "case": "I have not opened it.",
+        "component": "auxiliary_compatibility",
+        "correct": false,
+        "actual": "have",
+        "expected": "open"
+      },
+      {
+        "case": "I give her a book.",
+        "component": "construction",
+        "correct": true,
+        "actual": {
+          "recipient": "her",
+          "theme": "a book"
+        },
+        "expected": {
+          "recipient": "her",
+          "theme": "a book"
+        }
+      },
+      {
+        "case": "I give a book to her.",
+        "component": "construction",
+        "correct": false,
+        "actual": {
+          "recipient": "a",
+          "theme": "book to her"
+        },
+        "expected": {
+          "recipient": "her",
+          "theme": "a book"
+        }
+      },
+      {
+        "case": "They gave a key to us.",
+        "component": "construction",
+        "correct": false,
+        "actual": {
+          "recipient": "a",
+          "theme": "key to us"
+        },
+        "expected": {
+          "recipient": "us",
+          "theme": "a key"
+        }
+      },
+      {
+        "case": "I opened 3 files.",
+        "component": "quantity",
+        "correct": false
+      },
+      {
+        "case": "You gave 2.5 coins to me.",
+        "component": "quantity",
+        "correct": false
+      },
+      {
+        "case": "unsupported construction remains uncertain",
+        "component": "uncertainty",
+        "correct": false,
+        "actual": {
+          "confidence": 0.98,
+          "reasons": []
+        }
+      },
+      {
+        "case": "recent identities and tie ordering",
+        "component": "memory_correctness",
+        "correct": true
+      },
+      {
+        "case": "ordered query avoids temporary sort",
+        "component": "memory_resources",
+        "correct": false
+      },
+      {
+        "case": "task-aligned audio and written coverage",
+        "component": "guidance_selection",
+        "correct": false
+      },
+      {
+        "case": "guidance preserves source bytes and bound",
+        "component": "provenance",
+        "correct": true
+      },
+      {
+        "case": "coherent group uses two reads and one write",
+        "component": "state_resources",
+        "correct": false
+      },
+      {
+        "case": "unrelated queue preserved",
+        "component": "state_correctness",
+        "correct": true
+      },
+      {
+        "case": "default CLI retires before configuration or server",
+        "component": "harness_retirement",
+        "correct": false
+      }
+    ],
+    "measurements": {
+      "hunger_caller_io": {
+        "reads": 6,
+        "writes": 3
+      },
+      "memory_lookup": {
+        "seconds": [
+          0.0016040490008890629,
+          0.001462915912270546,
+          0.0014685350470244884,
+          0.001448886003345251,
+          0.0015574879944324493,
+          0.0015244870446622372,
+          0.0014276951551437378
+        ],
+        "median_seconds": 0.0014685350470244884,
+        "database_bytes": 790528,
+        "query_plan": [
+          "(4, 0, 216, 'SCAN fragments')",
+          "(19, 0, 0, 'USE TEMP B-TREE FOR ORDER BY')"
+        ],
+        "rows": 10000,
+        "fixture": "synthetic"
+      },
+      "state_io": {
+        "reads": 6,
+        "writes": 3
+      }
+    },
+    "version": "V1",
+    "baseline_revision": "e13c6b4517f4df9859148a5f96cca0b4814bb9d0",
+    "live_output_quality": "unavailable",
+    "security_tests": "not_run",
+    "environment": {
+      "python": "3.14.6 (main, Jun 11 2026, 00:00:00) [GCC 16.1.1 20260515 (Red Hat 16.1.1-2)]",
+      "platform": "Linux-7.1.8-200.fc44.x86_64-x86_64-with-glibc2.43",
+      "sqlite": "3.51.2",
+      "storage": "temporary directory; no HDD/NVMe comparison"
+    },
+    "interpretation": "selection, analyzer and resource fixtures; not a global capability score"
+  },
+  "V2": {
+    "correct": 22,
+    "total": 22,
+    "cases": [
+      {
+        "case": "hunger caller retains values",
+        "component": "state_correctness",
+        "correct": true
+      },
+      {
+        "case": "hunger caller groups its reads and writes",
+        "component": "state_resources",
+        "correct": true
+      },
+      {
+        "case": "I run.",
+        "component": "predicate",
+        "correct": true,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "i",
+          "predicate": "run",
+          "arguments": {},
+          "negated": false,
+          "negation_scope": null,
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "i",
+            "run"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "i"
+        }
+      },
+      {
+        "case": "She ran.",
+        "component": "predicate",
+        "correct": true,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "she",
+          "predicate": "run",
+          "arguments": {},
+          "negated": false,
+          "negation_scope": null,
+          "tense": "past",
+          "modality": null,
+          "surface_words": [
+            "she",
+            "ran"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "she"
+        }
+      },
+      {
+        "case": "We are running.",
+        "component": "predicate",
+        "correct": true,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "we",
+          "predicate": "run",
+          "arguments": {},
+          "negated": false,
+          "negation_scope": null,
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "we",
+            "are",
+            "running"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "we"
+        }
+      },
+      {
+        "case": "I do not run.",
+        "component": "predicate",
+        "correct": true,
+        "actual": {
+          "id": "c0",
+          "parent_clause": null,
+          "subject": "i",
+          "predicate": "run",
+          "arguments": {},
+          "negated": true,
+          "negation_scope": "c0",
+          "tense": "present",
+          "modality": null,
+          "surface_words": [
+            "i",
+            "do",
+            "not",
+            "run"
+          ]
+        },
+        "expected": {
+          "predicate": "run",
+          "subject": "i"
+        }
+      },
+      {
+        "case": "I am happy to run.",
+        "component": "auxiliary_compatibility",
+        "correct": true,
+        "actual": "be",
+        "expected": "be"
+      },
+      {
+        "case": "I have a book to give.",
+        "component": "auxiliary_compatibility",
+        "correct": true,
+        "actual": "have",
+        "expected": "have"
+      },
+      {
+        "case": "I have not opened it.",
+        "component": "auxiliary_compatibility",
+        "correct": true,
+        "actual": "open",
+        "expected": "open"
+      },
+      {
+        "case": "I give her a book.",
+        "component": "construction",
+        "correct": true,
+        "actual": {
+          "recipient": "her",
+          "theme": "a book"
+        },
+        "expected": {
+          "recipient": "her",
+          "theme": "a book"
+        }
+      },
+      {
+        "case": "I give a book to her.",
+        "component": "construction",
+        "correct": true,
+        "actual": {
+          "theme": "a book",
+          "recipient": "her"
+        },
+        "expected": {
+          "recipient": "her",
+          "theme": "a book"
+        }
+      },
+      {
+        "case": "They gave a key to us.",
+        "component": "construction",
+        "correct": true,
+        "actual": {
+          "theme": "a key",
+          "recipient": "us"
+        },
+        "expected": {
+          "recipient": "us",
+          "theme": "a key"
+        }
+      },
+      {
+        "case": "I opened 3 files.",
+        "component": "quantity",
+        "correct": true
+      },
+      {
+        "case": "You gave 2.5 coins to me.",
+        "component": "quantity",
+        "correct": true
+      },
+      {
+        "case": "unsupported construction remains uncertain",
+        "component": "uncertainty",
+        "correct": true,
+        "actual": {
+          "confidence": 0.45,
+          "reasons": [
+            "unsupported surface or construction"
+          ]
+        }
+      },
+      {
+        "case": "recent identities and tie ordering",
+        "component": "memory_correctness",
+        "correct": true
+      },
+      {
+        "case": "ordered query avoids temporary sort",
+        "component": "memory_resources",
+        "correct": true
+      },
+      {
+        "case": "task-aligned audio and written coverage",
+        "component": "guidance_selection",
+        "correct": true
+      },
+      {
+        "case": "guidance preserves source bytes and bound",
+        "component": "provenance",
+        "correct": true
+      },
+      {
+        "case": "coherent group uses two reads and one write",
+        "component": "state_resources",
+        "correct": true
+      },
+      {
+        "case": "unrelated queue preserved",
+        "component": "state_correctness",
+        "correct": true
+      },
+      {
+        "case": "default CLI retires before configuration or server",
+        "component": "harness_retirement",
+        "correct": true
+      }
+    ],
+    "measurements": {
+      "hunger_caller_io": {
+        "reads": 1,
+        "writes": 1
+      },
+      "memory_lookup": {
+        "seconds": [
+          4.1150953620672226e-05,
+          2.86102294921875e-05,
+          2.469075843691826e-05,
+          2.4629756808280945e-05,
+          2.4621374905109406e-05,
+          2.477085217833519e-05,
+          2.4640001356601715e-05
+        ],
+        "median_seconds": 2.469075843691826e-05,
+        "database_bytes": 1122304,
+        "query_plan": [
+          "(5, 0, 224, 'SCAN fragments USING INDEX idx_fragments_recent')"
+        ],
+        "rows": 10000,
+        "fixture": "synthetic"
+      },
+      "state_io": {
+        "reads": 2,
+        "writes": 1
+      }
+    },
+    "version": "V2",
+    "baseline_revision": "e13c6b4517f4df9859148a5f96cca0b4814bb9d0",
+    "live_output_quality": "unavailable",
+    "security_tests": "not_run",
+    "environment": {
+      "python": "3.14.6 (main, Jun 11 2026, 00:00:00) [GCC 16.1.1 20260515 (Red Hat 16.1.1-2)]",
+      "platform": "Linux-7.1.8-200.fc44.x86_64-x86_64-with-glibc2.43",
+      "sqlite": "3.51.2",
+      "storage": "temporary directory; no HDD/NVMe comparison"
+    },
+    "interpretation": "selection, analyzer and resource fixtures; not a global capability score"
+  },
+  "implementation_identity": {
+    "status": "recorded",
+    "head": "e13c6b4517f4df9859148a5f96cca0b4814bb9d0",
+    "changes_sha256": "8de4f217e8f68699a1499aeb700b4aed65173daf59fa09ee9dd05544d84cb5f8",
+    "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+  }
+}

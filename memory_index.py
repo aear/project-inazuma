@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -107,6 +108,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS fragment_tags (tag TEXT, frag_id TEXT, PRIMARY KEY(tag, frag_id))")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fragment_tags_tag ON fragment_tags(tag)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fragments_recent ON fragments(mtime_ns DESC, frag_id DESC)")
 
 
 def index_is_current(json_path: Path, db_path: Path) -> bool:
@@ -118,16 +120,70 @@ def index_is_current(json_path: Path, db_path: Path) -> bool:
         with sqlite3.connect(str(db_path)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'source_mtime_ns'").fetchone()
             schema = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        return bool(row and schema and schema[0] == "2" and int(row[0]) == int(json_path.stat().st_mtime_ns))
+        return bool(row and schema and schema[0] in {"2", "3"} and int(row[0]) == int(json_path.stat().st_mtime_ns))
     except Exception:
         return False
 
 
-def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 2048) -> bool:
-    """Build a current sidecar with bounded memory; safe for multi-GB JSON."""
+def _has_recent_index(db_path: Path) -> bool:
+    try:
+        with sqlite3.connect(str(db_path), timeout=0.25) as conn:
+            return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_fragments_recent'").fetchone())
+    except sqlite3.Error:
+        return False
+
+
+def upgrade_recent_index_sidecar(db_path: Path, *, max_seconds: float = 20.0) -> dict[str, Any]:
+    """Explicit, time-bounded additive maintenance; never read fragment payloads.
+
+    Run only during maintenance: SQLite index construction needs a write lock.
+    The transaction preserves the existing database on timeout or disagreement.
+    """
+    max_seconds = float(max_seconds)
+    if not 0.1 <= max_seconds <= 60.0:
+        raise ValueError("max_seconds must be 0.1..60")
+    started = time.monotonic()
+    conn = None
+    try:
+        uri = Path(db_path).resolve().as_uri() + "?mode=rw"
+        conn = sqlite3.connect(uri, uri=True, timeout=min(float(max_seconds), 0.25))
+        conn.set_progress_handler(lambda: int(time.monotonic() - started >= max_seconds), 1000)
+        conn.execute("BEGIN IMMEDIATE")
+        metadata = dict(conn.execute("SELECT key,value FROM meta"))
+        if metadata.get("schema_version") not in {"2", "3"}:
+            conn.rollback()
+            return {"upgraded": False, "reason": "unsupported_schema"}
+        query = "SELECT frag_id FROM fragments ORDER BY mtime_ns DESC,frag_id DESC LIMIT 64"
+        before = conn.execute(query).fetchall()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fragments_recent ON fragments(mtime_ns DESC, frag_id DESC)")
+        after = conn.execute(query).fetchall()
+        if before != after:
+            conn.rollback()
+            return {"upgraded": False, "reason": "selection_disagreement"}
+        conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+        conn.commit()
+        return {"upgraded": True, "reason": "verified_additive_upgrade",
+                "selection_preserved": True, "elapsed_seconds": time.monotonic()-started}
+    except (OSError, sqlite3.Error) as exc:
+        if conn is not None:
+            conn.set_progress_handler(None, 0)
+            conn.rollback()
+        return {"upgraded": False, "reason": "deferred", "error_type": type(exc).__name__,
+                "elapsed_seconds": time.monotonic()-started}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 2048, upgrade_recent_index: bool = False) -> bool:
+    """Build a current sidecar with bounded memory; safe for multi-GB JSON.
+
+    Existing V2 databases remain usable. Adding their sort index requires an
+    explicit opt-in because indexing a large sidecar may block other writers.
+    """
     json_path = Path(json_path)
     db_path = Path(db_path)
-    if index_is_current(json_path, db_path):
+    if index_is_current(json_path, db_path) and (not upgrade_recent_index or _has_recent_index(db_path)):
         return True
     if not json_path.exists():
         return db_path.exists()
@@ -135,9 +191,21 @@ def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = db_path.with_suffix(db_path.suffix + ".build.lock")
     with file_lock(lock_path):
-        if index_is_current(json_path, db_path):
+        if index_is_current(json_path, db_path) and (not upgrade_recent_index or _has_recent_index(db_path)):
             return True
         source_mtime = int(json_path.stat().st_mtime_ns)
+        if db_path.exists():
+            with sqlite3.connect(str(db_path), timeout=0.25) as existing:
+                try:
+                    metadata = dict(existing.execute("SELECT key, value FROM meta"))
+                except sqlite3.DatabaseError:
+                    metadata = {}
+                if (metadata.get("schema_version") == "2"
+                        and metadata.get("source_mtime_ns") == str(source_mtime)):
+                    # Transactional, additive migration preserves recall touches
+                    # and avoids reparsing the source or replacing the database.
+                    report = upgrade_recent_index_sidecar(db_path)
+                    return bool(report["upgraded"]) and index_is_current(json_path, db_path)
         temp_path = db_path.with_name(f"{db_path.name}.{uuid.uuid4().hex}.tmp")
         conn = sqlite3.connect(str(temp_path))
         try:
@@ -191,7 +259,7 @@ def ensure_memory_index_db(json_path: Path, db_path: Path, *, batch_size: int = 
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('source_mtime_ns', ?)",
                 (str(source_mtime),),
             )
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')")
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '3')")
             conn.commit()
             conn.close()
             os.replace(temp_path, db_path)

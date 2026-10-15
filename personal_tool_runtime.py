@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from code_experiment_lab import CodeExperimentLab
+from memory_maintenance_tools import inspect_indexes, trial_configured_index, change_index
 from config_layers import load_config
 from expression_core import ExpressionTraceStore, TextRealiser, create_expression_intent
 from ina_desktop.files import VirtualFileSystem, configured_drives
@@ -40,6 +41,20 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "memory_index_inspect": {
+                "arguments": [], "scope": "configured index locations and schema only; no fragment payloads",
+                "authority": "process-local voluntary action capability", "automatic_trigger": False,
+            },
+            "memory_index_trial": {
+                "arguments": ["location? (temporary or configured index location)"], "scope": "one disposable synthetic trial on a chosen device and a private receipt; no live memory",
+                "authority": "process-local voluntary action capability", "automatic_trigger": False,
+            },
+            "memory_index_change": {
+                "arguments": ["location", "confirmation (inspection identity)", "choice (upgrade, rollback, defer, decline)", "max_seconds? (0.1..10)"],
+                "scope": "one transactional derived index change; no memory movement, traces or payload rewrites",
+                "authority": "process-local voluntary action capability", "automatic_trigger": False,
+                "rollback": "fresh inspection then choice=rollback; retained receipt records both locations and schemas",
+            },
             "cyber_evidence_verify": {
                 "arguments": ["evidence", "content_base64"],
                 "scope": "verify at most 64 KiB of explicitly supplied bytes; no file reads or source-identity claim",
@@ -146,7 +161,15 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "predictive_landscape":
+    if action == "memory_index_inspect":
+        value = inspect_indexes(child, root.resolve(), cfg)
+    elif action == "memory_index_trial":
+        value = trial_configured_index(child, root.resolve(), cfg, personal, location=str(command.get("location") or "temporary"))
+    elif action == "memory_index_change":
+        value = change_index(child, root.resolve(), cfg, personal,
+            location=str(command.get("location") or ""), confirmation=str(command.get("confirmation") or ""),
+            choice=str(command.get("choice") or "defer"), max_seconds=command.get("max_seconds", 5))
+    elif action == "predictive_landscape":
         model = revise_landscape(command.get('specification') or {}, command.get('previous_model'))
         path = fs.write_note(model['model_id'], json.dumps(model, ensure_ascii=False), folder='Predictive Landscapes')
         value = {'model': model, 'path': str(path), 'private': True, 'scheduled_work': False}
