@@ -93,14 +93,20 @@ class VirtualFileSystem:
                 break
         return rows
 
-    def read(self, drive_id: str, relative: str) -> bytes:
+    def read(self, drive_id: str, relative: str, *, max_bytes: int = MAX_READ_BYTES) -> bytes:
+        if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_READ_BYTES:
+            raise ValueError("read budget must be within the explorer read limit")
         drive = self._drive(drive_id)
         path = self._path(drive, relative, existing=True)
         if not path.is_file():
             raise FileNotFoundError(relative)
-        if path.stat().st_size > MAX_READ_BYTES:
+        if path.stat().st_size > max_bytes:
             raise ValueError("file exceeds the explorer read limit")
-        return path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("file grew beyond the explorer read limit")
+        return data
 
     def write(self, drive_id: str, relative: str, data: bytes | str) -> Path:
         drive = self._drive(drive_id)

@@ -1,0 +1,60 @@
+{
+  "schema": "ina.work_report_tools_evidence/V1",
+  "date": "2026-10-16",
+  "comparison": {
+    "V1": {
+      "baseline_revision": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+      "signals": {
+        "native_authored_note_retained": true,
+        "structured_reports_discoverable": false,
+        "drawing_report_roundtrip": false,
+        "music_report_roundtrip": false,
+        "experiment_report_roundtrip": false,
+        "capability_report_roundtrip": false,
+        "bug_report_roundtrip": false,
+        "revision_retains_original": false,
+        "connected_static_file_candidates": false,
+        "source_hash_and_no_execution": false,
+        "syntax_failure_is_reported": false,
+        "safe_minimal_pair_no_flag": false,
+        "file_budget_rejected_before_parse": false,
+        "self_label_cannot_authorize_report": false
+      },
+      "elapsed_seconds": 0.0007044069934636354,
+      "live_creative_quality_and_bug_detection_recall": "unavailable; synthetic structural fixtures only"
+    },
+    "V2": {
+      "baseline_revision": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+      "signals": {
+        "native_authored_note_retained": true,
+        "structured_reports_discoverable": true,
+        "drawing_report_roundtrip": true,
+        "music_report_roundtrip": true,
+        "experiment_report_roundtrip": true,
+        "capability_report_roundtrip": true,
+        "bug_report_roundtrip": true,
+        "revision_retains_original": true,
+        "connected_static_file_candidates": true,
+        "source_hash_and_no_execution": true,
+        "syntax_failure_is_reported": true,
+        "safe_minimal_pair_no_flag": true,
+        "file_budget_rejected_before_parse": true,
+        "self_label_cannot_authorize_report": true
+      },
+      "elapsed_seconds": 0.004376097989734262,
+      "live_creative_quality_and_bug_detection_recall": "unavailable; synthetic structural fixtures only"
+    }
+  },
+  "verification": {
+    "pytest_passed": 1081,
+    "pytest_skipped": 2,
+    "pytest_warnings": 8,
+    "native_focused_passed": 9
+  },
+  "scope": "disposable filesystem/network isolation; no live memory mounts; scoped host shutdown verified privately",
+  "unavailable": [
+    "live report quality",
+    "live bug detection recall and false positives",
+    "real creative capability assessment"
+  ]
+}

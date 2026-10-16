@@ -391,9 +391,11 @@ def plan_experience_cognition(
     prediction_candidates: Iterable[Mapping[str, Any]] = (),
     max_routes: int = MAX_ROUTES,
     max_steps: int = MAX_COGNITIVE_STEPS,
+    perspective_event: Mapping[str, Any] | None = None,
+    review_steps: int = 1,
 ) -> dict[str, Any]:
     """Compose the mechanisms without collapsing their independent evidence."""
-    return {
+    result = {
         "schema": SCHEMA,
         "routing": route_experience(event, max_routes=max_routes),
         "attention_lenses": inspect_attention_lenses(event),
@@ -408,6 +410,12 @@ def plan_experience_cognition(
             "trains_parameters": False,
         },
     }
+
+    if perspective_event is not None:
+        from perspective_review import begin_review
+        result["perspective_review"] = begin_review(
+            perspective_event, variant="instinct", max_steps=review_steps)
+    return result
 
 
 __all__ = [

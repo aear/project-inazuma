@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter, OrderedDict
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -17,10 +18,12 @@ _CONTRACTIONS = {
     "won't": ("will", "not"), "shouldn't": ("should", "not"), "wouldn't": ("would", "not"),
     "i'm": ("i", "am"), "you're": ("you", "are"), "that's": ("that", "is"),
 }
-_LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did": "do", "was": "be", "is": "be", "are": "be", "am": "be", "were": "be", "does": "do", "has": "have", "had": "have", "ran": "run", "running": "run"}
-_PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had", "ran"}
+_LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did": "do", "was": "be", "is": "be", "are": "be", "am": "be", "were": "be", "does": "do", "has": "have", "had": "have", "ran": "run", "running": "run", "given": "give", "gone": "go", "went": "go", "seen": "see", "saw": "see", "found": "find", "felt": "feel", "written": "write", "wrote": "write", "read": "read", "taught": "teach", "thought": "think"}
+_PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had", "ran", "went", "saw", "found", "felt", "wrote", "taught", "thought"}
 _MODALS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
-_VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive", "run"}
+_VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive", "run", "close", "go", "see", "feel", "write", "read", "teach", "learn", "revise", "understand", "recognize", "recognise", "keep", "change"}
+MAX_ANALYSIS_TOKENS = 512
+MAX_ANALYSIS_CHARACTERS = 16384
 _PRONOUNS = {"i", "me", "my", "you", "your", "he", "him", "his", "she", "her", "hers", "they", "them", "their", "it", "its", "we", "us", "our"}
 
 
@@ -46,10 +49,13 @@ def _lemma_word(word: str) -> str:
 
 def morphology(text: str) -> list[dict[str, Any]]:
     result = []
-    for surface in _TOKEN_RE.findall(text):
+    for match in islice(_TOKEN_RE.finditer(str(text)[:MAX_ANALYSIS_CHARACTERS]), MAX_ANALYSIS_TOKENS):
+        surface = match.group()
         lowered = surface.casefold().replace("’", "'")
         expanded = _CONTRACTIONS.get(lowered, (lowered,))
         for index, normalized in enumerate(expanded):
+            if len(result) >= MAX_ANALYSIS_TOKENS:
+                return result
             if normalized in ".!?,":
                 result.append({"surface": surface, "normalized": normalized, "lemma": normalized, "features": {"punctuation": True}})
                 continue
@@ -121,59 +127,106 @@ class ConstructionLearner:
 
 
 def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> dict[str, Any]:
+    words = list(words)
     candidates = [i for i, word in enumerate(words) if _lemma_word(word) in _VERBS or word in _MODALS]
     verb_at = candidates[0] if candidates else None
-    if (len(candidates) > 1
-            and _lemma_word(words[candidates[0]]) in ({"do", "be", "have"} | _MODALS)
-            and all(word in {"not", "never"} for word in words[candidates[0] + 1:candidates[1]])):
-        verb_at = candidates[1]
-    subject = words[0] if words and verb_at not in (None, 0) else None
+    auxiliary = None
+    question_word = words[0] if words and words[0] in {"who", "what", "where", "when", "why", "how"} else None
+    front = 1 if question_word else 0
+    inverted = bool(candidates and candidates[0] == front
+                    and (_lemma_word(words[front]) in {"do", "be", "have"} or words[front] in _MODALS))
+    if len(candidates) > 1:
+        first, second = candidates[:2]
+        is_aux = _lemma_word(words[first]) in {"do", "be", "have"} or words[first] in _MODALS
+        between = words[first + 1:second]
+        if is_aux and (inverted or all(word in {"not", "never"} for word in between)):
+            auxiliary, verb_at = words[first], second
     predicate_word = words[verb_at] if verb_at is not None else None
     predicate = _lemma_word(predicate_word or "") or None
-    negated = "not" in words
+    if inverted and auxiliary is not None:
+        subject_words = [word for word in words[front + 1:verb_at] if word not in {"not", "never"}]
+    elif inverted and predicate == "be":
+        # A short copular question has a subject followed by its complement.
+        subject_words = words[front + 1:front + 2]
+    else:
+        subject_words = words[:candidates[0] if auxiliary else verb_at] if verb_at is not None else []
+    subject = " ".join(subject_words) or None
+    negated = any(word in {"not", "never"} for word in words)
     arguments: dict[str, Any] = {}
-    tail = [word for word in words[(verb_at + 1 if verb_at is not None else len(words)):] if word not in {"not", ".", "!", "?", ","}]
-    if predicate == "tell":
-        if tail: arguments["addressee"] = tail[0]
-    elif predicate == "give":
+    tail_start = verb_at + 1 if verb_at is not None else len(words)
+    if inverted and auxiliary is None and predicate == "be": tail_start = front + 2
+    tail = [word for word in words[tail_start:] if word not in {"not", "never", ".", "!", "?", ","}]
+    voice = "active"
+    # Preserve semantic roles across passive/active forms; do not invent a by-agent.
+    passive = bool(auxiliary and _lemma_word(auxiliary) == "be"
+                   and (predicate_word in {"given", "seen", "written", "taught"} or str(predicate_word).endswith("ed")))
+    if passive:
+        voice = "passive"
+        arguments["theme"] = subject
+        if "by" in tail:
+            at = tail.index("by"); subject = " ".join(tail[at + 1:]) or None; tail = tail[:at]
+        else:
+            subject = None
+        if "to" in tail:
+            at = tail.index("to")
+            arguments["recipient"] = " ".join(tail[at + 1:])
+    elif predicate in {"give", "tell", "teach"}:
+        recipient_role = "addressee" if predicate == "tell" else "recipient"
         if "to" in tail:
             at = tail.index("to")
             if at: arguments["theme"] = " ".join(tail[:at])
-            if at + 1 < len(tail): arguments["recipient"] = " ".join(tail[at + 1:])
-        elif tail and tail[0] not in {"a", "an", "the"} and len(tail) > 1:
-            arguments["recipient"] = tail[0]
-            arguments["theme"] = " ".join(tail[1:])
-        elif tail:
-            arguments["theme"] = " ".join(tail)
+            if at + 1 < len(tail): arguments[recipient_role] = " ".join(tail[at + 1:])
+        elif tail and tail[0] not in {"a", "an", "the"} and (len(tail) > 1 or predicate == "tell"):
+            arguments[recipient_role] = tail[0]
+            if len(tail) > 1: arguments["theme"] = " ".join(tail[1:])
+        elif tail: arguments["theme"] = " ".join(tail)
     elif tail:
         arguments["theme"] = " ".join(tail)
+    tense_word = auxiliary or predicate_word or ""
     return {
         "id": clause_id, "parent_clause": parent, "subject": subject,
         "predicate": predicate, "arguments": arguments, "negated": negated,
         "negation_scope": clause_id if negated else None,
-        "tense": "past" if any(word in _PAST or word.endswith("ed") for word in words) else "present",
+        "tense": "past" if tense_word in _PAST or tense_word.endswith("ed") else "present",
         "modality": next((word for word in words if word in _MODALS), None),
+        "voice": voice, "question_word": question_word, "inverted": inverted,
         "surface_words": words,
     }
 
 
 def _clauses(tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    words = [item["normalized"] for item in tokens if item["normalized"] not in ".!?,"]
-    reporting = next((i for i, word in enumerate(words) if _lemma_word(word) in {"say", "tell"}), None)
-    complement_start = None
-    if reporting is not None:
-        start = reporting + 1
-        if _lemma_word(words[reporting]) == "tell" and start < len(words): start += 1
-        if start + 1 < len(words) and any(_lemma_word(word) in _VERBS for word in words[start + 1:]):
-            complement_start = start
-    if complement_start is None:
-        return [_clause(words, clause_id="c0")]
-    return [_clause(words[:complement_start], clause_id="c0"), _clause(words[complement_start:], clause_id="c1", parent="c0")]
+    segments, current = [], []
+    for item in tokens:
+        word = item["normalized"]
+        if word in {".", "!", "?", ";"}:
+            if current: segments.append(current); current = []
+        elif word not in {",", '"', "“", "”"}:
+            current.append(word)
+    if current: segments.append(current)
+    result = []
+    for words in segments[:8]:
+        reporting = next((i for i, word in enumerate(words) if _lemma_word(word) in {"say", "tell"}), None)
+        split = None
+        if reporting is not None:
+            start = reporting + 1
+            if _lemma_word(words[reporting]) == "tell" and start < len(words): start += 1
+            if start < len(words) and words[start] == "that": start += 1
+            if start + 1 < len(words) and any(_lemma_word(word) in _VERBS or word in _MODALS for word in words[start + 1:]):
+                split = start
+        identifier = f"c{len(result)}"
+        if split is None:
+            result.append(_clause(words, clause_id=identifier))
+        else:
+            result.append(_clause(words[:split], clause_id=identifier))
+            result.append(_clause(words[split:], clause_id=f"c{len(result)}", parent=identifier))
+        if len(result) >= 8: break
+    return result[:8] or [_clause([], clause_id="c0")]
 
 
 def _speech_act(text: str, context: Mapping[str, Any]) -> dict[str, Any]:
     lowered = text.casefold().strip()
-    act = "question" if lowered.endswith("?") else "request" if lowered.split()[:1] and lowered.split()[0] in {"please", "could", "would"} else "assertion"
+    first = lowered.split()[0] if lowered.split() else ""
+    act = "question" if lowered.endswith("?") or first in {"who", "what", "where", "when", "why", "how"} else "request" if first in {"please", "could", "would"} else "assertion"
     tone = str(context.get("tone") or context.get("pragmatic_tone") or "").casefold()
     sarcastic = tone in {"sarcastic", "ironic"} or bool(context.get("sarcastic"))
     reading = "sarcastic_negative_evaluation" if sarcastic and "great" in lowered else "sincere_positive_evaluation" if "great" in lowered else act
@@ -183,8 +236,11 @@ def _speech_act(text: str, context: Mapping[str, Any]) -> dict[str, Any]:
 def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, discourse: DiscourseEntityMemory | None = None, constructions: ConstructionLearner | None = None, turn: int | None = None) -> dict[str, Any]:
     context = context or {}
     discourse = discourse or DiscourseEntityMemory()
+    text = str(text or "")
     tokens = morphology(text)
+    incomplete = len(text) > MAX_ANALYSIS_CHARACTERS or len(tokens) >= MAX_ANALYSIS_TOKENS
     clauses = _clauses(tokens)
+    incomplete = incomplete or len(clauses) >= 8
     for clause in clauses:
         subject = clause.get("subject")
         if subject and subject not in _PRONOUNS: discourse.mention(subject, role="agent", turn=turn)
@@ -227,6 +283,10 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
                 or not tokens or not all(c.get("predicate") for c in clauses) else ["heuristic analysis; not empirically calibrated"],
         },
     }
+    if incomplete:
+        for dimension in uncertainties.values():
+            dimension["confidence"] = min(dimension["confidence"], 0.35)
+            dimension["reasons"].append("analysis budget reached; interpretation incomplete")
     alternatives = []
     for ref in referents:
         for candidate in ref["candidates"][:4]:
@@ -237,11 +297,11 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 3, "text": text, "morphology": tokens, "clauses": clauses,
+        "version": 4, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V3", inputs={"text": text}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V4", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 

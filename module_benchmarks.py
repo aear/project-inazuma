@@ -1917,6 +1917,33 @@ def _expression_core_v6() -> dict[str, Any]:
     ])
 
 
+def _work_reports_version(version: str) -> dict[str, Any]:
+    from benchmarks.benchmark_work_reports import evaluate
+    result = evaluate(version)
+    return _capability([
+        {"case": name, "component": "private_reporting_and_static_diagnostics", "correct": passed}
+        for name, passed in result["signals"].items()
+    ])
+
+
+def _perspective_review_variant(variant: str) -> dict[str, Any]:
+    from benchmarks.benchmark_perspective_review import measure
+    outcome = measure(variant)
+    return _capability([
+        {"case": name, "component": "bounded_review", "correct": passed}
+        for name, passed in outcome["signals"].items()
+    ])
+
+
+def _english_review_version(historical: bool) -> dict[str, Any]:
+    import language_intelligence
+    from benchmarks.benchmark_english_review import measure, historical as baseline
+    return _capability([
+        {"case": name, "component": "structural_english", "correct": passed}
+        for name, passed in measure(baseline() if historical else language_intelligence).items()
+    ])
+
+
 def _self_inquiry_journey_v1() -> dict[str, Any]:
     return _capability([
         {"case": "deep introspection requires an explicit request", "component": "agency", "correct": False},
@@ -2655,6 +2682,18 @@ _REGISTRY = {
     "predictive_landscape": (
         ModuleVersion("predictive_landscape", "V1", "Bounded spatial timeline analogue", _predictive_landscape_v1),
     ),
+    "work_reports": (
+        ModuleVersion("work_reports", "V1", "Pinned generic private-note baseline", lambda: _work_reports_version("V1")),
+        ModuleVersion("work_reports", "V2", "Chosen structured reports, bounded readback and static bug candidates", lambda: _work_reports_version("V2")),
+    ),
+    "perspective_review": (
+        ModuleVersion("perspective_review", "V1", "Explicitly chosen private review with bounded continuation", lambda: _perspective_review_variant("private_tool")),
+        ModuleVersion("perspective_review", "V2", "Event-triggered provisional instinct, same continuation core", lambda: _perspective_review_variant("instinct")),
+    ),
+    "english_review": (
+        ModuleVersion("english_review", "V1", "Pinned a31f132 structural English baseline", lambda: _english_review_version(True)),
+        ModuleVersion("english_review", "V2", "Questions, passive roles, sentence boundaries and incomplete budgets", lambda: _english_review_version(False)),
+    ),
     "expression_core": (
         ModuleVersion("expression_core", "V1", "Medium-specific expression decisions without a shared trace", _expression_core_v1),
         ModuleVersion("expression_core", "V2", "Output-neutral intent with medium realisers and reaction provenance", _expression_core_v2),
@@ -2722,6 +2761,8 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
             accuracy=round(correct / total, 6) if total else 0.0,
             correct=correct, total=total, elapsed_seconds=round(elapsed, 6),
             source_revision=(
+                "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
+                if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
                 if spec.module in {"review_efficiency", "memory_maintenance_tools"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)

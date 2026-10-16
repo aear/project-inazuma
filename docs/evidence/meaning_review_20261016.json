@@ -1,0 +1,447 @@
+{
+  "schema": "ina.maintenance_review_evidence/V1",
+  "date": "2026-10-16",
+  "baseline": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+  "scope": "isolated disposable fixtures; no live memory mounts or network",
+  "comparison": {
+    "english": {
+      "V1": {
+        "question_subject": false,
+        "question_past": true,
+        "passive_agent": false,
+        "passive_theme": false,
+        "modal_subject": true,
+        "modal_negation": true,
+        "reported_negation_scope": true,
+        "separate_sentence_subjects": false,
+        "quantity_surface_retained": true,
+        "native_surface_uncertainty": true,
+        "bounded_input_discloses_incomplete": false
+      },
+      "V2": {
+        "question_subject": true,
+        "question_past": true,
+        "passive_agent": true,
+        "passive_theme": true,
+        "modal_subject": true,
+        "modal_negation": true,
+        "reported_negation_scope": true,
+        "separate_sentence_subjects": true,
+        "quantity_surface_retained": true,
+        "native_surface_uncertainty": true,
+        "bounded_input_discloses_incomplete": true
+      }
+    },
+    "review": {
+      "private_tool": {
+        "signals": {
+          "one_step_yields_with_choices": true,
+          "repeated_evidence_stops": true,
+          "terminal_state_cannot_resume": true,
+          "distinct_countercheck_can_continue": true,
+          "explicit_budget_terminates": true,
+          "counterevidence_retained": true,
+          "candidate_history_retained": true,
+          "no_truth_or_memory_authority": true,
+          "no_idle_start": true,
+          "exit_stop": true,
+          "exit_defer": true,
+          "exit_ask_evidence": true,
+          "exit_remain_uncertain": true
+        },
+        "elapsed_seconds": 0.0002972570073325187,
+        "fixture_steps": 3,
+        "serialized_bytes": 2751,
+        "interpretation_quality_and_independent_evidence": "unavailable: supplied fixture candidates, no learned revision model"
+      },
+      "instinct": {
+        "signals": {
+          "one_step_yields_with_choices": true,
+          "repeated_evidence_stops": true,
+          "terminal_state_cannot_resume": true,
+          "distinct_countercheck_can_continue": true,
+          "explicit_budget_terminates": true,
+          "counterevidence_retained": true,
+          "candidate_history_retained": true,
+          "no_truth_or_memory_authority": true,
+          "no_idle_start": true,
+          "exit_stop": true,
+          "exit_defer": true,
+          "exit_ask_evidence": true,
+          "exit_remain_uncertain": true
+        },
+        "elapsed_seconds": 0.00022727600298821926,
+        "fixture_steps": 3,
+        "serialized_bytes": 2747,
+        "interpretation_quality_and_independent_evidence": "unavailable: supplied fixture candidates, no learned revision model"
+      }
+    }
+  },
+  "registry": {
+    "perspective_review": [
+      {
+        "module": "perspective_review",
+        "version": "V1",
+        "benchmark_version": "V1",
+        "accuracy": 1.0,
+        "correct": 13,
+        "total": 13,
+        "elapsed_seconds": 0.000872,
+        "source_revision": "working-tree",
+        "cases": [
+          {
+            "case": "one_step_yields_with_choices",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "repeated_evidence_stops",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "terminal_state_cannot_resume",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "distinct_countercheck_can_continue",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "explicit_budget_terminates",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "counterevidence_retained",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "candidate_history_retained",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "no_truth_or_memory_authority",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "no_idle_start",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_stop",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_defer",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_ask_evidence",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_remain_uncertain",
+            "component": "bounded_review",
+            "correct": true
+          }
+        ],
+        "component_scores": {
+          "bounded_review": {
+            "correct": 13,
+            "total": 13
+          }
+        },
+        "run_at": "2026-10-16T10:11:51.213576+00:00",
+        "implementation_identity": {
+          "status": "recorded",
+          "head": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+          "changes_sha256": "b422e7f7d92d17dea60eb34c6f3c527b1f9b32dfeaf1c4b1d98b0c1ab702aac1",
+          "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+        }
+      },
+      {
+        "module": "perspective_review",
+        "version": "V2",
+        "benchmark_version": "V1",
+        "accuracy": 1.0,
+        "correct": 13,
+        "total": 13,
+        "elapsed_seconds": 0.000253,
+        "source_revision": "working-tree",
+        "cases": [
+          {
+            "case": "one_step_yields_with_choices",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "repeated_evidence_stops",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "terminal_state_cannot_resume",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "distinct_countercheck_can_continue",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "explicit_budget_terminates",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "counterevidence_retained",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "candidate_history_retained",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "no_truth_or_memory_authority",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "no_idle_start",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_stop",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_defer",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_ask_evidence",
+            "component": "bounded_review",
+            "correct": true
+          },
+          {
+            "case": "exit_remain_uncertain",
+            "component": "bounded_review",
+            "correct": true
+          }
+        ],
+        "component_scores": {
+          "bounded_review": {
+            "correct": 13,
+            "total": 13
+          }
+        },
+        "run_at": "2026-10-16T10:11:51.213845+00:00",
+        "implementation_identity": {
+          "status": "recorded",
+          "head": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+          "changes_sha256": "b422e7f7d92d17dea60eb34c6f3c527b1f9b32dfeaf1c4b1d98b0c1ab702aac1",
+          "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+        }
+      }
+    ],
+    "english_review": [
+      {
+        "module": "english_review",
+        "version": "V1",
+        "benchmark_version": "V1",
+        "accuracy": 0.545455,
+        "correct": 6,
+        "total": 11,
+        "elapsed_seconds": 0.008427,
+        "source_revision": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+        "cases": [
+          {
+            "case": "question_subject",
+            "component": "structural_english",
+            "correct": false
+          },
+          {
+            "case": "question_past",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "passive_agent",
+            "component": "structural_english",
+            "correct": false
+          },
+          {
+            "case": "passive_theme",
+            "component": "structural_english",
+            "correct": false
+          },
+          {
+            "case": "modal_subject",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "modal_negation",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "reported_negation_scope",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "separate_sentence_subjects",
+            "component": "structural_english",
+            "correct": false
+          },
+          {
+            "case": "quantity_surface_retained",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "native_surface_uncertainty",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "bounded_input_discloses_incomplete",
+            "component": "structural_english",
+            "correct": false
+          }
+        ],
+        "component_scores": {
+          "structural_english": {
+            "correct": 6,
+            "total": 11
+          }
+        },
+        "run_at": "2026-10-16T10:11:51.230255+00:00",
+        "implementation_identity": {
+          "status": "recorded",
+          "head": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+          "changes_sha256": "b422e7f7d92d17dea60eb34c6f3c527b1f9b32dfeaf1c4b1d98b0c1ab702aac1",
+          "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+        }
+      },
+      {
+        "module": "english_review",
+        "version": "V2",
+        "benchmark_version": "V1",
+        "accuracy": 1.0,
+        "correct": 11,
+        "total": 11,
+        "elapsed_seconds": 0.001495,
+        "source_revision": "working-tree",
+        "cases": [
+          {
+            "case": "question_subject",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "question_past",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "passive_agent",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "passive_theme",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "modal_subject",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "modal_negation",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "reported_negation_scope",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "separate_sentence_subjects",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "quantity_surface_retained",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "native_surface_uncertainty",
+            "component": "structural_english",
+            "correct": true
+          },
+          {
+            "case": "bounded_input_discloses_incomplete",
+            "component": "structural_english",
+            "correct": true
+          }
+        ],
+        "component_scores": {
+          "structural_english": {
+            "correct": 11,
+            "total": 11
+          }
+        },
+        "run_at": "2026-10-16T10:11:51.231763+00:00",
+        "implementation_identity": {
+          "status": "recorded",
+          "head": "a31f1323ee4bb589d0ca0bf02aea87201b69cd21",
+          "changes_sha256": "b422e7f7d92d17dea60eb34c6f3c527b1f9b32dfeaf1c4b1d98b0c1ab702aac1",
+          "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+        }
+      }
+    ]
+  },
+  "verification": {
+    "pytest": {
+      "passed": 1072,
+      "skipped": 2,
+      "warnings": 8,
+      "seconds": 4.28
+    },
+    "native_focused": {
+      "passed": 25,
+      "failed": 0,
+      "skipped": 0
+    },
+    "shutdown": "host proc check found no scoped runtime; private log retained outside repo"
+  },
+  "unavailable": [
+    "real-world interpretation revision quality",
+    "independent evidence verification",
+    "live English intelligibility",
+    "live instinct calibration",
+    "production interference/audio/frame latency"
+  ]
+}

@@ -41,6 +41,23 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "work_report_write": {
+                "arguments": ["report (kind, title, observations, uncertainties, evidence?, measurements?, interpretations?, next_steps?, reproduction_steps?, expected?, actual?, previous_report?)"],
+                "kinds": ["drawing", "music", "experiment", "capability", "bug"],
+                "scope": "new private report per revision; preserves supplied wording and references; no publication or promotion",
+            },
+            "work_report_read": {
+                "arguments": ["report_id"], "scope": "read one chosen private report; no directory scan",
+            },
+            "bug_source_inspect": {
+                "arguments": ["code", "source_reference?"],
+                "scope": "64 KiB supplied Python source; static candidates, no import or execution",
+            },
+            "bug_file_inspect": {
+                "arguments": ["relative_path"],
+                "scope": "one non-private Python file on read-only code drive; no scan or execution",
+                "follow_up": "chosen experiment_create/run/judge for bounded reproduction; work_report_write for findings",
+            },
             "memory_index_inspect": {
                 "arguments": [], "scope": "configured index locations and schema only; no fragment payloads",
                 "authority": "process-local voluntary action capability", "automatic_trigger": False,
@@ -73,6 +90,14 @@ def capability_catalog() -> dict[str, Any]:
             "intuition_inquire": {
                 "arguments": ["hunch", "question", "countercheck", "trigger_references", "depth_budget?"],
                 "scope": "voluntary finite evidence request; no execution or memory retrieval",
+            },
+            "perspective_begin": {
+                "arguments": ["event", "max_steps? (1..4)"],
+                "scope": "chosen private review; provisional, finite, no public delivery",
+            },
+            "perspective_step": {
+                "arguments": ["state", "choice (continue, stop, defer, ask_evidence, remain_uncertain)", "observation_references?", "countercheck?", "hypotheses?"],
+                "scope": "one bounded step, yields control; no memory retrieval or automatic adoption",
             },
             "intuition_review": {
                 "arguments": ["journey", "choice (deeper, stop, remain_uncertain)", "observation_references?", "hypotheses?"],
@@ -161,7 +186,17 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "memory_index_inspect":
+    if action in {"work_report_write", "work_report_read", "bug_source_inspect", "bug_file_inspect"}:
+        from ina_work_reports import save_work_report, read_work_report, inspect_python_source, inspect_code_file
+        if action == "work_report_write":
+            value = save_work_report(fs, command.get("report") or {})
+        elif action == "work_report_read":
+            value = read_work_report(fs, command.get("report_id"))
+        elif action == "bug_file_inspect":
+            value = inspect_code_file(fs, command.get("relative_path"))
+        else:
+            value = inspect_python_source(command.get("code"), source_reference=command.get("source_reference") or "")
+    elif action == "memory_index_inspect":
         value = inspect_indexes(child, root.resolve(), cfg)
     elif action == "memory_index_trial":
         value = trial_configured_index(child, root.resolve(), cfg, personal, location=str(command.get("location") or "temporary"))
@@ -175,6 +210,15 @@ def execute_personal_tool_command(
         value = {'model': model, 'path': str(path), 'private': True, 'scheduled_work': False}
     elif action == "memetic_process":
         value = process_meme(dict(command))
+    elif action == "perspective_begin":
+        from perspective_review import begin_review
+        value = begin_review(command.get("event") or {}, variant="private_tool", chosen=True,
+                             max_steps=command.get("max_steps", 1))
+    elif action == "perspective_step":
+        from perspective_review import review_step
+        value = review_step(command.get("state") or {}, choice=command.get("choice"),
+            observation_references=command.get("observation_references") or (),
+            countercheck=command.get("countercheck") or "", hypotheses=command.get("hypotheses"))
     elif action == "intuition_inquire":
         journey = begin_intuition_inquiry(command.get('hunch'), question=command.get('question'),
             countercheck=command.get('countercheck'), trigger_references=command.get('trigger_references'),

@@ -29,7 +29,7 @@ def build_semantic_event(text: str, discourse: Mapping[str, Any] | None = None) 
         subject = clause.get("subject")
         subject_resolution = resolution_for(discourse, str(subject or ""))
         agent = None
-        if subject_resolution and len(subject_resolution.get("referents") or ()) == 1:
+        if subject_resolution and not subject_resolution.get("ambiguous") and len(subject_resolution.get("referents") or ()) == 1:
             agent = dict(subject_resolution["referents"][0])
         events.append({
             "id": clause.get("id"),
@@ -44,9 +44,14 @@ def build_semantic_event(text: str, discourse: Mapping[str, Any] | None = None) 
             "modality": clause.get("modality"),
             "negated": bool(clause.get("negated")),
             "negation_scope": clause.get("negation_scope"),
+            "parent_clause": clause.get("parent_clause"),
+            "voice": clause.get("voice", "active"),
+            "question_word": clause.get("question_word"),
+            "inverted": clause.get("inverted", False),
         })
     return {
-        "version": 1,
+        "version": 2,
+        "incomplete": bool(analysis.get("incomplete")),
         "source_text": str(text or ""),
         "events": events,
         "speech_act": dict(analysis.get("speech_act") or {}),
