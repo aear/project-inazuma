@@ -473,6 +473,14 @@ def _mirror_v2() -> dict[str, Any]:
     return _capability([{"case": "audience-specific learned reaction", "actual": actual, "expected": 0.9, "correct": abs(actual - 0.9) < 0.1}])
 
 
+def _prediction_feedback(version: str) -> dict[str, Any]:
+    from benchmarks.benchmark_prediction_experience_loop import measure_hindsight_semantics
+    return _capability([
+        {"case":name,"component":"forecast_observation_boundary","correct":passed}
+        for name,passed in measure_hindsight_semantics(current=version == "V2").items()
+    ])
+
+
 def _hindsight_v1() -> dict[str, Any]:
     module = _v1_module("transformers/hindsight_transformer.py", package="transformers")
     transformer = module.HindsightTransformer()
@@ -2598,6 +2606,10 @@ _REGISTRY = {
     "q_decoder": (ModuleVersion("q_decoder", "V1", "Fixed bit tables", _q_decoder_v1), ModuleVersion("q_decoder", "V2", "Experience-adaptive bit meanings", _q_decoder_v2)),
     "bridge_origin": (ModuleVersion("bridge_origin", "V1", "Question text without origin", _bridge_origin_v1), ModuleVersion("bridge_origin", "V2", "Composable contradiction origin", _bridge_origin_v2)),
     "mirror_audience": (ModuleVersion("mirror_audience", "V1", "Generic 0.8 projection", _mirror_v1), ModuleVersion("mirror_audience", "V2", "Audience-specific learned transform", _mirror_v2)),
+    "prediction_feedback": (
+        ModuleVersion("prediction_feedback", "V1", "Pinned 5576e4e next-forecast fallback", lambda: _prediction_feedback("V1")),
+        ModuleVersion("prediction_feedback", "V2", "Forecast updates retained separately from observed outcomes", lambda: _prediction_feedback("V2")),
+    ),
     "hindsight_claims": (ModuleVersion("hindsight_claims", "V1", "Clarity-only comparison", _hindsight_v1), ModuleVersion("hindsight_claims", "V2", "Multidimensional confidence calibration", _hindsight_v2)),
     "mycelial_links": (ModuleVersion("mycelial_links", "V1", "First available cross-domain links", _mycelial_v1), ModuleVersion("mycelial_links", "V2", "Ranked useful lateral links", _mycelial_v2)),
     "seedling_clusters": (ModuleVersion("seedling_clusters", "V1", "First-character grouping", _seedling_v1), ModuleVersion("seedling_clusters", "V2", "Profile and vector geometry", _seedling_v2)),
@@ -2761,6 +2773,8 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
             accuracy=round(correct / total, 6) if total else 0.0,
             correct=correct, total=total, elapsed_seconds=round(elapsed, 6),
             source_revision=(
+                "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0"
+                if spec.module == "prediction_feedback" and spec.version == "V1" else
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])

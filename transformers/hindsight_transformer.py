@@ -9,6 +9,7 @@ from model_manager import load_config, update_inastate
 from .fractal_multidimensional_transformers import FractalTransformer
 from symbol_generator import generate_symbol_from_parts
 from origin_record import make_origin
+from io_utils import atomic_write_json
 
 class HindsightTransformer:
     """
@@ -29,6 +30,7 @@ class HindsightTransformer:
         self.emotion_log_path = self.memory_path / "emotion_log.json"
         self.emotion_drift_path = self.memory_path / "emotion_drift_log.json"
         self.pred_evo_path = self.memory_path / "prediction_evolution.json"
+        self.prediction_updates_path = self.memory_path / "prediction_updates.json"
         self.transformer = FractalTransformer()
         self.intent_telemetry: Dict[str, Any] = {}
 
@@ -107,13 +109,12 @@ class HindsightTransformer:
         return result
 
     def evaluate_claims(self, curr, nxt):
-        """Compare every numeric claim to an observed outcome or legacy next snapshot."""
+        """Compare claims to explicit observations; another forecast is never an outcome."""
         predicted = self._numeric_map(curr.get("predicted_vector"))
         actual_source = (
             curr.get("observed_vector") or curr.get("actual_vector")
             or (curr.get("outcome") if isinstance(curr.get("outcome"), dict) else None)
             or nxt.get("observed_vector") or nxt.get("actual_vector")
-            or nxt.get("predicted_vector")
         )
         actual = self._numeric_map(actual_source)
         confidence_map = curr.get("prediction_confidence") if isinstance(curr.get("prediction_confidence"), dict) else {}
@@ -225,6 +226,24 @@ class HindsightTransformer:
         except Exception as e:
             log_to_statusbox(f"[Hindsight] Failed to update predictions: {e}")
 
+    def save_prediction_updates(self, predictions):
+        """Rebuildable bounded links; never rewrite the predictor-owned forecast log."""
+        updates = []
+        for record in predictions[-100:]:
+            update = record.get("prediction_update")
+            if not isinstance(update, dict):
+                continue
+            updates.append({
+                "prediction_reference": str(record.get("prediction_id") or record.get("event_id") or record.get("timestamp", ""))[:500],
+                "update_reference": str(update.get("reference", ""))[:500],
+                "relationship": "subsequent_forecast", "target_alignment": "unverified",
+                "is_observation": False,
+            })
+        atomic_write_json(self.prediction_updates_path, {
+            "schema": "ina.prediction_updates/V1", "updates": updates,
+            "rebuildable": True, "contains_observed_outcomes": False,
+        }, indent=2, ensure_ascii=False)
+
     def compute_hindsight(self, predictions):
         insights = []
         emotion_log = self.load_emotion_log()
@@ -236,9 +255,20 @@ class HindsightTransformer:
                 t2 = datetime.fromisoformat(nxt["timestamp"])
             except Exception:
                 continue
+            if isinstance(nxt.get("predicted_vector"), dict):
+                # The following forecast remains its own record. Preserve a link,
+                # never overwrite the original or call revision a world outcome.
+                curr["prediction_update"] = {
+                    "reference": str(nxt.get("prediction_id") or nxt.get("event_id") or nxt["timestamp"]),
+                    "relationship": "subsequent_forecast",
+                    "target_alignment": "unverified",
+                    "is_observation": False,
+                }
             dimensions = self.evaluate_claims(curr, nxt)
             if not dimensions:
+                curr["outcome_status"] = "awaiting_observation"
                 continue
+            curr["outcome_status"] = "observed"
             errors = [row["error"] for row in dimensions.values()]
             mean_error = round(sum(errors) / len(errors), 4)
             mean_abs_error = round(sum(abs(value) for value in errors) / len(errors), 4)
@@ -312,7 +342,8 @@ class HindsightTransformer:
             return
         insights, updated_preds = self.compute_hindsight(preds)
         if not insights:
-            log_to_statusbox("[Hindsight] No insights generated.")
+            self.save_prediction_updates(updated_preds)
+            log_to_statusbox("[Hindsight] Forecast updates retained; no observed outcomes to score.")
             return
         trust_value, avg_error = self.adjust_trust(insights)
         self.save_hindsight_map(insights)

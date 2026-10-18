@@ -1,0 +1,217 @@
+{
+  "schema": "ina.prediction_feedback_investigation/V1",
+  "date": "2026-10-18",
+  "baseline_revision": "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0",
+  "boundary": {
+    "V1": {
+      "pending_link_snapshot_is_bounded": false,
+      "next_forecast_not_an_outcome": false,
+      "explicit_outcome_still_evaluated": true,
+      "original_forecast_preserved": true,
+      "revision_link_is_not_observation": false,
+      "missing_observation_remains_pending": false,
+      "forecast_updates_saved_without_lessons": false
+    },
+    "V2": {
+      "pending_link_snapshot_is_bounded": true,
+      "next_forecast_not_an_outcome": true,
+      "explicit_outcome_still_evaluated": true,
+      "original_forecast_preserved": true,
+      "revision_link_is_not_observation": true,
+      "missing_observation_remains_pending": true,
+      "forecast_updates_saved_without_lessons": true
+    },
+    "source": {
+      "status": "recorded",
+      "head": "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0",
+      "changes_sha256": "2f01b195e4ebf0a6a628ee2a0f4fad17c20ab122bf704bd4f8992c2e86ea05f8",
+      "scope": "tracked_python_diff_and_untracked_python; excludes learned state and configuration"
+    }
+  },
+  "nvme_12_step": {
+    "benchmark": "prediction_experience_loop",
+    "benchmark_version": "V1",
+    "baseline_revision": "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0",
+    "results": {
+      "V1": {
+        "samples": [
+          {
+            "seconds": 0.2615443510003388,
+            "bytes": 50193,
+            "files": 38,
+            "python_peak_bytes": 1776031,
+            "phase_mae": {
+              "train": 0.4,
+              "held_out": 0.4,
+              "shifted": 0.2
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          },
+          {
+            "seconds": 0.2522646140132565,
+            "bytes": 50193,
+            "files": 38,
+            "python_peak_bytes": 1633382,
+            "phase_mae": {
+              "train": 0.4,
+              "held_out": 0.4,
+              "shifted": 0.2
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          },
+          {
+            "seconds": 0.2510711450013332,
+            "bytes": 50193,
+            "files": 38,
+            "python_peak_bytes": 1623318,
+            "phase_mae": {
+              "train": 0.4,
+              "held_out": 0.4,
+              "shifted": 0.2
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          }
+        ],
+        "median_seconds": 0.2522646140132565
+      },
+      "V2": {
+        "samples": [
+          {
+            "seconds": 0.264902261988027,
+            "bytes": 50441,
+            "files": 38,
+            "python_peak_bytes": 1623734,
+            "phase_mae": {
+              "train": 0.1,
+              "held_out": 0.0,
+              "shifted": 0.6
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          },
+          {
+            "seconds": 0.24638700098148547,
+            "bytes": 50441,
+            "files": 38,
+            "python_peak_bytes": 1614006,
+            "phase_mae": {
+              "train": 0.1,
+              "held_out": 0.0,
+              "shifted": 0.6
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          },
+          {
+            "seconds": 0.25556480398518033,
+            "bytes": 50441,
+            "files": 38,
+            "python_peak_bytes": 1613990,
+            "phase_mae": {
+              "train": 0.1,
+              "held_out": 0.0,
+              "shifted": 0.6
+            },
+            "cycle_count": 12,
+            "final_choice": "stop"
+          }
+        ],
+        "median_seconds": 0.25556480398518033
+      }
+    },
+    "scope": "synthetic domain adapter; existing engine and pinned pure Hindsight scoring",
+    "unavailable": [
+      "live Ina learning",
+      "probability calibration",
+      "missing-outcome/security tests while Ina running",
+      "end-to-end responsiveness",
+      "long-term retention costs"
+    ]
+  },
+  "nvme_3_step": {
+    "benchmark": "prediction_experience_loop",
+    "benchmark_version": "V1",
+    "baseline_revision": "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0",
+    "results": {
+      "V1": {
+        "samples": [
+          {
+            "seconds": 0.08872482102015056,
+            "bytes": 27866,
+            "files": 11,
+            "python_peak_bytes": 1776028,
+            "phase_mae": {
+              "train": 0.4,
+              "held_out": 0.4,
+              "shifted": 0.2
+            },
+            "cycle_count": 3,
+            "final_choice": "stop"
+          }
+        ],
+        "median_seconds": 0.08872482102015056
+      },
+      "V2": {
+        "samples": [
+          {
+            "seconds": 0.08013044198742136,
+            "bytes": 27928,
+            "files": 11,
+            "python_peak_bytes": 1634822,
+            "phase_mae": {
+              "train": 0.4,
+              "held_out": 0.0,
+              "shifted": 0.6
+            },
+            "cycle_count": 3,
+            "final_choice": "stop"
+          }
+        ],
+        "median_seconds": 0.08013044198742136
+      }
+    },
+    "scope": "synthetic domain adapter; existing engine and pinned pure Hindsight scoring",
+    "unavailable": [
+      "live Ina learning",
+      "probability calibration",
+      "missing-outcome/security tests while Ina running",
+      "end-to-end responsiveness",
+      "long-term retention costs"
+    ]
+  },
+  "hdd": {
+    "status": "unavailable",
+    "attempts": [
+      {
+        "samples": 3,
+        "steps": 12,
+        "timeout_seconds": 55,
+        "exit_code": 124
+      },
+      {
+        "samples": 1,
+        "steps": 3,
+        "timeout_seconds": 55,
+        "exit_code": 124
+      }
+    ],
+    "completed_measurements": false
+  },
+  "verification": {
+    "focused_cycle_and_feedback_pytest_passed": 13,
+    "focused_hindsight_pytest_passed": 6,
+    "focused_native_passed": 5,
+    "full_suite": "not_run: Ina active; suite includes security/adversarial cases"
+  },
+  "limitations": [
+    "synthetic residual fixture is not Ina learning",
+    "normal explicit observation fields are caller-supplied and not independently authenticated",
+    "no live memory or live runtime tests",
+    "Python allocation peaks are not process RSS",
+    "HDD comparison not completed",
+    "no runtime default changed or memory migration run"
+  ]
+}
