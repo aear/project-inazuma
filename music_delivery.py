@@ -16,6 +16,7 @@ def ensure_opus_sidecar(
     wav_path: Path | str,
     *,
     timeout_seconds: int = DEFAULT_OPUS_CONVERSION_TIMEOUT_SECONDS,
+    public_export: bool = False,
 ) -> dict:
     """Create or refresh ``<stem>.opus`` without modifying the source WAV."""
     source = Path(wav_path)
@@ -25,7 +26,7 @@ def ensure_opus_sidecar(
     if source.is_symlink() or opus.is_symlink():
         return {"status": "rejected", "reason": "symlink_rejected"}
     try:
-        if opus.is_file() and opus.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+        if not public_export and opus.is_file() and opus.stat().st_mtime_ns >= source.stat().st_mtime_ns:
             return {
                 "status": "reused", "wav_path": str(source),
                 "opus_path": str(opus), "bytes": opus.stat().st_size,
@@ -42,7 +43,10 @@ def ensure_opus_sidecar(
             completed = subprocess.run(
                 [
                     ffmpeg, "-nostdin", "-y", "-loglevel", "error",
-                    "-i", str(source), "-vn", "-c:a", "libopus",
+                    *(["-protocol_whitelist", "file,pipe", "-threads", "1"] if public_export else []),
+                    "-i", str(source), "-vn",
+                    *(["-map_metadata", "-1", "-map_chapters", "-1", "-threads", "1", "-ac", "2", "-ar", "48000"] if public_export else []),
+                    "-c:a", "libopus",
                     "-b:a", "128k", "-vbr", "on", str(staged),
                 ],
                 capture_output=True, text=True,

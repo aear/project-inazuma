@@ -1,0 +1,37 @@
+{
+	admin off
+	persist_config off
+	auto_https disable_redirects
+	http_port 8080
+	https_port 8443
+	servers {
+ protocols h1 h2
+		max_header_size 8KB
+		timeouts {
+			read_header 5s
+			read_body 5s
+			write_idle 15s
+			idle 30s
+		}
+	}
+}
+SITE_ADDRESS {
+ BIND_CONFIGURATION
+ TLS_CONFIGURATION
+	root * /srv/radio
+	@badmethod not method GET HEAD
+	respond @badmethod 405
+	@badpath not path_regexp safe ^/(|index\.html|player\.js|style\.css|station\.json|media/[a-f0-9]{64}\.opus)$
+	respond @badpath 404
+	header {
+		Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Cache-Control no-store
+		-Server
+	}
+	@audio path /media/*
+	header @audio Content-Type audio/ogg
+	file_server
+}

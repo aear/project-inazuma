@@ -41,6 +41,15 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "radio_status": {"arguments": [], "scope": "local station clip catalog; no listener data"},
+            "radio_prepare_clip": {"arguments": ["relative_path (PCM WAV)", "source_drive? (ina_hdd or music_renders)", "title", "kind (song or speech)", "publication=ina_authored_public"],
+                "scope": "explicit public Opus export, isolated decoder; original untouched; not scheduled automatically"},
+            "radio_render_announcement": {"arguments": ["symbols (1..8 chosen native voice symbols)"],
+                "scope": "existing Ina voice, private WAV only; no microphone relay or external voice imitation"},
+            "radio_publish": {"arguments": ["clips (1..32 chosen IDs in order)", "start_at? (UTC epoch seconds)"],
+                "scope": "finite public programme up to two hours; no repeat or listener commands"},
+            "radio_stop": {"arguments": [], "scope": "stop programme; downloaded public copies cannot be recalled"},
+            "radio_remove_clip": {"arguments": ["clip_id"], "scope": "stop programme then remove one exported clip; original preserved"},
             "work_report_write": {
                 "arguments": ["report (kind, title, observations, uncertainties, evidence?, measurements?, interpretations?, next_steps?, reproduction_steps?, expected?, actual?, previous_report?)"],
                 "kinds": ["drawing", "music", "experiment", "capability", "bug"],
@@ -186,7 +195,23 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action in {"work_report_write", "work_report_read", "bug_source_inspect", "bug_file_inspect"}:
+    if action.startswith("radio_"):
+        import radio_station as radio
+        from ina_desktop.files import VirtualDrive
+        fs=VirtualFileSystem(tuple(fs.drives.values()) + (VirtualDrive(
+            "music_renders", "Ina's own music renders", root/"AI_Children"/child/"memory"/"music_studio"/"renders",
+            False,"ina_authored_music"),))
+        if action == "radio_status":value=radio.status(cfg)
+        elif action == "radio_prepare_clip":
+            value=radio.prepare_clip(fs,cfg,relative_path=command.get("relative_path"),title=command.get("title"),
+                kind=command.get("kind"),publication=command.get("publication"),source_drive=command.get("source_drive") or "ina_hdd")
+        elif action == "radio_render_announcement":
+            value=radio.render_announcement(fs,symbols=command.get("symbols"),child=child)
+        elif action == "radio_publish":value=radio.publish_program(cfg,clips=command.get("clips"),start_at=command.get("start_at"))
+        elif action == "radio_stop":value=radio.stop_program(cfg)
+        elif action == "radio_remove_clip":value=radio.remove_clip(cfg,clip_id=command.get("clip_id"))
+        else:raise ValueError("unknown radio tool")
+    elif action in {"work_report_write", "work_report_read", "bug_source_inspect", "bug_file_inspect"}:
         from ina_work_reports import save_work_report, read_work_report, inspect_python_source, inspect_code_file
         if action == "work_report_write":
             value = save_work_report(fs, command.get("report") or {})

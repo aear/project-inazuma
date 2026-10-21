@@ -473,6 +473,12 @@ def _mirror_v2() -> dict[str, Any]:
     return _capability([{"case": "audience-specific learned reaction", "actual": actual, "expected": 0.9, "correct": abs(actual - 0.9) < 0.1}])
 
 
+def _radio_station_version(version: str) -> dict[str, Any]:
+    from benchmarks.benchmark_radio_station import measure
+    return _capability([{"case":key,"component":"optional_public_radio","correct":passed}
+        for key,passed in measure(version)["signals"].items()])
+
+
 def _prediction_feedback(version: str) -> dict[str, Any]:
     from benchmarks.benchmark_prediction_experience_loop import measure_hindsight_semantics
     return _capability([
@@ -2606,6 +2612,10 @@ _REGISTRY = {
     "q_decoder": (ModuleVersion("q_decoder", "V1", "Fixed bit tables", _q_decoder_v1), ModuleVersion("q_decoder", "V2", "Experience-adaptive bit meanings", _q_decoder_v2)),
     "bridge_origin": (ModuleVersion("bridge_origin", "V1", "Question text without origin", _bridge_origin_v1), ModuleVersion("bridge_origin", "V2", "Composable contradiction origin", _bridge_origin_v2)),
     "mirror_audience": (ModuleVersion("mirror_audience", "V1", "Generic 0.8 projection", _mirror_v1), ModuleVersion("mirror_audience", "V2", "Audience-specific learned transform", _mirror_v2)),
+    "radio_station": (
+        ModuleVersion("radio_station", "V1", "Pinned no radio station tools", lambda: _radio_station_version("V1")),
+        ModuleVersion("radio_station", "V2", "Finite scheduled station and voluntary native speech clips", lambda: _radio_station_version("V2")),
+    ),
     "prediction_feedback": (
         ModuleVersion("prediction_feedback", "V1", "Pinned 5576e4e next-forecast fallback", lambda: _prediction_feedback("V1")),
         ModuleVersion("prediction_feedback", "V2", "Forecast updates retained separately from observed outcomes", lambda: _prediction_feedback("V2")),
@@ -2773,6 +2783,8 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
             accuracy=round(correct / total, 6) if total else 0.0,
             correct=correct, total=total, elapsed_seconds=round(elapsed, 6),
             source_revision=(
+                "26250eded439c36b8f2a88dc2e090f19fd353445"
+                if spec.module == "radio_station" and spec.version == "V1" else
                 "5576e4ed3ff7374c5f7edf25f95ffb96ef996de0"
                 if spec.module == "prediction_feedback" and spec.version == "V1" else
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"

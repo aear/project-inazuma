@@ -23,7 +23,7 @@ class _LocalCodeAuthority:
 
 LOCAL_VOLUNTARY_CODE_AUTHORITY = _LocalCodeAuthority()
 _SEAL_KEY = secrets.token_bytes(32)
-_EXECUTABLE_ACTIONS = frozenset({"work_report_write", "work_report_read", "bug_source_inspect", "bug_file_inspect", "perspective_begin", "perspective_step", "experiment_create", "experiment_run", "experiment_judge", "memory_index_inspect", "memory_index_trial", "memory_index_change"})
+_EXECUTABLE_ACTIONS = frozenset({"radio_status", "radio_prepare_clip", "radio_render_announcement", "radio_publish", "radio_stop", "radio_remove_clip", "work_report_write", "work_report_read", "bug_source_inspect", "bug_file_inspect", "perspective_begin", "perspective_step", "experiment_create", "experiment_run", "experiment_judge", "memory_index_inspect", "memory_index_trial", "memory_index_change"})
 _UNTRUSTED_SOURCES = frozenset({"discord", "discord_message", "external_research", "untrusted_external_data"})
 
 
