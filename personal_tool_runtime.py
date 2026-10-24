@@ -41,6 +41,11 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "speech_render": {
+                "arguments": ["text (1..512 UTF-8 bytes)", "voice? (en-gb, en-us, de, fr, es)"],
+                "scope": "local eSpeak NG TTS; private WAV; no playback, publication, translation or learning",
+                "automatic_trigger": False,
+            },
             "radio_status": {"arguments": [], "scope": "local station clip catalog; no listener data"},
             "radio_prepare_clip": {"arguments": ["relative_path (PCM WAV)", "source_drive? (ina_hdd or music_renders)", "title", "kind (song or speech)", "publication=ina_authored_public"],
                 "scope": "explicit public Opus export, isolated decoder; original untouched; not scheduled automatically"},
@@ -195,7 +200,10 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action.startswith("radio_"):
+    if action == "speech_render":
+        from speech_bridge import render_private_speech
+        value = render_private_speech(fs, text=command.get("text"), voice=command.get("voice", "en-gb"))
+    elif action.startswith("radio_"):
         import radio_station as radio
         from ina_desktop.files import VirtualDrive
         fs=VirtualFileSystem(tuple(fs.drives.values()) + (VirtualDrive(

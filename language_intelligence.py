@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 
 from io_utils import atomic_write_json, load_json_dict
 from origin_record import make_origin
+from discourse_context import resolution_for
 
 _TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*|[^\W\d_]+(?:['’][^\W\d_]+)?|[^\s]", re.UNICODE)
 _CONTRACTIONS = {
@@ -96,8 +97,13 @@ class DiscourseEntityMemory:
 
     def candidates(self, pronoun: str) -> list[dict[str, Any]]:
         values = list(self.entities.values())
-        if pronoun.casefold() in {"i", "me", "my"}:
-            values = [item for item in values if item.get("speaker") is True] or values
+        role = {"i": "speaker", "me": "speaker", "my": "speaker",
+                "you": "addressee", "your": "addressee"}.get(pronoun.casefold())
+        if role:
+            # Missing conversational identity cannot be replaced by recency.
+            values = [item for item in values if item.get(role) is True]
+        elif pronoun.casefold() in {"we", "us", "our"}:
+            return []  # A group needs explicit discourse evidence.
         return [dict(item) for item in reversed(values[-4:])]
 
     def snapshot(self) -> dict[str, Any]:
@@ -111,18 +117,31 @@ class ConstructionLearner:
         self.path = Path(path) if path else None
         self.max_patterns = max(8, int(max_patterns))
         raw = load_json_dict(self.path) if self.path else {}
-        self.counts = Counter({str(k): int(v) for k, v in (raw.get("counts") or {}).items()})
+        self.counts = Counter({str(k): int(v) for k, v in islice((raw.get("counts") or {}).items(), self.max_patterns)})
+        self.source_events = list(dict.fromkeys(str(v)[:160] for v in (raw.get("source_events") or ())[-512:]))
 
-    def observe(self, clauses: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    def observe(self, clauses: Iterable[Mapping[str, Any]], *, source_event: str | None = None) -> list[dict[str, Any]]:
+        """Count supplied examples, not independent corroboration or comprehension.
+
+        Optional event IDs suppress replay within the retained 512-event window.
+        They are caller provenance, not authenticated observations.
+        """
+        if source_event is not None and (not isinstance(source_event, str) or not 1 <= len(source_event) <= 160):
+            raise ValueError("source_event must be 1..160 characters")
+        replay = source_event is not None and source_event in self.source_events
         matches = []
-        for clause in clauses:
+        for clause in islice(clauses, 8):
             roles = clause.get("arguments") or {}
             pattern = f"{clause.get('predicate')}({','.join(sorted(roles))})"
-            self.counts[pattern] += 1
-            matches.append({"pattern": pattern, "observations": self.counts[pattern]})
+            if not replay:
+                self.counts[pattern] += 1
+            matches.append({"pattern": pattern, "observations": self.counts[pattern],
+                            "source_event": source_event, "replay": replay})
         self.counts = Counter(dict(self.counts.most_common(self.max_patterns)))
-        if self.path:
-            atomic_write_json(self.path, {"version": 1, "counts": dict(self.counts)})
+        if source_event is not None and not replay:
+            self.source_events = (self.source_events + [source_event])[-512:]
+        if self.path and not replay:
+            atomic_write_json(self.path, {"version": 2, "counts": dict(self.counts), "source_events": self.source_events})
         return matches
 
 
@@ -233,7 +252,7 @@ def _speech_act(text: str, context: Mapping[str, Any]) -> dict[str, Any]:
     return {"act": act, "interpretation": reading, "tone": "sarcastic" if sarcastic else "literal", "confidence": 0.9 if tone else 0.7}
 
 
-def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, discourse: DiscourseEntityMemory | None = None, constructions: ConstructionLearner | None = None, turn: int | None = None) -> dict[str, Any]:
+def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, discourse: DiscourseEntityMemory | None = None, constructions: ConstructionLearner | None = None, turn: int | None = None, source_event: str | None = None) -> dict[str, Any]:
     context = context or {}
     discourse = discourse or DiscourseEntityMemory()
     text = str(text or "")
@@ -249,28 +268,40 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
                 discourse.mention(name, role=role, turn=turn)
     proper = [name for name in re.findall(r"\b[A-Z][a-z]+\b", text) if name.casefold() not in _PRONOUNS]
     for name in proper: discourse.mention(name, turn=turn)
+    authoritative = context.get("discourse")
+    def referent_candidates(surface: str) -> list[dict[str, Any]]:
+        route = resolution_for(authoritative, surface) if isinstance(authoritative, Mapping) else None
+        if route is not None:
+            return [dict(item) for item in (route.get("referents") or ())[:8]
+                    if isinstance(item, Mapping) and item.get("id") not in {None, "unknown"}]
+        return discourse.candidates(surface)
+
+    def resolved_id(surface: str, candidates: list[dict[str, Any]]) -> str | None:
+        route = resolution_for(authoritative, surface) if isinstance(authoritative, Mapping) else None
+        return candidates[0]["id"] if len(candidates) == 1 and not (route or {}).get("ambiguous") else None
+
     referents: list[dict[str, Any]] = []
     for clause in clauses:
         subject = str(clause.get("subject") or "").casefold()
-        if subject in {"he", "she", "they", "him", "her", "them"}:
-            candidates = discourse.candidates(subject)
+        if subject in _PRONOUNS:
+            candidates = referent_candidates(subject)
             referents.append({
                 "surface": subject, "relation": "subject", "candidates": candidates,
-                "resolved": candidates[0]["id"] if len(candidates) == 1 else None,
+                "resolved": resolved_id(subject, candidates),
             })
     possessive = re.search(r"\b(his|her|their|my|your|our|its)\s+(\w+)|\b(\w+)'s\s+(\w+)", text, re.I)
     if possessive:
         pronoun_owner, pronoun_thing, named_owner, named_thing = possessive.groups()
         owner, thing = (pronoun_owner, pronoun_thing) if pronoun_owner else (named_owner, named_thing)
         if owner.casefold() in {"his", "her", "their"}:
-            candidates = discourse.candidates(owner)
+            candidates = referent_candidates(owner)
         elif owner.casefold() in _PRONOUNS:
-            candidates = discourse.candidates(owner)
+            candidates = referent_candidates(owner)
         else:
             candidates = [discourse.mention(owner, role="possessor", turn=turn)]
-        referents.append({"surface": owner, "relation": "possessor", "object": thing, "candidates": candidates, "resolved": candidates[0]["id"] if len(candidates) == 1 else None})
+        referents.append({"surface": owner, "relation": "possessor", "object": thing, "candidates": candidates, "resolved": resolved_id(owner, candidates)})
     pragmatic = _speech_act(text, context)
-    matches = (constructions or ConstructionLearner()).observe(clauses)
+    matches = (constructions or ConstructionLearner()).observe(clauses, source_event=source_event)
     uncertainties = {
         "predicate_arguments": {"confidence": 0.9 if all(c.get("predicate") for c in clauses) else 0.35, "reasons": []},
         "negation_scope": {"confidence": 0.95 if any(c.get("negated") for c in clauses) else 1.0, "reasons": []},
@@ -290,18 +321,19 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
     alternatives = []
     for ref in referents:
         for candidate in ref["candidates"][:4]:
-            alternatives.append({"meaning": {"clauses": clauses, "possessor": candidate["id"], "pragmatics": pragmatic["interpretation"]}, "changes": ["possessor"], "confidence": round(1 / max(1, len(ref["candidates"])), 3)})
+            factor = "possessor" if ref["relation"] == "possessor" else "subject"
+            alternatives.append({"meaning": {"clauses": clauses, factor: candidate["id"], "pragmatics": pragmatic["interpretation"]}, "changes": [factor], "confidence": round(1 / max(1, len(ref["candidates"])), 3)})
     if "great" in text.casefold():
         alternatives.extend([
             {"meaning": {"clauses": clauses, "pragmatics": "sincere_positive_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 4, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
+        "version": 5, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V4", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V5", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 

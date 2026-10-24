@@ -323,6 +323,7 @@ def build_language_context_snapshot(
     linguistic_analysis = analyze_utterance(
         current_text,
         context={
+            "discourse": supplied_discourse,
             "tone": signals.get("tone") or scene.get("tone"),
             "sarcastic": signals.get("sarcastic", False),
         },

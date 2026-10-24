@@ -809,6 +809,36 @@ def _question_resolution_v2() -> dict[str, Any]:
     ])
 
 
+def _referent_learning_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import language_v1
+    return language_v1()
+
+
+def _referent_learning_v2() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import language_v2
+    return language_v2()
+
+
+def _speech_bridge_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import speech_v1
+    return speech_v1()
+
+
+def _speech_bridge_v2() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import speech_v2
+    return speech_v2()
+
+
+def _language_limits_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import limits_v1
+    return limits_v1()
+
+
+def _language_limits_v2() -> dict[str, Any]:
+    from benchmarks.benchmark_language_speech import limits_v2
+    return limits_v2()
+
+
 def _language_v1() -> dict[str, Any]:
     source = _v1_text("language_context.py")
     components = ("composition", "morphology", "constructions", "pragmatics", "discourse", "uncertainty", "counterfactuals", "reading_spans")
@@ -2632,6 +2662,18 @@ _REGISTRY = {
     "self_question_display": (ModuleVersion("self_question_display", "V1", "Latest timestamp and resolved state only", _question_display_v1), ModuleVersion("self_question_display", "V2", "Bounded trigger history and reversible display hiding", _question_display_v2)),
     "self_question_resolution": (ModuleVersion("self_question_resolution", "V1", "Questions accumulate without evidence routing", _question_resolution_v1), ModuleVersion("self_question_resolution", "V2", "Typed evidence routing and evaluated lifecycle", _question_resolution_v2)),
     "ina_ml_distribution": (ModuleVersion("ina_ml_distribution", "V1", "Historical native numerics", _ina_ml_distribution_v1), ModuleVersion("ina_ml_distribution", "V2", "Native distribution and entropy kernels", _ina_ml_distribution_v2)),
+    "language_transfer_limits": (
+        ModuleVersion("language_transfer_limits", "V1", "Pinned untuned language challenges", _language_limits_v1),
+        ModuleVersion("language_transfer_limits", "V2", "Current untuned language challenges", _language_limits_v2),
+    ),
+    "language_referent_learning": (
+        ModuleVersion("language_referent_learning", "V1", "Pinned pre-change language memory", _referent_learning_v1),
+        ModuleVersion("language_referent_learning", "V2", "Authoritative participants and replay-aware construction learning", _referent_learning_v2),
+    ),
+    "speech_bridge": (
+        ModuleVersion("speech_bridge", "V1", "Pinned predecessor tool availability", _speech_bridge_v1),
+        ModuleVersion("speech_bridge", "V2", "Optional private local TTS", _speech_bridge_v2),
+    ),
     "language_components": (
         ModuleVersion("language_components", "V1", "Historical language context", _language_v1),
         ModuleVersion("language_components", "V2", "Compositional and discourse-aware language", _language_v2),
@@ -2790,7 +2832,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
-                if spec.module in {"review_efficiency", "memory_maintenance_tools"} and spec.version == "V1" else
+                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"
