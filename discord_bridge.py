@@ -43,6 +43,7 @@ from communicative_meaning import (
 )
 from experience_cognition import plan_experience_cognition
 from conversation_scene import scene_with_memory_consideration
+from discord_english_support import discord_english_support
 from backend_discord import (
     make_sender_info_from_discord,
     make_channel_info_from_discord,
@@ -2020,10 +2021,10 @@ BACKEND_NAME = "discord"
 
 def process_inbound_message(msg) -> CommsResponse:
     """
-    This is where you'd plug Ina's real brain in.
+    Select a grounded or native expression, preserving the option of silence.
 
-    For now, this tries a lightweight grounded-language adapter; if that is
-    unavailable, it falls back to an echo so the bridge remains testable.
+    Optional social-English analysis remains private conversation context; it
+    never creates a reply or establishes willingness to use a language.
     """
     cfg = get_discord_config()
     if isinstance(cfg, dict) and cfg.get("allow_replies") is False:
@@ -2156,6 +2157,25 @@ def process_inbound_message(msg) -> CommsResponse:
     if vision_context.get("perceptions"):
         metadata["vision_context"] = vision_context
 
+    from discourse_context import build_discourse_context
+    incoming_discourse = conversation_scene.get("discourse")
+    if not isinstance(incoming_discourse, dict) or not incoming_discourse:
+        incoming_discourse = build_discourse_context(
+            user_text[:8192],
+            speaker={"id": msg.sender.backend_id, "name": msg.sender.display_name},
+            # A guild message may address another participant. Only supplied
+            # scene evidence resolves "you"; DMs have the bridge as listener.
+            addressee=({"id": child, "name": child, "is_self": True}
+                       if (msg.metadata or {}).get("is_dm") else "unknown"),
+            self_identity={"id": child, "name": child, "is_self": True},
+        )
+    english_support = discord_english_support(
+        user_text, stage="incoming", discourse=incoming_discourse,
+        language_preference=language_preference,
+    )
+    metadata["social_english_support"] = english_support
+    logger.info("Social English support V1: incoming=%s", english_support.get("status"))
+
     tokens = _extract_tokens(user_text)
     if tokens and vision_context.get("event_ids") and vision_context.get("visual_token_ids"):
         try:
@@ -2216,6 +2236,7 @@ def process_inbound_message(msg) -> CommsResponse:
 
     symbolic_context = {
         "source": "discord",
+        "social_english_support": english_support,
         "source_text": user_text,
         "tokens": tokens,
         "visual_inference_words": visual_inference_words,
@@ -2476,6 +2497,13 @@ def process_inbound_message(msg) -> CommsResponse:
         metadata["song_expression_fallback"] = selected_strategy
     if selected_strategy == "mirror" and symbolic_text:
         metadata["adapter"] = "deliberate_mirror"
+        # A mirrored utterance is still the sender's wording, not Ina's "I".
+        metadata["social_english_draft_review"] = discord_english_support(
+            symbolic_text, stage="selected_draft", discourse=incoming_discourse,
+            language_preference=("native_only" if effective_language_mode != "english" else language_preference),
+        )
+        logger.info("Social English support V1: mirrored_draft=%s",
+                    metadata["social_english_draft_review"].get("status"))
         return CommsResponse(text=symbolic_text, metadata=metadata)
     if selected_strategy == "silence":
         metadata["adapter"] = "expression_silence"
@@ -2587,6 +2615,18 @@ def process_inbound_message(msg) -> CommsResponse:
     if reply_text:
         inbound_discourse = conversation_scene.get("discourse") if isinstance(conversation_scene.get("discourse"), dict) else {}
         inbound_speaker = inbound_discourse.get("speaker") or {"id": "unknown", "name": "unknown"}
+        reply_discourse = build_discourse_context(
+            reply_text[:8192],
+            speaker={"id": child, "name": child, "is_self": True},
+            addressee=incoming_discourse.get("speaker") or "unknown",
+            self_identity={"id": child, "name": child, "is_self": True},
+            mentioned_entities=(conversation_scene.get("participants") or ())[:8]
+                if isinstance(conversation_scene.get("participants"), (list, tuple)) else (),
+        )
+        metadata["social_english_draft_review"] = discord_english_support(
+            reply_text, stage="selected_draft", discourse=reply_discourse,
+            language_preference=language_preference,
+        )
         reply_text, encoding_metadata = encode_selected_text_expression(
             reply_text,
             child=child,
@@ -2605,6 +2645,12 @@ def process_inbound_message(msg) -> CommsResponse:
             },
         )
         metadata.update(encoding_metadata)
+
+    logger.info(
+        "Social English support V1: incoming=%s selected_draft=%s output_unchanged=true",
+        english_support.get("status"),
+        (metadata.get("social_english_draft_review") or {}).get("status", "not_selected"),
+    )
 
     show_memory_consideration = bool(
         root_cfg.get("conversation_scene_show_memory_consideration", False)
