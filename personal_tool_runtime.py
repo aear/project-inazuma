@@ -41,6 +41,16 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "english_social_options": {
+                "arguments": ["topic_reference?", "audience_reference?"],
+                "scope": "owner-invited English in ordinary conversation or chosen short practice; mixed/native/clarify/silence remain choices",
+                "automatic_trigger": False,
+            },
+            "english_social_review": {
+                "arguments": ["draft?", "incoming_text?", "reference_draft?", "mode? (conversation or rephrase)", "choice? (english, mixed, native_only, clarify, abstain, silence)", "discourse?"],
+                "scope": "one private structural review of supplied words; no invented reply, correction, delivery, reward or automatic learning",
+                "automatic_trigger": False,
+            },
             "speech_render": {
                 "arguments": ["text (1..512 UTF-8 bytes)", "voice? (en-gb, en-us, de, fr, es)"],
                 "scope": "local eSpeak NG TTS; private WAV; no playback, publication, translation or learning",
@@ -200,7 +210,16 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "speech_render":
+    if action == "english_social_options":
+        from social_english import social_english_options
+        value = social_english_options(topic_reference=command.get("topic_reference", ""),
+                                      audience_reference=command.get("audience_reference", ""))
+    elif action == "english_social_review":
+        from social_english import review_social_english
+        value = review_social_english(command.get("draft", ""), incoming_text=command.get("incoming_text", ""),
+            reference_draft=command.get("reference_draft", ""), mode=command.get("mode", "conversation"),
+            choice=command.get("choice", "english"), discourse=command.get("discourse"))
+    elif action == "speech_render":
         from speech_bridge import render_private_speech
         value = render_private_speech(fs, text=command.get("text"), voice=command.get("voice", "en-gb"))
     elif action.startswith("radio_"):

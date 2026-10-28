@@ -23,6 +23,12 @@ _LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did"
 _PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had", "ran", "went", "saw", "found", "felt", "wrote", "taught", "thought"}
 _MODALS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
 _VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive", "run", "close", "go", "see", "feel", "write", "read", "teach", "learn", "revise", "understand", "recognize", "recognise", "keep", "change"}
+# Grammar recognition only: these labels do not ground a desire or social intent.
+_VERBS |= {"want", "like", "enjoy", "prefer", "need", "ask", "help", "show", "share", "explain", "listen", "talk", "try", "choose", "love", "hope"}
+_PASSIVE_PARTICIPLES = {"given", "seen", "written", "taught", "found", "kept", "stolen", "told"}
+_LEMMA.update({"kept": "keep", "stolen": "steal", "chose": "choose", "chosen": "choose"})
+_PAST.update({"kept", "chose"})
+
 MAX_ANALYSIS_TOKENS = 512
 MAX_ANALYSIS_CHARACTERS = 16384
 _PRONOUNS = {"i", "me", "my", "you", "your", "he", "him", "his", "she", "her", "hers", "they", "them", "their", "it", "its", "we", "us", "our"}
@@ -178,7 +184,7 @@ def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> d
     voice = "active"
     # Preserve semantic roles across passive/active forms; do not invent a by-agent.
     passive = bool(auxiliary and _lemma_word(auxiliary) == "be"
-                   and (predicate_word in {"given", "seen", "written", "taught"} or str(predicate_word).endswith("ed")))
+                   and (predicate_word in _PASSIVE_PARTICIPLES or str(predicate_word).endswith("ed")))
     if passive:
         voice = "passive"
         arguments["theme"] = subject
@@ -256,8 +262,10 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
     context = context or {}
     discourse = discourse or DiscourseEntityMemory()
     text = str(text or "")
+    oversized = len(text) > MAX_ANALYSIS_CHARACTERS
+    text = text[:MAX_ANALYSIS_CHARACTERS]
     tokens = morphology(text)
-    incomplete = len(text) > MAX_ANALYSIS_CHARACTERS or len(tokens) >= MAX_ANALYSIS_TOKENS
+    incomplete = oversized or len(tokens) >= MAX_ANALYSIS_TOKENS
     clauses = _clauses(tokens)
     incomplete = incomplete or len(clauses) >= 8
     for clause in clauses:
@@ -289,17 +297,21 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
                 "surface": subject, "relation": "subject", "candidates": candidates,
                 "resolved": resolved_id(subject, candidates),
             })
-    possessive = re.search(r"\b(his|her|their|my|your|our|its)\s+(\w+)|\b(\w+)'s\s+(\w+)", text, re.I)
-    if possessive:
+    possessives = re.finditer(r"\b(his|her|their|my|your|our|its)\s+(\w+)|\b(\w+)['’]s\s+(\w+)", text[:MAX_ANALYSIS_CHARACTERS], re.I)
+    possessive_matches = list(islice(possessives, 33))
+    incomplete = incomplete or len(possessive_matches) > 32
+    for possessive in possessive_matches[:32]:
         pronoun_owner, pronoun_thing, named_owner, named_thing = possessive.groups()
         owner, thing = (pronoun_owner, pronoun_thing) if pronoun_owner else (named_owner, named_thing)
+        if named_owner and (named_owner.casefold() + "'s") in _CONTRACTIONS:
+            continue  # "that's" is a contraction, not possession evidence.
         if owner.casefold() in {"his", "her", "their"}:
             candidates = referent_candidates(owner)
         elif owner.casefold() in _PRONOUNS:
             candidates = referent_candidates(owner)
         else:
             candidates = [discourse.mention(owner, role="possessor", turn=turn)]
-        referents.append({"surface": owner, "relation": "possessor", "object": thing, "candidates": candidates, "resolved": resolved_id(owner, candidates)})
+        referents.append({"surface": owner, "relation": "possessor", "object": thing, "source_span": list(possessive.span()), "candidates": candidates, "resolved": resolved_id(owner, candidates)})
     pragmatic = _speech_act(text, context)
     matches = (constructions or ConstructionLearner()).observe(clauses, source_event=source_event)
     uncertainties = {
@@ -329,11 +341,11 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 5, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
+        "version": 6, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V5", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V6", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 
