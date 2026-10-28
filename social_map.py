@@ -33,13 +33,11 @@ def _load_root_config() -> dict:
     Lightweight loader for config.json so Ina can read social_map.json
     without pulling in heavier modules.
     """
-    if not CONFIG_PATH.exists():
-        return {}
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to read config at %s", CONFIG_PATH)
-        return {}
+    if CONFIG_PATH == Path("config.json"):
+        from config_layers import load_config
+        return load_config()
+    from io_utils import load_json_dict
+    return load_json_dict(CONFIG_PATH)
 
 
 def resolve_social_map_path(config: Optional[dict] = None) -> Path:
@@ -49,6 +47,14 @@ def resolve_social_map_path(config: Optional[dict] = None) -> Path:
     """
     cfg = config or _load_root_config()
     discord_cfg = cfg.get("discord") if isinstance(cfg, dict) else None
+    mount = discord_cfg.get("social_map_storage_mount") if isinstance(discord_cfg, dict) else None
+    if mount and not Path(mount).is_mount():
+        raise OSError("configured social storage is not mounted")
+    if isinstance(discord_cfg, dict) and discord_cfg.get("social_map_backend") == "sqlite":
+        path = discord_cfg.get("social_map_database_path")
+        if not isinstance(path, str) or not path.strip() or Path(path).suffix.lower() not in {".sqlite", ".sqlite3", ".db"}:
+            raise ValueError("SQLite social backend requires an explicit database path")
+        return Path(path).expanduser()
     raw_path = discord_cfg.get("social_map_path") if isinstance(discord_cfg, dict) else None
     if raw_path:
         return Path(raw_path)
@@ -62,12 +68,27 @@ def load_social_map(config: Optional[dict] = None) -> List[Dict[str, Any]]:
     Read-only loader for Ina. Returns a list of entries with at least:
     user_id, display_name, tags, trust_hint, last_interaction.
     """
-    path = resolve_social_map_path(config)
+    try:
+        path = resolve_social_map_path(config)
+    except (OSError, ValueError):
+        return []
+    if _database_path(path):
+        try:
+            from social_map_store import load
+            return load(path)
+        except Exception:
+            logger.warning("Social database unavailable; no fallback trust grants.")
+            return []
     if not path.exists():
         return []
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        from social_map_store import MAX_SOURCE_BYTES
+        with path.open("rb") as handle:
+            data = handle.read(MAX_SOURCE_BYTES + 1)
+        if len(data) > MAX_SOURCE_BYTES:
+            raise ValueError("social JSON read budget")
+        data = json.loads(data)
     except Exception:
         logger.exception("Failed to read social map at %s", path)
         return []
@@ -135,13 +156,58 @@ def _merge_tags(existing: Any, new_tags: List[str]) -> List[str]:
     return merged
 
 
-def _write_social_map(entries: List[Dict[str, Any]], path: Path) -> bool:
+def _database_path(path: Path) -> bool:
+    return Path(path).suffix.lower() in {".sqlite", ".sqlite3", ".db"}
+
+
+def _write_social_map(entries: List[Dict[str, Any]], path: Path, *, template=None) -> bool:
+    if _database_path(path):
+        raise ValueError("SQLite contact updates require a transactional mutation")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        from io_utils import atomic_write_json
+        # Preserve a migration compatibility link rather than replacing it.
+        if isinstance(template, dict) and isinstance(template.get("people"), list):
+            payload = {**template, "people": entries}
+        elif isinstance(template, dict) and len(entries) == 1:
+            payload = entries[0]
+        else:
+            payload = entries
+        atomic_write_json(path.resolve(), payload, ensure_ascii=False)
         return True
     except Exception:
-        logger.exception("Failed to write social map to %s", path)
+        logger.exception("Failed to write social map.")
+        return False
+
+
+def _edit_contact(path, config, user_id, edit):
+    if _database_path(path):
+        try:
+            from social_map_store import mutate
+            return mutate(path, user_id, edit)
+        except Exception:
+            logger.warning("Social database update deferred; original data retained.")
+            return False
+    try:
+        from io_utils import file_lock
+        real_path = path.resolve()
+        with file_lock(real_path.with_suffix(real_path.suffix + ".lock")):
+            raw = []
+            if real_path.exists():
+                from social_map_store import MAX_SOURCE_BYTES
+                with real_path.open("rb") as handle:
+                    data = handle.read(MAX_SOURCE_BYTES + 1)
+                if len(data) > MAX_SOURCE_BYTES:
+                    raise ValueError("social JSON read budget")
+                raw = json.loads(data)
+            if isinstance(raw, list):
+                entries = raw
+            elif isinstance(raw, dict):
+                entries = raw["people"] if isinstance(raw.get("people"), list) else [raw]
+            else:
+                raise ValueError("unsupported social JSON shape")
+            return _write_social_map(entries, real_path, template=raw) if edit(entries) else False
+    except Exception:
+        logger.warning("Social JSON update deferred; original data retained.")
         return False
 
 
@@ -152,6 +218,18 @@ def find_social_entry(
     config: Optional[dict] = None,
 ) -> Optional[Dict[str, Any]]:
     """Lookup helper for pulling a single entry by user_id."""
+    if social_map is None:
+        try:
+            path = resolve_social_map_path(config)
+        except (OSError, ValueError):
+            return None
+        if _database_path(path):
+            try:
+                from social_map_store import find
+                return find(path, user_id)
+            except Exception:
+                logger.warning("Social database lookup unavailable; no fallback trust grant.")
+                return None
     entries = social_map if social_map is not None else load_social_map(config)
     for entry in entries:
         try:
@@ -193,46 +271,47 @@ def record_dm_attempt(
     Returns True if the file was updated.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    path = resolve_social_map_path(config)
-    entries = load_social_map(config)
-    entry = find_social_entry(user_id, social_map=entries)
-
-    tags = tags if tags is not None else ["dm_attempt"]
-    normalized_tags = _sanitize_tags(tags)
-    name_safe = _json_safe_text(display_name) if display_name else None
-    trust_hint_safe = _json_safe_text(trust_hint) if trust_hint is not None else None
-    default_trust = trust_hint_safe or "unknown"
-
-    updated = False
-    if entry:
-        if name_safe and name_safe != entry.get("display_name"):
-            entry["display_name"] = name_safe
-            updated = True
-        if normalized_tags:
-            entry["tags"] = _merge_tags(entry.get("tags"), normalized_tags)
-            updated = True
-        if entry.get("last_interaction") != timestamp:
-            updated = True
-        entry["last_interaction"] = timestamp
-        if trust_hint_safe and (trust_hint != "unknown" or not entry.get("trust_hint")):
-            entry["trust_hint"] = trust_hint_safe
-            updated = True
-    else:
-        entries.append(
-            {
-                "user_id": str(user_id),
-                "display_name": name_safe or str(user_id),
-                "tags": normalized_tags,
-                "trust_hint": default_trust,
-                "last_interaction": timestamp,
-            }
-        )
-        updated = True
-
-    if not updated:
+    try:
+        path = resolve_social_map_path(config)
+    except (OSError, ValueError):
         return False
+    def edit(entries):
+        entry = find_social_entry(user_id, social_map=entries)
 
-    return _write_social_map(entries, path)
+        selected_tags = tags if tags is not None else ["dm_attempt"]
+        normalized_tags = _sanitize_tags(selected_tags)
+        name_safe = _json_safe_text(display_name) if display_name else None
+        trust_hint_safe = _json_safe_text(trust_hint) if trust_hint is not None else None
+        default_trust = trust_hint_safe or "unknown"
+
+        updated = False
+        if entry:
+            if name_safe and name_safe != entry.get("display_name"):
+                entry["display_name"] = name_safe
+                updated = True
+            if normalized_tags:
+                entry["tags"] = _merge_tags(entry.get("tags"), normalized_tags)
+                updated = True
+            if entry.get("last_interaction") != timestamp:
+                updated = True
+            entry["last_interaction"] = timestamp
+            if trust_hint_safe and (trust_hint != "unknown" or not entry.get("trust_hint")):
+                entry["trust_hint"] = trust_hint_safe
+                updated = True
+        else:
+            entries.append(
+                {
+                    "user_id": str(user_id),
+                    "display_name": name_safe or str(user_id),
+                    "tags": normalized_tags,
+                    "trust_hint": default_trust,
+                    "last_interaction": timestamp,
+                }
+            )
+            updated = True
+
+        return updated
+    return _edit_contact(path, config, str(user_id), edit)
 
 
 def update_social_entry(
@@ -249,45 +328,46 @@ def update_social_entry(
 
     Returns True if the file was updated.
     """
-    path = resolve_social_map_path(config)
-    entries = load_social_map(config)
-    entry = find_social_entry(user_id, social_map=entries)
-
-    name_safe = _json_safe_text(display_name) if display_name else None
-    new_tags = _sanitize_tags(tags)
-    trust_hint_safe = _json_safe_text(trust_hint) if trust_hint is not None else None
-    timestamp = last_interaction or datetime.now(timezone.utc).isoformat()
-
-    updated = False
-    if entry:
-        if name_safe and name_safe != entry.get("display_name"):
-            entry["display_name"] = name_safe
-            updated = True
-        if new_tags:
-            entry["tags"] = _merge_tags(entry.get("tags"), new_tags)
-            updated = True
-        if trust_hint_safe and trust_hint_safe != entry.get("trust_hint"):
-            entry["trust_hint"] = trust_hint_safe
-            updated = True
-        if last_interaction is not None or entry.get("last_interaction") != timestamp:
-            entry["last_interaction"] = timestamp
-            updated = True
-    else:
-        entries.append(
-            {
-                "user_id": str(user_id),
-                "display_name": name_safe or str(user_id),
-                "tags": new_tags,
-                "trust_hint": trust_hint_safe or "unknown",
-                "last_interaction": timestamp,
-            }
-        )
-        updated = True
-
-    if not updated:
+    try:
+        path = resolve_social_map_path(config)
+    except (OSError, ValueError):
         return False
+    def edit(entries):
+        entry = find_social_entry(user_id, social_map=entries)
 
-    return _write_social_map(entries, path)
+        name_safe = _json_safe_text(display_name) if display_name else None
+        new_tags = _sanitize_tags(tags)
+        trust_hint_safe = _json_safe_text(trust_hint) if trust_hint is not None else None
+        timestamp = last_interaction or datetime.now(timezone.utc).isoformat()
+
+        updated = False
+        if entry:
+            if name_safe and name_safe != entry.get("display_name"):
+                entry["display_name"] = name_safe
+                updated = True
+            if new_tags:
+                entry["tags"] = _merge_tags(entry.get("tags"), new_tags)
+                updated = True
+            if trust_hint_safe and trust_hint_safe != entry.get("trust_hint"):
+                entry["trust_hint"] = trust_hint_safe
+                updated = True
+            if last_interaction is not None or entry.get("last_interaction") != timestamp:
+                entry["last_interaction"] = timestamp
+                updated = True
+        else:
+            entries.append(
+                {
+                    "user_id": str(user_id),
+                    "display_name": name_safe or str(user_id),
+                    "tags": new_tags,
+                    "trust_hint": trust_hint_safe or "unknown",
+                    "last_interaction": timestamp,
+                }
+            )
+            updated = True
+
+        return updated
+    return _edit_contact(path, config, str(user_id), edit)
 
 
 def is_owner_friend(

@@ -839,6 +839,26 @@ def _language_limits_v2() -> dict[str, Any]:
     return limits_v2()
 
 
+def _social_storage_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_social_storage import v1
+    return v1()
+
+
+def _social_storage_v2() -> dict[str, Any]:
+    from benchmarks.benchmark_social_storage import v2
+    return v2()
+
+
+def _discord_storage_v1() -> dict[str, Any]:
+    from benchmarks.benchmark_discord_storage import v1
+    return v1()
+
+
+def _discord_storage_v2() -> dict[str, Any]:
+    from benchmarks.benchmark_discord_storage import v2
+    return v2()
+
+
 def _discord_social_english_v1() -> dict[str, Any]:
     from benchmarks.benchmark_discord_social_english import v1
     return v1()
@@ -2694,6 +2714,14 @@ _REGISTRY = {
         ModuleVersion("speech_bridge", "V1", "Pinned predecessor tool availability", _speech_bridge_v1),
         ModuleVersion("speech_bridge", "V2", "Optional private local TTS", _speech_bridge_v2),
     ),
+    "social_storage": (
+        ModuleVersion("social_storage", "V1", "Pinned JSON social map persistence", _social_storage_v1),
+        ModuleVersion("social_storage", "V2", "Explicit SQLite backend and loss-preserving JSON compatibility", _social_storage_v2),
+    ),
+    "discord_storage": (
+        ModuleVersion("discord_storage", "V1", "Pinned synchronous social-map lookup on gateway loop", _discord_storage_v1),
+        ModuleVersion("discord_storage", "V2", "Bounded storage worker preserves gateway heartbeat and authority checks", _discord_storage_v2),
+    ),
     "discord_social_english": (
         ModuleVersion("discord_social_english", "V1", "Pinned bridge without optional social English support", _discord_social_english_v1),
         ModuleVersion("discord_social_english", "V2", "Bounded private Discord comprehension and selected-draft review", _discord_social_english_v2),
@@ -2860,7 +2888,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
-                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english"} and spec.version == "V1" else
+                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"

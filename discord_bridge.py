@@ -44,6 +44,7 @@ from communicative_meaning import (
 from experience_cognition import plan_experience_cognition
 from conversation_scene import scene_with_memory_consideration
 from discord_english_support import discord_english_support
+from discord_storage_worker import BoundedDiscordStorage
 from backend_discord import (
     make_sender_info_from_discord,
     make_channel_info_from_discord,
@@ -51,6 +52,7 @@ from backend_discord import (
 )
 from social_map import (
     get_owner_user_id,
+    load_social_map,
     is_owner_friend,
     is_high_trust,
     get_high_trust_contacts,
@@ -2792,6 +2794,45 @@ class InaDiscordClient(discord.Bot):
         self._language_review_task = None
         self._ina_application_commands = register_ina_application_commands(self)
 
+    async def _storage_call(self, function, *args, default=None, **kwargs):
+        """Wait briefly for storage without blocking gateway heartbeats.
+
+        One running and one queued operation at most; failure returns no trust
+        grant. A running OS read cannot be cancelled by an asyncio deadline.
+        """
+        worker = getattr(self, "_storage_worker", None)
+        if worker is None:
+            worker = self._storage_worker = BoundedDiscordStorage()
+        try:
+            return await worker.call(function, *args, timeout=1.0, **kwargs)
+        except Exception as exc:
+            now = time.monotonic()
+            if now >= getattr(self, "_storage_notice_after", 0.0):
+                logger.warning("Discord storage deferred (%s); heartbeats remain independent.", type(exc).__name__)
+                self._storage_notice_after = now + 60.0
+            return default
+
+    async def _social_flags(self, user_id):
+        # Owner authority is already configured; don't make it wait for a map
+        # lookup that cannot add necessary authority for this decision.
+        if user_id == SAKURA_USER_ID:
+            return False, False
+
+        def read_flags():
+            entries = load_social_map(config=load_root_config())
+            return (
+                is_owner_friend(user_id, social_map=entries),
+                is_high_trust(user_id, social_map=entries),
+            )
+        return await self._storage_call(read_flags, default=(False, False))
+
+    async def _application_allowed_async(self, ctx, *, owner_only=False):
+        author_id = getattr(getattr(ctx, "author", None), "id", None)
+        if owner_only or author_id == SAKURA_USER_ID or getattr(ctx, "guild", None) is not None:
+            return self._application_command_allowed(ctx, owner_only=owner_only)
+        friend, high_trust = await self._social_flags(author_id)
+        return friend or high_trust
+
     def _application_command_allowed(self, ctx, *, owner_only: bool = False) -> bool:
         author = getattr(ctx, "author", None)
         author_id = getattr(author, "id", None)
@@ -2821,13 +2862,13 @@ class InaDiscordClient(discord.Bot):
         return channel_id in reply_ids or channel_name in reply_names
 
     async def _handle_application_status(self, ctx) -> None:
-        if not self._application_command_allowed(ctx):
+        if not await self._application_allowed_async(ctx):
             await ctx.respond("Ina's commands are not enabled in this channel.", ephemeral=True)
             return
         await ctx.respond("Ina is listening here.", ephemeral=True)
 
     async def _handle_application_history_review(self, ctx) -> None:
-        if not self._application_command_allowed(ctx, owner_only=True):
+        if not await self._application_allowed_async(ctx, owner_only=True):
             await ctx.respond("Only Ina's operator can start a history review.", ephemeral=True)
             return
         await ctx.defer(ephemeral=True)
@@ -2835,7 +2876,7 @@ class InaDiscordClient(discord.Bot):
         await ctx.followup.send(format_history_review_result(result), ephemeral=True)
 
     async def _handle_application_voice(self, ctx, *, join: bool) -> None:
-        if not self._application_command_allowed(ctx):
+        if not await self._application_allowed_async(ctx):
             await ctx.respond("Ina's commands are not enabled in this channel.", ephemeral=True)
             return
         await ctx.defer()
@@ -2929,10 +2970,10 @@ class InaDiscordClient(discord.Bot):
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user and self.user.id)
         logger.info("Discord bridge is active. DMs from owner (%s) + configured text channel will be routed.", SAKURA_USER_ID)
-        log_to_statusbox(
+        await self._storage_call(log_to_statusbox,
             "[Discord] Bridge ready; local /ina status, join, leave, and learn command handlers registered."
         )
-        update_inastate("discord_bridge_update", {
+        await self._storage_call(update_inastate, "discord_bridge_update", {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "ready",
             "voice_io_revision": 2,
@@ -3034,11 +3075,8 @@ class InaDiscordClient(discord.Bot):
         edit_analysis = infer_message_edit(before.content or "", after.content or "")
         is_dm = after.guild is None
         if is_dm:
-            trusted = (
-                after.author.id == SAKURA_USER_ID
-                or is_owner_friend(after.author.id)
-                or is_high_trust(after.author.id)
-            )
+            owner_friend, high_trust = await self._social_flags(after.author.id)
+            trusted = after.author.id == SAKURA_USER_ID or owner_friend or high_trust
             if not trusted:
                 return
             roleplay_mode = None
@@ -3069,8 +3107,8 @@ class InaDiscordClient(discord.Bot):
         await asyncio.to_thread(
             self._route_to_comms,
             after, is_dm=is_dm,
-            owner_friend=is_owner_friend(after.author.id) if is_dm else False,
-            high_trust=is_high_trust(after.author.id) if is_dm else False,
+            owner_friend=owner_friend if is_dm else False,
+            high_trust=high_trust if is_dm else False,
             conversation_context=context, edit_analysis=edit_analysis,
             roleplay=bool(roleplay_mode),
         )
@@ -3090,12 +3128,11 @@ class InaDiscordClient(discord.Bot):
         # DMs stay owner-only
         if message.guild is None:
             is_owner = message.author.id == SAKURA_USER_ID
-            owner_friend = is_owner_friend(message.author.id)
-            high_trust = is_high_trust(message.author.id)
+            owner_friend, high_trust = await self._social_flags(message.author.id)
             added = False
             if not is_owner:
                 try:
-                    added = record_dm_attempt(
+                    added = await self._storage_call(record_dm_attempt,
                         user_id=message.author.id,
                         display_name=message.author.display_name or str(message.author),
                     )
@@ -3124,13 +3161,13 @@ class InaDiscordClient(discord.Bot):
                 message.content,
                 message.channel.id,
             )
-            self._record_social_contact(message)
+            await self._storage_call(self._record_social_contact, message)
             # inastate.json is shared with the memory graph and its advisory
             # lock can be held for a long time when the backing disk is busy.
             # Never wait for that synchronous lock on Discord's event loop:
             # doing so prevents gateway heartbeats and eventually disconnects
             # the client.
-            await asyncio.to_thread(self._remember_last_dm_contact, message)
+            await self._storage_call(self._remember_last_dm_contact, message)
             if lower in VOICE_JOIN_COMMANDS:
                 await self._handle_voice_join(message)
                 return
@@ -3157,7 +3194,7 @@ class InaDiscordClient(discord.Bot):
         if not in_primary_channel and roleplay_mode is None:
             return
 
-        self._record_social_contact(message)
+        await self._storage_call(self._record_social_contact, message)
         recent_context = await self._recent_message_context(message)
         if roleplay_mode:
             await asyncio.to_thread(self._remember_roleplay_turn, message, recent_context)
@@ -3261,7 +3298,10 @@ class InaDiscordClient(discord.Bot):
         await message.channel.send("Left voice channel.")
 
     async def _ingest_image_attachments(self, message: discord.Message) -> list[dict]:
-        level = get_memory_guard_level()
+        attachments = list(message.attachments or [])
+        if not attachments:
+            return []
+        level = await self._storage_call(get_memory_guard_level, default="hard")
         if level in {"soft", "hard"}:
             logger.info("Skipping Discord image attachments due to memory guard (%s).", level)
             return []
@@ -3272,10 +3312,6 @@ class InaDiscordClient(discord.Bot):
                 allow_images = cfg.get("allow_attachments")
             if allow_images is False:
                 return []
-
-        attachments = list(message.attachments or [])
-        if not attachments:
-            return []
 
         child = get_current_child()
         attachment_dir = _resolve_attachment_dir(child, cfg)
@@ -3937,15 +3973,21 @@ class InaDiscordClient(discord.Bot):
                 if not already_connected:
                     metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
                     urge_level = _coerce_nonnegative_float(metadata.get("urge_to_voice"), 0.0)
+                    members = list(getattr(self.voice_channel, "members", []))
                     trusted_present = any(
-                        not getattr(member, "bot", False)
-                        and (
-                            getattr(member, "id", None) == SAKURA_USER_ID
-                            or is_owner_friend(getattr(member, "id", None))
-                            or is_high_trust(getattr(member, "id", None))
-                        )
-                        for member in getattr(self.voice_channel, "members", [])
+                        not getattr(member, "bot", False) and getattr(member, "id", None) == SAKURA_USER_ID
+                        for member in members
                     )
+                    if not trusted_present:
+                        def trusted_members():
+                            entries = load_social_map(config=load_root_config())
+                            return any(
+                                not getattr(member, "bot", False) and (
+                                    is_owner_friend(getattr(member, "id", None), social_map=entries)
+                                    or is_high_trust(getattr(member, "id", None), social_map=entries)
+                                ) for member in members
+                            )
+                        trusted_present = await self._storage_call(trusted_members, default=False)
                     human_present = any(
                         not getattr(member, "bot", False)
                         for member in getattr(self.voice_channel, "members", [])
@@ -4085,14 +4127,24 @@ class InaDiscordClient(discord.Bot):
             str(getattr(member, "id", "")) for member in getattr(guild, "members", [])
             if getattr(member, "id", None) and not getattr(member, "bot", False)
         }
-        last_heard = get_inastate("last_heard_contact") or {}
+        def invitation_context():
+            return {
+                "last_heard": get_inastate("last_heard_contact") or {},
+                "last_invitation": get_inastate("last_discord_voice_invitation"),
+                "contacts": get_high_trust_contacts(config=load_root_config(), min_level="high", limit=16),
+            }
+        snapshot = await self._storage_call(invitation_context)
+        if snapshot is None:
+            # Missing cooldown evidence must never be treated as "no prior DM".
+            return False
+        last_heard = snapshot["last_heard"]
         decision = select_voice_invitation_candidate(
             discord_cfg,
-            contacts=get_high_trust_contacts(config=load_root_config(), min_level="high", limit=16),
+            contacts=snapshot["contacts"],
             owner_user_id=SAKURA_USER_ID,
             guild_member_ids=guild_members,
             last_heard_user_id=last_heard.get("user_id") if isinstance(last_heard, dict) else None,
-            last_invitation=get_inastate("last_discord_voice_invitation"),
+            last_invitation=snapshot["last_invitation"],
             now=time.time(),
         )
         if not decision.get("selected"):
@@ -4218,7 +4270,8 @@ class InaDiscordClient(discord.Bot):
         if target_user_id:
             try:
                 uid = int(target_user_id)
-                if uid == SAKURA_USER_ID or is_high_trust(uid):
+                _friend, high_trust = await self._social_flags(uid)
+                if uid == SAKURA_USER_ID or high_trust:
                     sent = await _send_dm(uid)
                 else:
                     logger.info(
@@ -4233,7 +4286,7 @@ class InaDiscordClient(discord.Bot):
             sent = await _send_dm(SAKURA_USER_ID)
 
         if not sent and target in {"trusted_dm", "high_trust_dm"}:
-            contacts = get_high_trust_contacts(limit=1)
+            contacts = await self._storage_call(get_high_trust_contacts, limit=1, default=[])
             if contacts:
                 try:
                     uid = int(contacts[0].get("user_id"))
@@ -4923,7 +4976,7 @@ class InaDiscordClient(discord.Bot):
 
     async def close(self) -> None:
         """Leave voice explicitly before a bridge restart or orderly shutdown."""
-        update_inastate("discord_bridge_update", {
+        await self._storage_call(update_inastate, "discord_bridge_update", {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "stopping",
             "reason": "bridge_close",
@@ -4931,12 +4984,15 @@ class InaDiscordClient(discord.Bot):
         })
         await self._reset_voice_client()
         await super().close()
-        update_inastate("discord_bridge_update", {
+        await self._storage_call(update_inastate, "discord_bridge_update", {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "stopped",
             "reason": "bridge_close",
             "voice_disconnected": True,
         })
+        worker = getattr(self, "_storage_worker", None)
+        if worker is not None:
+            worker.close()
 
     def _on_record_complete(self, sink, generation=None, error=None):
         """
