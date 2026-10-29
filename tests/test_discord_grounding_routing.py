@@ -533,9 +533,9 @@ def test_incomplete_selected_translation_keeps_native_signal_and_english_choice(
         max_symbols=24,
     )
     assert english_rendered == (
+        "English expression: " + response + "\n"
         "Native: glyph_known sym_snd_internal\n"
         "Word-for-word: known\n"
-        "English expression: " + response + "\n"
         "Emotion/sound signal: sym_snd_internal"
     )
     assert english_metadata["effective_language_mode"] == "english_incomplete_native"
@@ -564,9 +564,9 @@ def test_emotion_symbols_keep_their_grounded_word_for_word_gloss(monkeypatch):
         language_preference="english", max_symbols=24,
     )
     assert rendered == (
+        "English expression: State signal\n"
         "Native: glyph_intensity glyph_safety\n"
         "Word-for-word: intensity safety\n"
-        "English expression: State signal\n"
         "Emotion/sound signal: sym_snd_intensity sym_emotion_safety"
     )
     assert metadata["selected_expression_word_for_word_text"] == "intensity safety"
@@ -635,8 +635,8 @@ def test_complete_selected_translation_can_render_native_and_english(monkeypatch
         language_preference="english", max_symbols=24,
     )
     assert english == (
-        "Native: λcalm λhere\nWord-for-word: calm here\n"
-        "English expression: calm here"
+        "English expression: calm here\n"
+        "Native: λcalm λhere\nWord-for-word: calm here"
     )
 
 
@@ -658,8 +658,8 @@ def test_complete_translation_keeps_word_for_word_line(monkeypatch):
         language_preference="english", max_symbols=24,
     )
     assert rendered == (
-        "Native: n1 n2 n3\nWord-for-word: law but still\n"
-        "English expression: better but still"
+        "English expression: better but still\n"
+        "Native: n1 n2 n3\nWord-for-word: law but still"
     )
 
 
@@ -709,7 +709,7 @@ def test_song_conversion_creates_persistent_sidecar(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
-def test_unknown_input_uses_expression_signal_not_lexicon_fallback(monkeypatch, tmp_path):
+def test_unknown_input_does_not_use_irrelevant_emotion_or_lexicon_fallback(monkeypatch, tmp_path):
     _enable_replying(monkeypatch)
     monkeypatch.chdir(tmp_path)
     state_path = tmp_path / "AI_Children" / "TestChild" / "memory" / "inastate.json"
@@ -741,12 +741,12 @@ def test_unknown_input_uses_expression_signal_not_lexicon_fallback(monkeypatch, 
 
     result = db.process_inbound_message(_message("Better?"))
 
-    assert result.text.startswith("State signal")
+    assert not result.text.startswith("State signal")
     assert adapter.calls == []
-    assert result.metadata["expression_decision"]["strategy"] == "emotion"
+    assert result.metadata["expression_decision"]["strategy"] == "mirror"
     assert result.metadata["expression_decision"]["adapter_response_available"] is False
     assert result.metadata["expression_decision"]["adapter_rejection"] == "unmapped_input"
-    assert result.metadata["adapter"] == "emotion_signal"
+    assert result.metadata["adapter"] == "deliberate_mirror"
 
 
 
@@ -788,14 +788,14 @@ def test_fully_mapped_input_rejects_nonconstructive_legacy_adapter(monkeypatch, 
 
     result = db.process_inbound_message(_message("Ok, take another shot."))
 
-    assert result.text.startswith("State signal")
+    assert not result.text.startswith("State signal")
     assert adapter.probes == ["Ok, take another shot."]
     assert adapter.calls == []
     decision = result.metadata["expression_decision"]
-    assert decision["strategy"] == "emotion"
+    assert decision["strategy"] == "mirror"
     assert decision["adapter_response_available"] is False
     assert decision["adapter_rejection"] == "no_grounded_reply"
-    assert result.metadata["adapter"] == "emotion_signal"
+    assert result.metadata["adapter"] == "deliberate_mirror"
 
 def test_history_parser_recovers_native_english_pairs_without_cross_pairing():
     assert db.extract_symbolic_history_alignments(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from collections import Counter, OrderedDict
 from itertools import islice
 from pathlib import Path
@@ -63,11 +64,11 @@ def morphology(text: str) -> list[dict[str, Any]]:
         for index, normalized in enumerate(expanded):
             if len(result) >= MAX_ANALYSIS_TOKENS:
                 return result
-            if normalized in ".!?,":
-                result.append({"surface": surface, "normalized": normalized, "lemma": normalized, "features": {"punctuation": True}})
+            if all(unicodedata.category(c).startswith("P") for c in normalized):
+                result.append({"surface": surface, "source_span": list(match.span()), "normalized": normalized, "lemma": normalized, "features": {"punctuation": True}})
                 continue
             if re.fullmatch(r"\d+(?:[.,]\d+)*", normalized):
-                result.append({"surface": surface, "normalized": normalized, "lemma": normalized,
+                result.append({"surface": surface, "source_span": list(match.span()), "normalized": normalized, "lemma": normalized,
                                "features": {"quantity": True}})
                 continue
             lemma = _lemma_word(normalized)
@@ -79,7 +80,7 @@ def morphology(text: str) -> list[dict[str, Any]]:
             if normalized == "not": features["negation"] = True
             if normalized in _PAST: features["tense"] = "past"
             if normalized in _MODALS: features["modality"] = normalized
-            result.append({"surface": surface, "normalized": normalized, "lemma": lemma, "features": features})
+            result.append({"surface": surface, "source_span": list(match.span()), "normalized": normalized, "lemma": lemma, "features": features})
     return result
 
 
@@ -262,6 +263,11 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
     context = context or {}
     discourse = discourse or DiscourseEntityMemory()
     text = str(text or "")
+    from character_language import analyze_characters
+    character_analysis = analyze_characters(
+        text, known_words=context.get("known_words") or (),
+        expansions=context.get("surface_expansions") or (),
+    )
     oversized = len(text) > MAX_ANALYSIS_CHARACTERS
     text = text[:MAX_ANALYSIS_CHARACTERS]
     tokens = morphology(text)
@@ -313,6 +319,26 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             candidates = [discourse.mention(owner, role="possessor", turn=turn)]
         referents.append({"surface": owner, "relation": "possessor", "object": thing, "source_span": list(possessive.span()), "candidates": candidates, "resolved": resolved_id(owner, candidates)})
     pragmatic = _speech_act(text, context)
+    surface_interpretations = []
+    surface_interpretations_complete = character_analysis["complete"] and all(
+        form["candidate_set_complete"] for form in character_analysis["forms"]
+    )
+    if character_analysis["bounds"]["source_complete"]:
+        for form in character_analysis["forms"]:
+            for candidate in form["candidates"]:
+                if len(surface_interpretations) >= 8:
+                    surface_interpretations_complete = False
+                    break
+                start, end = form["span"]
+                variant = text[:start] + candidate["text"] + text[end:]
+                surface_interpretations.append({
+                    "text_candidate": variant, "source_span": [start, end],
+                    "source_surface": form["surface"], "candidate_evidence": candidate,
+                    "clauses": _clauses(morphology(variant)),
+                    "speech_act": _speech_act(variant, context),
+                    "status": "unconfirmed_alternative", "selected": False,
+                    "meaning_certified": False,
+                })
     matches = (constructions or ConstructionLearner()).observe(clauses, source_event=source_event)
     uncertainties = {
         "predicate_arguments": {"confidence": 0.9 if all(c.get("predicate") for c in clauses) else 0.35, "reasons": []},
@@ -341,11 +367,14 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 6, "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
+        "version": 7, "character_analysis": character_analysis,
+        "surface_interpretations": surface_interpretations,
+        "surface_interpretations_complete": surface_interpretations_complete,
+        "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V6", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V7", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 

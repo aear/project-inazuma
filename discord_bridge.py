@@ -833,6 +833,8 @@ def choose_text_expression_strategy(
     code_pointer_available: bool,
     song_available: bool = False,
     conversation_scene: object = None,
+    incoming_text: str = "",
+    language_preference: object = "auto",
 ) -> dict:
     """Choose response, deliberate mirroring, a fallback signal, or silence."""
     state = state if isinstance(state, dict) else {}
@@ -876,14 +878,18 @@ def choose_text_expression_strategy(
         + min(0.06, 0.03 * relevant_memory_count)
     )
 
+    from response_language_policy import emotion_response_context, prefers_english
+    emotion_context = emotion_response_context(incoming_text, state)
+    english_bonus = 0.08 if prefers_english(language_preference) and adapter_available else 0.0
     scores = {
-        "respond": 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
+        "respond": english_bonus + 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
         if adapter_available else None,
         "mirror": mirror_evaluation["score"] if mapped and coverage >= 0.6 else None,
         "emotion": (
             0.12 + 0.20 * unit("intensity") + 0.18 * (1.0 - unit("clarity"))
             + 0.10 * unit("stress") + 0.08 * unit("isolation")
-        ) if emotion_available else None,
+            + (0.65 if emotion_context["direct_check_in"] else 0.0)
+        ) if emotion_available and emotion_context["eligible"] else None,
         "code_pointer": 0.14 + 0.12 * unit("curiosity") + 0.08 * unit("clarity")
         if code_pointer_available else None,
         "song": (
@@ -917,6 +923,8 @@ def choose_text_expression_strategy(
         "requested_strategy": requested or None,
         "intent_available": requested in available if requested else None,
         "scores": {name: round(score, 4) if score is not None else None for name, score in scores.items()},
+        "emotion_context": emotion_context,
+        "english_response_bonus": english_bonus,
         "mapping_coverage": round(coverage, 4),
         "mapped_count": mapped,
         "token_count": tokens,
@@ -1094,6 +1102,10 @@ def _encode_selected_text_expression(
     selected_text = str(text or "").strip()
     if not selected_text:
         return "", {"effective_language_mode": "none"}
+    from response_language_policy import protected_language_choice
+    protected_choice = protected_language_choice(language_preference)
+    if protected_choice in {"clarify", "abstain"}:
+        return "", {"effective_language_mode": protected_choice, "language_choice_preserved": True}
     context = context if isinstance(context, dict) else {}
     from discourse_context import build_discourse_context, render_referent_gloss, resolution_for
     from semantic_event import build_semantic_event
@@ -1133,8 +1145,13 @@ def _encode_selected_text_expression(
     )
     symbols = list(encoded.get("symbols") or []) if encoded else []
     if not symbols:
-        return selected_text, {
-            "effective_language_mode": "english_unmapped",
+        _, empty_mode = select_symbolic_message_text(
+            {"native_text": "", "gloss_text": "", "text": ""}, language_preference
+        )
+        declined = protected_choice == "native_only" or empty_mode in {"clarify", "abstain"}
+        return ("" if declined else selected_text), {
+            "language_choice_preserved": declined,
+            "effective_language_mode": empty_mode if declined else "english_unmapped",
             "selected_expression_symbols": [],
             "native_translation_complete": False,
             "native_translation_rejections": ["no_mapped_symbols"],
@@ -1272,10 +1289,10 @@ def _encode_selected_text_expression(
         )
         layers = []
         if requested_mode == "english":
+            layers.append(f"English expression: {selected_text}")
             if native_text:
                 layers.append(f"Native: {native_text}")
             layers.append(f"Word-for-word: {word_for_word_text}")
-            layers.append(f"English expression: {selected_text}")
             effective_mode = "english_incomplete_native"
         else:
             if native_text:
@@ -1295,10 +1312,10 @@ def _encode_selected_text_expression(
     )
     layers = []
     if effective_mode == "english":
+        layers.append(f"English expression: {selected_text}")
         if native_text:
             layers.append(f"Native: {native_text}")
         layers.append(f"Word-for-word: {word_for_word_text}")
-        layers.append(f"English expression: {selected_text}")
     else:
         if native_text:
             layers.append(f"Native: {native_text}")
@@ -2062,12 +2079,8 @@ def process_inbound_message(msg) -> CommsResponse:
     except Exception:
         state = {}
     urge_state = state.get("urge_to_type") or state.get("urge_to_communicate") or {}
-    language_preference = (
-        state.get("discord_language_preference")
-        or state.get("communication_language_preference")
-        or cfg.get("language_mode")
-        or "auto"
-    )
+    from response_language_policy import resolve_response_language_preference
+    language_preference = resolve_response_language_preference(state, cfg)
     urge_level = _resolve_adjusted_urge_level(urge_state)
     ignore_urge = bool(root_cfg.get("ignore_urge_for_typing", False)) if isinstance(root_cfg, dict) else False
     if not ignore_urge and urge_level < min_urge:
@@ -2084,6 +2097,9 @@ def process_inbound_message(msg) -> CommsResponse:
     reply_text = None
     adapter = get_chat_adapter()
     metadata = {"source": "discord_bridge.process_inbound_message", "adapter": "expression_arbiter"}
+    from character_language import analyze_characters
+    character_analysis = analyze_characters(user_text)
+    metadata["incoming_character_analysis"] = character_analysis
     conversation_scene = (msg.metadata or {}).get("conversation_scene") or {}
     prior_memory_candidates = [
         dict(reference)
@@ -2239,6 +2255,7 @@ def process_inbound_message(msg) -> CommsResponse:
     symbolic_context = {
         "source": "discord",
         "social_english_support": english_support,
+        "character_analysis": character_analysis,
         "source_text": user_text,
         "tokens": tokens,
         "visual_inference_words": visual_inference_words,
@@ -2383,7 +2400,10 @@ def process_inbound_message(msg) -> CommsResponse:
     metadata["conversation_meaning_examples"] = conversation_examples
     metadata["communicative_meaning_shadow_output_unchanged"] = True
     metadata["experience_cognition_shadow_output_unchanged"] = True
-    emotion_signal = format_emotion_signal(state)
+    from response_language_policy import emotion_response_context
+    emotion_context = emotion_response_context(user_text, state)
+    emotion_signal = format_emotion_signal(state) if emotion_context["eligible"] else None
+    metadata["emotion_response_context"] = emotion_context
     code_pointer_signal = format_code_pointer_signal(state)
     song_candidate = resolve_song_expression_candidate(state, child=child)
     adapter_can_respond = bool(adapter and (user_text.strip() or not attachments))
@@ -2428,6 +2448,8 @@ def process_inbound_message(msg) -> CommsResponse:
         code_pointer_available=code_pointer_signal is not None,
         song_available=bool(song_candidate.get("available")),
         conversation_scene=conversation_scene,
+        incoming_text=user_text,
+        language_preference=language_preference,
     )
     decision_record = {
         **expression_decision,

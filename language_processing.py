@@ -2239,6 +2239,12 @@ def generate_symbolic_reply_from_text(
         return None
 
     reply_context: Dict[str, Any] = dict(context) if isinstance(context, dict) else {}
+    from character_language import analyze_characters
+    character_analysis = analyze_characters(
+        text, known_words=reply_context.get("known_words") or (),
+        expansions=reply_context.get("surface_expansions") or (),
+    )
+    reply_context["character_analysis"] = character_analysis
     from semantic_event import build_native_intent, build_semantic_event
     semantic_event = reply_context.get("semantic_event")
     if not isinstance(semantic_event, dict):
@@ -2386,6 +2392,7 @@ def generate_symbolic_reply_from_text(
         "symbol_limit": symbol_limit,
         "language_context_shadow": language_context_shadow,
         "resolved_meanings": resolved_meanings,
+        "character_analysis": character_analysis,
         "learned_media_guidance": learned_media_guidance,
         "semantic_event": semantic_event,
         "native_intent": native_intent,
