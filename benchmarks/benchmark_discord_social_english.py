@@ -17,7 +17,7 @@ BASELINE = '5273e488040a3aabc2695da592a526b806317723'
 
 def route_fixture(source, *, text='I enjoy your song.', draft='I might share my song.',
                   strategy='respond', preference='auto', scene=True, dm=False,
-                  support=None, disabled=False, low_urge=False):
+                  support=None, disabled=False, low_urge=False, identity_aliases=None):
     from discourse_context import build_discourse_context
     from discord_english_support import discord_english_support
     tree=ast.parse(source)
@@ -40,7 +40,7 @@ def route_fixture(source, *, text='I enjoy your song.', draft='I might share my 
         return (('∘⊙' if preference=='native_only' else text),{'fixture_encoding':True})
     env={
         'CommsResponse':lambda **kwargs:SimpleNamespace(**kwargs),
-        'get_discord_config':lambda:{'allow_replies':not disabled,'language_mode':preference},
+        'get_discord_config':lambda:{'allow_replies':not disabled,'language_mode':preference,'identity_aliases':{'Ina':identity_aliases or []}},
         'get_current_child':lambda:'Ina','_format_image_attachment_note':lambda a:'',
         '_collect_vision_context':lambda a:{},'load_root_config':lambda:{'ignore_urge_for_typing':not low_urge},
         'Path':lambda p:NoFile(),'_resolve_adjusted_urge_level':lambda s:0 if low_urge else 1,

@@ -43,8 +43,12 @@ def build_semantic_event(text: str, discourse: Mapping[str, Any] | None = None) 
             "tense": clause.get("tense"),
             "modality": clause.get("modality"),
             "negated": bool(clause.get("negated")),
+            "negation_operator": clause.get("negation_operator"),
             "negation_scope": clause.get("negation_scope"),
             "parent_clause": clause.get("parent_clause"),
+            "clausal_relation": clause.get("clausal_relation"),
+            "embedded_content_is_fact": False,
+            "alternatives": list(clause.get("alternatives") or [])[:4],
             "voice": clause.get("voice", "active"),
             "question_word": clause.get("question_word"),
             "inverted": clause.get("inverted", False),
@@ -95,6 +99,12 @@ def build_native_intent(semantic_event: Mapping[str, Any]) -> dict[str, Any]:
             grammar.append({"construction": "modality", "value": event.get("modality")})
         if event.get("negated"):
             grammar.append({"construction": "negation", "scope": event.get("negation_scope")})
+        if event.get("parent_clause"):
+            grammar.append({"construction": "embedded_content", "parent": event["parent_clause"],
+                            "relation": event.get("clausal_relation"), "asserted_as_fact": False})
+        if event.get("alternatives"):
+            grammar.append({"construction": "alternatives", "scope": event.get("id"),
+                            "options": event["alternatives"], "choice_selected": False})
     lexical = []
     for concept in concepts:
         surface = concept.get("surface")
@@ -102,6 +112,7 @@ def build_native_intent(semantic_event: Mapping[str, Any]) -> dict[str, Any]:
             lexical.append(surface)
     return {
         "version": 1, "events": list(semantic_event.get("events") or ())[:8],
+        "incomplete": bool(semantic_event.get("incomplete")),
         "concepts": concepts[:32], "grammar": grammar[:16],
         "lexical_realizations": lexical[:32],
     }

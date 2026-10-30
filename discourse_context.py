@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 MODULE_NAME = "discourse"
-MODULE_VERSION = "V3"
+MODULE_VERSION = "V4"
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -26,9 +26,10 @@ def _entity(value: Any, *, fallback: str = "unknown") -> dict[str, Any]:
         name = str(value.get("display_name") or value.get("name") or value.get("id") or fallback)[:80]
         is_self = bool(value.get("is_self"))
         identifier = "self" if is_self else str(value.get("id") or value.get("internal_id") or name).strip().casefold()[:128]
-        return {"id": identifier or fallback, "name": name, "is_self": is_self}
+        return {"id": identifier or fallback, "name": name, "is_self": is_self,
+                "label_only": bool(value.get("label_only")) or not bool(value.get("id") or value.get("internal_id"))}
     name = str(value or fallback).strip()[:80] or fallback
-    return {"id": name.casefold(), "name": name, "is_self": False}
+    return {"id": name.casefold(), "name": name, "is_self": False, "label_only": True}
 
 
 def _unique_entities(values: Iterable[Any], limit: int = 8) -> list[dict[str, Any]]:
@@ -48,6 +49,7 @@ def _unique_entities(values: Iterable[Any], limit: int = 8) -> list[dict[str, An
 def build_discourse_context(
     text: str, *, speaker: Any, addressee: Any, self_identity: Any = None,
     current_subject: Any = None, mentioned_entities: Iterable[Any] = (), prior_referent: Any = None,
+    self_aliases: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Resolve explicit conversational roles while preserving ambiguity."""
     speaker_entity = _entity(speaker)
@@ -101,12 +103,16 @@ def build_discourse_context(
         "prior_referent": prior,
         "mentioned_entities": mentioned,
     }
-    return {
+    result = {
         "version": 2, "speaker": speaker_entity, "addressee": addressee_entity,
         "self": self_entity, "current_subject": subject,
         "mentioned_entities": mentioned, "referent_table": referent_table,
         "resolutions": resolutions[:32],
     }
+    if self_aliases:
+        from identity_language import enrich_named_references
+        result = enrich_named_references(result, text, self_aliases)
+    return result
 
 
 def retrieval_routes(context: Mapping[str, Any]) -> list[dict[str, Any]]:

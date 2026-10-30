@@ -975,6 +975,19 @@ def _developmental_readiness(
         if status != 'complete' or passed is not True:
             state += ' · highlight'
         rows.append((f'Assessment · {label}', value, state, _modified(assessment_path), json.dumps(assessment, indent=2)))
+        if domain == 'language_english':
+            profile = assessment.get('learning_profile')
+            profile = profile if isinstance(profile, dict) else {}
+            goals = profile.get('goals')
+            goals = goals if isinstance(goals, list) else []
+            for goal in goals[:16]:
+                if not isinstance(goal, dict):
+                    continue
+                progress = {"fixtures_available": "tools checked", "limitations_retained": "limits observed", "not_assessed": "not measured"}.get(goal.get("implementation_status"), "not measured")
+                rows.append((f"English goal · {goal.get('dimension', 'practice')} · {goal.get('id', '')}",
+                             str(goal.get('description') or ''),
+                             f"optional · {progress} · Ina not assessed",
+                             _modified(assessment_path), json.dumps(goal, indent=2)))
     cards = [
         ('Domains', str(len(report['domains']))),
         ('Sandbox ready', str(report['summary']['sandbox_ready'])),

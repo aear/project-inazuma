@@ -14,6 +14,8 @@ def assess_english_foundation() -> dict[str, Any]:
     selections = (
         ("language_components", ("V3",)), ("discourse", ("V3",)),
         ("semantic_topology", ("V3",)), ("expression_core", ("V6",)),
+        ("character_language", ("V2",)), ("self_name_reference", ("V2",)),
+        ("english_workbench", ("V2",)), ("language_transfer_limits", ("V2",)),
     )
     results = []
     for module, versions in selections:
@@ -24,8 +26,11 @@ def assess_english_foundation() -> dict[str, Any]:
                 "components": result.component_scores, "source_revision": result.source_revision,
                 "implementation_identity": result.implementation_identity,
             })
+    from english_learning_profile import build_english_learning_profile
     return {
-        "schema": "ina.capability_assessment/V1", "domain": "language_english",
+        "schema": "ina.capability_assessment/V2", "domain": "language_english",
+        "status": "complete", "learning_profile": build_english_learning_profile(results),
+        "assessment_scope": "implementation_fixtures; not an Ina response trial",
         "subject": "current_implementation", "assessed_at": datetime.now(timezone.utc).isoformat(),
         "results": results, "all_cases_passed": all(row["correct"] == row["total"] for row in results),
         "live_social_expression_assessed": False,

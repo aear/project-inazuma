@@ -835,6 +835,7 @@ def choose_text_expression_strategy(
     conversation_scene: object = None,
     incoming_text: str = "",
     language_preference: object = "auto",
+    name_context: object = None,
 ) -> dict:
     """Choose response, deliberate mirroring, a fallback signal, or silence."""
     state = state if isinstance(state, dict) else {}
@@ -915,10 +916,16 @@ def choose_text_expression_strategy(
         strategy = requested
         reason = "explicit_intent"
     else:
+        name_context = name_context if isinstance(name_context, dict) else {}
+        if name_context.get("direct_self_address") or name_context.get("self_name_statement"):
+            # Echoing a greeting/name correction is not evidence of answering it.
+            # Deliberate mirroring above still remains an available choice.
+            available.pop("mirror", None)
         strategy = max(available, key=lambda name: (available[name], name))
         reason = "internal_state_scores"
     return {
         "strategy": strategy,
+        "automatic_mirror_excluded": "mirror" not in available and scores["mirror"] is not None,
         "reason": reason,
         "requested_strategy": requested or None,
         "intent_available": requested in available if requested else None,
@@ -1117,6 +1124,7 @@ def _encode_selected_text_expression(
             addressee=context.get("addressee") or "unknown",
             self_identity={"id": child, "name": child, "is_self": True},
             mentioned_entities=context.get("mentioned_entities") or (),
+            self_aliases=context.get("self_aliases") or (),
         )
     semantic_event = build_semantic_event(selected_text, supplied_discourse)
     encoded = generate_symbolic_reply_from_text(
@@ -2187,6 +2195,33 @@ def process_inbound_message(msg) -> CommsResponse:
                        if (msg.metadata or {}).get("is_dm") else "unknown"),
             self_identity={"id": child, "name": child, "is_self": True},
         )
+    from identity_language import identity_aliases
+    configured_aliases = cfg.get("identity_aliases")
+    configured_aliases = configured_aliases.get(child, []) if isinstance(configured_aliases, dict) else []
+    self_aliases = identity_aliases(state.get(
+        "communication_identity_aliases", configured_aliases
+    ))
+    if self_aliases:
+        # Reuse the authoritative scene roles; do not turn another person's
+        # message into Ina's first-person speech or silently learn a new name.
+        incoming_discourse = build_discourse_context(
+            user_text[:8192],
+            speaker=incoming_discourse.get("speaker") or {"id": msg.sender.backend_id, "name": msg.sender.display_name},
+            addressee=incoming_discourse.get("addressee") or "unknown",
+            self_identity={"id": child, "name": (incoming_discourse.get("self") or {}).get("name") or child, "is_self": True},
+            self_aliases=self_aliases,
+            current_subject=incoming_discourse.get("current_subject"),
+            prior_referent=(incoming_discourse.get("referent_table") or {}).get("prior_referent"),
+            mentioned_entities=incoming_discourse.get("mentioned_entities") or (),
+        )
+        incoming_discourse["self_name_context"]["alias_source"] = (
+            "state.communication_identity_aliases" if "communication_identity_aliases" in state
+            else "discord_config.identity_aliases"
+        )
+    name_context = incoming_discourse.get("self_name_context") or {}
+    conversation_scene = {**conversation_scene, "discourse": incoming_discourse}
+    metadata["conversation_scene"] = conversation_scene
+    metadata["self_name_context"] = name_context
     english_support = discord_english_support(
         user_text, stage="incoming", discourse=incoming_discourse,
         language_preference=language_preference,
@@ -2256,6 +2291,7 @@ def process_inbound_message(msg) -> CommsResponse:
         "source": "discord",
         "social_english_support": english_support,
         "character_analysis": character_analysis,
+        "discourse": incoming_discourse,
         "source_text": user_text,
         "tokens": tokens,
         "visual_inference_words": visual_inference_words,
@@ -2450,6 +2486,7 @@ def process_inbound_message(msg) -> CommsResponse:
         conversation_scene=conversation_scene,
         incoming_text=user_text,
         language_preference=language_preference,
+        name_context=name_context,
     )
     decision_record = {
         **expression_decision,
@@ -2644,6 +2681,7 @@ def process_inbound_message(msg) -> CommsResponse:
             speaker={"id": child, "name": child, "is_self": True},
             addressee=incoming_discourse.get("speaker") or "unknown",
             self_identity={"id": child, "name": child, "is_self": True},
+            self_aliases=self_aliases,
             mentioned_entities=(conversation_scene.get("participants") or ())[:8]
                 if isinstance(conversation_scene.get("participants"), (list, tuple)) else (),
         )
@@ -2663,6 +2701,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 "tags": ["discord", "selected_expression", selected_strategy],
                 "channel": msg.channel.name,
                 "expression_drive": urge_level,
+                **({"self_aliases": self_aliases} if self_aliases else {}),
                 "speaker": {"id": child, "name": child, "is_self": True},
                 "addressee": inbound_speaker,
                 "mentioned_entities": conversation_scene.get("participants") or (),

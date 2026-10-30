@@ -41,6 +41,16 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "english_compose_selected": {
+                "arguments": ["native_intent", "expression_intent", "choice?", "cognition_plan?"],
+                "scope": "one private English candidate from selected structured meaning; no thought selection, delivery or automatic learning",
+                "automatic_trigger": False,
+            },
+            "english_learning_options": {
+                "arguments": [],
+                "scope": "optional comprehension, expression and held-out assessment goals; does not run benchmarks or adopt a goal",
+                "automatic_trigger": False,
+            },
             "english_social_options": {
                 "arguments": ["topic_reference?", "audience_reference?"],
                 "scope": "owner-invited English in ordinary conversation or chosen short practice; mixed/native/clarify/silence remain choices",
@@ -210,7 +220,14 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "english_social_options":
+    if action == "english_compose_selected":
+        from english_composition import compose_selected_english
+        value = compose_selected_english(command.get("native_intent"), command.get("expression_intent"),
+            choice=command.get("choice", "english"), cognition_plan=command.get("cognition_plan"))
+    elif action == "english_learning_options":
+        from english_learning_profile import build_english_learning_profile
+        value = build_english_learning_profile()
+    elif action == "english_social_options":
         from social_english import social_english_options
         value = social_english_options(topic_reference=command.get("topic_reference", ""),
                                       audience_reference=command.get("audience_reference", ""))

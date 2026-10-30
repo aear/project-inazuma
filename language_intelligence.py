@@ -26,6 +26,8 @@ _MODALS = {"can", "could", "may", "might", "must", "shall", "should", "will", "w
 _VERBS = {"tell", "say", "steal", "give", "be", "do", "have", "find", "remember", "think", "know", "open", "arrive", "run", "close", "go", "see", "feel", "write", "read", "teach", "learn", "revise", "understand", "recognize", "recognise", "keep", "change"}
 # Grammar recognition only: these labels do not ground a desire or social intent.
 _VERBS |= {"want", "like", "enjoy", "prefer", "need", "ask", "help", "show", "share", "explain", "listen", "talk", "try", "choose", "love", "hope"}
+_VERBS |= {"believe", "wish", "suppose", "doubt"}
+_COMPLEMENT_VERBS = {"say", "tell", "think", "know", "believe", "hope", "wish", "suppose", "doubt", "want"}
 _PASSIVE_PARTICIPLES = {"given", "seen", "written", "taught", "found", "kept", "stolen", "told"}
 _LEMMA.update({"kept": "keep", "stolen": "steal", "chose": "choose", "chosen": "choose"})
 _PAST.update({"kept", "chose"})
@@ -208,15 +210,27 @@ def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> d
         elif tail: arguments["theme"] = " ".join(tail)
     elif tail:
         arguments["theme"] = " ".join(tail)
+    alternatives = []
+    choice_words = str(arguments.get("theme") or "").split()
+    if not passive and choice_words.count("or") == 1:
+        at = choice_words.index("or")
+        left = choice_words[:at]
+        if left and left[0] == "either": left = left[1:]
+        if left and choice_words[at + 1:]:
+            alternatives.append({"relation": "alternative", "argument_role": "theme",
+                                 "options": [" ".join(left), " ".join(choice_words[at + 1:])],
+                                 "exclusivity": "unresolved",
+                                 "negation_scope": "unresolved" if negated else None})
     tense_word = auxiliary or predicate_word or ""
     return {
         "id": clause_id, "parent_clause": parent, "subject": subject,
         "predicate": predicate, "arguments": arguments, "negated": negated,
+        "negation_operator": "never" if "never" in words else "not" if "not" in words else None,
         "negation_scope": clause_id if negated else None,
         "tense": "past" if tense_word in _PAST or tense_word.endswith("ed") else "present",
         "modality": next((word for word in words if word in _MODALS), None),
         "voice": voice, "question_word": question_word, "inverted": inverted,
-        "surface_words": words,
+        "surface_words": words, "alternatives": alternatives,
     }
 
 
@@ -230,22 +244,38 @@ def _clauses(tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
             current.append(word)
     if current: segments.append(current)
     result = []
-    for words in segments[:8]:
-        reporting = next((i for i, word in enumerate(words) if _lemma_word(word) in {"say", "tell"}), None)
-        split = None
-        if reporting is not None:
-            start = reporting + 1
-            if _lemma_word(words[reporting]) == "tell" and start < len(words): start += 1
-            if start < len(words) and words[start] == "that": start += 1
-            if start + 1 < len(words) and any(_lemma_word(word) in _VERBS or word in _MODALS for word in words[start + 1:]):
-                split = start
+    def admit(words, parent=None, depth=0, relation=None):
+        if len(result) >= 8: return
         identifier = f"c{len(result)}"
-        if split is None:
-            result.append(_clause(words, clause_id=identifier))
+        matrix = next((i for i, word in enumerate(words) if _lemma_word(word) in _COMPLEMENT_VERBS), None)
+        split = None
+        if matrix is not None:
+            start = matrix + 1
+            if _lemma_word(words[matrix]) == "tell" and start < len(words): start += 1
+            if start < len(words) and words[start] == "that": start += 1
+            inner_verb = next((i for i in range(start + 1, len(words))
+                               if _lemma_word(words[i]) in _VERBS or words[i] in _MODALS), None)
+            prefix = words[start:inner_verb] if inner_verb is not None else []
+            # A finite complement needs an explicit subject. Infinitives and
+            # implied subjects remain outside this bounded recognizer.
+            if prefix and "to" not in prefix and not any(word in {"not", "never", "or", "and"} for word in prefix):
+                split = start
+        if split is not None and depth < 4:
+            outer_words = words[:split]
+            if outer_words and outer_words[-1] == "that": outer_words = outer_words[:-1]
+            outer = _clause(outer_words, clause_id=identifier, parent=parent)
+            outer["clausal_relation"] = relation
+            outer["embedded_content_is_fact"] = False
+            result.append(outer)
+            admit(words[split:], parent=identifier, depth=depth+1,
+                  relation="reported_content" if outer["predicate"] in {"say", "tell"} else "attitude_content")
         else:
-            result.append(_clause(words[:split], clause_id=identifier))
-            result.append(_clause(words[split:], clause_id=f"c{len(result)}", parent=identifier))
-        if len(result) >= 8: break
+            clause = _clause(words, clause_id=identifier, parent=parent)
+            clause["clausal_relation"] = relation
+            clause["embedded_content_is_fact"] = False
+            clause["scope_incomplete"] = split is not None or (matrix is not None and "to" in words[matrix+1:] and any(word in {"not", "never"} for word in words[matrix+1:]))
+            result.append(clause)
+    for words in segments[:8]:admit(words)
     return result[:8] or [_clause([], clause_id="c0")]
 
 
@@ -273,7 +303,7 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
     tokens = morphology(text)
     incomplete = oversized or len(tokens) >= MAX_ANALYSIS_TOKENS
     clauses = _clauses(tokens)
-    incomplete = incomplete or len(clauses) >= 8
+    incomplete = incomplete or len(clauses) >= 8 or any(c.get("scope_incomplete") for c in clauses)
     for clause in clauses:
         subject = clause.get("subject")
         if subject and subject not in _PRONOUNS: discourse.mention(subject, role="agent", turn=turn)
@@ -367,14 +397,14 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
             {"meaning": {"clauses": clauses, "pragmatics": "sarcastic_negative_evaluation"}, "changes": ["pragmatics"], "confidence": 0.5},
         ])
     return {
-        "version": 7, "character_analysis": character_analysis,
+        "version": 8, "character_analysis": character_analysis,
         "surface_interpretations": surface_interpretations,
         "surface_interpretations_complete": surface_interpretations_complete,
         "text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete, "morphology": tokens, "clauses": clauses,
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V7", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V8", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 
