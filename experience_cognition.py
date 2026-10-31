@@ -45,11 +45,18 @@ LENS_SIGNALS: dict[str, tuple[str, ...]] = {
 def _unit(value: Any, default: float = 0.0) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = default
     if not math.isfinite(number):
         number = default
     return max(0.0, min(1.0, number))
+
+
+def _evidence_refs(raw: Any, limit: int = 8) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return list(dict.fromkeys(item.strip()[:256] for item in raw[:limit]
+                             if isinstance(item, str) and item.strip()))
 
 
 def bounded_signals(event: Mapping[str, Any]) -> dict[str, float]:
@@ -108,11 +115,7 @@ def inspect_attention_lenses(event: Mapping[str, Any]) -> list[dict[str, Any]]:
     for lens, names in LENS_SIGNALS.items():
         values = {name: signals[name] for name in names}
         supplied = evidence.get(lens)
-        references = []
-        if isinstance(supplied, (list, tuple)):
-            references = [str(item)[:256] for item in supplied[:8] if str(item)]
-        elif supplied:
-            references = [str(supplied)[:256]]
+        references = _evidence_refs(supplied)
         rows.append({
             "lens": lens,
             "salience": round(max(values.values(), default=0.0), 6),
@@ -146,10 +149,7 @@ def gate_transient_state(
             + .25 * factors["salience"] + .10 * factors["novelty"]
             + .10 * min(1.0, corroboration / 2.0)
         )
-        source_references = [
-            str(item)[:256] for item in islice(candidate.get("source_references") or (), 8)
-            if str(item)
-        ]
+        source_references = _evidence_refs(candidate.get("source_references"))
         action = "propagate" if score >= propagate_at else ("hold" if score >= hold_at else "decay")
         if action == "propagate" and not source_references:
             action = "hold"
@@ -240,7 +240,7 @@ def assess_uncertainty(event: Mapping[str, Any]) -> dict[str, Any]:
         for reference in references[:8]:
             origin = origins.get(str(reference))
             if isinstance(origin, str) and origin.strip():
-                groups.add(origin[:256])
+                groups.add(origin.strip()[:256])
     if not available or candidate_answer is None or (missing and uncertainty >= .75):
         status = "unknown"
         confidence = 0.0
@@ -359,8 +359,8 @@ def build_multi_horizon_predictions(
             continue
         horizon = str(candidate.get("horizon") or "").lower()
         description = str(candidate.get("prediction") or "")[:1000]
-        sources = [str(item)[:256] for item in islice(candidate.get("source_references") or (), 8) if str(item)]
-        disconfirm = [str(item)[:512] for item in islice(candidate.get("disconfirming_observations") or (), 8) if str(item)]
+        sources = _evidence_refs(candidate.get("source_references"))
+        disconfirm = _evidence_refs(candidate.get("disconfirming_observations"))
         if horizon not in grouped or not description or not sources or not disconfirm:
             rejected.append({
                 "prediction": description, "horizon": horizon,

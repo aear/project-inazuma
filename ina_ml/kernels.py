@@ -19,7 +19,11 @@ def coerce_vector(values: Iterable[Any] | None, *, invalid: float = 0.0) -> list
 
 
 def vector_norm(vector: Sequence[float]) -> float:
-    return math.sqrt(sum(float(value) * float(value) for value in vector))
+    values = vector if hasattr(vector, "__len__") else tuple(vector)
+    try:
+        return math.hypot(*values)
+    except TypeError:
+        return math.hypot(*(float(value) for value in values))
 
 
 def normalize_vector(
@@ -29,8 +33,18 @@ def normalize_vector(
     digits: Optional[int] = None,
 ) -> list[float]:
     values = coerce_vector(vector)
-    norm = vector_norm(values) or 1.0
-    normalized = [(value / norm) * float(scale) for value in values]
+    raw_norm = vector_norm(values)
+    norm = raw_norm or 1.0
+    if values and all(math.isfinite(value) for value in values) and (
+        any(values) and (not math.isfinite(raw_norm) or raw_norm < 1e-150)
+    ):
+        # A finite vector can overflow/underflow intermediate squared norms.
+        peak = max(abs(value) for value in values)
+        scaled = [value / peak for value in values]
+        length = math.hypot(*scaled)
+        normalized = [(value / length) * float(scale) for value in scaled]
+    else:
+        normalized = [(value / norm) * float(scale) for value in values]
     return [round(value, digits) for value in normalized] if digits is not None else normalized
 
 
@@ -66,16 +80,39 @@ def cosine_similarity(
     """Use the project's established unequal-length semantics."""
     if not left or not right:
         return 0.0
-    dot = sum(float(a) * float(b) for a, b in zip(left, right))
+    padding = float(epsilon)
+    if not math.isfinite(padding) or padding < 0:
+        raise ValueError("epsilon must be finite and nonnegative")
     if overlap_norms:
         length = min(len(left), len(right))
-        left_norm = math.sqrt(sum(float(left[index]) ** 2 for index in range(length)))
-        right_norm = math.sqrt(sum(float(right[index]) ** 2 for index in range(length)))
+        left, right = left[:length], right[:length]
+    a_norm, b_norm = vector_norm(left), vector_norm(right)
+    if a_norm == 0.0 or b_norm == 0.0:
+        return 0.0
+    if math.isfinite(a_norm) and math.isfinite(b_norm):
+        # Finite hypot norms also establish finite coordinates. Keep the common
+        # path allocation-light; scaled copies are only needed at numeric limits.
+        dot = sum(float(x) * float(y) for x, y in zip(left, right))
+        mass = a_norm * b_norm
+        denominator = mass + padding
+        if math.isfinite(dot) and math.isfinite(denominator) and mass > 1e-280:
+            return max(-1.0, min(1.0, dot / denominator))
+    a, b = [float(value) for value in left], [float(value) for value in right]
+    if not all(math.isfinite(value) for value in (*a, *b)):
+        return 0.0  # Invalid coordinates cannot establish a similarity match.
+    a_peak, b_peak = max(map(abs, a), default=0.0), max(map(abs, b), default=0.0)
+    if not a_peak or not b_peak:
+        return 0.0
+    a_scaled, b_scaled = [x / a_peak for x in a], [y / b_peak for y in b]
+    scaled_dot = math.fsum(x * y for x, y in zip(a_scaled, b_scaled))
+    # Preserve epsilon's original absolute damping, including on tiny vectors.
+    if padding:
+        logarithm = math.log(padding) - math.log(a_peak) - math.log(b_peak)
+        correction = math.inf if logarithm > 709.0 else math.exp(logarithm)
     else:
-        left_norm = vector_norm(left)
-        right_norm = vector_norm(right)
-    denominator = left_norm * right_norm + float(epsilon)
-    return dot / denominator if denominator > 0.0 else 0.0
+        correction = 0.0
+    stable = scaled_dot / (math.hypot(*a_scaled) * math.hypot(*b_scaled) + correction)
+    return max(-1.0, min(1.0, stable))
 
 
 @lru_cache(maxsize=65_536)

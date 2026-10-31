@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 import math
 import uuid
+from itertools import islice
 
 from cognition_runtime.cognitive_context import CognitiveContext, _bounded
 from expression_core import (
@@ -62,6 +63,7 @@ class Decision:
     modalities: tuple[str, ...]
     alternatives: tuple[str, ...]
     reason: str
+    evidence_summary: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +72,7 @@ class Decision:
             "scores": dict(self.scores), "evidence": [dict(row) for row in self.evidence],
             "confidence": self.confidence, "modalities": list(self.modalities),
             "alternatives": list(self.alternatives), "reason": self.reason,
+            "evidence_summary": dict(self.evidence_summary),
         }
 
 
@@ -154,30 +157,40 @@ class ThoughtProcessor:
         its contribution. No lexical or non-lexical modality gets an implicit
         preference.
         """
-        names = tuple(dict.fromkeys(str(item)[:256] for item in options if str(item)))[:32]
-        thought_index = {item.thought_id: item for item in tuple(thoughts)[:64]}
+        option_rows, thought_rows, evidence_rows = list(islice(options, 33)), list(islice(thoughts, 65)), list(islice(evidence, 129))
+        names = tuple(dict.fromkeys(str(item)[:256] for item in option_rows[:32] if str(item)))
+        thought_index = {item.thought_id: item for item in thought_rows[:64] if isinstance(item, Thought)}
         scores = {name: 0.0 for name in names}
-        used = []
-        for row in tuple(evidence)[:128]:
+        groups = {}; duplicate_rows = 0
+        for row in evidence_rows[:128]:
+            if not isinstance(row, Mapping):continue
             option = str(row.get("option") or "")[:256]
             thought = thought_index.get(str(row.get("thought_id") or ""))
-            if option not in scores or thought is None:
-                continue
-            try:
-                weight = float(row.get("weight", 1.0))
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(weight):
-                continue
+            if option not in scores or thought is None:continue
+            try:weight = float(row.get("weight", 1.0))
+            except (TypeError, ValueError, OverflowError):continue
+            if not math.isfinite(weight):continue
             weight = max(-1.0, min(1.0, weight))
-            contribution = weight * thought.confidence * thought.relevance
-            scores[option] += contribution
-            used.append({
-                "option": option, "thought_id": thought.thought_id,
-                "mode": thought.mode, "weight": weight,
-                "contribution": round(contribution, 6),
-                "reason": str(row.get("reason") or "")[:512],
-            })
+            key = (option, thought.thought_id)
+            weights = groups.setdefault(key, {})
+            reason = str(row.get("reason") or "")[:512]
+            if weight in weights:
+                duplicate_rows += 1
+                if reason not in weights[weight]:weights[weight].append(reason)
+                continue
+            weights[weight] = [reason]
+        used = []
+        for (option, thought_id), weights in groups.items():
+            thought = thought_index[thought_id]
+            # Several readings of one thought are not several independent votes.
+            # Distinct signed readings remain visible and share its contribution.
+            for weight, reasons in weights.items():
+                contribution = weight * thought.confidence * thought.relevance / len(weights)
+                scores[option] += contribution
+                used.append({"option": option, "thought_id": thought_id, "mode": thought.mode,
+                             "weight": weight, "contribution": round(contribution, 6),
+                             "reason": reasons[0], "reason_observations": list(reasons),
+                             "shared_readings": len(weights)})
         ranked = sorted(names, key=lambda name: (-scores[name], names.index(name)))
         selected = ranked[0] if ranked else None
         runner_up = scores[ranked[1]] if len(ranked) > 1 else 0.0
@@ -198,6 +211,11 @@ class ThoughtProcessor:
             scores={key: round(value, 6) for key, value in scores.items()},
             evidence=tuple(used), confidence=confidence, modalities=modalities,
             alternatives=tuple(ranked), reason=reason,
+            evidence_summary={"duplicate_rows_ignored": duplicate_rows,
+                              "thought_option_groups": len(groups),
+                              "input_truncated": len(option_rows)>32 or len(thought_rows)>64 or len(evidence_rows)>128,
+                              "confidence_is_calibrated": False,
+                              "independence_inferred_from_repetition": False},
         )
 
     def guided_decision(
