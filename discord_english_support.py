@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 def discord_english_support(
     text: str, *, stage: str, discourse: Mapping[str, Any] | None = None,
-    language_preference: object = 'auto',
+    language_preference: object = 'auto', incoming_text: str = '',
 ) -> dict[str, Any]:
     """Review one supplied utterance using its own speaker/addressee frame.
 
@@ -39,6 +39,9 @@ def discord_english_support(
         review['choice_is_caller_supplied'] = False
         review['review_choice_source'] = base['review_choice_source']
         result = {**base, 'status': review['status'], 'review': review}
+        if stage == 'selected_draft' and incoming_text:
+            from conversation_questions import review_conversational_reply
+            result['conversation_review'] = review_conversational_reply(incoming_text, text)
         if stage == 'incoming':
             result['options'] = social_english_options()
         return result

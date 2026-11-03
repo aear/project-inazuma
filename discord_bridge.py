@@ -880,12 +880,14 @@ def choose_text_expression_strategy(
     )
 
     from response_language_policy import emotion_response_context, prefers_english
+    from conversation_questions import question_context
+    question = question_context(incoming_text)
     emotion_context = emotion_response_context(incoming_text, state)
     english_bonus = 0.08 if prefers_english(language_preference) and adapter_available else 0.0
     scores = {
-        "respond": english_bonus + 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
+        "respond": question["response_bonus"] + english_bonus + 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
         if adapter_available else None,
-        "mirror": mirror_evaluation["score"] if mapped and coverage >= 0.6 else None,
+        "mirror": mirror_evaluation["score"] + question["mirror_adjustment"] if mapped and coverage >= 0.6 else None,
         "emotion": (
             0.12 + 0.20 * unit("intensity") + 0.18 * (1.0 - unit("clarity"))
             + 0.10 * unit("stress") + 0.08 * unit("isolation")
@@ -930,6 +932,7 @@ def choose_text_expression_strategy(
         "requested_strategy": requested or None,
         "intent_available": requested in available if requested else None,
         "scores": {name: round(score, 4) if score is not None else None for name, score in scores.items()},
+        "question_context": question,
         "emotion_context": emotion_context,
         "english_response_bonus": english_bonus,
         "mapping_coverage": round(coverage, 4),
@@ -2287,7 +2290,11 @@ def process_inbound_message(msg) -> CommsResponse:
                 break
     symbolic_input = user_text if user_text.strip() else " ".join(visual_inference_words)
 
+    from conversation_questions import question_context
+    incoming_question = question_context(user_text)
+    metadata["question_context"] = incoming_question
     symbolic_context = {
+        "question_context": incoming_question,
         "source": "discord",
         "social_english_support": english_support,
         "character_analysis": character_analysis,
@@ -2560,7 +2567,7 @@ def process_inbound_message(msg) -> CommsResponse:
         metadata["adapter"] = "deliberate_mirror"
         # A mirrored utterance is still the sender's wording, not Ina's "I".
         metadata["social_english_draft_review"] = discord_english_support(
-            symbolic_text, stage="selected_draft", discourse=incoming_discourse,
+            symbolic_text, stage="selected_draft", incoming_text=user_text, discourse=incoming_discourse,
             language_preference=("native_only" if effective_language_mode != "english" else language_preference),
         )
         logger.info("Social English support V1: mirrored_draft=%s",
@@ -2686,7 +2693,7 @@ def process_inbound_message(msg) -> CommsResponse:
                 if isinstance(conversation_scene.get("participants"), (list, tuple)) else (),
         )
         metadata["social_english_draft_review"] = discord_english_support(
-            reply_text, stage="selected_draft", discourse=reply_discourse,
+            reply_text, stage="selected_draft", incoming_text=user_text, discourse=reply_discourse,
             language_preference=language_preference,
         )
         reply_text, encoding_metadata = encode_selected_text_expression(

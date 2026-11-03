@@ -30,6 +30,11 @@ def social_english_options(*, topic_reference: str = '', audience_reference: str
             {'kind': 'ordinary_conversation', 'activity': 'Express one thing you choose, or ask one follow-up question; invite a listener to check the meaning if useful.'},
             {'kind': 'chosen_practice', 'activity': 'Supply an English draft or incoming sentence for one private review; revise, keep, defer or stop as you choose.'},
         ],
+        'question_conventions': {
+            'guidance': 'A question usually invites an answer, rather than a repeat of the question. A short grounded answer, clarification, uncertainty or deferral can help the listener. You can also choose native expression or silence.',
+            'answer_required': False, 'penalty_for_silence': False,
+            'practice': 'If you choose, distinguish what is being asked from what you know before selecting wording.',
+        },
         'choices': ['english', 'mixed', 'native_only', 'clarify', 'abstain', 'silence'],
         'willingness_inferred': False, 'automatic_expression': False,
         'automatic_learning': False, 'scheduled': False, 'continuation_budget': 0,
@@ -75,6 +80,11 @@ def review_social_english(
     if not draft.strip() and not incoming_text.strip():
         result['status'] = 'no_material_supplied'
         return result
+    from conversation_questions import question_context, review_conversational_reply
+    if incoming_text.strip():
+        result['question_context'] = question_context(incoming_text)
+        if draft.strip():
+            result['conversation_review'] = review_conversational_reply(incoming_text, draft)
     context = {'discourse': discourse} if isinstance(discourse, Mapping) else {}
     if draft.strip():
         result['draft_analysis'] = analyze_utterance(draft, context=context)

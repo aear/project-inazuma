@@ -243,10 +243,12 @@ class ConversationSceneBuffer:
             self_identity={"id": self_speakers[-1] if self_speakers else "self", "name": self_speakers[-1] if self_speakers else "self", "is_self": True},
             current_subject=topics[0] if topics else None, mentioned_entities=participants,
         )
+        from conversation_questions import question_context
+        question = question_context(current_text)
         reply_expected = bool(
             current_turn
             and current_turn.get("direction") == "inbound"
-            and (current_text.rstrip().endswith("?") or current_turn.get("reply_to_id"))
+            and (question["answer_invitation"] or current_turn.get("reply_to_id"))
         )
         return {
             "version": 1,
@@ -261,7 +263,8 @@ class ConversationSceneBuffer:
             "signals": {
                 "has_prior_context": len(turns) > 1,
                 "reply_expected": reply_expected,
-                "current_is_question": current_text.rstrip().endswith("?"),
+                "current_is_question": question["answer_invitation"],
+                "question_context": question,
                 "continuity_terms": sorted(current_words & prior_words)[:8],
                 "participant_count": len(participants),
             },
