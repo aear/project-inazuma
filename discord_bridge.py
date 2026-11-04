@@ -836,6 +836,7 @@ def choose_text_expression_strategy(
     incoming_text: str = "",
     language_preference: object = "auto",
     name_context: object = None,
+    clarification_available: bool = False,
 ) -> dict:
     """Choose response, deliberate mirroring, a fallback signal, or silence."""
     state = state if isinstance(state, dict) else {}
@@ -899,6 +900,7 @@ def choose_text_expression_strategy(
             0.12 + 0.16 * unit("connection") + 0.14 * unit("interest")
             + 0.12 * playfulness + 0.08 * unit("intensity")
         ) if song_available else None,
+        "clarify": 0.34 if clarification_available else None,
         "silence": max(0.0, 0.06 + 0.18 * (1.0 - drive) + 0.10 * unit("isolation") + 0.10 * (1.0 - unit("connection")) - (0.08 if reply_expected else 0.0)),
     }
     available = {name: score for name, score in scores.items() if score is not None}
@@ -910,7 +912,8 @@ def choose_text_expression_strategy(
         "mimic": "mirror", "state": "emotion", "feelings": "emotion",
         "module": "code_pointer", "modules": "code_pointer", "code": "code_pointer",
         "music": "song", "track": "song",
-        "quiet": "silence",
+        "quiet": "silence", "defer": "silence", "abstain": "silence",
+        "clarification": "clarify",
     }
     normalized_request = str(requested or "").strip().lower()
     requested = aliases.get(normalized_request, normalized_request)
@@ -2480,7 +2483,20 @@ def process_inbound_message(msg) -> CommsResponse:
             adapter_rejection = "unmapped_input"
         else:
             adapter_rejection = "no_constructive_reply"
-    ordinary_response_available = adapter_has_constructive_reply or bool(attachments)
+    try:
+        from conversation_grounding import plan_conversation_reply, english_candidate_allowed
+        dialogue_language_allowed = english_candidate_allowed(language_preference)
+        dialogue_plan = plan_conversation_reply(user_text, conversation_scene, discourse=incoming_discourse)
+    except Exception:
+        logger.exception("Bounded conversational evidence planning failed.")
+        dialogue_plan = {"status": "planning_unavailable", "answer_candidate": None, "clarification_candidate": None}
+        dialogue_language_allowed = False
+    metadata["conversation_reply_plan"] = dialogue_plan
+    # Preserve native/abstain/clarify language choices; these English candidates
+    # follow the existing language renderer only when the preference permits.
+    dialogue_answer = dialogue_plan.get("answer_candidate") if dialogue_language_allowed else None
+    dialogue_clarification = dialogue_plan.get("clarification_candidate") if dialogue_language_allowed else None
+    ordinary_response_available = adapter_has_constructive_reply or bool(attachments) or bool(dialogue_answer)
     expression_decision = choose_text_expression_strategy(
         state,
         mapped_count=len(symbolic.get("symbols") or []) if symbolic else 0,
@@ -2494,12 +2510,15 @@ def process_inbound_message(msg) -> CommsResponse:
         incoming_text=user_text,
         language_preference=language_preference,
         name_context=name_context,
+        clarification_available=bool(dialogue_clarification),
     )
     decision_record = {
         **expression_decision,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbolic_unknown_count": len(symbolic_unknown),
         "adapter_response_available": adapter_has_constructive_reply,
+        "conversation_answer_available": bool(dialogue_answer),
+        "conversation_clarification_available": bool(dialogue_clarification),
         "adapter_rejection": adapter_rejection,
     }
     metadata["expression_decision"] = decision_record
@@ -2584,6 +2603,13 @@ def process_inbound_message(msg) -> CommsResponse:
         reply_text = code_pointer_signal["text"]
         metadata["adapter"] = "code_pointer_signal"
         metadata["code_pointer_signal"] = code_pointer_signal
+
+    if selected_strategy == "clarify" and dialogue_clarification:
+        reply_text = dialogue_clarification
+        metadata["adapter"] = "conversation_clarification"
+    elif selected_strategy == "respond" and dialogue_answer:
+        reply_text = dialogue_answer
+        metadata["adapter"] = "conversation_evidence"
 
     if (
         not reply_text
@@ -3522,6 +3548,7 @@ class InaDiscordClient(discord.Bot):
         roleplay_mode = self._roleplay_mode(message) if roleplay else None
         space = discord_space_identity(message, roleplay_mode=roleplay_mode)
         metadata = {
+            "referenced_backend_message_id": str(getattr(getattr(message, "reference", None), "message_id", "") or "") or None,
             "discord_author_id": str(message.author.id),
             "discord_channel_id": str(message.channel.id),
             "is_dm": is_dm,

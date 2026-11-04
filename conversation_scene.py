@@ -118,7 +118,8 @@ class ConversationSceneBuffer:
                 prior_scene = metadata.get("conversation_scene")
                 if isinstance(prior_scene, Mapping):
                     self._remember_references(scene, prior_scene.get("memory_references"))
-            text = _bounded_text(getattr(message, "text", ""), self.max_turn_chars)
+            raw_text = getattr(message, "text", "")
+            text = _bounded_text(raw_text, self.max_turn_chars)
             sender = getattr(message, "sender", None)
             speaker = _bounded_text(
                 getattr(sender, "display_name", None)
@@ -137,6 +138,11 @@ class ConversationSceneBuffer:
                 "reply_to_id": getattr(message, "reply_to_id", None),
                 "is_self": bool(getattr(sender, "is_self", False)),
                 "speaker_backend_id": getattr(sender, "backend_id", None),
+                "backend_message_id": metadata.get("backend_message_id") if isinstance(metadata, Mapping) else None,
+                "referenced_message_id": metadata.get("referenced_backend_message_id") if isinstance(metadata, Mapping) else None,
+                "author_is_bot": bool(metadata.get("author_is_bot")) if isinstance(metadata, Mapping) else False,
+                "text_complete": isinstance(raw_text, str) and len(" ".join(raw_text.split())) <= self.max_turn_chars,
+                "text_single_line": isinstance(raw_text, str) and "\n" not in raw_text and "\r" not in raw_text,
                 "seeded": False,
             }
             if text:
@@ -238,11 +244,20 @@ class ConversationSceneBuffer:
             addressee = self_speakers[-1] if self_speakers else "self"
         discourse = build_discourse_context(
             current_text,
-            speaker={"id": current_speaker, "name": current_speaker, "is_self": bool((current_turn or {}).get("is_self"))},
+            speaker={"id": (current_turn or {}).get("speaker_backend_id") or current_speaker, "name": current_speaker, "is_self": bool((current_turn or {}).get("is_self"))},
             addressee={"id": addressee, "name": addressee, "is_self": addressee in self_speakers or addressee == "self"},
             self_identity={"id": self_speakers[-1] if self_speakers else "self", "name": self_speakers[-1] if self_speakers else "self", "is_self": True},
             current_subject=topics[0] if topics else None, mentioned_entities=participants,
         )
+        if current_turn is not None:
+            current_turn["discourse"] = discourse
+            try:
+                from conversation_grounding import observe_conversation_turn
+                current_turn["conversation_observation"] = observe_conversation_turn(current_turn, discourse)
+            except Exception:
+                # This optional evidence path must not interrupt ordinary communication.
+                current_turn["conversation_observation"] = {"status": "observation_unavailable"}
+            turns = [dict(turn) for turn in scene.turns]
         from conversation_questions import question_context
         question = question_context(current_text)
         reply_expected = bool(

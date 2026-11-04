@@ -8,7 +8,7 @@ GOALS=(
  ('surface','Retain punctuation and spelling alternatives without silently changing meaning.', 'comprehension', ['character_language']),
  ('composition','Choose one grounded meaning, review an English candidate, then keep, revise or decline it.', 'expression', ['english_workbench','expression_core']),
  ('transfer','Try unfamiliar wording and predicates using held-out material.', 'transfer', ['language_transfer_limits']),
- ('listener','Recognise a question, choose a grounded answer or clarification if useful, and ask a willing listener what meaning they recovered.', 'human_quality', ['conversation_questions']),
+ ('listener','Recognise a question, choose a grounded answer or clarification if useful, and ask a willing listener what meaning they recovered.', 'human_quality', ['conversation_questions','conversation_grounding']),
  ('external_tasks','Choose a small held-out reading or instruction-following trial.', 'external_assessment', []),
 )
 

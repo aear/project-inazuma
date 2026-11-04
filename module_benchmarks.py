@@ -2734,6 +2734,10 @@ _REGISTRY = {
         ModuleVersion("character_language", "V1", "Pinned word and grammar analysis without character tokens", lambda: __import__("benchmarks.benchmark_character_language", fromlist=["assess"]).assess("V1")),
         ModuleVersion("character_language", "V2", "Lossless character evidence and unconfirmed spelling or short-form alternatives", lambda: __import__("benchmarks.benchmark_character_language", fromlist=["assess"]).assess("V2")),
     ),
+    "conversation_grounding": (
+        ModuleVersion("conversation_grounding", "V1", "Pinned conversation route without source-backed question answers", lambda: __import__("benchmarks.benchmark_conversation_grounding", fromlist=["assess"]).assess("V1")),
+        ModuleVersion("conversation_grounding", "V2", "Recent attributed claims, role-sensitive answers and linked repairs", lambda: __import__("benchmarks.benchmark_conversation_grounding", fromlist=["assess"]).assess("V2")),
+    ),
     "conversation_questions": (
         ModuleVersion("conversation_questions", "V1", "Pinned question punctuation and generic response scoring", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V1")),
         ModuleVersion("conversation_questions", "V2", "Bounded question invitations, voluntary response preference and echo review", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V2")),
@@ -2912,7 +2916,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
-                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions"} and spec.version == "V1" else
+                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions", "conversation_grounding"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"

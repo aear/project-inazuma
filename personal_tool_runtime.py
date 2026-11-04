@@ -46,6 +46,11 @@ def capability_catalog() -> dict[str, Any]:
                 "scope": "one private English candidate from selected structured meaning; no thought selection, delivery or automatic learning",
                 "automatic_trigger": False,
             },
+            "conversation_evidence_review": {
+                "arguments": ["question", "scene", "discourse?"],
+                "scope": "one private source-attributed answer/clarification plan from at most 12 supplied scene turns; no delivery or durable learning",
+                "automatic_trigger": False,
+            },
             "english_learning_options": {
                 "arguments": [],
                 "scope": "optional comprehension, expression and held-out assessment goals; does not run benchmarks or adopt a goal",
@@ -224,6 +229,9 @@ def execute_personal_tool_command(
         from english_composition import compose_selected_english
         value = compose_selected_english(command.get("native_intent"), command.get("expression_intent"),
             choice=command.get("choice", "english"), cognition_plan=command.get("cognition_plan"))
+    elif action == "conversation_evidence_review":
+        from conversation_grounding import plan_conversation_reply
+        value = plan_conversation_reply(command.get("question", ""), command.get("scene"), discourse=command.get("discourse"))
     elif action == "english_learning_options":
         from english_learning_profile import build_english_learning_profile
         value = build_english_learning_profile()

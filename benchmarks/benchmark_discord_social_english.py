@@ -6,6 +6,7 @@ wiring and English support, not Discord delivery or Ina's live comprehension.
 """
 from __future__ import annotations
 import ast
+import json
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
@@ -17,34 +18,37 @@ BASELINE = '5273e488040a3aabc2695da592a526b806317723'
 
 def route_fixture(source, *, text='I enjoy your song.', draft='I might share my song.',
                   strategy='respond', preference='auto', scene=True, dm=False,
-                  support=None, disabled=False, low_urge=False, identity_aliases=None):
+                  support=None, disabled=False, low_urge=False, identity_aliases=None,
+                  scene_data=None, real_strategy=False, adapter_available=True, state=None):
     from discourse_context import build_discourse_context
     from discord_english_support import discord_english_support
     tree=ast.parse(source)
     node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='process_inbound_message')
     captured={}
     incoming=build_discourse_context(text,speaker='Mira',addressee='Ina',self_identity='Ina')
-    message=SimpleNamespace(text=text,metadata={'conversation_scene':{'discourse':incoming} if scene else {},'is_dm':dm},
+    message=SimpleNamespace(text=text,metadata={'conversation_scene':scene_data if scene_data is not None else {'discourse':incoming} if scene else {},'is_dm':dm},
         sender=SimpleNamespace(backend_id='mira',display_name='Mira',internal_id='mira'),
         channel=SimpleNamespace(name='fixture',backend_id='fixture'))
     class NoFile:
         def __truediv__(self, part):return self
-        def exists(self):return False
+        def exists(self):return state is not None
+        def read_text(self,**kwargs):return json.dumps(state)
     def symbolic(*args,**kwargs):
         captured['context']=kwargs.get('context')
-        if strategy=='mirror':return {'text':text,'symbols':['fixture'],'unknown':[]}
+        if strategy=='mirror':return {'text':text,'symbols':['fixture'+str(i) for i in range(len(text.split()) if real_strategy else 1)],'unknown':[]}
         return None
     adapter=SimpleNamespace(has_constructive_reply=lambda text:True,handle_prompt=lambda *a,**k:draft)
     def encode(text,**kwargs):
         captured['encoding']=kwargs
         return (('∘⊙' if preference=='native_only' else text),{'fixture_encoding':True})
     env={
+        'json':json,
         'CommsResponse':lambda **kwargs:SimpleNamespace(**kwargs),
         'get_discord_config':lambda:{'allow_replies':not disabled,'language_mode':preference,'identity_aliases':{'Ina':identity_aliases or []}},
         'get_current_child':lambda:'Ina','_format_image_attachment_note':lambda a:'',
         '_collect_vision_context':lambda a:{},'load_root_config':lambda:{'ignore_urge_for_typing':not low_urge},
         'Path':lambda p:NoFile(),'_resolve_adjusted_urge_level':lambda s:0 if low_urge else 1,
-        'get_chat_adapter':lambda:adapter,'logger':logging.getLogger('fixture'),
+        'get_chat_adapter':lambda:adapter if adapter_available else None,'logger':logging.getLogger('fixture'),
         '_extract_tokens':lambda t:t.split(),'generate_symbolic_reply_from_text':symbolic,
         '_coerce_positive_int':lambda v,d:d,'DEFAULT_MAX_REPLY_SYMBOLS':64,
         'select_symbolic_message_text':lambda s,p:(s['text'] if s else None,'english'),
@@ -58,6 +62,9 @@ def route_fixture(source, *, text='I enjoy your song.', draft='I might share my 
         'encode_selected_text_expression':encode,
         'discord_english_support':support or discord_english_support,
     }
+    if real_strategy:
+        from benchmarks.benchmark_response_language_policy import functions
+        env['choose_text_expression_strategy']=functions(source)
     exec(compile(ast.Module(body=[node],type_ignores=[]),'<copied Discord route>','exec'),env)
     started=time.perf_counter()
     result=env['process_inbound_message'](message)

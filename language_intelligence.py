@@ -175,14 +175,18 @@ def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> d
         subject_words = [word for word in words[front + 1:verb_at] if word not in {"not", "never"}]
     elif inverted and predicate == "be":
         # A short copular question has a subject followed by its complement.
-        subject_words = words[front + 1:front + 2]
+        subject_words = ([word for word in words[front + 1:] if word not in {".", "!", "?", ","}]
+                         if question_word == "where" else words[front + 1:front + 2])
     else:
         subject_words = words[:candidates[0] if auxiliary else verb_at] if verb_at is not None else []
+    if len(subject_words) > 1 and subject_words[-1] == "never":
+        subject_words = subject_words[:-1]
     subject = " ".join(subject_words) or None
     negated = any(word in {"not", "never"} for word in words)
     arguments: dict[str, Any] = {}
     tail_start = verb_at + 1 if verb_at is not None else len(words)
-    if inverted and auxiliary is None and predicate == "be": tail_start = front + 2
+    if inverted and auxiliary is None and predicate == "be":
+        tail_start = len(words) if question_word == "where" else front + 2
     tail = [word for word in words[tail_start:] if word not in {"not", "never", ".", "!", "?", ","}]
     voice = "active"
     # Preserve semantic roles across passive/active forms; do not invent a by-agent.
@@ -404,7 +408,7 @@ def analyze_utterance(text: str, *, context: Mapping[str, Any] | None = None, di
         "constructions": matches, "speech_act": pragmatic, "referents": referents,
         "discourse_state": discourse.snapshot(), "uncertainty": uncertainties,
         "whole_utterance_interpretations": alternatives[:8],
-        "origins": [make_origin("LanguageIntelligence", "V8", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
+        "origins": [make_origin("LanguageIntelligence", "V9", inputs={"text": text[:MAX_ANALYSIS_CHARACTERS], "incomplete": incomplete}, trigger="utterance_received")],
     }
 
 
