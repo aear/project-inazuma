@@ -135,29 +135,25 @@ def _json_lock(path: Path):
 
 
 def _atomic_write_json(path: Path, payload: Any, *, indent: int = 2, ensure_ascii: bool = False):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            json.dump(payload, tmp, indent=indent, ensure_ascii=ensure_ascii)
-            tmp.write("\n")
-    finally:
-        os.replace(tmp_path, path)
+    # Reuse the canonical success-only replacement and failed-stage cleanup.
+    from io_utils import atomic_write_json
+    return atomic_write_json(path, payload, indent=indent, ensure_ascii=ensure_ascii)
 
 
 def load_text_vocab(child: Optional[str] = None) -> Dict[str, Any]:
     path = _memory_root(child) / "text_vocab.json"
-    if not path.exists():
-        return {"vocab": {}, "updated": _now_iso()}
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-            if isinstance(data, dict):
-                data.setdefault("vocab", {})
-                return data
-    except Exception:
-        pass
-    return {"vocab": {}, "updated": _now_iso()}
+    except FileNotFoundError:
+        return {"vocab": {}, "updated": _now_iso()}
+    except Exception as exc:
+        # Let the caller defer rather than learn into an invented empty store.
+        raise OSError("Existing text vocabulary could not be read") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("vocab", {}), dict):
+        raise ValueError("Existing text vocabulary has an unsupported shape")
+    data.setdefault("vocab", {})
+    return data
 
 
 def _trim_vocab(vocab: Dict[str, Any], limit: int) -> Dict[str, Any]:

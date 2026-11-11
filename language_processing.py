@@ -384,13 +384,9 @@ def _json_lock(path: Path):
 
 
 def _atomic_write_json(path: Path, payload: Any, *, indent: int = 4, ensure_ascii: bool = True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            json.dump(payload, tmp, indent=indent, ensure_ascii=ensure_ascii)
-    finally:
-        os.replace(tmp_path, path)
+    # Reuse the canonical success-only replacement and failed-stage cleanup.
+    from io_utils import atomic_write_json
+    return atomic_write_json(path, payload, indent=indent, ensure_ascii=ensure_ascii)
 
 def load_generated_symbols(child: str, base_path: Optional[Path] = None):
     """
@@ -680,20 +676,30 @@ def extract_sound_features_from_summary(summary):
 
 def load_symbol_to_token(child, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "symbol_to_token.json"
-    data: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            with open(path, "r") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data = loaded
-        except Exception:
-            data = {}
-
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except FileNotFoundError:
+        data = {}
+    except Exception as exc:
+        # A failed retained-store read must stop both bootstrap and learners.
+        raise OSError("Existing symbol vocabulary could not be read") from exc
+    if not isinstance(data, dict):
+        raise OSError("Existing symbol vocabulary has an unsupported shape")
     if _bootstrap_symbol_vocabulary(child, data, base_path):
         save_symbol_to_token(child, data, base_path)
-
     return data
+
+
+def _load_symbol_subset_scoped(child, base_path=None, *, symbols=(), words=()):
+    """Use a fresh indexed projection; preserve legacy learning/write paths."""
+    from symbol_vocab_store import load_symbol_subset
+    path = _memory_root(child, base_path) / "symbol_to_token.json"
+    subset = load_symbol_subset(path, symbols=symbols, words=words)
+    if subset is not None:
+        return subset
+    return load_symbol_to_token(child, base_path=base_path)
+
 
 def save_symbol_to_token(child, data, base_path: Optional[Path] = None):
     path = _memory_root(child, base_path) / "symbol_to_token.json"
@@ -1248,9 +1254,11 @@ def _shadow_audit_text_vocab_mappings(
 def load_text_vocab_word_symbol_index(
     child: str,
     base_path: Optional[Path] = None,
+    *, words=None,
 ) -> Dict[str, str]:
     """Return the learned English/native word index used by text translation."""
-    links_payload = load_text_vocab_links(child, base_path=base_path)
+    links_payload = (_load_text_vocab_links_scoped(child, base_path=base_path, words=words)
+                     if words is not None else load_text_vocab_links(child, base_path=base_path))
     return _build_text_vocab_word_symbol_index(links_payload)
 
 
@@ -1309,7 +1317,7 @@ def build_dual_symbolic_message(
     vocab: Optional[Dict[str, Any]] = symbol_to_token_vocab if isinstance(symbol_to_token_vocab, dict) else None
     if use_glyphs and native_unresolved_indexes:
         if vocab is None and fallback_to_symbol_to_token:
-            vocab = load_symbol_to_token(child, base_path=base_path)
+            vocab = _load_symbol_subset_scoped(child, base_path=base_path, symbols=normalized)
         if isinstance(vocab, dict):
             still_native_unresolved: List[tuple] = []
             for idx, sym in native_unresolved_indexes:
@@ -1324,7 +1332,7 @@ def build_dual_symbolic_message(
 
     if not explicit_human_text and unresolved_indexes and fallback_to_symbol_to_token:
         if vocab is None:
-            vocab = load_symbol_to_token(child, base_path=base_path)
+            vocab = _load_symbol_subset_scoped(child, base_path=base_path, symbols=normalized)
         still_unresolved: List[tuple] = []
         for idx, sym in unresolved_indexes:
             entry = vocab.get(sym) if isinstance(vocab, dict) else {}
@@ -2275,6 +2283,18 @@ def generate_symbolic_reply_from_text(
     word_to_symbol: Dict[str, str] = {}
     embedding_index = []
     vocab_loaded = False
+    projected_vocab = None
+    projected_words = {}
+    used_projection_exact = False
+    try:
+        from symbol_vocab_store import load_symbol_subset
+        projected_vocab = load_symbol_subset(
+            _memory_root(child, base_path) / "symbol_to_token.json", words=tokens[:256])
+        if projected_vocab is not None:
+            projected_words = {(entry.get("word") or "").lower(): symbol
+                for symbol, entry in projected_vocab.items() if isinstance(entry, dict) and entry.get("word")}
+    except Exception:
+        projected_vocab = None
 
     def ensure_vocab_loaded():
         nonlocal vocab, word_to_symbol, embedding_index, vocab_loaded
@@ -2310,6 +2330,14 @@ def generate_symbolic_reply_from_text(
                 seen.add(sym)
             continue
 
+        sym = projected_words.get(tok) if not vocab_loaded else None
+        if sym:
+            used_projection_exact = True
+            vocab.update(projected_vocab or {})
+            if sym not in seen:
+                matched.append(sym)
+                seen.add(sym)
+            continue
         ensure_vocab_loaded()
         sym = word_to_symbol.get(tok)
         if sym:
@@ -2367,6 +2395,19 @@ def generate_symbolic_reply_from_text(
             reply_tags.append(tag)
     reply_context["tags"] = reply_tags
 
+    if used_projection_exact and not vocab_loaded:
+        # Preserve the matched-symbol metadata used by realisation/insights,
+        # including symbols selected by the independent learned-link route.
+        try:
+            projected_matched = load_symbol_subset(
+                _memory_root(child, base_path) / "symbol_to_token.json", symbols=symbols_to_speak)
+            if projected_matched is None:
+                ensure_vocab_loaded()
+            else:
+                vocab.update(projected_matched)
+        except Exception:
+            ensure_vocab_loaded()
+
     dual_message = build_dual_symbolic_message(
         symbols_to_speak,
         child=child,
@@ -2374,7 +2415,7 @@ def generate_symbolic_reply_from_text(
         context=reply_context,
         fallback_to_symbol_to_token=False,
         native_style="glyphs",
-        symbol_to_token_vocab=vocab if vocab_loaded else None,
+        symbol_to_token_vocab=vocab if vocab_loaded or used_projection_exact else None,
     )
     fallback_text = " ".join(symbols_to_speak)
     transformer_insights = _build_reply_transformer_insights(symbols_to_speak, vocab, unknown)

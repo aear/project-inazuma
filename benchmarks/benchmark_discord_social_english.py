@@ -19,7 +19,8 @@ BASELINE = '5273e488040a3aabc2695da592a526b806317723'
 def route_fixture(source, *, text='I enjoy your song.', draft='I might share my song.',
                   strategy='respond', preference='auto', scene=True, dm=False,
                   support=None, disabled=False, low_urge=False, identity_aliases=None,
-                  scene_data=None, real_strategy=False, adapter_available=True, state=None):
+                  scene_data=None, real_strategy=False, adapter_available=True, state=None,
+                  selected_renderer=None, emotion_signal=None, symbolic_error=None):
     from discourse_context import build_discourse_context
     from discord_english_support import discord_english_support
     tree=ast.parse(source)
@@ -34,12 +35,17 @@ def route_fixture(source, *, text='I enjoy your song.', draft='I might share my 
         def exists(self):return state is not None
         def read_text(self,**kwargs):return json.dumps(state)
     def symbolic(*args,**kwargs):
+        if symbolic_error is not None:raise symbolic_error
         captured['context']=kwargs.get('context')
         if strategy=='mirror':return {'text':text,'symbols':['fixture'+str(i) for i in range(len(text.split()) if real_strategy else 1)],'unknown':[]}
         return None
-    adapter=SimpleNamespace(has_constructive_reply=lambda text:True,handle_prompt=lambda *a,**k:draft)
+    def handle_prompt(*args,**kwargs):
+        captured['prompt_calls']=captured.get('prompt_calls',0)+1
+        return draft
+    adapter=SimpleNamespace(has_constructive_reply=lambda text:True,handle_prompt=handle_prompt)
     def encode(text,**kwargs):
         captured['encoding']=kwargs
+        if selected_renderer is not None:return selected_renderer(text,**kwargs)
         return (('∘⊙' if preference=='native_only' else text),{'fixture_encoding':True})
     env={
         'json':json,
@@ -55,7 +61,7 @@ def route_fixture(source, *, text='I enjoy your song.', draft='I might share my 
         'build_conversation_examples':lambda *a,**k:{},
         'interpret_communicative_meaning':lambda *a,**k:{},
         'plan_experience_cognition':lambda *a,**k:{},'build_expression_cognition_event':lambda a:{},
-        'format_emotion_signal':lambda s:None,'format_code_pointer_signal':lambda s:None,
+        'format_emotion_signal':lambda s:emotion_signal,'format_code_pointer_signal':lambda s:None,
         'resolve_song_expression_candidate':lambda *a,**k:{'available':False},
         'choose_text_expression_strategy':lambda *a,**k:{'strategy':strategy},
         'datetime':datetime,'timezone':timezone,'update_inastate':lambda *a,**k:None,

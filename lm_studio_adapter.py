@@ -15,6 +15,7 @@ from experience_logger import ExperienceLogger
 from language_processing import (
     describe_word_grounding,
     load_symbol_to_token,
+    _load_symbol_subset_scoped,
     load_text_vocab_word_symbol_index,
 )
 from live_experience_bridge import LiveExperienceBridge
@@ -501,7 +502,12 @@ class LMStudioAdapter:
                 return "I did not catch any words. Could you rephrase that for me?"
             return ""
 
-        vocab = self._load_known_words()
+        scoped_words = words if len(words) <= 256 else None
+        try:
+            vocab = self._load_known_words(words=scoped_words)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc): raise
+            vocab = self._load_known_words()
         grounded_details: List[Tuple[str, Dict[str, Any]]] = []
         unknown_words: List[str] = []
         seen_grounded: set[str] = set()
@@ -556,15 +562,16 @@ class LMStudioAdapter:
 
         return "\n\n".join(sections)
 
-    def _load_known_words(self) -> Dict[str, str]:
-        vocabulary = load_symbol_to_token(self.child, base_path=self._base_path)
+    def _load_known_words(self, *, words: Optional[Iterable[str]] = None) -> Dict[str, str]:
+        vocabulary = (_load_symbol_subset_scoped(self.child, base_path=self._base_path, words=words)
+                      if words is not None else load_symbol_to_token(self.child, base_path=self._base_path))
         known = {
             entry.get("word", "").lower(): symbol
             for symbol, entry in vocabulary.items()
             if entry.get("word")
         }
         known.update(load_text_vocab_word_symbol_index(
-            self.child, base_path=self._base_path
+            self.child, base_path=self._base_path, **({"words": words} if words is not None else {})
         ))
         return known
 

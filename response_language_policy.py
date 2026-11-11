@@ -37,6 +37,9 @@ def emotion_response_context(text, state):
     if len(surface) > 2048:
         return {'eligible': explicit, 'direct_check_in': False,
                 'reason': 'explicit_intent' if explicit else 'input_budget_exceeded'}
+    from conversation_grounding import language_surface_projection
+    surface, _ = language_surface_projection(surface)
+    surface = surface.replace('？', '?')
     # Strip only customary direct address / politeness, not arbitrary leading text.
     surface = ' '.join(surface.lower().replace('’', "'").split())
     surface = re.sub(r'^(?:hey[,!]?\s+)?(?:ina[,!:]?\s+)?(?:please\s+)?', '', surface)

@@ -885,7 +885,11 @@ def choose_text_expression_strategy(
     question = question_context(incoming_text)
     emotion_context = emotion_response_context(incoming_text, state)
     english_bonus = 0.08 if prefers_english(language_preference) and adapter_available else 0.0
+    from response_passes import native_expression_candidate, response_passes, language_mode
+    native_candidate = native_expression_candidate(state)
+    if language_mode(language_preference) in {"english_only", "assessed_choice"}: native_candidate = None
     scores = {
+        "native": 0.46 + 0.14 * drive if native_candidate else None,
         "respond": question["response_bonus"] + english_bonus + 0.55 + 0.10 * unit("complexity") + 0.08 * unit("connection") + 0.07 * unit("interest") + scene_response_bonus
         if adapter_available else None,
         "mirror": mirror_evaluation["score"] + question["mirror_adjustment"] if mapped and coverage >= 0.6 else None,
@@ -913,7 +917,7 @@ def choose_text_expression_strategy(
         "module": "code_pointer", "modules": "code_pointer", "code": "code_pointer",
         "music": "song", "track": "song",
         "quiet": "silence", "defer": "silence", "abstain": "silence",
-        "clarification": "clarify",
+        "clarification": "clarify", "native_only": "native",
     }
     normalized_request = str(requested or "").strip().lower()
     requested = aliases.get(normalized_request, normalized_request)
@@ -928,7 +932,12 @@ def choose_text_expression_strategy(
             available.pop("mirror", None)
         strategy = max(available, key=lambda name: (available[name], name))
         reason = "internal_state_scores"
+    passes = response_passes({"strategy": strategy, "reason": reason, "scores": scores},
+        state=state, preference=language_preference, emotion_eligible=emotion_context["eligible"])
+    strategy = passes["strategy"]
+    if passes["reason"] == "bounded_response_passes": reason = passes["reason"]
     return {
+        "response_passes": passes,
         "strategy": strategy,
         "automatic_mirror_excluded": "mirror" not in available and scores["mirror"] is not None,
         "reason": reason,
@@ -2334,21 +2343,26 @@ def process_inbound_message(msg) -> CommsResponse:
         },
         "vision": vision_context,
     }
-    symbolic = generate_symbolic_reply_from_text(
-        symbolic_input,
-        child=child,
-        base_path=Path("AI_Children"),
-        max_symbols=_coerce_positive_int(
-            cfg.get("max_reply_symbols", DEFAULT_MAX_REPLY_SYMBOLS),
-            DEFAULT_MAX_REPLY_SYMBOLS,
-        ),
-        context=symbolic_context,
-        # Starting local sounddevice playback here also starts a PortAudio
-        # callback thread in the bridge process; a retained SIGILL core
-        # identified that callback as the crashing thread. Keep local rig
-        # playback owned by early_comm and Discord playback owned by its outbox.
-        playback=False,
-    )
+    try:
+        symbolic = generate_symbolic_reply_from_text(
+            symbolic_input,
+            child=child,
+            base_path=Path("AI_Children"),
+            max_symbols=_coerce_positive_int(
+                cfg.get("max_reply_symbols", DEFAULT_MAX_REPLY_SYMBOLS),
+                DEFAULT_MAX_REPLY_SYMBOLS,
+            ),
+            context=symbolic_context,
+            # Starting local sounddevice playback here also starts a PortAudio
+            # callback thread in the bridge process; a retained SIGILL core
+            # identified that callback as the crashing thread. Keep local rig
+            # playback owned by early_comm and Discord playback owned by its outbox.
+            playback=False,
+        )
+    except (OSError, MemoryError) as exc:
+        symbolic = None
+        metadata["symbolic_comprehension"] = {"status": "unavailable", "error_type": type(exc).__name__}
+        logger.warning("Symbolic language pass unavailable; considering supported alternatives.")
     if isinstance(symbolic, dict):
         shadow = symbolic.get("language_context_shadow")
         audit = shadow.get("counterfactual_audit") if isinstance(shadow, dict) else None
@@ -2527,7 +2541,8 @@ def process_inbound_message(msg) -> CommsResponse:
         update_inastate("last_text_expression_decision", decision_record)
         raw_intent = state.get("text_expression_intent") if isinstance(state, dict) else None
         if (
-            expression_decision.get("reason") == "explicit_intent"
+            (expression_decision.get("reason") == "explicit_intent"
+             or expression_decision.get("strategy") == "native")
             and isinstance(raw_intent, dict)
             and raw_intent.get("once", True) is not False
         ):
@@ -2592,6 +2607,12 @@ def process_inbound_message(msg) -> CommsResponse:
         logger.info("Social English support V1: mirrored_draft=%s",
                     metadata["social_english_draft_review"].get("status"))
         return CommsResponse(text=symbolic_text, metadata=metadata)
+    if selected_strategy == "native":
+        from response_passes import native_expression_candidate
+        native_candidate = native_expression_candidate(state)
+        metadata["adapter"] = "selected_native_expression" if native_candidate else "expression_silence"
+        metadata["native_expression"] = native_candidate
+        return CommsResponse(text=native_candidate["text"] if native_candidate else None, metadata=metadata)
     if selected_strategy == "silence":
         metadata["adapter"] = "expression_silence"
         return CommsResponse(text=None, metadata=metadata)
@@ -2695,14 +2716,28 @@ def process_inbound_message(msg) -> CommsResponse:
         metadata["adapter"] = "image_acknowledgement"
         metadata["vision_context"] = vision_context
 
+    pre_render_repass = None
     if not reply_text:
-        fallback_signal = emotion_signal or code_pointer_signal
-        if fallback_signal:
-            reply_text = fallback_signal["text"]
-            if fallback_signal is emotion_signal:
-                metadata["adapter"] = "emotion_signal_fallback"
-                metadata["emotion_signal"] = emotion_signal
-            else:
+        from response_passes import response_passes, native_expression_candidate, language_mode
+        pre_render_repass = response_passes(expression_decision, state=state, preference=language_preference,
+            english_available=False, emotion_eligible=emotion_context["eligible"], rendering_failed=True)
+        metadata["response_realisation_passes"] = pre_render_repass
+        if pre_render_repass["strategy"] == "native":
+            candidate = native_expression_candidate(state)
+            if candidate:
+                metadata["adapter"] = "native_realisation_fallback"
+                metadata["native_expression"] = candidate
+                return CommsResponse(text=candidate["text"], metadata=metadata)
+        elif (pre_render_repass["strategy"] == "emotion" and emotion_signal
+              and language_mode(language_preference) in {"auto", "english", "en", "english_only", "mixed"}):
+            reply_text = emotion_signal["text"]
+            metadata["adapter"] = "emotion_signal_fallback"
+            metadata["emotion_signal"] = emotion_signal
+        if not reply_text and code_pointer_signal:
+            code_score = (expression_decision.get("scores") or {}).get("code_pointer")
+            silence_score = (expression_decision.get("scores") or {}).get("silence", 1.)
+            if code_score is not None and code_score > silence_score:
+                reply_text = code_pointer_signal["text"]
                 metadata["adapter"] = "code_pointer_signal_fallback"
                 metadata["code_pointer_signal"] = code_pointer_signal
 
@@ -2741,6 +2776,22 @@ def process_inbound_message(msg) -> CommsResponse:
             },
         )
         metadata.update(encoding_metadata)
+
+    if not reply_text:
+        from response_passes import response_passes, native_expression_candidate, language_mode
+        repass = pre_render_repass or response_passes(expression_decision, state=state, preference=language_preference,
+            english_available=False, emotion_eligible=emotion_context["eligible"], rendering_failed=True)
+        metadata["response_realisation_passes"] = repass
+        if repass["strategy"] == "native":
+            candidate = native_expression_candidate(state)
+            if candidate:
+                reply_text = candidate["text"]
+                metadata["adapter"] = "native_realisation_fallback"
+                metadata["native_expression"] = candidate
+        elif (repass["strategy"] == "emotion" and emotion_signal
+              and language_mode(language_preference) in {"auto", "english", "en", "english_only", "mixed"}):
+            reply_text = emotion_signal["text"]
+            metadata["adapter"] = "emotion_realisation_fallback"
 
     logger.info(
         "Social English support V1: incoming=%s selected_draft=%s output_unchanged=true",

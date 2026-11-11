@@ -41,6 +41,16 @@ def capability_catalog() -> dict[str, Any]:
         "voluntary": True,
         "automatic_trigger": False,
         "commands": {
+            "language_path_status": {
+                "arguments": [],
+                "scope": "fixed language-file sizes/timestamps only; no private payloads, repair, migration or training",
+                "automatic_trigger": False,
+            },
+            "text_expression_choice": {
+                "arguments": ["strategy", "native_text?", "meaning_references?", "once?"],
+                "scope": "choose the next response strategy or a referenced native fallback; no immediate delivery or inferred willingness",
+                "automatic_trigger": False,
+            },
             "english_compose_selected": {
                 "arguments": ["native_intent", "expression_intent", "choice?", "cognition_plan?"],
                 "scope": "one private English candidate from selected structured meaning; no thought selection, delivery or automatic learning",
@@ -225,7 +235,19 @@ def execute_personal_tool_command(
     verify_code_command(command)
     command_id = str(command.get("id") or "")[:160]
     fs, personal = _paths(child, root, cfg)
-    if action == "english_compose_selected":
+    if action == "language_path_status":
+        if not isinstance(child, str) or child in {"", ".", ".."} or "/" in child or "\\" in child:
+            raise ValueError("one child path component required")
+        from language_path_status import inspect_language_paths
+        layout = cfg.get("storage_layout") or {}
+        fast = layout.get("fast_index_root") if isinstance(layout, dict) else None
+        fast = fast.format(child=child) if isinstance(fast, str) else None
+        value = inspect_language_paths(root / "AI_Children" / child / "memory", fast)
+    elif action == "text_expression_choice":
+        from runtime_state import set_text_expression_intent
+        value = set_text_expression_intent(command.get("strategy"), native_text=command.get("native_text"),
+            meaning_references=command.get("meaning_references"), once=command.get("once", True), child=child)
+    elif action == "english_compose_selected":
         from english_composition import compose_selected_english
         value = compose_selected_english(command.get("native_intent"), command.get("expression_intent"),
             choice=command.get("choice", "english"), cognition_plan=command.get("cognition_plan"))

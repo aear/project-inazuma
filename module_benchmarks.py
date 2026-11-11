@@ -2742,6 +2742,14 @@ _REGISTRY = {
         ModuleVersion("conversation_questions", "V1", "Pinned question punctuation and generic response scoring", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V1")),
         ModuleVersion("conversation_questions", "V2", "Bounded question invitations, voluntary response preference and echo review", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V2")),
     ),
+    "response_passes": (
+        ModuleVersion("response_passes", "V1", "Pinned single-stage selection", lambda: __import__("benchmarks.benchmark_response_passes", fromlist=["assess"]).assess("V1")),
+        ModuleVersion("response_passes", "V2", "Bounded English/native/relevant-state reconsideration", lambda: __import__("benchmarks.benchmark_response_passes", fromlist=["assess"]).assess("V2")),
+    ),
+    "symbol_vocab_projection": (
+        ModuleVersion("symbol_vocab_projection", "V1", "Pinned complete JSON vocabulary reader", lambda: __import__("benchmarks.benchmark_symbol_vocab_projection", fromlist=["assess"]).assess("V1")),
+        ModuleVersion("symbol_vocab_projection", "V2", "Explicit streaming SQLite projection and scoped reader", lambda: __import__("benchmarks.benchmark_symbol_vocab_projection", fromlist=["assess"]).assess("V2")),
+    ),
     "response_language_policy": (
         ModuleVersion("response_language_policy", "V1", "Pinned response scoring and generic emotion fallback", lambda: __import__("benchmarks.benchmark_response_language_policy", fromlist=["assess"]).assess("V1")),
         ModuleVersion("response_language_policy", "V2", "Voluntary English preference and contextual emotion reports", lambda: __import__("benchmarks.benchmark_response_language_policy", fromlist=["assess"]).assess("V2")),
@@ -2916,7 +2924,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
-                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions", "conversation_grounding"} and spec.version == "V1" else
+                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions", "conversation_grounding", "response_passes", "symbol_vocab_projection"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"

@@ -50,7 +50,7 @@ def _argument(event):
     return _phrase(value)
 
 
-def _language_projection(text):
+def language_surface_projection(text):
     """Keep a terminal heart/emoji trace while parsing its preceding sentence.
 
     No affection, willingness or semantic equivalence is inferred. Extra lexical
@@ -88,7 +88,7 @@ def observe_conversation_turn(turn, discourse):
         return {**base,'status':'scope_unresolved'}
     repair=bool(re.match(r'^actually,\s+',text,re.I))
     parsed=re.sub(r'^actually,\s+','',text,flags=re.I) if repair else text
-    parsed,suffix=_language_projection(parsed)
+    parsed,suffix=language_surface_projection(parsed)
     if question_context(parsed)['answer_invitation']: return base
     event,record=_single_event(parsed,discourse)
     if event is None or record.get('speech_act',{}).get('act')!='assertion': return base
@@ -116,7 +116,7 @@ def _query(text, discourse):
     if not context['answer_invitation'] or not context['complete']: return None
     if re.search(r'["“”`\n]|(?<!\w)[\x27‘]',text): return None
     # Only remove a supplied identity's comma-marked vocative, not arbitrary names.
-    parsed,suffix=_language_projection(text)
+    parsed,suffix=language_surface_projection(text)
     parsed=parsed.replace('？','?')
     for alias in (discourse.get('self') or {}).get('aliases',[])[:8]:
         if isinstance(alias,str) and len(alias)<=80:
@@ -280,3 +280,6 @@ def english_candidate_allowed(preference):
         if isinstance(preference.get('mutual_intelligibility_assessment'),Mapping):return False
         preference=preference.get('mode') or preference.get('language_mode') or preference.get('preference')
     return isinstance(preference,str) and preference.strip().casefold().replace('-','_') in {'english','en','english_only','auto','mixed'}
+
+# Compatibility for earlier private callers; the shared public helper is above.
+_language_projection = language_surface_projection

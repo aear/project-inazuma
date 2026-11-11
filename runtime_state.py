@@ -110,6 +110,8 @@ def set_text_expression_intent(
     pointers: Optional[List[Any]] = None,
     song_path: Optional[str] = None,
     caption: Optional[str] = None,
+    native_text: Optional[str] = None,
+    meaning_references: Optional[List[str]] = None,
     max_emotion_sliders: Optional[int] = None,
     max_code_pointers: Optional[int] = None,
     once: bool = True,
@@ -128,17 +130,28 @@ def set_text_expression_intent(
         "code": "code_pointer",
         "music": "song",
         "track": "song",
-        "quiet": "silence",
+        "quiet": "silence", "defer": "silence", "abstain": "silence",
+        "native_only": "native", "clarification": "clarify",
     }
     normalized = str(strategy or "").strip().lower()
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"respond", "mirror", "emotion", "code_pointer", "song", "silence"}:
+    if normalized not in {"respond", "mirror", "emotion", "code_pointer", "song", "silence", "native", "clarify"}:
         raise ValueError(f"Unsupported text expression strategy: {strategy!r}")
     payload: Dict[str, Any] = {
         "strategy": normalized,
         "once": bool(once),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if native_text is not None or meaning_references is not None:
+        from response_passes import native_expression_candidate
+        candidate = native_expression_candidate({"text_expression_intent": {
+            "native_text": native_text, "meaning_references": meaning_references}})
+        if candidate is None:
+            raise ValueError("native expression requires bounded text and meaning references")
+        payload["native_text"] = candidate["text"]
+        payload["meaning_references"] = candidate["references"]
+    if normalized == "native" and "native_text" not in payload:
+        raise ValueError("native strategy requires a selected referenced expression")
     if pointers is not None:
         payload["pointers"] = list(pointers)[:24]
     if song_path is not None:

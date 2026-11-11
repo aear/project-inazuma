@@ -17,6 +17,7 @@ def assess_english_foundation() -> dict[str, Any]:
         ("character_language", ("V2",)), ("self_name_reference", ("V2",)),
         ("english_workbench", ("V2",)), ("language_transfer_limits", ("V2",)),
         ("conversation_questions", ("V2",)), ("conversation_grounding", ("V2",)),
+        ("response_passes", ("V2",)), ("symbol_vocab_projection", ("V2",)),
     )
     results = []
     for module, versions in selections:
