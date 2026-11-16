@@ -40,6 +40,16 @@ def capability_catalog() -> dict[str, Any]:
         "schema": "ina.personal_tool_capabilities/V1",
         "voluntary": True,
         "automatic_trigger": False,
+        "process_local": {
+            "private_thinking": {
+                "entrypoint": "model_manager.open_private_thinking",
+                "authority": "local voluntary code only",
+                "scope": "optional bounded RAM-only thought; no journal, language requirement, reporting or delivery",
+                "automatic_trigger": False,
+                "queue_supported": False,
+                "persistent": False,
+            },
+        },
         "commands": {
             "language_path_status": {
                 "arguments": [],
@@ -212,6 +222,8 @@ def request_personal_tool(
     command: Mapping[str, Any], *, child: str | None = None, code_authority: object | None = None,
 ) -> dict[str, Any]:
     """Queue one chosen command; callers must supply the action and content."""
+    if command.get("action") in {"private_thinking", "private_thought", "private_deliberation"}:
+        raise ValueError("private thinking is process-local; do not put contents in a durable queue")
     payload = dict(command)
     payload.setdefault("id", f"personal_tool_{datetime.now(timezone.utc).timestamp():.6f}")
     payload = seal_code_command(payload, code_authority)

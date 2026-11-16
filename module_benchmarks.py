@@ -2742,6 +2742,10 @@ _REGISTRY = {
         ModuleVersion("conversation_questions", "V1", "Pinned question punctuation and generic response scoring", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V1")),
         ModuleVersion("conversation_questions", "V2", "Bounded question invitations, voluntary response preference and echo review", lambda: __import__("benchmarks.benchmark_conversation_questions", fromlist=["assess"]).assess("V2")),
     ),
+    "private_thinking": (
+        ModuleVersion("private_thinking", "V1", "Inspectable thought records; offline-only privacy comparison", lambda: __import__("benchmarks.benchmark_private_thinking", fromlist=["assess"]).assess("V1")),
+        ModuleVersion("private_thinking", "V2", "Optional private RAM workspace; offline-only privacy comparison", lambda: __import__("benchmarks.benchmark_private_thinking", fromlist=["assess"]).assess("V2")),
+    ),
     "python_runtime_split": (
         ModuleVersion("python_runtime_split", "V1", "Pinned shared service interpreter", lambda: __import__("benchmarks.benchmark_python_runtime_split", fromlist=["assess"]).assess("V1")),
         ModuleVersion("python_runtime_split", "V2", "Reviewed main runtime with supported Discord interpreter", lambda: __import__("benchmarks.benchmark_python_runtime_split", fromlist=["assess"]).assess("V2")),
@@ -2932,7 +2936,7 @@ def benchmark_module(module: str, versions: tuple[str, ...] | None = None) -> tu
                 "a31f1323ee4bb589d0ca0bf02aea87201b69cd21"
                 if spec.module in {"english_review", "work_reports"} and spec.version == "V1" else
                 str(outcome["baseline_revision"])
-                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions", "conversation_grounding", "response_passes", "symbol_vocab_projection", "runtime_startup", "python_runtime_split"} and spec.version == "V1" else
+                if spec.module in {"review_efficiency", "memory_maintenance_tools", "language_referent_learning", "speech_bridge", "language_transfer_limits", "social_english", "discord_social_english", "discord_storage", "social_storage", "response_language_policy", "character_language", "self_name_reference", "english_workbench", "ml_cognition_reliability", "conversation_questions", "conversation_grounding", "response_passes", "symbol_vocab_projection", "runtime_startup", "python_runtime_split", "private_thinking"} and spec.version == "V1" else
                 resolve_revision(TRANSFORMER_V1_REVISION)
                 if spec.module in _HISTORY_BACKED_MODULES and spec.version == "V1"
                 else "working-tree"

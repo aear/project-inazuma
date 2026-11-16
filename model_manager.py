@@ -4741,6 +4741,12 @@ def build_cognitive_context(
     )
 
 
+def open_private_thinking(*, code_authority, max_bytes=256*1024):
+    """Offer optional RAM-only thought; never queue, record or interpret contents."""
+    from private_thinking import PrivateThoughtSpace
+    return PrivateThoughtSpace(code_authority=code_authority, max_bytes=max_bytes)
+
+
 def guide_thought_decision(
     options, guidance, *, evidence, context: Optional[CognitiveContext] = None,
     observations=(), goals=(), active_state=None, discourse=None, provenance=(),
