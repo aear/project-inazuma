@@ -1,0 +1,17 @@
+# Fedora 45 startup repair — 2026-11-16
+
+Observed baseline: `6ddc708052af29c993925a935ed4f2dda2a3e49b`.
+
+The saved service status showed repeated Discord exits, return code 1, after about 0.14 seconds, nine recorded failures and a 30-second retry delay. The supervisor was stopped when inspected; no matching host processes were found. This supports a restart loop, rather than concurrent healthy Discord clients. The original failing process traceback was not captured.
+
+Fedora's Python is now 3.15.2. The retained venv contains Python 3.14 packages but its `bin/python` link pointed to `/usr/bin/python`, now 3.15. The saved service command also used `/usr/bin/python`. Neither interpreter could locate Discord in its active package paths. Python 3.14 was absent.
+
+A private Python 3.14.10 interpreter from Astral's python-build-standalone release 20261110 was downloaded and matched against the release API asset SHA-256 digest. The original venv links and configuration are retained in `.runtime/environment-before-fedora45-repair/`. Only the base interpreter link and pyvenv.cfg home/version/executable were changed; existing packages were retained. `.runtime/` is excluded from Git. The private interpreter is a local installation, not distributed through the source commit. It requires normal future security maintenance.
+
+GUI startup now selects the project's venv before importing the GUI or entering its existing resource envelope. A bounded external-dependency import probe with numerical pools capped at one worker runs before the GUI and before Discord launches. It does not import Ina or read learned stores. Broken dependencies block a launch with repair guidance. Ordinary repeated failures retain backoff but pause after five consecutive crashes (configurable `runtime_services.max_consecutive_failures`, bounded 1..32). An explicit operator Restart renews that budget. Existing singleton ownership and process-exit-before-restart behavior are retained. Exit codes and runtimes reach the status log. Shutdown clears stale pending-retry states.
+
+Validation: 19 focused native-runner tests passed in a source-only Bubblewrap room, network disabled, with no live memory mounts. Pinned V1 benchmark 5/12; candidate V2 12/12: eleven behavioral supervisor fixtures plus one explicitly labelled launcher source-wiring check. The fixtures use finite fake processes/timers, not real Discord clients. Existing duplicate-launch suppression, disabled-service policy, graceful operator restart, delayed first retry and shutdown behavior remain covered. Additional dependency probes checked real stdlib imports and failure reporting.
+
+External dependency checks with the restored venv succeeded for NumPy, discord, discord.sinks, aiohttp, audioop, nacl, davey, OpenCV, PyQt5.QtWidgets and tkinter. A Tcl interpreter initialized successfully. These checks do not establish a successful live login, GUI boot, voice handshake, whole-runtime performance or full-suite compatibility. No live service or learning process was started for verification. No memory migration occurred.
+
+Activation: fully reopen the GUI, then use normal startup. Source changes are uncommitted. The repaired local environment is already installed. Rollback requires Ina stopped: restore the saved pyvenv.cfg and original symlink targets; these targets point back to Fedora's currently incompatible system Python, so rollback alone does not provide a working bridge. Source rollback can be reviewed separately through Git. Keep the private runtime while any environment links to it.

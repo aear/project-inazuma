@@ -1,0 +1,4 @@
+# Install alongside requirements-core.txt using Pycord-supported Python 3.14.
+# Current Pycord releases require Python <3.15; do not override that metadata.
+py-cord[voice]>=2.8,<3
+davey>=0.1.6,<0.2

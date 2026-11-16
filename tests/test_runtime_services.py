@@ -124,3 +124,62 @@ def test_operator_restart_is_immediate_and_does_not_count_as_crash(monkeypatch, 
 
     assert supervisor.failures["discord_bridge"] == 0
     assert calls == [("discord_bridge", True)]
+
+
+def test_dependency_failure_blocks_without_spawn(monkeypatch):
+    monkeypatch.setattr(services, 'load_config', lambda: {})
+    s=services.RuntimeServiceSupervisor('Fixture')
+    monkeypatch.setattr(s, '_publish', lambda: None)
+    monkeypatch.setattr(services, 'check_environment', lambda *a: {'ok':False,'reason':'missing'})
+    monkeypatch.setattr(services, 'safe_popen', lambda *a,**k: (_ for _ in ()).throw(AssertionError('must not spawn')))
+    monkeypatch.setattr(services, 'log_to_statusbox', lambda *a: None)
+    s._launch('discord_bridge')
+    assert s.state['services']['discord_bridge']['status']=='blocked_environment'
+    assert not s.timers
+
+
+def test_versioned_startup_fixtures():
+    from benchmarks.benchmark_runtime_startup import cases
+    rows=cases(Path(services.__file__).read_text())
+    assert rows and all(row['correct'] for row in rows), rows
+
+
+def test_stale_exit_does_not_replace_current_process(monkeypatch):
+    monkeypatch.setattr(services, 'load_config', lambda: {})
+    s=services.RuntimeServiceSupervisor('Fixture')
+    current=SimpleNamespace(pid=7);s.processes['discord_bridge']=current
+    s._handle_exit('discord_bridge',{'process':SimpleNamespace(pid=6),'returncode':1})
+    assert s.processes['discord_bridge'] is current
+    assert s.failures['discord_bridge']==0
+
+
+def test_shutdown_clears_waiting_service_state(monkeypatch):
+    monkeypatch.setattr(services, 'load_config', lambda: {})
+    s=services.RuntimeServiceSupervisor('Fixture')
+    monkeypatch.setattr(s,'_publish',lambda:None)
+    monkeypatch.setattr(s,'_launch',lambda name:s._service_state(name,status='restart_wait',restart_in_sec=30))
+    s.request_stop();s.run()
+    assert s.state['status']=='stopped'
+    assert all(v['status']=='stopped' and v['restart_in_sec'] is None for v in s.state['services'].values())
+
+
+def test_live_operator_restart_renews_budget(monkeypatch):
+    monkeypatch.setattr(services,'load_config',lambda:{})
+    s=services.RuntimeServiceSupervisor('Fixture')
+    monkeypatch.setattr(s,'_publish',lambda:None)
+    s.failures['discord_bridge']=4
+    s.processes['discord_bridge']=SimpleNamespace(pid=7,poll=lambda:None,terminate=lambda:None)
+    s._restart('discord_bridge')
+    assert s.failures['discord_bridge']==0
+
+
+def test_bridge_launch_uses_supported_interpreter(monkeypatch):
+    monkeypatch.setattr(services,'load_config',lambda:{})
+    s=services.RuntimeServiceSupervisor('Fixture')
+    monkeypatch.setattr(s,'_publish',lambda:None)
+    seen=[]
+    monkeypatch.setattr(services,'project_python',lambda root,service=None:'/fixture/bridge314/python')
+    monkeypatch.setattr(services,'check_environment',lambda exe,*a:seen.append(('probe',exe)) or {'ok':True})
+    monkeypatch.setattr(services,'safe_popen',lambda command,**k:seen.append(('launch',command[0])) or None)
+    s._launch('discord_bridge')
+    assert seen==[('probe','/fixture/bridge314/python'),('launch','/fixture/bridge314/python')]

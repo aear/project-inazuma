@@ -1,6 +1,10 @@
 import os
 import sys
 if __name__ == "__main__":
+    from pathlib import Path
+    from runtime_environment import prepare_gui
+
+    prepare_gui(Path(__file__).resolve().parent)
     from resource_envelope import ensure_runtime_hard_limit
 
     ensure_runtime_hard_limit([sys.executable, *sys.argv])

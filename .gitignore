@@ -78,3 +78,10 @@ Project Inazuma.code-workspace
 
 !docs/evidence/radio_station_20261021.json
 .character_language.py.x2pt4l09
+
+# Private compatible Python runtime and environment rollback data.
+.runtime/
+
+# Reproducible split Python environments.
+!requirements-core.txt
+!requirements-discord.txt

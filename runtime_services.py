@@ -20,6 +20,7 @@ from gui_hook import log_to_statusbox
 from io_utils import atomic_write_json
 from runtime_lifecycle import stop_runtime_services
 from safe_popen import safe_popen
+from runtime_environment import check_environment, environment_message, DISCORD_MODULES, project_python, python_environment
 
 try:
     import fcntl
@@ -91,7 +92,7 @@ def ensure_runtime_service_supervisor(child: str) -> Optional[int]:
                 f"[Services] Replaced detached runtime services: {', '.join(stopped['matched'])}."
             )
         process = safe_popen(
-            [sys.executable, "runtime_services.py", "--supervise", "--child", str(child)],
+            [project_python(Path(__file__).resolve().parent), "runtime_services.py", "--supervise", "--child", str(child)],
             cwd=str(Path(__file__).resolve().parent),
         )
         if process is None:
@@ -202,6 +203,7 @@ class RuntimeServiceSupervisor:
             self.enabled["discord_bridge"] = False
         self.restart_base = max(0.25, float(policy.get("restart_base_delay_sec", 1.0) or 1.0))
         self.restart_max = max(self.restart_base, float(policy.get("restart_max_delay_sec", 30.0) or 30.0))
+        self.max_failures = max(1, min(32, int(policy.get("max_consecutive_failures", 5) or 5)))
         self.stable_seconds = max(5.0, float(policy.get("stable_reset_sec", 60.0) or 60.0))
 
     def _publish(self) -> None:
@@ -233,12 +235,21 @@ class RuntimeServiceSupervisor:
         if current is not None and current.poll() is None:
             return
         command = list(SERVICE_COMMANDS[name])
+        command[0] = project_python(self.project_root, service=name)
         if name == "virtual_workspace":
             command.extend(["--child", self.child])
+        if name == "discord_bridge":
+            report = check_environment(command[0], DISCORD_MODULES)
+            if not report.get("ok"):
+                message = environment_message(report)
+                self._service_state(name, status="blocked_environment", pid=None, last_error=message)
+                log_to_statusbox(f"[Services] {name}: {message}")
+                return
         process = safe_popen(
             command,
             cwd=str(self.project_root),
             governor_module=name,
+            env=python_environment(command[0]),
         )
         if process is None:
             self.events.put(("exit", name, {"process": None, "returncode": None, "error": "launch_failed"}))
@@ -263,7 +274,11 @@ class RuntimeServiceSupervisor:
         old_timer = self.timers.pop(name, None)
         if old_timer is not None:
             old_timer.cancel()
-        delay = 0.0 if immediate else min(self.restart_max, self.restart_base * (2 ** max(0, self.failures[name] - 1)))
+        if not immediate and self.failures[name] >= self.max_failures:
+            self._service_state(name, status="blocked_crash_loop", pid=None, restart_in_sec=None)
+            log_to_statusbox(f"[Services] {name} paused after {self.failures[name]} consecutive failures; repair the cause, then use Restart.")
+            return
+        delay = 0.0 if immediate else min(self.restart_max, self.restart_base * (2 ** min(30, max(0, self.failures[name] - 1))))
         self._service_state(name, status="restart_wait", pid=None, restart_in_sec=round(delay, 2))
         timer = threading.Timer(delay, lambda: self.events.put(("launch", name, None)))
         timer.daemon = True
@@ -274,6 +289,8 @@ class RuntimeServiceSupervisor:
         if not self.enabled.get(name, False):
             self._service_state(name, status="disabled", pid=None)
             return
+        # Only an explicit operator request opens a fresh finite retry budget.
+        self.failures[name] = 0
         process = self.processes.get(name)
         if process is None or process.poll() is not None:
             self._schedule_restart(name, immediate=True)
@@ -308,6 +325,7 @@ class RuntimeServiceSupervisor:
             restart_count=int(self.failures[name]),
         )
         if not self.stopping:
+            log_to_statusbox(f"[Services] {name} exited (code={detail.get('returncode')}, runtime={runtime:.2f}s).")
             self._schedule_restart(name, immediate=requested)
 
     def request_stop(self) -> None:
@@ -366,6 +384,9 @@ class RuntimeServiceSupervisor:
             self._service_state(
                 name, status="forced" if name in stragglers else "stopped", pid=None,
             )
+        for name in SERVICE_COMMANDS:
+            if name not in self.processes:
+                self._service_state(name, status="stopped", pid=None, restart_in_sec=None)
         self.state["status"] = "stopped"
         self._publish()
 
