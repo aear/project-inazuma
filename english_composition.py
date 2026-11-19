@@ -74,7 +74,11 @@ def compose_selected_english(native_intent, expression_intent, *, choice='englis
     def render(identifier,depth=0):
         if depth>3 or identifier in seen:raise UnsupportedEnglish('cyclic_or_deep_structure')
         seen.add(identifier);e=by_id[identifier]
-        if e.get('question_word'):raise UnsupportedEnglish('wh_question_scope_not_supported')
+        question = e.get('question_word')
+        if question is not None and (not isinstance(question, str) or question not in {'who', 'what', 'where', 'when', 'why', 'how'}):
+            raise UnsupportedEnglish('wh_question_scope_not_supported')
+        if question and (e.get('parent_clause') or children[identifier]):
+            raise UnsupportedEnglish('embedded_wh_question_not_supported')
         if e.get('negation_operator') not in {None,'not'}:raise UnsupportedEnglish('negation_operator_not_supported')
         verb=e.get('predicate')
         if not isinstance(verb,str) or verb not in _VERBS:raise UnsupportedEnglish('unsupported_predicate')
@@ -97,6 +101,7 @@ def compose_selected_english(native_intent, expression_intent, *, choice='englis
         subject=e.get('agent')
         voice=e.get('voice') or 'active'
         if voice=='passive':
+            if question:raise UnsupportedEnglish('passive_wh_question_not_supported')
             if children[identifier] or 'theme' not in args or modal or e.get('inverted'):raise UnsupportedEnglish('unsupported_passive_structure')
             theme=_phrase(args['theme']);plural=e.get('agreement_number')=='plural' or theme.casefold() in {'we','they','you'}
             auxiliary=('were' if plural else 'was') if tense=='past' else ('are' if plural else 'is')
@@ -106,6 +111,11 @@ def compose_selected_english(native_intent, expression_intent, *, choice='englis
                 parts+=['by',agent]
         elif voice=='active':
             subject=_agent(subject)
+            subject_question = question in {'who', 'what'} and subject.casefold() == question
+            if question and not subject_question and not e.get('inverted'):
+                raise UnsupportedEnglish('wh_question_requires_explicit_inversion')
+            if subject_question and e.get('inverted'):
+                raise UnsupportedEnglish('subject_question_must_not_invert')
             plural=e.get('agreement_number')=='plural' or subject.casefold() in {'you','we','they'} or ' and ' in subject.casefold()
             third=not plural and subject.casefold()!='i'
             complement=[]
@@ -115,6 +125,8 @@ def compose_selected_english(native_intent, expression_intent, *, choice='englis
                 complement.append(recipient)
             if 'theme' in args:complement.append(_phrase(args['theme']))
             inverted=bool(e.get('inverted'))
+            if question in {'who', 'what'} and not subject_question and args.get('theme'):
+                raise UnsupportedEnglish('wh_question_slot_already_filled')
             if modal:auxiliary=modal;lexical=verb
             elif verb=='be':
                 auxiliary=('were' if plural else 'was') if tense=='past' else ('am' if subject=='I' else 'are' if plural else 'is');lexical=None
@@ -130,12 +142,14 @@ def compose_selected_english(native_intent, expression_intent, *, choice='englis
                 if child.get('clausal_relation') not in {'reported_content','attitude_content'}:raise UnsupportedEnglish('unknown_complement_relation')
                 parts+=['that',render(child['id'],depth+1)]
         else:raise UnsupportedEnglish('unsupported_voice')
+        if question and not subject_question:
+            parts.insert(0, question)
         return ' '.join(parts)
     try:
         sentences=[]
         for identifier in roots:
             text=render(identifier)
-            text=text[:1].upper()+text[1:]+('?' if by_id[identifier].get('inverted') else '.')
+            text=text[:1].upper()+text[1:]+('?' if by_id[identifier].get('inverted') or by_id[identifier].get('question_word') else '.')
             sentences.append(text)
         if len(seen)!=len(events):raise UnsupportedEnglish('unreachable_or_cyclic_event')
         candidate=' '.join(sentences)

@@ -20,6 +20,15 @@ _CONTRACTIONS = {
     "won't": ("will", "not"), "shouldn't": ("should", "not"), "wouldn't": ("would", "not"),
     "i'm": ("i", "am"), "you're": ("you", "are"), "that's": ("that", "is"),
 }
+# Unambiguous grammatical expansions only; no word meanings are learned here.
+_CONTRACTIONS.update({
+    "we're": ("we", "are"), "they're": ("they", "are"),
+    "i'll": ("i", "will"), "you'll": ("you", "will"),
+    "he'll": ("he", "will"), "she'll": ("she", "will"),
+    "it'll": ("it", "will"), "we'll": ("we", "will"), "they'll": ("they", "will"),
+    "aren't": ("are", "not"), "weren't": ("were", "not"),
+    "couldn't": ("could", "not"), "mustn't": ("must", "not"),
+})
 _LEMMA = {"told": "tell", "said": "say", "stole": "steal", "gave": "give", "did": "do", "was": "be", "is": "be", "are": "be", "am": "be", "were": "be", "does": "do", "has": "have", "had": "have", "ran": "run", "running": "run", "given": "give", "gone": "go", "went": "go", "seen": "see", "saw": "see", "found": "find", "felt": "feel", "written": "write", "wrote": "write", "read": "read", "taught": "teach", "thought": "think"}
 _PAST = {"told", "said", "stole", "gave", "did", "was", "were", "had", "ran", "went", "saw", "found", "felt", "wrote", "taught", "thought"}
 _MODALS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
@@ -30,7 +39,10 @@ _VERBS |= {"believe", "wish", "suppose", "doubt"}
 _COMPLEMENT_VERBS = {"say", "tell", "think", "know", "believe", "hope", "wish", "suppose", "doubt", "want"}
 _PASSIVE_PARTICIPLES = {"given", "seen", "written", "taught", "found", "kept", "stolen", "told"}
 _LEMMA.update({"kept": "keep", "stolen": "steal", "chose": "choose", "chosen": "choose"})
-_PAST.update({"kept", "chose"})
+_PAST.update({"kept", "chose", "knew", "understood"})
+_LEMMA.update({"knew": "know", "understood": "understand"})
+_PASSIVE_PARTICIPLES.add("understood")
+_COMPLEMENT_VERBS.add("understand")
 
 MAX_ANALYSIS_TOKENS = 512
 MAX_ANALYSIS_CHARACTERS = 16384
@@ -52,8 +64,15 @@ def _lemma_word(word: str) -> str:
         if len(stem) > 2 and stem[-1] == stem[-2]:
             stem = stem[:-1]
         return stem + "e" if stem + "e" in _VERBS else stem
+    if word.endswith("ies") and word[:-3] + "y" in _VERBS:
+        return word[:-3] + "y"
     if word.endswith("s") and len(word) > 3:
-        return word[:-1]
+        singular = word[:-1]
+        if singular in _VERBS:
+            return singular
+        if word.endswith("es") and word[:-2] in _VERBS:
+            return word[:-2]
+        return singular
     return word
 
 
@@ -157,6 +176,11 @@ class ConstructionLearner:
 def _clause(words: list[str], *, clause_id: str, parent: str | None = None) -> dict[str, Any]:
     words = list(words)
     candidates = [i for i, word in enumerate(words) if _lemma_word(word) in _VERBS or word in _MODALS]
+    # A determiner followed immediately by a verb-like form belongs to the
+    # subject phrase: "the wishes change" / "my open gate closed". Recognition
+    # of an inflection alone does not make that token the finite predicate.
+    if words and words[0] in {"the", "a", "an", "my", "your", "our", "their", "his", "her", "its"}:
+        candidates = [i for i in candidates if i > 1]
     verb_at = candidates[0] if candidates else None
     auxiliary = None
     question_word = words[0] if words and words[0] in {"who", "what", "where", "when", "why", "how"} else None

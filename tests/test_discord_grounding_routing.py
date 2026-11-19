@@ -743,10 +743,11 @@ def test_unknown_input_does_not_use_irrelevant_emotion_or_lexicon_fallback(monke
 
     assert not result.text.startswith("State signal")
     assert adapter.calls == []
-    assert result.metadata["expression_decision"]["strategy"] == "mirror"
+    assert result.metadata["expression_decision"]["strategy"] == "clarify"
     assert result.metadata["expression_decision"]["adapter_response_available"] is False
     assert result.metadata["expression_decision"]["adapter_rejection"] == "unmapped_input"
-    assert result.metadata["adapter"] == "deliberate_mirror"
+    assert result.metadata["adapter"] == "conversation_clarification"
+    assert result.text == "Could you rephrase that question?"
 
 
 

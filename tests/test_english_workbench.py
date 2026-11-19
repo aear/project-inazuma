@@ -76,7 +76,7 @@ def test_observatory_rows_distinguish_goal_and_implementation_evidence(tmp_path)
     path=tmp_path/'current.json';path.write_text(json.dumps({'assessments':{'language_english':{'status':'complete','results':[],'learning_profile':build_english_learning_profile()}}}))
     cards,rows=namespace['_developmental_readiness'](tmp_path/'none',tmp_path/'none2',path)
     goals=[r for r in rows if r[0].startswith('English goal')]
-    assert len(goals)==7 and all('optional' in r[2] and 'Ina not assessed' in r[2] for r in goals)
+    assert {r[0].rsplit(' · ',1)[-1] for r in goals}=={'forms','scope','roles','surface','composition','transfer','listener','external_tasks'} and all('optional' in r[2] and 'Ina not assessed' in r[2] for r in goals)
 
 
 def test_operators_and_partial_meanings_are_not_silently_lost():

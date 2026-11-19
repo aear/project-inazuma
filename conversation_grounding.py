@@ -171,6 +171,15 @@ def _realise_attributed_claim(row, recipient_id, intent):
         'meaning_fidelity':'quotation_not_verified_world_fact'}
 
 
+def _question_repair(text, result, reason):
+    """Offer a repair for measured comprehension limits; never invent an answer."""
+    question = question_context(text)
+    if question['complete'] and question['answer_invitation']:
+        return {**result, 'clarification_candidate': 'Could you rephrase that question?',
+                'repair_basis': reason}
+    return result
+
+
 def plan_conversation_reply(text, scene, *, discourse=None):
     """Offer source-backed answer/clarification candidates for the existing chooser.
 
@@ -186,9 +195,9 @@ def plan_conversation_reply(text, scene, *, discourse=None):
             'evidence_scope':'recent_channel_claims_only','independence_inferred':False}
     if not isinstance(text,str) or len(text)>MAX_SOURCE_CHARS or not isinstance(scene,Mapping): return {**result,'status':'input_budget_exceeded'}
     frame=discourse if isinstance(discourse,Mapping) else scene.get('discourse')
-    if not isinstance(frame,Mapping): return {**result,'status':'missing_discourse'}
+    if not isinstance(frame,Mapping): return _question_repair(text, {**result,'status':'missing_discourse'}, 'missing_discourse')
     query=_query(text,frame);result['query']=query
-    if query is None: return {**result,'status':'unsupported_question'}
+    if query is None: return _question_repair(text, {**result,'status':'unsupported_question'}, 'unsupported_question')
     turns=scene.get('turns') or []
     if not isinstance(turns,(list,tuple)) or len(turns)>MAX_TURNS: return {**result,'status':'scene_budget_exceeded'}
     current=scene.get('current_turn_id');total=0;rows=[];seen={};invalid=set()
@@ -271,6 +280,9 @@ def plan_conversation_reply(text, scene, *, discourse=None):
         result['clarification_candidate']='Could you clarify the location of “'+query['subject_surface']+'”?'
     elif conflict:
         result['clarification_candidate']='Could you clarify which of those earlier statements applies?'
+    elif question_context(text)['answer_invitation']:
+        result['clarification_candidate']='Could you give me more context for that question?'
+        result['repair_basis']='missing_conversational_evidence'
     return result
 
 

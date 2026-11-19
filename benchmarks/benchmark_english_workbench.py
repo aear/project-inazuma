@@ -86,7 +86,7 @@ def assess(version):
         target.write_text(json.dumps({'assessments':{'language_english':{'status':'complete','learning_profile':profile}}}))
         _,display=env['_developmental_readiness'](Path(directory)/'none',Path(directory)/'none2',target)
         goal_rows=[r for r in display if r[0].startswith('English goal')]
-        add('Observatory shows optional goals without claiming Ina performance','reporting',len(goal_rows)==7 and all('Ina not assessed' in r[2] for r in goal_rows))
+        add('Observatory shows optional goals without claiming Ina performance','reporting',{r[0].rsplit(' · ',1)[-1] for r in goal_rows}=={'forms','scope','roles','surface','composition','transfer','listener','external_tasks'} and all('Ina not assessed' in r[2] for r in goal_rows))
     add('private selected-meaning and optional-goal tools available','availability','english_compose_selected' in tool_source and 'english_learning_options' in tool_source)
     return {'correct':sum(r['correct'] for r in rows),'total':len(rows),'cases':rows,
             'baseline_revision':BASELINE if version=='V1' else None,

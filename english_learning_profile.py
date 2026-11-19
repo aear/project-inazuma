@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 GOALS=(
+ ('forms','Keep everyday inflections, contractions and chosen questions consistent with their roles and scope.', 'comprehension_expression', ['linguistic_forms']),
  ('scope','Keep who believes or says something separate from whether it happened.', 'comprehension', ['english_workbench']),
  ('roles','Keep speaker, listener, nickname, possession and negation consistent.', 'comprehension', ['language_components','discourse','self_name_reference']),
  ('surface','Retain punctuation and spelling alternatives without silently changing meaning.', 'comprehension', ['character_language']),
